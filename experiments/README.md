@@ -1,0 +1,158 @@
+# experiments/
+
+Slurm (pyxis + enroot) recipes for running miles on **cw-dfw**. Non-agentic RL
+first: these establish that the container, the checkpoints, the rollout loop and
+the reward path all work, before anything needs a sandbox provider.
+
+Everything here is deliberately explicit — paths, argument groups, and mounts
+are spelled out rather than inherited from `scripts/`, so a diff between two
+experiments shows exactly what changed.
+
+## Layout
+
+```
+experiments/
+  env.sh                        shared paths / account / container mounts
+  status.sh                     queue + logs at a glance
+  container/import_image.sbatch docker image -> dated .sqsh
+  setup/download_assets.sbatch  HF model + datasets
+  setup/convert_checkpoint.sbatch  HF -> torch_dist (Megatron)
+  setup/stage_model.sh          one model: download + convert, chained
+  math_sync/<model>/            single-turn math RL (GRPO, deepscaler reward)
+  math_async/<model>/           the same task on the fully-async rollout
+  tool_multiturn/<model>/       multi-turn tool-calling RL (ReTool v2 style)
+  notes/                        reference notes + notes/agents/ work log
+  outputs/                      job logs (git-ignored)
+```
+
+A recipe is `<task>/<model>/`, e.g. `math_sync/qwen3-4b/`. The task directory
+fixes the RL setup (rollout mode, reward, generate function); the model
+directory fixes the weights, the parallelism and the batch shape. Adding a
+model to an existing task means one new subdirectory, not a new task.
+
+Each recipe is a pair: `run.sbatch` allocates the node and starts the
+container, `train.sh` runs inside it and holds the actual argument groups.
+
+## Logs
+
+Every job writes one combined stdout+stderr file to
+`experiments/outputs/<job-name>-<jobid>.log`. The `#SBATCH --output` path is
+relative, so **submit from the repo root**.
+
+```bash
+experiments/status.sh            # queue + the 10 newest logs
+experiments/status.sh -f         # follow the newest log
+experiments/status.sh 15004856   # job detail + follow that job's log
+```
+
+`experiments/outputs/` is git-ignored (`outputs/.gitignore`), so logs never end
+up in a commit.
+
+## Paths on lustre
+
+| Purpose | Host path | In container |
+|---|---|---|
+| Datasets | `/lustre/fsw/portfolios/coreai/users/kfujii/datasets` | `/data` |
+| HF weights | `…/checkpoints/hf` | `/ckpt/hf` |
+| Megatron (`torch_dist`) weights | `…/checkpoints/megatron` | `/ckpt/megatron` |
+| Training checkpoints | `…/checkpoints/training` | `/ckpt/training` |
+| Container images | `…/container` | — |
+| Caches (HF, enroot) | `…/cache` | `/root/.cache` |
+| miles checkout | `…/src/miles` | `/root/miles` |
+
+The image ships miles at `/root/miles`; the mount shadows it with this checkout,
+so edits here take effect without rebuilding.
+
+## Order of operations
+
+```bash
+export ACC=coreai_horizon_dilations
+
+# 1. Image (CPU node, ~30-60 min). Writes miles-latest-YYYYMMDD.sqsh and
+#    repoints the miles-latest.sqsh symlink.
+sbatch -A $ACC experiments/container/import_image.sbatch
+
+# 2. Model + datasets (CPU node).
+sbatch -A $ACC experiments/setup/download_assets.sbatch
+
+# 3. HF -> torch_dist (GPU node, ~10 min).
+sbatch -A $ACC experiments/setup/convert_checkpoint.sbatch
+```
+
+Adding one more model later does not need the whole list re-staged.
+`stage_model.sh` submits that model's download and chains its conversion behind
+it; both halves are skipped if already done.
+
+```bash
+experiments/setup/stage_model.sh Qwen3-4B-Instruct-2507
+```
+
+Then the training recipes:
+
+```bash
+# 4a. Math RL smoke test (colocated).
+sbatch -A $ACC experiments/math_sync/qwen3-4b/run.sbatch
+
+# 4b. Multi-turn tool RL.
+sbatch -A $ACC experiments/tool_multiturn/qwen3-4b/run.sbatch
+```
+
+A fast smoke variant (a few rollouts, short responses):
+
+```bash
+sbatch -A $ACC -p interactive --time=01:00:00 \
+  --export=ALL,NUM_ROLLOUT=3,ROLLOUT_BATCH_SIZE=8,N_SAMPLES_PER_PROMPT=8,GLOBAL_BATCH_SIZE=64,MAX_RESPONSE_LEN=1024 \
+  experiments/math_sync/qwen3-4b/run.sbatch
+```
+
+Keep the four-knob invariant when changing batch sizes:
+
+```
+rollout_batch_size × n_samples_per_prompt = global_batch_size × num_steps_per_rollout
+```
+
+miles aborts at startup if it does not hold.
+
+## Cluster facts these scripts assume
+
+Measured on cw-dfw, 2026-08-03:
+
+- GPU partitions all serve the same `pool0-*` nodes: **H100 x8, 128 CPUs, 2 TB RAM**.
+  The partition also selects the QoS (`batch_short` -> `p_batch_short`), so
+  `--qos` is never passed explicitly — **choosing the partition is the only
+  scheduling lever**:
+
+  | partition | MaxTime | node cap |
+  |---|---|---|
+  | `interactive` | 4 h | **2** (GPU 16) |
+  | `batch_short` | 2 h | 4 |
+  | `batch` | 4 h | 768 |
+  | `batch_long` | 8 h | 768 |
+  | `batch_large_long` | 14 d | 768 |
+
+  **Default to `interactive`.** Every recipe here is single-node and 4 h, which
+  is exactly what it covers, and it schedules far ahead of `batch`. Reach for
+  `batch_long` / `batch_large_long` only when a run genuinely needs more than
+  4 h, and for `batch` only above 2 nodes.
+- CPU partitions (`cpu` 1d, `cpu_long` 7d): 96 CPUs, no GPU. `cpu_interactive`
+  (1 d) is the fast lane for downloads and image imports.
+- **No docker and no apptainer**; `enroot` + pyxis (`srun --container-image`) only.
+  `/etc/subuid` is empty, so nested rootless docker / `--fakeroot` is not an option.
+- Compute nodes have egress (huggingface.co, ghcr.io, app.daytona.io all reachable).
+- `/tmp` is RAM-backed — never point enroot scratch at it (see `import_image.sbatch`).
+
+## Optional
+
+- **wandb**: set `WANDB_API_KEY` (and optionally `WANDB_PROJECT`) in the
+  submitting shell; `--export=ALL` carries it in. Without it, wandb stays off.
+- **Docker Hub rate limits**: if `enroot import` returns HTTP 429, put
+  credentials in `$ENROOT_CONFIG_PATH/.credentials`
+  (`machine auth.docker.io login <user> password <token>`).
+
+## Next step (agentic RL)
+
+These two recipes need no sandbox. The agentic recipes in `examples/`
+(Harbor, OpenEnv, NeMo-Gym) each need a container runtime or an external sandbox
+service; on this cluster that means the internal OpenSandbox service, which is
+reachable from cw-dfw compute nodes (verified: HTTP 401 without a key). See
+`docs/user-guide/environments.md` for how the connectors plug in.
