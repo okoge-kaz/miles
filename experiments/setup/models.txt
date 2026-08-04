@@ -1,0 +1,65 @@
+# Models to stage:
+#   MODEL_NAME | HF_REPO | MEGATRON_MODEL_TYPE | [CONVERT_EXTRA_ARGS] | [NODES]
+# MEGATRON_MODEL_TYPE names a scripts/models/<type>.sh MODEL_ARGS file.
+# CONVERT_EXTRA_ARGS is appended to tools/convert_hf_to_torch_dist.py.
+# NODES > 1 runs the conversion across that many 8-GPU nodes.
+# Everything <= 120B that has a MODEL_ARGS file in the repo and a public HF repo.
+# Sizes are the HF download; the torch_dist output is roughly the same again.
+#
+# --- RL experiment workhorses (experiments/math_sync, math_async, tool_multiturn) ---
+# Qwen3-4B (hybrid thinking) is already staged and is the model the first math
+# runs used. It sits at its post-training RLVR fixed point on math: raw_reward
+# 0.84 flat over 46 steps, 21.6/32 groups zero-variance, AIME24 avg@16 0.70 ->
+# 0.68. Usable as a collapse detector, not as a model with headroom.
+#
+# Qwen3-4B-Instruct-2507 is the non-thinking instruct: same architecture (its
+# MODEL_ARGS file just re-sources qwen3-4B.sh with rotary base 5e6), so it is a
+# drop-in checkpoint swap, but a much lower math ceiling means real headroom.
+# It keeps the tools-aware chat template, which the multi-turn tool recipe
+# structurally requires (generate_endpoint_utils.py:30 applies the template with
+# tools=; multi_turn.py:39 parses the model's native tool-call format).
+Qwen3-4B-Instruct-2507            | Qwen/Qwen3-4B-Instruct-2507                    | qwen3-4B-Instruct-2507
+#
+# dense
+Qwen3-8B                          | Qwen/Qwen3-8B                                  | qwen3-8B
+Qwen3.5-9B                        | Qwen/Qwen3.5-9B                                | qwen3.5-9B
+Qwen3.5-27B                       | Qwen/Qwen3.5-27B                               | qwen3.5-27B
+# MoE
+Qwen3-30B-A3B                     | Qwen/Qwen3-30B-A3B                             | qwen3-30B-A3B
+Qwen3.5-35B-A3B                   | Qwen/Qwen3.5-35B-A3B                           | qwen3.5-35B-A3B
+Qwen3.6-35B-A3B                   | Qwen/Qwen3.6-35B-A3B                           | qwen3.6-35B-A3B
+GLM-4.7-Flash                     | zai-org/GLM-4.7-Flash                          | glm4.7-flash
+# NVIDIA Nemotron 3 (hybrid Mamba + Attention) — DISABLED 2026-08-03.
+# tools/convert_hf_to_torch_dist.py goes through mbridge, which rejects the
+# architecture outright:
+#   ValueError: Unregistered model type: nemotron_h, now only support
+#   dict_keys(['deepseek_v3','llama','qwen2','mimo','mixtral','qwen2_5_vl',
+#   'qwen2_moe','qwen3','qwen3_moe','glm4_moe','glm4v','glm4v_moe','gemma3',
+#   'internvl_chat','qwen3_vl','qwen3_vl_moe','deepseek_v32','glm_moe_dsa',
+#   'deepseek_v4','glm4','glm4_moe_lite','joyai_llm_flash','qwen3_5',
+#   'qwen3_5_moe','qwen3_6','qwen3_6_moe','qwen3_next'])
+# Not a size problem — the 4B fails the same way. Re-enable when mbridge adds
+# nemotron_h; the HF weights are already downloaded.
+# NVIDIA-Nemotron-3-Nano-4B-BF16    | nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16          | nemotron-3-nano-4b
+# NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 | nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16   | nemotron-3-nano-30b-a3b
+# NVIDIA-Nemotron-3-Super-120B-A12B-BF16 | nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16 | nemotron-3-super-120b-a12b
+#
+# --- additional dense / small MoE used as examples in scripts/ ---
+Qwen3-14B                         | Qwen/Qwen3-14B                                 | qwen3-14B
+Qwen3-32B                         | Qwen/Qwen3-32B                                 | qwen3-32B
+# gpt-oss-20b — DISABLED 2026-08-03: same mbridge gap as Nemotron.
+#   ValueError: Unregistered model type: gpt_oss
+# (--no-bias-dropout-fusion fixed the earlier TEGroupedMLP assert, but the
+# architecture is simply not registered.) HF weights are downloaded.
+# gpt-oss-20b                     | openai/gpt-oss-20b                             | gpt-oss-20b | --no-bias-dropout-fusion
+#
+# --- >= 80B: the scales the SWE-RL / agentic examples actually use ---
+# Conversion is single-node (8xH100 = 640 GB); the 355B entry is the first that
+# may not fit and is expected to need a multi-node path.
+Qwen3-Next-80B-A3B-Instruct       | Qwen/Qwen3-Next-80B-A3B-Instruct               | qwen3-next-80B-A3B
+GLM-4.5-Air                       | zai-org/GLM-4.5-Air                            | glm4.5-106B-A12B
+Qwen3-235B-A22B                   | Qwen/Qwen3-235B-A22B                           | qwen3-235B-A22B | --pipeline-model-parallel-size 2 --expert-model-parallel-size 4
+# 355B bf16 is ~710 GB: one node (640 GB) cannot hold it, so convert on two.
+# 92 layers => PP must divide 92; PP=4 gives 23 layers per stage, EP=4 shards
+# the experts across the remaining ranks (4 x 4 = 16 GPUs).
+GLM-4.5                           | zai-org/GLM-4.5                                | glm4.5-355B-A32B | --pipeline-model-parallel-size 4 --expert-model-parallel-size 4 | 2
