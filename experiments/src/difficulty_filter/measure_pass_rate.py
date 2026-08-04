@@ -19,6 +19,7 @@ correctness concern, only a wall-clock one.
 
 import argparse
 import asyncio
+import importlib
 import json
 import os
 import sys
@@ -86,6 +87,12 @@ def parse_args():
     p.add_argument("--dump-responses", default=None, help="write full responses + rewards here for auditing")
     p.add_argument("--dump-limit", type=int, default=8, help="number of prompts to dump")
     p.add_argument("--policy", default=None, help="name this measurement is filed under (default: model dir name)")
+    # Some verifiers admit no synthesizable correct answer. `ifbench` grades
+    # arbitrary per-row constraints ("4 paragraphs, the 3rd starting with
+    # 'crash'"), so no generic probe can satisfy them and a strict preflight
+    # would refuse every such sweep. `warn` keeps the diagnostic without the
+    # veto; `off` skips the probes entirely.
+    p.add_argument("--preflight", choices=("strict", "warn", "off"), default="strict")
     return p.parse_args()
 
 
@@ -157,7 +164,17 @@ def load_prompts(path, input_key, label_key, limit=None):
             if not line:
                 continue
             row = json.loads(line)
-            rows.append({"index": i, "prompt": row[input_key], "label": row.get(label_key)})
+            # metadata rides along: gpqa reads valid_letters from it, ifbench reads
+            # instruction_id_list/kwargs. rm_hub.async_rm forwards sample.metadata, so a
+            # verifier needing more than a bare label gets it without a driver change.
+            rows.append(
+                {
+                    "index": i,
+                    "prompt": row[input_key],
+                    "label": row.get(label_key),
+                    "metadata": row.get("metadata") or {},
+                }
+            )
             if limit is not None and len(rows) >= limit:
                 break
     return rows
@@ -181,12 +198,23 @@ def load_done_indices(path):
     return done
 
 
-def build_prompt_text(tokenizer, prompt):
+def build_prompt_text(tokenizer, prompt, tools=None):
     """Mirror miles' own prompt construction (generate_endpoint_utils.py:29-34):
-    a chat-formatted prompt goes through the template, a plain string does not."""
+    a chat-formatted prompt goes through the template, a plain string does not.
+
+    `tools` is per-row here rather than global. The agentic tool-use components
+    span 838 domains and ship their own tool signatures on every line, so a
+    single `--generate-tool-specs-path` (what miles' multi_turn generate function
+    expects) cannot describe them; without the row's own tools in the prompt the
+    policy has no function to call and would be scored against an expert call it
+    was never shown.
+    """
     if isinstance(prompt, str):
         return prompt
-    return tokenizer.apply_chat_template(prompt, tokenize=False, add_generation_prompt=True)
+    kwargs = {"tokenize": False, "add_generation_prompt": True}
+    if tools:
+        kwargs["tools"] = tools
+    return tokenizer.apply_chat_template(prompt, **kwargs)
 
 
 def scalar_reward(reward, reward_key=None) -> float:
@@ -201,14 +229,67 @@ def scalar_reward(reward, reward_key=None) -> float:
     return float(reward)
 
 
-async def score_responses(args, prompt, label, responses):
+async def score_responses(args, prompt, label, responses, metadata=None):
     rm_args = SimpleNamespace(rm_type=args.rm_type, custom_rm_path=args.custom_rm_path)
-    samples = [Sample(prompt=prompt, response=r, label=label) for r in responses]
+    samples = [Sample(prompt=prompt, response=r, label=label, metadata=dict(metadata or {})) for r in responses]
     rewards = await batched_async_rm(rm_args, samples)
     return [scalar_reward(r, args.reward_key) for r in rewards]
 
 
-async def verifier_preflight(args, label):
+def _build_probes(label, metadata):
+    """Synthetic (correct, wrong) responses in the answer formats this label admits.
+
+    The correct form depends on the task, not on the verifier: a boxed value for
+    maths, a bare option letter for multiple choice. Probing both and requiring
+    that *some* correct form is graded keeps the check useful across rm types
+    without hard-coding which one the caller picked.
+    """
+    correct = {
+        "plain_boxed": f"So the answer is.\n\nAnswer: \\boxed{{{label}}}",
+        "thinking_boxed": f"<think>work</think>\nAnswer: \\boxed{{{label}}}",
+        "bare_answer": f"Answer: {label}",
+    }
+
+    # A wrong answer has to be wrong in the same alphabet as the right one, or
+    # the verifier may fail to parse it and score 0 for the wrong reason.
+    letters = [str(x).upper() for x in (metadata or {}).get("valid_letters") or []]
+    if len(label) == 1 and label.upper() in letters:
+        other = next((x for x in letters if x != label.upper()), None)
+        wrong = f"Answer: {other}" if other else "Answer: \\boxed{-987654321}"
+    else:
+        wrong = "Answer: \\boxed{-987654321}"
+    return correct, wrong
+
+
+def _custom_preflight_probes(args, label, metadata):
+    """Ask a custom verifier's own module for its (correct, wrong) probe pair.
+
+    Convention: a module exporting `--custom-rm-path` may also export
+    `build_preflight_probes(label, metadata) -> (correct, wrong)`. Both halves
+    have to come from there. The driver cannot invent a correct answer for an
+    arbitrary verifier -- "the expert's tool call" is not guessable from a label
+    -- and it cannot invent a wrong one either: for a tool-use row whose expert
+    replied in text, the generic wrong answer calls no tool and so scores as
+    correct, tripping the guard on a false positive.
+    """
+    if not args.custom_rm_path:
+        return None
+    module_path = args.custom_rm_path.rsplit(".", 1)[0]
+    try:
+        module = importlib.import_module(module_path)
+    except ImportError:
+        return None
+    builder = getattr(module, "build_preflight_probes", None)
+    if builder is None:
+        return None
+    try:
+        return builder(label, metadata)
+    except Exception as exc:  # noqa: BLE001 - a broken probe must not block a sweep
+        print(f"  preflight probe builder failed: {type(exc).__name__}: {exc}", flush=True)
+        return None
+
+
+async def verifier_preflight(args, label, metadata=None):
     """Refuse to run a sweep whose verifier cannot recognise a correct answer.
 
     An all-zero pass-rate file is indistinguishable from "this policy is bad at
@@ -217,30 +298,55 @@ async def verifier_preflight(args, label):
     nothing. The `deepscaler` case is the concrete one this exists for: it gates
     on a `</think>` delimiter that no non-thinking model emits.
     """
+    if args.preflight == "off":
+        print("verifier preflight: skipped (--preflight off)", flush=True)
+        return
     label = label if isinstance(label, str) and label else "37"
-    probes = {
-        "plain_boxed": f"So the answer is.\n\nAnswer: \\boxed{{{label}}}",
-        "thinking_boxed": f"<think>work</think>\nAnswer: \\boxed{{{label}}}",
-        "clearly_wrong": "Answer: \\boxed{-987654321}",
-    }
-    scores = dict(zip(probes, await score_responses(args, "", label, list(probes.values())), strict=True))
-    print(f"verifier preflight (--rm-type {args.rm_type}): {scores}", flush=True)
+    correct, wrong = _build_probes(label, metadata)
+    custom_probes = _custom_preflight_probes(args, label, metadata)
+    if custom_probes is not None:
+        correct = {"verifier_supplied": custom_probes[0]}
+        wrong = custom_probes[1]
+    elif args.custom_rm_path:
+        print(
+            f"  no build_preflight_response in {args.custom_rm_path.rsplit('.', 1)[0]}; "
+            f"probing with generic answer formats, which a custom verifier may legitimately reject",
+            flush=True,
+        )
+    names = list(correct) + ["clearly_wrong"]
+    responses = list(correct.values()) + [wrong]
+    scores = dict(zip(names, await score_responses(args, "", label, responses, metadata), strict=True))
+    print(f"verifier preflight (--rm-type {args.rm_type}, label={label!r}): {scores}", flush=True)
 
     threshold = args.correct_threshold
+    lenient = args.preflight == "warn"
+
+    def fail(message):
+        if lenient:
+            print(f"  PREFLIGHT WARNING (--preflight warn): {message}", flush=True)
+            return
+        raise SystemExit(message)
+
     if scores["clearly_wrong"] >= threshold:
-        raise SystemExit(f"--rm-type {args.rm_type} scores a clearly wrong answer as correct; refusing to measure")
-    if scores["plain_boxed"] >= threshold:
+        fail(f"--rm-type {args.rm_type} scores a clearly wrong answer as correct; refusing to measure")
         return
-    if scores["thinking_boxed"] >= threshold:
-        raise SystemExit(
+
+    graded = [name for name in correct if scores[name] >= threshold]
+    if graded:
+        print(f"  correct answers are graded in these forms: {graded}", flush=True)
+        return
+
+    if scores.get("thinking_boxed", 0.0) >= threshold:
+        fail(
             f"--rm-type {args.rm_type} only grades responses containing a '</think>' delimiter, but the policy "
             f"being measured does not emit one, so every response would score 0.\n"
             f"Use --rm-type math (same boxed-answer grading, no thinking-format gate) and make the training "
             f"recipe match."
         )
-    raise SystemExit(
-        f"--rm-type {args.rm_type} scored a correct boxed answer as {scores['plain_boxed']}; "
-        f"the verifier and the prompt's answer format disagree."
+        return
+    fail(
+        f"--rm-type {args.rm_type} scored every correct-answer form as 0 ({scores}); "
+        f"the verifier and this dataset's answer format disagree."
     )
 
 
@@ -255,7 +361,7 @@ async def generate_group(session, url, text, sampling_params, timeout):
 
 async def measure_one(session, args, tokenizer, row, sampling_params, sem, out_file, lock, counters):
     async with sem:
-        text = build_prompt_text(tokenizer, row["prompt"])
+        text = build_prompt_text(tokenizer, row["prompt"], (row.get("metadata") or {}).get("tools"))
         try:
             outputs = await generate_group(session, args.server_url, text, sampling_params, args.request_timeout)
         except Exception as exc:  # noqa: BLE001 - one bad prompt must not kill a 17k-prompt sweep
@@ -272,7 +378,7 @@ async def measure_one(session, args, tokenizer, row, sampling_params, sem, out_f
                      else m.get("finish_reason") == "length"
                      for m in metas]
 
-        rewards = await score_responses(args, row["prompt"], row["label"], responses)
+        rewards = await score_responses(args, row["prompt"], row["label"], responses, row.get("metadata"))
 
         record = PassRateRecord(
             index=row["index"],
@@ -324,7 +430,7 @@ async def main_async(args):
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
 
     rows = load_prompts(args.prompt_data, args.input_key, args.label_key, args.limit)
-    await verifier_preflight(args, rows[0]["label"] if rows else None)
+    await verifier_preflight(args, rows[0]["label"] if rows else None, rows[0].get("metadata") if rows else None)
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
     write_meta(args)
 

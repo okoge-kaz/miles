@@ -20,6 +20,9 @@
 #   N_SAMPLES        samples per prompt                    (8, matches training)
 #   MAX_NEW_TOKENS   generation cap; MUST match the recipe    (24576)
 #                    --rollout-max-response-len
+#   CUSTOM_RM_PATH   dotted path to a custom verifier; wins over RM_TYPE
+#   EXTRA_PIP        comma-separated packages to install first (verifier deps)
+#   PREFLIGHT        strict | warn | off   (default strict)
 #   RM_TYPE          verifier; MUST match the recipe        (math)
 #                    `deepscaler` returns 0 unless the response contains
 #                    `</think>`, so it zeroes every non-thinking model.
@@ -83,6 +86,18 @@ export HF_HOME=/root/.cache/huggingface
 export PYTHONPATH=/root/Megatron-LM:/root/miles
 export PYTHONUNBUFFERED=1
 
+# Verifier dependencies the image does not ship. '--rm-type ifbench' clones
+# allenai/IFBench at runtime and imports its evaluation_lib, which needs nltk and
+# friends; miles points at examples/eval_multi_task/requirements_ifbench.txt for
+# these but that file is not in this checkout, so they are named here instead.
+# Comma-separated: --export values cannot contain spaces, so sbatch would read a
+# space-separated list as a second argument and fail before the job is queued.
+if [[ -n "\${EXTRA_PIP:-}" ]]; then
+    _pkgs=\$(echo \${EXTRA_PIP} | tr ',' ' ')
+    echo \"installing verifier deps: \${_pkgs}\"
+    pip install --no-input --quiet \${_pkgs} || { echo 'verifier dep install failed'; exit 1; }
+fi
+
 # dp-size 8: eight independent replicas behind one endpoint. Qwen3-4B fits on a
 # single H100, so data parallelism beats tensor parallelism here -- no
 # cross-GPU collectives on the critical path of a pure-inference sweep.
@@ -120,6 +135,8 @@ python3 experiments/src/difficulty_filter/measure_pass_rate.py \
     --model-path /ckpt/hf/${MODEL_NAME} \
     --server-url http://127.0.0.1:${SERVER_PORT} \
     --rm-type ${RM_TYPE} \
+    ${CUSTOM_RM_PATH:+--custom-rm-path ${CUSTOM_RM_PATH}} \
+    ${PREFLIGHT:+--preflight ${PREFLIGHT}} \
     --policy ${MODEL_NAME} \
     ${REWARD_KEY:+--reward-key ${REWARD_KEY}} \
     --n-samples ${N_SAMPLES} \
