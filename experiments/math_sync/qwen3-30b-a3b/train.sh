@@ -13,7 +13,7 @@ source /root/miles/scripts/models/qwen3-30B-A3B.sh
 
 RUN_NAME="${RUN_NAME:-math-grpo-qwen3-30b-a3b}"
 
-source /root/miles/experiments/lib/ray_cluster.sh
+source /root/miles/experiments/common/ray_cluster.sh
 
 ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-${NNODES}}"
 ACTOR_GPUS_PER_NODE="${ACTOR_GPUS_PER_NODE:-${ACTOR_GPUS:-${GPUS_PER_NODE}}}"

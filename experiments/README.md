@@ -19,7 +19,7 @@ experiments/
   setup/convert_checkpoint.sbatch  HF -> torch_dist (Megatron)
   setup/stage_model.sh          one model: download + convert, chained
   configs/eval_math.yaml        multi-benchmark eval (--eval-config)
-  lib/ray_cluster.sh            multi-node ray bring-up, sourced by every train.sh
+  common/ray_cluster.sh          multi-node ray bring-up, sourced by every train.sh
   math_sync/<model>/            single-turn math RL (GRPO, deepscaler reward)
   math_async/<model>/           the same task on the fully-async rollout
   tool_multiturn/<model>/       multi-turn tool-calling RL (ReTool v2 style)
@@ -101,7 +101,7 @@ sbatch -A $ACC -N 4 experiments/math_sync/qwen3-8b/run.sbatch
 ```
 
 `run.sbatch` runs one task per node and each `train.sh` sources
-`lib/ray_cluster.sh`, the one copy of the bring-up: node 0 is the Ray head and
+`common/ray_cluster.sh`, the one copy of the bring-up: node 0 is the Ray head and
 the driver, the rest join it and idle until the driver signals completion
 through a flag file under `experiments/outputs/.ray/`. Workers `exit` from
 inside that file, so nothing after the `source` line runs on them. The driver
