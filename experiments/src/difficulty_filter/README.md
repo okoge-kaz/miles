@@ -89,7 +89,7 @@ Nothing errors — the sweep completes and reports a clean, entirely false
 
 This is not only a measurement concern. **Every `math_sync` / `math_async` /
 `tool_multiturn` recipe ships `--rm-type deepscaler` except the
-`qwen3-4b-instruct-2507` pair, which defaults to `math` for exactly this
+`qwen3-4b-instruct-2507` recipes, which default to `math` for exactly this
 reason.** Pointing any of the others at a non-thinking checkpoint without
 changing `--rm-type` produces reward ≡ 0, zero advantage, and a run that looks
 like a model failing to learn rather than a misconfiguration.
@@ -161,6 +161,6 @@ it stays a drop-in `--prompt-data` while remaining traceable to its measurement.
 Use it by pointing a recipe at the filtered file:
 
 ```bash
-experiments/submit_training.sh math_sync/qwen3-4b-instruct-2507 filtered-math \
+experiments/submit_training.sh math_sync/dapo-math/qwen3-4b-instruct-2507 filtered-math \
   --export=ALL,PROMPT_DATA=/data/dapo-math-17k/dapo-math-17k-p20-80.jsonl
 ```

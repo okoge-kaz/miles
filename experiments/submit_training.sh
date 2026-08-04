@@ -1,15 +1,13 @@
 #!/bin/bash
 # Submit a training run with its log under experiments/outputs/training/<RUN_NAME>/.
 #
-#   experiments/submit_training.sh <recipe>/<model> <run-name> [extra sbatch args...]
+#   experiments/submit_training.sh <task>/<dataset>/<model> <run-name> [sbatch args...]
 #
-#   recipe/model: math_sync/<model> | math_async/<model> | tool_multiturn/<model>
-#   <model>:      qwen3-1.7b | qwen3-4b | qwen3-4b-instruct-2507 | qwen3-8b
-#                 | qwen3-30b-a3b
-#   (run with no arguments to list what actually exists on disk)
+#   recipe: <task>/<dataset>/<model>, e.g. math_sync/dapo-math/qwen3-8b
+#   (an unknown recipe lists what actually exists on disk)
 #
 # Example — a real 24k-response colocated run, resumable across three 4 h jobs:
-#   experiments/submit_training.sh math_sync/qwen3-4b real-math-24k \
+#   experiments/submit_training.sh math_sync/dapo-math/qwen3-4b real-math-24k \
 #       -p batch --time=04:00:00 --export=ALL,MAX_RESPONSE_LEN=24576,SAVE_INTERVAL=5
 #
 # RUN_NAME is exported for the recipe (it names the checkpoint directory) and
@@ -18,8 +16,8 @@
 
 set -euo pipefail
 
-RECIPE="${1:?usage: submit_training.sh <recipe>/<model> <run-name> [sbatch args...]}"
-RUN_NAME="${2:?usage: submit_training.sh <recipe>/<model> <run-name> [sbatch args...]}"
+RECIPE="${1:?usage: submit_training.sh <task>/<dataset>/<model> <run-name> [sbatch args...]}"
+RUN_NAME="${2:?usage: submit_training.sh <task>/<dataset>/<model> <run-name> [sbatch args...]}"
 shift 2
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." &>/dev/null && pwd)"
@@ -28,7 +26,7 @@ cd "${REPO_ROOT}"
 if [[ ! -f "experiments/${RECIPE}/run.sbatch" ]]; then
     echo "no such recipe: ${RECIPE}"
     echo "available:"
-    find experiments -mindepth 3 -maxdepth 3 -name run.sbatch -printf '  %h\n' | sed 's|^  experiments/|  |' | sort
+    find experiments -mindepth 4 -maxdepth 4 -name run.sbatch -printf '  %h\n' | sed 's|^  experiments/|  |' | sort
     exit 1
 fi
 

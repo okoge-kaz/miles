@@ -19,10 +19,17 @@ Partition is the only scheduling lever on cw-dfw — it selects the QoS, so neve
 pass `--qos`. `interactive` caps at 2 nodes and schedules ahead of everything
 else; `batch_short` caps at 2 h and 4 nodes; `batch` is the 4 h production lane.
 
-Recipes live at `experiments/<task>/<model>/`, submitted as
-`experiments/<task>/<model>/run.sbatch` with `-N <nodes>`. Every knob is an
-environment variable carried in by `--export=ALL`. Submit from the repo root —
-the `#SBATCH --output` paths are relative.
+Recipes live at `experiments/<task>/<dataset>/<model>/`, submitted as
+`experiments/<task>/<dataset>/<model>/run.sbatch` with `-N <nodes>`. Every knob is a
+`: "${VAR:=value}"` line at the top of `run.sbatch`: edit it there for a lasting
+change, or override on the command line with `--export=ALL,VAR=…`, which wins
+over the `:=` default. `train.sh` defines no defaults, so what `run.sbatch` says
+is what runs. Submit from the repo root — the `#SBATCH --output` paths are
+relative.
+
+Node counts are never inferred. `-N 4` allocates four nodes; `ACTOR_NUM_NODES`,
+`ACTOR_GPUS_PER_NODE` and `ROLLOUT_NUM_GPUS` say how they are used, and
+`common/placement.sh` rejects a shape that does not add up before `srun` runs.
 
 ## Stage 1 — bring-up on `interactive`
 
@@ -35,7 +42,7 @@ Cut the work down so a failure surfaces in minutes, not hours:
 ```bash
 sbatch -A coreai_horizon_dilations -N 2 --time=01:00:00 \
   --export=ALL,NUM_ROLLOUT=3,ROLLOUT_BATCH_SIZE=8,N_SAMPLES_PER_PROMPT=8,GLOBAL_BATCH_SIZE=64,MAX_RESPONSE_LEN=1024,EVAL_INTERVAL=1 \
-  experiments/math_sync/qwen3-1.7b/run.sbatch
+  experiments/math_sync/dapo-math/qwen3-1.7b/run.sbatch
 ```
 
 Keep the four-knob invariant when shrinking:
@@ -48,11 +55,10 @@ Check, in this order — each one fails earlier than the next:
 1. **Ray cluster formed.** `ray cluster ready: 2/2 nodes` in the log. A run that
    proceeds with `1/2` was never multi-node. The usual cause is a stale done-flag
    under `experiments/outputs/.ray/`, which releases the workers immediately.
-2. **Placement line matches intent.** The recipe echoes
-   `placement: N node(s) x G GPU = W training GPUs, tpT cpC -> dpD`. Confirm `D`
-   is what you expect: data parallelism is whatever `tp × cp × pp` leaves over,
-   so it grows with the allocation and is the thing that silently changes when
-   you add nodes.
+2. **Placement line matches intent.** `run.sbatch` echoes
+   `placement AxG train (W GPU) + R rollout, tpT cpC -> dpD` before `srun`.
+   Confirm `D` is what you expect: data parallelism is whatever `tp × cp` leaves
+   over, so it changes whenever the node count or the parallelism does.
 3. **Checkpoint path.** The recipe echoes `checkpoints: /ckpt/training/<task>/<dataset>/<model>/<config>`.
    Two different configurations must never print the same path — that would make
    one resume from the other's optimizer state.
@@ -81,7 +87,7 @@ Enable telemetry and read it rather than guessing:
 ```bash
 sbatch -A coreai_horizon_dilations -p batch_short -N 2 --time=02:00:00 \
   --export=ALL,NUM_ROLLOUT=10,CONFIG_TAG=tune-<what-you-changed> \
-  experiments/math_sync/qwen3-4b/run.sbatch
+  experiments/math_sync/dapo-math/qwen3-4b/run.sbatch
 
 python -m miles.dashboard.serve --dump-details <dump-dir> --follow   # port 7788
 ```
@@ -133,7 +139,7 @@ fast a step is.
 ## Stage 3 — production on `batch`
 
 ```bash
-experiments/submit_training.sh math_sync/qwen3-8b <run-name> \
+experiments/submit_training.sh math_sync/dapo-math/qwen3-8b <run-name> \
   -p batch -N 8 --time=04:00:00 --export=ALL,SAVE_INTERVAL=5
 ```
 

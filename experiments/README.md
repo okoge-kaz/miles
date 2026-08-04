@@ -19,18 +19,24 @@ experiments/
   setup/convert_checkpoint.sbatch  HF -> torch_dist (Megatron)
   setup/stage_model.sh          one model: download + convert, chained
   configs/eval_math.yaml        multi-benchmark eval (--eval-config)
-  common/ray_cluster.sh          multi-node ray bring-up, sourced by every train.sh
-  math_sync/<model>/            single-turn math RL (GRPO, deepscaler reward)
-  math_async/<model>/           the same task on the fully-async rollout
+  common/run_identity.sh        run name, config tag, checkpoint path
+  common/placement.sh           derive + validate the GPU split, before srun
+  common/ray_cluster.sh         multi-node ray bring-up
+  math_sync/<dataset>/<model>/  single-turn math RL (GRPO, deepscaler reward)
+  math_async/<dataset>/<model>/ the same task on the fully-async rollout
   tool_multiturn/<model>/       multi-turn tool-calling RL (ReTool v2 style)
   notes/                        reference notes + notes/agents/ work log
   outputs/                      job logs (git-ignored)
 ```
 
-A recipe is `<task>/<model>/`, e.g. `math_sync/qwen3-4b/`. The task directory
-fixes the RL setup (rollout mode, reward, generate function); the model
-directory fixes the weights, the parallelism and the batch shape. Adding a
-model to an existing task means one new subdirectory, not a new task.
+A recipe is `<task>/<dataset>/<model>/`, e.g. `math_sync/dapo-math/qwen3-4b/`.
+The task directory fixes the RL setup (rollout mode, reward, generate function),
+the dataset directory fixes the prompt file and the eval benchmarks, and the
+model directory fixes the weights, the parallelism and the batch shape.
+
+Every level is a directory rather than a conditional inside a script: there is
+no `if` picking a dataset or an eval set at runtime, so the file that runs is
+the file you read.
 
 Each recipe is a pair: `run.sbatch` allocates the node and starts the
 container, `train.sh` runs inside it and holds the actual argument groups.
@@ -76,16 +82,14 @@ an implicit consequence of `--global-batch-size`, and it is what turns the
 four-knob invariant into a startup assert (`arguments.py:3056` only checks it
 when the flag is present).
 
-Dynamic sampling and partial rollout are **on by default** in both tasks
-(`DYNAMIC_SAMPLING=0`, `PARTIAL_ROLLOUT=0` opt out). They belong together:
-over-sampling aborts whatever is still generating once enough groups have passed
-the filter, and without `--partial-rollout` that work is discarded rather than
-resumed.
+Dynamic sampling and partial rollout are **always on** — not toggles. They
+belong together: over-sampling aborts whatever is still generating once enough
+groups have passed the filter, and without `--partial-rollout` that work is
+discarded rather than resumed.
 
-`--mask-offpolicy-in-partial-rollout` is **off** (`MASK_OFFPOLICY=1` turns it
-on). It zeroes the loss over everything a resumed sample produced under the
-previous weights, which discards exactly the tokens partial rollout was enabled
-to keep.
+`--mask-offpolicy-in-partial-rollout` is **never** passed. It zeroes the loss
+over everything a resumed sample produced under the previous weights, which
+discards exactly the tokens partial rollout exists to keep.
 
 `math_async` additionally bounds staleness with `--max-weight-staleness`
 (default 2) — miles' own default is *no bound*, which lets an arbitrarily old
@@ -93,40 +97,35 @@ group reach the optimizer — and corrects the remaining lag with `--use-tis`.
 
 ### Multi-node
 
-Every recipe takes its node count from the allocation, so `-N` is the only thing
-that changes:
+Node counts and parallelism are set at the top of `run.sbatch`, in one block of
+`: "${VAR:=value}"` defaults. Edit that block for a lasting change, or override
+any of it on the command line — the `:=` form means an exported value wins:
 
 ```bash
-sbatch -A $ACC -N 4 experiments/math_sync/qwen3-8b/run.sbatch
+sbatch -A $ACC -N 4 \
+  --export=ALL,ACTOR_NUM_NODES=2,ACTOR_GPUS_PER_NODE=8,ROLLOUT_NUM_GPUS=16 \
+  experiments/math_async/dapo-math/qwen3-8b/run.sbatch
 ```
 
-`run.sbatch` runs one task per node and each `train.sh` sources
-`common/ray_cluster.sh`, the one copy of the bring-up: node 0 is the Ray head and
-the driver, the rest join it and idle until the driver signals completion
-through a flag file under `experiments/outputs/.ray/`. Workers `exit` from
-inside that file, so nothing after the `source` line runs on them. The driver
-waits for every worker to *register* — reachable is not registered — because
-miles sizes its placement groups from the node count.
+Nothing is inferred from the allocation. `-N 4` allocates four nodes;
+`ACTOR_NUM_NODES` and `ROLLOUT_NUM_GPUS` say what they are used for, and
+`common/placement.sh` rejects the job **before `srun`** — in seconds, without
+starting a single container — if:
 
-`train.sh` itself carries no comments: it is the configuration, and the
-reasoning behind each setting is here instead.
+* the split does not add up to the allocation,
+* `tp × cp` does not divide the training GPUs,
+* the global batch is not divisible by the resulting `dp`,
+* the engine pool is not divisible by `--rollout-num-gpus-per-engine`.
 
-Placement is derived and then checked before anything expensive starts. The
-per-model parallelism is fixed, so **data parallelism is whatever is left over
-and grows with the allocation**; the recipe prints it and refuses to start if
-`tp × cp × pp` does not divide the training GPUs or if the global batch is not
-divisible by the resulting `dp`:
+It prints the resolved shape on success:
 
 ```
-placement: 4 node(s) x 8 GPU = 32 training GPUs, tp4 cp2 -> dp4
+placement 2x8 train (16 GPU) + 16 rollout, tp2 cp2 -> dp4
 ```
 
-`ACTOR_NUM_NODES`, `ACTOR_GPUS_PER_NODE` and (async) `ROLLOUT_NUM_GPUS` override
-the derived split. `math_async` defaults to 4+4 GPUs within one node, and to a
-half-and-half split by node from two nodes up.
-
-More nodes raise `dp` and shrink the per-rank batch; they do not by themselves
-make a step more informative. Raise `ROLLOUT_BATCH_SIZE` with the allocation.
+`train.sh` reads these as plain variables and defines no defaults of its own,
+so the value in `run.sbatch` is the value that runs. More nodes raise `dp` and
+shrink the per-rank batch; raise `ROLLOUT_BATCH_SIZE` with the allocation.
 
 ### Checkpoint layout
 
@@ -137,22 +136,31 @@ Checkpoints are keyed by configuration, not by job id:
 /ckpt/training/math/dapo-math-17k/Qwen3-4B/async-off-1step-rollout-length-24k-lr1e-6
 ```
 
-so a resumed run finds its own history and two settings never share a `--load`.
+The run name carries the same information —
+`math-dapo-math-17k-Qwen3-4B-async-off-1step-rollout-length-24k-lr1e-6` — so the
+wandb group, the log and the checkpoint directory all name the same thing.
+`common/run_identity.sh` computes all of it once and is sourced by both
+`run.sbatch` and `train.sh`, so the two cannot disagree.
+
+A resumed run therefore finds its own history and two settings never share a `--load`.
 `CONFIG_TAG` defaults to the rollout mode, the steps per rollout, the response
 length and the learning rate; set it explicitly for anything that default does
 not encode — a filtered prompt file, dynamic sampling turned off, a tuning job.
 The dump directory follows the same path.
 
-wandb is keyed the same way: the project defaults to `off-policy-<dataset>`
-(e.g. `off-policy-dapo-math-17k`) so every run varying the off-policy knobs on
-one dataset is directly comparable, with `CONFIG_TAG` separating the settings.
+wandb is always on and keyed the same way: project `off-policy-<dataset>` (e.g.
+`off-policy-dapo-math`), group `RUN_NAME`. `run.sbatch` fails at submit time if
+`WANDB_API_KEY` is unset rather than quietly running without logging; `env.sh`
+resolves it from `~/.netrc`.
 
 ### Eval
 
 `--eval-prompt-data` takes name/path pairs and accepts as many as you give it, so
-several benchmarks each report their own series. The default is **AIME-2024 plus
-AIME-2025**: same size and difficulty, but 2025 is outside the 2024 contamination
-window, so a gap between the two is the cheapest memorisation signal available.
+several benchmarks each report their own series. The `dapo-math` recipes evaluate
+**AIME-2024 and AIME-2025**: same size and difficulty, but 2025 is outside the
+2024 contamination window, so a gap between the two is the cheapest memorisation
+signal available. The pairs are written out in `train.sh` — a different eval set
+is a different dataset directory, not a branch.
 
 Everything listed must already be in `prompt`/`label` shape, since the global
 `--input-key`/`--label-key` apply to eval too. `setup/build_math_jsonl.py`
@@ -162,14 +170,11 @@ were converted with it.
 Per-dataset settings (a cheaper `n` for a 500-problem set, a different verifier)
 are not expressible as pairs and need `--eval-config`, which **overrides**
 `--eval-prompt-data` entirely. `configs/eval_math.yaml` is that config, adding
-MATH-500 at `n=4`:
+MATH-500 at `n=4`; a recipe that wants it replaces its `--eval-prompt-data`
+lines with `--eval-config /root/miles/experiments/configs/eval_math.yaml`.
 
-```bash
---export=ALL,EVAL_CONFIG=/root/miles/experiments/configs/eval_math.yaml
-```
-
-Eval shares the engines with training rollout, so its cost is real: the config
-above is 2960 generations per eval interval.
+Eval shares the engines with training rollout, so its cost is real: that config
+is 2960 generations per eval interval.
 
 ### Telemetry
 
@@ -253,10 +258,10 @@ Then the training recipes:
 
 ```bash
 # 4a. Math RL, colocated.
-sbatch -A $ACC experiments/math_sync/qwen3-4b/run.sbatch
+sbatch -A $ACC experiments/math_sync/dapo-math/qwen3-4b/run.sbatch
 
 # 4b. The same task on the fully-async rollout.
-sbatch -A $ACC experiments/math_async/qwen3-4b/run.sbatch
+sbatch -A $ACC experiments/math_async/dapo-math/qwen3-4b/run.sbatch
 ```
 
 A fast smoke variant (a few rollouts, short responses). `qwen3-1.7b` is the
@@ -265,7 +270,7 @@ cheapest place to check a change before spending a slot on a bigger model:
 ```bash
 sbatch -A $ACC -p interactive --time=01:00:00 \
   --export=ALL,NUM_ROLLOUT=3,ROLLOUT_BATCH_SIZE=8,N_SAMPLES_PER_PROMPT=8,GLOBAL_BATCH_SIZE=64,MAX_RESPONSE_LEN=1024 \
-  experiments/math_sync/qwen3-1.7b/run.sbatch
+  experiments/math_sync/dapo-math/qwen3-1.7b/run.sbatch
 ```
 
 Keep the four-knob invariant when changing batch sizes:
