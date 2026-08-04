@@ -1,25 +1,4 @@
 #!/bin/bash
-# Runs INSIDE the container. Single node, 8 GPUs, DISAGGREGATED.
-#
-# Qwen3-30B-A3B MoE (48 layers, 128 experts, top-8). The only MoE in the sweep,
-# and the only recipe with R3 (--use-rollout-routing-replay): the SGLang-side
-# expert routing is captured and replayed during training so the two stages
-# agree on which experts ran. Without it, MoE RL is known to drift and collapse
-# after a few dozen steps (docs/developer/debug.md:89).
-#
-# 30B bf16 weights (60 GB) plus fp32 Adam state does not fit on one node, so
-# the optimizer state lives on the host — see OPTIMIZER_ARGS.
-#
-# Fully-async rollout: a persistent background worker keeps generating while the
-# trainer consumes finished groups (miles/rollout/fully_async_rollout.py).
-#
-# Three differences from the colocated recipe, per examples/fully_async/README.md:
-#   1. train_async.py instead of train.py
-#   2. MILES_EXPERIMENTAL_ROLLOUT_REFACTOR=1 (class-based rollout API)
-#   3. --fully-async
-#
-# Consequence: --colocate is rejected (arguments.py:53), so the 8 GPUs are split
-# between the trainer and the engines.
 
 set -ex
 
@@ -31,34 +10,70 @@ NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
 HAS_NVLINK=$([ "$NVLINK_COUNT" -gt 0 ] && echo 1 || echo 0)
 
 cd /root/miles
-source /root/miles/scripts/models/qwen3-30B-A3B.sh   # MODEL_ARGS
+source /root/miles/scripts/models/qwen3-30B-A3B.sh
 
 RUN_NAME="${RUN_NAME:-math-grpo-async-qwen3-30b-a3b}"
 
-# GPU split: trainer | rollout engines. Must sum to the 8 GPUs on the node.
-ACTOR_GPUS="${ACTOR_GPUS:-4}"
-ROLLOUT_GPUS="${ROLLOUT_GPUS:-4}"
+source /root/miles/experiments/lib/ray_cluster.sh
+
+ACTOR_GPUS_PER_NODE="${ACTOR_GPUS_PER_NODE:-${ACTOR_GPUS:-}}"
+ROLLOUT_NUM_GPUS="${ROLLOUT_NUM_GPUS:-${ROLLOUT_GPUS:-}}"
+
+if [[ "${NNODES}" -eq 1 ]]; then
+    ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-1}"
+    ACTOR_GPUS_PER_NODE="${ACTOR_GPUS_PER_NODE:-4}"
+    ROLLOUT_NUM_GPUS="${ROLLOUT_NUM_GPUS:-4}"
+else
+    ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-$(( NNODES / 2 ))}"
+    ACTOR_GPUS_PER_NODE="${ACTOR_GPUS_PER_NODE:-${GPUS_PER_NODE}}"
+    ROLLOUT_NUM_GPUS="${ROLLOUT_NUM_GPUS:-$(( (NNODES - ACTOR_NUM_NODES) * GPUS_PER_NODE ))}"
+fi
+TRAIN_WORLD=$(( ACTOR_NUM_NODES * ACTOR_GPUS_PER_NODE ))
+
+if (( TRAIN_WORLD + ROLLOUT_NUM_GPUS != NNODES * GPUS_PER_NODE )); then
+    echo "placement does not use the allocation: ${ACTOR_NUM_NODES}x${ACTOR_GPUS_PER_NODE}" \
+         "+ ${ROLLOUT_NUM_GPUS} rollout != ${NNODES}x${GPUS_PER_NODE}" >&2
+    exit 1
+fi
+
+_TP="${TENSOR_PARALLEL_SIZE:-4}"
+_CP="${CONTEXT_PARALLEL_SIZE:-1}"
+_PP=1
+if (( TRAIN_WORLD % (_TP * _CP * _PP) != 0 )); then
+    echo "tp${_TP} * cp${_CP} * pp${_PP} does not divide ${TRAIN_WORLD} training GPUs" >&2
+    exit 1
+fi
+_DP=$(( TRAIN_WORLD / (_TP * _CP * _PP) ))
+if (( ${GLOBAL_BATCH_SIZE:-256} % _DP != 0 )); then
+    echo "global_batch_size ${GLOBAL_BATCH_SIZE:-256} is not divisible by dp ${_DP}" >&2
+    exit 1
+fi
+echo "placement: ${ACTOR_NUM_NODES} node(s) x ${ACTOR_GPUS_PER_NODE} GPU" \
+     "= ${TRAIN_WORLD} training GPUs, tp${_TP} cp${_CP} -> dp${_DP}"
+
+TASK_FAMILY="${TASK_FAMILY:-math}"
+PROMPT_DATA="${PROMPT_DATA:-/data/dapo-math-17k/dapo-math-17k.jsonl}"
+DATASET_TAG="${DATASET_TAG:-$(basename "$(dirname "${PROMPT_DATA}")")}"
+LR="${LR:-1e-6}"
+CONFIG_TAG="${CONFIG_TAG:-async-on-${NUM_STEPS_PER_ROLLOUT:-1}step-rollout-length-$(( ${MAX_RESPONSE_LEN:-24576} / 1024 ))k-lr${LR}}"
+CKPT_PATH="/ckpt/training/${TASK_FAMILY}/${DATASET_TAG}/Qwen3-30B-A3B/${CONFIG_TAG}"
+echo "checkpoints: ${CKPT_PATH}"
 
 CKPT_ARGS=(
    --hf-checkpoint /ckpt/hf/Qwen3-30B-A3B
    --ref-load      /ckpt/megatron/Qwen3-30B-A3B_torch_dist
-   --load          /ckpt/training/${RUN_NAME}
-   --save          /ckpt/training/${RUN_NAME}
+   --load          "${CKPT_PATH}"
+   --save          "${CKPT_PATH}"
    --save-interval "${SAVE_INTERVAL:-20}"
 )
 
 ROLLOUT_ARGS=(
    --fully-async
-   --prompt-data "${PROMPT_DATA:-/data/dapo-math-17k/dapo-math-17k.jsonl}"
+   --prompt-data "${PROMPT_DATA}"
    --input-key prompt
    --label-key label
    --apply-chat-template
    --rollout-shuffle
-   # deepscaler grades the boxed answer like `math`, but first requires a
-   # `</think>` (or `###Response`) delimiter and returns 0 without one
-   # (rm_hub/deepscaler.py:36-44). Correct for this hybrid-thinking checkpoint; a
-   # NON-THINKING model never emits the delimiter, so every response would score 0
-   # and the run would look like a model that cannot learn.
    --rm-type "${RM_TYPE:-deepscaler}"
    --num-rollout "${NUM_ROLLOUT:-3000}"
    --rollout-batch-size "${ROLLOUT_BATCH_SIZE:-32}"
@@ -67,72 +82,54 @@ ROLLOUT_ARGS=(
    --rollout-max-context-len "${ROLLOUT_MAX_CONTEXT_LEN:-32768}"
    --rollout-temperature 1
 
-   # invariant: rollout_batch_size * n_samples_per_prompt
-   #            = global_batch_size * num_steps_per_rollout
-   # Passed explicitly so arguments.py:3056 actually checks it, and so the number
-   # of optimizer steps taken per rollout batch — i.e. how off-policy the later
-   # steps are — is a named knob rather than a side effect of global_batch_size.
    --global-batch-size "${GLOBAL_BATCH_SIZE:-256}"
    --num-steps-per-rollout "${NUM_STEPS_PER_ROLLOUT:-1}"
    --balance-data
 )
 
-# Dynamic sampling (DAPO). FullyAsyncRolloutFn applies the same filter at drain
-# time (fully_async_rollout.py:217); a dropped group is NOT recycled, since it
-# carries no usable gradient signal either way. ON by default; DYNAMIC_SAMPLING=0
-# turns it off.
 if [[ "${DYNAMIC_SAMPLING:-1}" != "0" ]]; then
    ROLLOUT_ARGS+=(
       --dynamic-sampling-filter-path miles.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
    )
 fi
 
-# Partial rollout. A weight sync aborts whatever is generating at that moment;
-# the fully-async worker hands the group's prompt samples back to the data source
-# (fully_async_rollout.py:198), and because generate_and_rm mutates samples in
-# place those objects still carry the tokens produced so far, so the next
-# submission continues from them instead of restarting.
-#
-# --mask-offpolicy-in-partial-rollout zeroes the loss over that carried-over
-# prefix (sglang_rollout.py:313). It is what --partial-rollout gates here: the
-# continuation itself happens either way, but setting a loss_mask without
-# --partial-rollout trips the assert at sglang_rollout.py:282. --use-tis below
-# corrects the ratio for the tokens that ARE trained on; the prefix predates the
-# current weights entirely, so it is masked rather than reweighted.
 if [[ "${PARTIAL_ROLLOUT:-1}" != "0" ]]; then
    ROLLOUT_ARGS+=(--partial-rollout)
-   [[ "${MASK_OFFPOLICY:-1}" != "0" ]] && ROLLOUT_ARGS+=(--mask-offpolicy-in-partial-rollout)
+   if [[ "${MASK_OFFPOLICY:-0}" != "0" ]]; then
+      ROLLOUT_ARGS+=(--mask-offpolicy-in-partial-rollout)
+   fi
 fi
 
-# Off-policy bound. Groups whose oldest weight version lags the engine by more
-# than this are recycled instead of trained on (fully_async_rollout.py:202-213).
-# The miles default is None = no bound at all, which lets an arbitrarily stale
-# group reach the optimizer; 2 keeps generation overlapped across a weight sync
-# without letting a group survive more than two of them.
 ROLLOUT_ARGS+=(--max-weight-staleness "${MAX_WEIGHT_STALENESS:-2}")
 
-# Generation concurrency, decoupled from the training batch. Unset means the
-# legacy bound of rollout_batch_size * n_samples_per_prompt.
 if [[ -n "${ASYNC_MAX_CONCURRENT_SAMPLES:-}" ]]; then
    ROLLOUT_ARGS+=(--async-max-concurrent-samples "${ASYNC_MAX_CONCURRENT_SAMPLES}")
 fi
 
-# Eval works under --fully-async. The flag only swaps the *rollout* function;
-# arguments.py:36 resolves eval_function_path before that override, so eval falls
-# back to the standard InferenceRolloutFn and train_async.py:59,105 calls it
-# exactly like train.py does. Kept identical to math_sync so the two recipes
-# report the same AIME number.
-#
-# Caveat: the persistent fully-async worker keeps generating during eval, so eval
-# shares the SGLang engines with training rollout and takes longer here than in
-# the colocated recipe.
+TELEMETRY_ARGS=()
+if [[ "${DUMP_DETAILS:-1}" != "0" ]]; then
+   TELEMETRY_ARGS+=(--dump-details "${DUMP_DIR:-${CKPT_PATH}/dump}")
+   if [[ "${USE_DASHBOARD:-1}" != "0" ]]; then
+      TELEMETRY_ARGS+=(--use-miles-dashboard)
+   fi
+   if [[ "${ROLLOUT_ENTROPY:-1}" != "0" ]]; then
+      TELEMETRY_ARGS+=(--use-rollout-entropy)
+   fi
+fi
+
 EVAL_ARGS=(
-   --eval-interval 20
-   --eval-prompt-data aime /data/aime-2024/aime-2024.jsonl
-   --n-samples-per-eval-prompt 16
+   --eval-interval "${EVAL_INTERVAL:-20}"
+   --n-samples-per-eval-prompt "${N_SAMPLES_PER_EVAL_PROMPT:-16}"
    --eval-max-response-len "${EVAL_MAX_RESPONSE_LEN:-24576}"
    --eval-top-p 1
 )
+
+if [[ -n "${EVAL_CONFIG:-}" ]]; then
+   EVAL_ARGS+=(--eval-config "${EVAL_CONFIG}")
+else
+   read -r -a _eval_pairs <<< "${EVAL_DATASETS:-aime24 /data/aime-2024/aime-2024.jsonl aime25 /data/aime-2025/aime-2025.jsonl}"
+   EVAL_ARGS+=(--eval-prompt-data "${_eval_pairs[@]}")
+fi
 
 PERF_ARGS=(
    --tensor-model-parallel-size "${TENSOR_PARALLEL_SIZE:-4}"
@@ -147,10 +144,6 @@ PERF_ARGS=(
    --recompute-num-layers 1
 
    --use-dynamic-batch-size
-   # A single sample must fit in max_tokens_per_gpu * cp_size
-   # (miles/backends/training_utils/data.py:473). With
-   # --rollout-max-context-len 32768 that is the floor this value has to clear:
-   #   32768 * 1 = 32768 >= 32768
    --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU:-32768}"
 )
 if [[ "${CONTEXT_PARALLEL_SIZE:-1}" -gt 1 ]]; then
@@ -165,27 +158,18 @@ GRPO_ARGS=(
    --entropy-coef 0.00
    --eps-clip 0.2
    --eps-clip-high 0.28
-   # truncated importance sampling: corrects for the policy lag that async
-   # generation introduces
    --use-tis
-   # R3: capture the expert routing SGLang used during generation and replay it in
-   # the training forward pass, so the two stages route identically. Also sets
-   # --use-routing-replay (arguments.py:3097). MoE-only, and doubly worth it here:
-   # async already trains on samples generated under older weights.
    --use-rollout-routing-replay
 )
 
 OPTIMIZER_ARGS=(
    --optimizer adam
-   --lr 1e-6
+   --lr "${LR}"
    --lr-decay-style constant
    --weight-decay 0.1
    --adam-beta1 0.9
    --adam-beta2 0.98
 
-   # 30B params of fp32 Adam state (m, v, master weights) is ~360 GB and does not
-   # fit next to the bf16 weights on one node, so it lives on the host and is
-   # streamed per step. Matches scripts/run_qwen3_30b_a3b.py on H100.
    --optimizer-cpu-offload
    --overlap-cpu-optimizer-d2h-h2d
    --use-precision-aware-optimizer
@@ -193,9 +177,12 @@ OPTIMIZER_ARGS=(
 
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine "${ROLLOUT_NUM_GPUS_PER_ENGINE:-4}"
-   --sglang-mem-fraction-static 0.7
-   --sglang-cuda-graph-max-bs 512
+   --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION:-0.7}"
 )
+if [[ -n "${SGLANG_MAX_RUNNING_REQUESTS:-}" ]]; then
+   SGLANG_ARGS+=(--sglang-max-running-requests "${SGLANG_MAX_RUNNING_REQUESTS}")
+fi
+SGLANG_ARGS+=(--sglang-cuda-graph-max-bs "${SGLANG_CUDA_GRAPH_MAX_BS:-512}")
 
 MISC_ARGS=(
    --attention-dropout 0.0
@@ -209,15 +196,11 @@ WANDB_ARGS=()
 if [[ -n "${WANDB_API_KEY:-}" ]]; then
    WANDB_ARGS=(
       --use-wandb
-      --wandb-project "${WANDB_PROJECT:-miles-kazuki-fujii}"
+      --wandb-project "${WANDB_PROJECT:-off-policy-${DATASET_TAG}}"
       --wandb-group "${RUN_NAME}"
       --wandb-key "${WANDB_API_KEY}"
    )
 fi
-
-ray stop --force || true
-ray start --head --node-ip-address 127.0.0.1 --num-gpus ${GPUS_PER_NODE:-8} \
-    --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
@@ -232,15 +215,16 @@ RUNTIME_ENV_JSON="{
 ray job submit --address="http://127.0.0.1:8265" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 train_async.py \
-   --actor-num-nodes 1 \
-   --actor-num-gpus-per-node ${ACTOR_GPUS} \
-   --rollout-num-gpus ${ROLLOUT_GPUS} \
+   --actor-num-nodes "${ACTOR_NUM_NODES}" \
+   --actor-num-gpus-per-node "${ACTOR_GPUS_PER_NODE}" \
+   --rollout-num-gpus "${ROLLOUT_NUM_GPUS}" \
    ${MODEL_ARGS[@]} \
    "${CKPT_ARGS[@]}" \
    "${ROLLOUT_ARGS[@]}" \
    "${OPTIMIZER_ARGS[@]}" \
    "${GRPO_ARGS[@]}" \
    "${WANDB_ARGS[@]}" \
+   "${TELEMETRY_ARGS[@]}" \
    "${PERF_ARGS[@]}" \
    "${EVAL_ARGS[@]}" \
    "${SGLANG_ARGS[@]}" \

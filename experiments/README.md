@@ -18,6 +18,8 @@ experiments/
   setup/download_assets.sbatch  HF model + datasets
   setup/convert_checkpoint.sbatch  HF -> torch_dist (Megatron)
   setup/stage_model.sh          one model: download + convert, chained
+  configs/eval_math.yaml        multi-benchmark eval (--eval-config)
+  lib/ray_cluster.sh            multi-node ray bring-up, sourced by every train.sh
   math_sync/<model>/            single-turn math RL (GRPO, deepscaler reward)
   math_async/<model>/           the same task on the fully-async rollout
   tool_multiturn/<model>/       multi-turn tool-calling RL (ReTool v2 style)
@@ -75,14 +77,123 @@ four-knob invariant into a startup assert (`arguments.py:3056` only checks it
 when the flag is present).
 
 Dynamic sampling and partial rollout are **on by default** in both tasks
-(`DYNAMIC_SAMPLING=0`, `PARTIAL_ROLLOUT=0`, `MASK_OFFPOLICY=0` opt out). They
-belong together: over-sampling aborts whatever is still generating once enough
-groups have passed the filter, and without `--partial-rollout` that work is
-discarded rather than resumed.
+(`DYNAMIC_SAMPLING=0`, `PARTIAL_ROLLOUT=0` opt out). They belong together:
+over-sampling aborts whatever is still generating once enough groups have passed
+the filter, and without `--partial-rollout` that work is discarded rather than
+resumed.
+
+`--mask-offpolicy-in-partial-rollout` is **off** (`MASK_OFFPOLICY=1` turns it
+on). It zeroes the loss over everything a resumed sample produced under the
+previous weights, which discards exactly the tokens partial rollout was enabled
+to keep.
 
 `math_async` additionally bounds staleness with `--max-weight-staleness`
 (default 2) — miles' own default is *no bound*, which lets an arbitrarily old
 group reach the optimizer — and corrects the remaining lag with `--use-tis`.
+
+### Multi-node
+
+Every recipe takes its node count from the allocation, so `-N` is the only thing
+that changes:
+
+```bash
+sbatch -A $ACC -N 4 experiments/math_sync/qwen3-8b/run.sbatch
+```
+
+`run.sbatch` runs one task per node and each `train.sh` sources
+`lib/ray_cluster.sh`, the one copy of the bring-up: node 0 is the Ray head and
+the driver, the rest join it and idle until the driver signals completion
+through a flag file under `experiments/outputs/.ray/`. Workers `exit` from
+inside that file, so nothing after the `source` line runs on them. The driver
+waits for every worker to *register* — reachable is not registered — because
+miles sizes its placement groups from the node count.
+
+`train.sh` itself carries no comments: it is the configuration, and the
+reasoning behind each setting is here instead.
+
+Placement is derived and then checked before anything expensive starts. The
+per-model parallelism is fixed, so **data parallelism is whatever is left over
+and grows with the allocation**; the recipe prints it and refuses to start if
+`tp × cp × pp` does not divide the training GPUs or if the global batch is not
+divisible by the resulting `dp`:
+
+```
+placement: 4 node(s) x 8 GPU = 32 training GPUs, tp4 cp2 -> dp4
+```
+
+`ACTOR_NUM_NODES`, `ACTOR_GPUS_PER_NODE` and (async) `ROLLOUT_NUM_GPUS` override
+the derived split. `math_async` defaults to 4+4 GPUs within one node, and to a
+half-and-half split by node from two nodes up.
+
+More nodes raise `dp` and shrink the per-rank batch; they do not by themselves
+make a step more informative. Raise `ROLLOUT_BATCH_SIZE` with the allocation.
+
+### Checkpoint layout
+
+Checkpoints are keyed by configuration, not by job id:
+
+```
+/ckpt/training/<task>/<dataset>/<model>/<config>
+/ckpt/training/math/dapo-math-17k/Qwen3-4B/async-off-1step-rollout-length-24k-lr1e-6
+```
+
+so a resumed run finds its own history and two settings never share a `--load`.
+`CONFIG_TAG` defaults to the rollout mode, the steps per rollout, the response
+length and the learning rate; set it explicitly for anything that default does
+not encode — a filtered prompt file, dynamic sampling turned off, a tuning job.
+The dump directory follows the same path.
+
+wandb is keyed the same way: the project defaults to `off-policy-<dataset>`
+(e.g. `off-policy-dapo-math-17k`) so every run varying the off-policy knobs on
+one dataset is directly comparable, with `CONFIG_TAG` separating the settings.
+
+### Eval
+
+`--eval-prompt-data` takes name/path pairs and accepts as many as you give it, so
+several benchmarks each report their own series. The default is **AIME-2024 plus
+AIME-2025**: same size and difficulty, but 2025 is outside the 2024 contamination
+window, so a gap between the two is the cheapest memorisation signal available.
+
+Everything listed must already be in `prompt`/`label` shape, since the global
+`--input-key`/`--label-key` apply to eval too. `setup/build_math_jsonl.py`
+converts a raw `problem`/`answer` file into that shape; AIME-2025 and MATH-500
+were converted with it.
+
+Per-dataset settings (a cheaper `n` for a 500-problem set, a different verifier)
+are not expressible as pairs and need `--eval-config`, which **overrides**
+`--eval-prompt-data` entirely. `configs/eval_math.yaml` is that config, adding
+MATH-500 at `n=4`:
+
+```bash
+--export=ALL,EVAL_CONFIG=/root/miles/experiments/configs/eval_math.yaml
+```
+
+Eval shares the engines with training rollout, so its cost is real: the config
+above is 2960 generations per eval interval.
+
+### Telemetry
+
+`--dump-details` and `--use-miles-dashboard` are **on by default**
+(`DUMP_DETAILS=0`, `USE_DASHBOARD=0`, `ROLLOUT_ENTROPY=0` opt out). View a run,
+live or finished, from anywhere that can see the directory:
+
+```bash
+python -m miles.dashboard.serve --dump-details <ckpt-path>/dump --follow
+```
+
+The collector is fire-and-forget and costs a few ms per step. **The dumps are the
+part that costs**: one rollout dump plus one train dump *per rank* every rollout
+and every eval, `torch.save` inline on the training path, and no retention or
+interval knob anywhere. Per-step volume scales with the training world size, not
+with `dp`, because TP/CP ranks write duplicate copies that are deduplicated only
+at read time. Measure it on a tuning run before committing a production
+allocation to it.
+
+### Running one
+
+`.claude/skills/miles-run-ladder` is the intended progression: `interactive` for
+bring-up on 2 nodes, `batch_short` for parallelism and rollout tuning, `batch`
+for the real 4 h job.
 
 ## Logs
 

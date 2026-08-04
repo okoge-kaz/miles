@@ -54,7 +54,9 @@ mkdir -p "${DATASET_DIR}" "${HF_CKPT_DIR}" "${MEGATRON_CKPT_DIR}" "${TRAIN_CKPT_
 # $HOME is not mounted into the container (--no-container-mount-home), so the
 # key is resolved here on the host and carried in by --export=ALL. Set
 # WANDB_API_KEY yourself to override; leave everything unset to disable wandb.
-export WANDB_PROJECT="${WANDB_PROJECT:-miles-kazuki-fujii}"
+# WANDB_PROJECT is deliberately NOT defaulted here. Each recipe derives it from
+# the experiment axis and the dataset (off-policy-<dataset>), which a default set
+# at this level would silently shadow. Export it yourself to override.
 if [[ -z "${WANDB_API_KEY:-}" && -f "${HOME}/.netrc" ]]; then
     _wandb_key=$(awk '
         /^[[:space:]]*machine[[:space:]]+api\.wandb\.ai/ { f = 1; next }

@@ -2,29 +2,29 @@
 #SBATCH --job-name=miles-math-async-qwen3-1.7b
 #SBATCH --partition=interactive
 #SBATCH --nodes=1
-#SBATCH --ntasks=1
+#SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:8
 #SBATCH --exclusive
 #SBATCH --time=04:00:00
 #SBATCH --output=experiments/outputs/training/%x-%j.log
 
-# Fully-async math RL on Qwen3-1.7B: rollout and training run concurrently
+# Fully-async math RL on Qwen3-1.7B: rollout and training run concurrently.
 #
 #   sbatch -A coreai_horizon_dilations experiments/math_async/qwen3-1.7b/run.sbatch
+#   sbatch -A coreai_horizon_dilations -N 4 -p batch experiments/math_async/qwen3-1.7b/run.sbatch
 #
-# Default partition is interactive (4h, <=2 nodes) — the fast lane. Longer runs:
-# -p batch_long (8h) or -p batch_large_long (14d), and raise --time to match.
-#
-# Knobs are env vars carried in by --export=ALL:
-#     ACTOR_GPUS, ROLLOUT_GPUS (must sum to 8), MAX_WEIGHT_STALENESS,
-#     ASYNC_MAX_CONCURRENT_SAMPLES, NUM_ROLLOUT, ROLLOUT_BATCH_SIZE,
-#     N_SAMPLES_PER_PROMPT, GLOBAL_BATCH_SIZE, NUM_STEPS_PER_ROLLOUT,
-#     MAX_RESPONSE_LEN, RM_TYPE, PROMPT_DATA,
-#     DYNAMIC_SAMPLING=0 / PARTIAL_ROLLOUT=0 / MASK_OFFPOLICY=0 to disable those,
-#     TENSOR_PARALLEL_SIZE, CONTEXT_PARALLEL_SIZE, MAX_TOKENS_PER_GPU
-#
-#   sbatch --export=ALL,NUM_ROLLOUT=5,ROLLOUT_BATCH_SIZE=8,GLOBAL_BATCH_SIZE=64 \
-#          -A coreai_horizon_dilations experiments/math_async/qwen3-1.7b/run.sbatch
+# Env vars carried in by --export=ALL:
+#     placement:  ACTOR_NUM_NODES, ACTOR_GPUS_PER_NODE, ROLLOUT_NUM_GPUS
+#     batch:      ROLLOUT_BATCH_SIZE, N_SAMPLES_PER_PROMPT, GLOBAL_BATCH_SIZE,
+#                 NUM_STEPS_PER_ROLLOUT, NUM_ROLLOUT, MAX_RESPONSE_LEN
+#     parallel:   TENSOR_PARALLEL_SIZE, CONTEXT_PARALLEL_SIZE,
+#                 EXPERT_PARALLEL_SIZE, MAX_TOKENS_PER_GPU
+#     rollout:    ROLLOUT_NUM_GPUS_PER_ENGINE, SGLANG_MEM_FRACTION,
+#                 SGLANG_MAX_RUNNING_REQUESTS, SGLANG_CUDA_GRAPH_MAX_BS
+#     sampling:   DYNAMIC_SAMPLING=0, PARTIAL_ROLLOUT=0, MASK_OFFPOLICY=1, MAX_WEIGHT_STALENESS,
+#                 ASYNC_MAX_CONCURRENT_SAMPLES
+#     telemetry:  DUMP_DETAILS=0, USE_DASHBOARD=0, ROLLOUT_ENTROPY=0, DUMP_DIR
+#     data:       PROMPT_DATA, RM_TYPE, SAVE_INTERVAL
 
 set -euo pipefail
 
@@ -36,7 +36,22 @@ source "${REPO_ROOT}/experiments/env.sh"
 
 export RUN_NAME="${RUN_NAME:-math-grpo-async-qwen3-1.7b-${SLURM_JOB_ID}}"
 
+# The batch script runs on the first node of the allocation, which is therefore
+# the Ray head; workers dial this address. The done-flag lives on the shared
+# filesystem so the workers can see it, and is cleared first in case a previous
+# job with the same RUN_NAME left one behind — a stale flag would make every
+# worker exit immediately and the run would fail with a one-node cluster.
+export RAY_HEAD_IP="$(hostname -I | awk '{print $1}')"
+export RAY_PORT="${RAY_PORT:-6379}"
+export RAY_DONE_FLAG="/root/miles/experiments/outputs/.ray/${RUN_NAME}.done"
+mkdir -p "${OUTPUT_DIR}/.ray"
+rm -f "${OUTPUT_DIR}/.ray/${RUN_NAME}.done"
+
+echo "nodes=${SLURM_JOB_NUM_NODES} head=${RAY_HEAD_IP} run=${RUN_NAME}"
+
 srun \
+    --nodes="${SLURM_JOB_NUM_NODES}" \
+    --ntasks-per-node=1 \
     --container-image="${SQSH_IMAGE}" \
     --container-mounts="${CONTAINER_MOUNTS}" \
     --container-writable \

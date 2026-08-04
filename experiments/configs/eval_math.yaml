@@ -1,0 +1,43 @@
+# Multi-benchmark eval for the math recipes.
+#
+#   EVAL_CONFIG=/root/miles/experiments/configs/eval_math.yaml
+#
+# --eval-config OVERRIDES --eval-prompt-data entirely (arguments.py:2508), so
+# everything the run should evaluate has to be listed here. Use it instead of the
+# name/path pairs when a dataset needs its own sampling budget or verifier —
+# pairs share one --n-samples-per-eval-prompt across every benchmark.
+#
+# Each entry maps onto EvalDatasetConfig (miles/utils/eval_config.py:95), which
+# also accepts rm_type, input_key, label_key, temperature, top_p, stop and
+# custom_generate_function_path per dataset.
+#
+# Cost note: eval samples come out of the same engines as training rollout, so
+# the total here is what each eval interval costs.
+#   aime24   30 x 16 =   480
+#   aime25   30 x 16 =   480
+#   math500 500 x  4 =  2000
+#                      -----
+#                       2960 generations per eval
+
+eval:
+  defaults:
+    n_samples_per_eval_prompt: 16
+    max_response_len: 24576
+    top_p: 1.0
+
+  datasets:
+    # The headline number, and the one every published Qwen3 figure uses.
+    - name: aime24
+      path: /data/aime-2024/aime-2024.jsonl
+
+    # Same size and difficulty, outside the 2024 contamination window. A run that
+    # improves on aime24 while aime25 stays flat is memorising, not learning.
+    - name: aime25
+      path: /data/aime-2025/aime-2025.jsonl
+
+    # 500 problems, so avg@4 already has a far smaller standard error than
+    # 30 x avg@16 does. This is the series that moves between AIME steps: on
+    # 30 problems a single flip is 3.3 points and reads as noise.
+    - name: math500
+      path: /data/math-500/math-500.jsonl
+      n_samples_per_eval_prompt: 4
