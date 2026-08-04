@@ -58,44 +58,62 @@ the question is whether something *learns*.
 
 ## What to search, and over what range
 
-Ordered by expected effect on this baseline. Change one class at a time; the
-`batch` lane is for results, not for sweeps (see
-[`miles-run-ladder`](../../../.claude/skills/miles-run-ladder/SKILL.md)).
+A hyperparameter here is any value that can move **throughput** or **downstream
+performance** — batch shape, off-policy step count, learning rate, context
+length, the GPU split, the engine geometry. Every row says which of the two it
+moves, because that decides which lane it is swept in: `quality` and `both` rows
+change what is learned and invalidate a comparison, `throughput` rows do not.
+See [`miles-run-ladder`](../../../.claude/skills/miles-run-ladder/SKILL.md).
 
 ### Batch shape — the largest gap to published work
 
-| knob | default | search | why |
-|---|---|---|---|
-| `ROLLOUT_BATCH_SIZE` | 32 | **64, 128, 256, 512** | DAPO used 512. At 76% zero-variance groups, 32 prompts leaves ~8 contributing per step, which is where the 0.04 grad_norm comes from. This is the first thing to move. |
-| `N_SAMPLES_PER_PROMPT` | 8 | **8, 16, 32** | At n=8 a 1/8 or 7/8 group carries only `sqrt(0.125·0.875)=0.33` of the maximum advantage. 16 is DAPO's value and halves the variance of the per-group estimate at 2× cost. |
-| `GLOBAL_BATCH_SIZE` | 256 | keep = `rollout_batch × n / num_steps` | Not free: the four-knob invariant is asserted at startup. |
-| `NUM_STEPS_PER_ROLLOUT` | 1 | **1, 2, 4** | >1 makes the later minibatch steps off-policy. `--use-tis` is on in this task, so the ratio is corrected; watch `dump/mean_abs_lp_diff` as it rises. |
-| `OVER_SAMPLING_BATCH_SIZE` | 2× rollout batch | **1.5×, 2×, 3×** | Higher means fewer resampling rounds but more aborted generations; partial rollout recovers those, so the cost is bounded. |
+| knob | default | search | affects | why |
+|---|---|---|---|---|
+| `ROLLOUT_BATCH_SIZE` | 32 | **64, 128, 256, 512** | both | DAPO used 512. At 76% zero-variance groups, 32 prompts leaves ~8 contributing per step, which is where the 0.04 grad_norm comes from. This is the first thing to move. Larger also amortises the weight sync over more generation. |
+| `N_SAMPLES_PER_PROMPT` | 8 | **8, 16, 32** | both | At n=8 a 1/8 or 7/8 group carries only `sqrt(0.125·0.875)=0.33` of the maximum advantage. 16 is DAPO's value: half the variance of the per-group estimate at 2× the generation cost. |
+| `GLOBAL_BATCH_SIZE` | 256 | derived | quality | Must equal `rollout_batch × n / num_steps`; the invariant is asserted at startup. Also has to be divisible by `dp`, which grows with the allocation. |
+| `NUM_STEPS_PER_ROLLOUT` (off-policy step) | 1 | **1, 2, 4** | both | >1 splits one rollout into several optimizer steps, so the later ones are off-policy. Throughput improves because generation is amortised over more updates; `--use-tis` is on in this task, so the ratio is corrected. Watch `dump/mean_abs_lp_diff` rise with it. |
+| `OVER_SAMPLING_BATCH_SIZE` | 2× rollout batch | **1.5×, 2×, 3×** | throughput | Higher means fewer resampling rounds but more aborted generations; partial rollout recovers those, so the cost is bounded. |
 
 ### Async / off-policy — what this task exists to study
 
-| knob | default | search | why |
-|---|---|---|---|
-| `MAX_WEIGHT_STALENESS` | 2 | **1, 2, 4, unset** | AReaL's central quantity. `unset` is miles' own default and means *no bound*; it is the upper end of the sweep, not a safe baseline. Read `dump/mixed_version_frac` and the per-sample `weight_version_min` to see what the bound actually binds. |
-| actor / rollout split | 1 node + 1 node | **1+1, 1+3, 2+2, 3+1** | Whichever side is starving decides. `async/queue_depth` growing means training is the bottleneck; sitting at 0 means rollout is. |
-| `ASYNC_MAX_CONCURRENT_SAMPLES` | unset (= one training batch) | **1×, 2×, 4× `rollout_batch × n`** | Decouples generation concurrency from the training batch. Raising it fills the engines but increases average staleness. |
-| `--use-tis` | on | on / off | Off only as a controlled ablation, to measure what the correction is worth at a given staleness. |
+| knob | default | search | affects | why |
+|---|---|---|---|---|
+| `MAX_WEIGHT_STALENESS` | 2 | **1, 2, 4, unset** | both | AReaL's central quantity. Looser lets generation overlap more weight syncs (throughput) at the cost of training on older samples (quality). `unset` is miles' own default and means *no bound* — the upper end of the sweep, not a safe baseline. Read `dump/mixed_version_frac` and per-sample `weight_version_min`. |
+| actor / rollout split | 1 node + 1 node | **1+1, 1+3, 2+2, 3+1** | throughput | Whichever side is starving decides. `async/queue_depth` growing means training is the bottleneck; sitting at 0 means rollout is. |
+| `ASYNC_MAX_CONCURRENT_SAMPLES` | unset (= one training batch) | **1×, 2×, 4× `rollout_batch × n`** | both | Decouples generation concurrency from the training batch. Raising it fills the engines but raises average staleness. |
+| `--use-tis` | on | on / off | quality | Off only as a controlled ablation, to measure what the correction is worth at a given staleness. |
 
 ### Optimization
 
+| knob | default | search | affects | why |
+|---|---|---|---|---|
+| `LR` | 1e-6 | **5e-7, 1e-6, 2e-6** | quality | Matches DAPO already. Move only after the batch shape is settled — the effective step size depends on both. |
+| `--eps-clip-high` | 0.28 | **0.2 (symmetric), 0.28, 0.32** | quality | DAPO's clip-higher exists to stop entropy collapse. Watch `dump/mean_entropy`. |
+| `--kl-loss-coef` | 0.00 | **0, 1e-3** | quality | Both DAPO and this recipe run without a KL penalty. Reintroduce only if the policy drifts off the reference in a way the reward does not catch. |
+| `--grpo-std-normalization` | on | on / off | quality | Dr. GRPO's correction is to turn this off. The cheapest published change here, targeting length inflation on wrong answers — check `dump/response_length_mean` split by reward. |
+
+### Generation and context
+
+| knob | default | search | affects | why |
+|---|---|---|---|---|
+| `MAX_RESPONSE_LEN` | 24576 | **8192, 16384, 24576, 32768** | both | Not free in either direction. Measured on Qwen3-4B-Instruct-2507, an 8192 budget truncated 18 of 32 prompts, and a truncated sample scores 0 under every rule-based verifier — so a short budget *biases* against long-solution problems rather than adding noise. Longer costs generation time roughly linearly and activation memory through `max_tokens_per_gpu × cp`. Watch `dump/truncated_frac`. |
+| `ROLLOUT_MAX_CONTEXT_LEN` | 32768 | **16384, 32768, 65536** | both | The hard cap on prompt + response, and the number `MAX_TOKENS_PER_GPU × cp` has to clear (`data.py:473`). Raising it without raising that product fails at startup; raising both costs activation memory and KV cache. Below `MAX_RESPONSE_LEN` + the longest prompt it silently truncates. |
+| `--rollout-temperature` | 1 | **0.8, 1.0, 1.2** | quality | Lower reduces unanimous-wrong groups; higher increases spread and therefore usable advantage. Interacts directly with `zero_std_group_frac`. |
+
+### Throughput only
+
+These change how fast a step is, never what it learns, so they are swept in the
+`batch_short` lane and then frozen.
+
 | knob | default | search | why |
 |---|---|---|---|
-| `LR` | 1e-6 | **5e-7, 1e-6, 2e-6** | Matches DAPO already; move only after the batch shape is settled, since the two interact. |
-| `--eps-clip-high` | 0.28 | **0.2 (symmetric), 0.28, 0.32** | DAPO's clip-higher exists to stop entropy collapse. Watch `dump/mean_entropy`. |
-| `--kl-loss-coef` | 0.00 | **0, 1e-3** | Both DAPO and this recipe run without a KL penalty. Reintroduce it only if the policy drifts off the reference in a way the reward does not catch. |
-| `--grpo-std-normalization` | on | on / off | Dr. GRPO's correction is to turn this off. It is the cheapest published change here and specifically targets length inflation on wrong answers — check `dump/response_length_mean` split by reward. |
-
-### Generation
-
-| knob | default | search | why |
-|---|---|---|---|
-| `MAX_RESPONSE_LEN` | 24576 | **8192, 16384, 24576, 32768** | Not a free parameter: measured on Qwen3-4B-Instruct-2507, an 8192 budget truncated 18 of 32 prompts, and a truncated sample scores 0 under every rule-based verifier, so a short budget biases against long-solution problems rather than adding noise. Watch `dump/truncated_frac`. Above 32768 also raise `ROLLOUT_MAX_CONTEXT_LEN` and re-check `max_tokens_per_gpu × cp`. |
-| `--rollout-temperature` | 1 | **0.8, 1.0, 1.2** | Lower reduces the fraction of unanimous-wrong groups; higher increases spread and therefore usable advantage. Interacts directly with `zero_std_group_frac`. |
+| `MAX_TOKENS_PER_GPU` | per model | up until OOM | Fewer microbatches per step. Must keep `MAX_TOKENS_PER_GPU × cp ≥ ROLLOUT_MAX_CONTEXT_LEN`. Usually the cheapest win. |
+| `TENSOR_PARALLEL_SIZE` / `CONTEXT_PARALLEL_SIZE` | per model | powers of 2 whose product divides the training GPUs | Sets `dp` as the remainder, which then has to divide `GLOBAL_BATCH_SIZE`. CP is what makes a long response fit at all. |
+| `EXPERT_PARALLEL_SIZE` | per model | MoE only | `qwen3-30b-a3b` only. |
+| `ROLLOUT_NUM_GPUS_PER_ENGINE` | per model | 1, 2, 4, 8 | Smaller engines mean more of them and more concurrency; larger ones are needed once the weights stop fitting. |
+| `SGLANG_MEM_FRACTION` | 0.7 | **0.6–0.85** | KV cache size. The dashboard advisory panel reads `sglang_token_usage` and `sglang_cache_hit_rate` back. |
+| `SGLANG_MAX_RUNNING_REQUESTS`, `SGLANG_CUDA_GRAPH_MAX_BS` | unset | from the observed peak | Capturing CUDA graphs above the concurrency actually reached costs startup time and memory for nothing. |
 
 ### Not a hyperparameter
 

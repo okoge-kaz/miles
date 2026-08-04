@@ -54,11 +54,16 @@ ranges it may be moved through are written down before any GPU time is spent.
 2. **Reference hyperparameters vs. this recipe.** A side-by-side of the leading
    paper's settings and the recipe's defaults, so the gaps are explicit rather
    than discovered later.
-3. **What to search, and over what range.** Per hyperparameter: the current
-   default, the range worth sweeping, and *why* — ideally naming the metric that
-   tells you whether the move worked. Grouped by class (batch shape,
-   optimization, generation, and whatever the task adds), ordered by expected
-   effect, because the run ladder moves one class at a time.
+3. **What to search, and over what range.** A hyperparameter here is any value
+   that can move **throughput** or **downstream performance** — global batch
+   size, samples per prompt, rollout batch size, off-policy steps, learning rate,
+   max response and context length, the GPU split, the engine geometry. Per
+   knob: the current default, the range worth sweeping, **which of the two it
+   affects** (`throughput` / `quality` / `both`), and *why* — naming the metric
+   that says whether the move worked. Grouped by class and ordered by expected
+   effect, because the run ladder moves one class at a time; the `throughput`
+   rows are exactly the ones that can be swept without invalidating a
+   comparison.
 
 A local baseline section — what this cluster actually measured — belongs between
 2 and 3 once it exists. Settings that are correctness rather than search space
