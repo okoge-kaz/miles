@@ -224,11 +224,27 @@ up in a commit.
 | Megatron (`torch_dist`) weights | `…/checkpoints/megatron` | `/ckpt/megatron` |
 | Training checkpoints | `…/checkpoints/training` | `/ckpt/training` |
 | Container images | `…/container` | — |
-| Caches (HF, enroot) | `…/cache` | `/root/.cache` |
+| Caches (HF, enroot, JIT) | `…/cache` | `/root/.cache` |
 | miles checkout | `…/src/miles` | `/root/miles` |
 
 The image ships miles at `/root/miles`; the mount shadows it with this checkout,
 so edits here take effect without rebuilding.
+
+`$HOME` is not mounted, so everything that writes to `~/.cache` already lands on
+that mount and survives the job — that is how `huggingface/`, `tvm-ffi/`
+(sgl_kernel) and `deep_gemm/` got there. `env.sh` additionally redirects the
+caches that default *outside* `~/.cache` and would otherwise be recompiled every
+job: torch inductor (`/tmp/torchinductor_$USER`, and `/tmp` is RAM-backed here),
+triton (`~/.triton/cache`), the CUDA PTX JIT cache (`~/.nv/ComputeCache`), and
+SGLang's DeepGEMM cache, which miles otherwise pins under `/tmp`
+(`ray/rollout/server_group.py:107`).
+
+CUDA graphs are not part of this: they are captured in-process at engine start
+and never written to disk. What a warm cache saves is the torch.compile and
+kernel-JIT work before the capture, not the capture itself.
+
+A corrupt entry after a killed job surfaces as a JIT or JSON decode error
+(`docs/faq.md:112`); delete that directory under `$CACHE_DIR` and rerun.
 
 ## Order of operations
 

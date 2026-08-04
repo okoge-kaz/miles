@@ -50,6 +50,38 @@ ${CACHE_DIR}:/root/.cache"
 mkdir -p "${DATASET_DIR}" "${HF_CKPT_DIR}" "${MEGATRON_CKPT_DIR}" "${TRAIN_CKPT_DIR}" \
          "${CONTAINER_DIR}" "${CACHE_DIR}" "${OUTPUT_DIR}"
 
+# --- Compile / JIT caches ---------------------------------------------------
+# $HOME is /root in the container and is not mounted, so anything writing to
+# ~/.cache already lands on CACHE_DIR and survives the job — that is how
+# huggingface/, tvm-ffi/ (sgl_kernel) and deep_gemm/ got there. These are the
+# ones that do NOT, because they default outside ~/.cache:
+#
+#   torch inductor  /tmp/torchinductor_$USER   <- /tmp is RAM-backed here
+#   triton          ~/.triton/cache            <- /root/.triton, not mounted
+#   CUDA PTX JIT    ~/.nv/ComputeCache         <- /root/.nv, not mounted
+#
+# Left alone, every job recompiles from scratch and the inductor cache eats
+# node RAM while doing it. The values are container paths; --export=ALL carries
+# them in. A corrupt entry after a killed job shows up as a JIT/JSONDecodeError
+# (docs/faq.md:112) — delete the directory under $CACHE_DIR and rerun.
+export TRITON_CACHE_DIR=/root/.cache/triton
+export TORCHINDUCTOR_CACHE_DIR=/root/.cache/torchinductor
+export TORCH_HOME=/root/.cache/torch
+export CUDA_CACHE_PATH=/root/.cache/nv_compute
+export CUDA_CACHE_MAXSIZE=4294967296
+export VLLM_CACHE_ROOT=/root/.cache/vllm
+
+# SGLang's DeepGEMM JIT cache. miles otherwise pins this to
+# /tmp/sglang_deep_gemm/<worker>_rank_<n> for per-rank isolation
+# (ray/rollout/server_group.py:107) — on RAM-backed /tmp, discarded every job.
+# It reads the env var first, so setting it here wins; PER_PROCESS=1 is the
+# supported way to keep the per-rank isolation under a shared directory
+# (the TODO at server_group.py:105, and scripts/run_deepseek_v4.py:575).
+export SGLANG_DG_CACHE_DIR=/root/.cache/deep_gemm
+export SGLANG_DG_CACHE_DIR_PER_PROCESS=1
+
+mkdir -p "${CACHE_DIR}"/{triton,torchinductor,torch,nv_compute,vllm,deep_gemm}
+
 # --- Weights & Biases -------------------------------------------------------
 # $HOME is not mounted into the container (--no-container-mount-home), so the
 # key is resolved here on the host and carried in by --export=ALL. Set
