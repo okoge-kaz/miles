@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=miles-dapo-math-async-qwen3-4b-instruct-2507
 #SBATCH --partition=interactive
-#SBATCH --nodes=1
+#SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:8
 #SBATCH --exclusive
@@ -18,15 +18,15 @@ source "${REPO_ROOT}/experiments/env.sh"
 MODEL_NAME=Qwen3-4B-Instruct-2507
 ROLLOUT_MODE=async-on
 DATASET_TAG=dapo-math
-: "${PROMPT_DATA:=/data/dapo-math-17k/dapo-math-17k.jsonl}"
+PROMPT_DATA=/data/dapo-math-17k/dapo-math-17k.jsonl
 
 : "${LR:=1e-6}"
 : "${MAX_RESPONSE_LEN:=24576}"
 : "${NUM_STEPS_PER_ROLLOUT:=1}"
 
 : "${ACTOR_NUM_NODES:=1}"
-: "${ACTOR_GPUS_PER_NODE:=4}"
-: "${ROLLOUT_NUM_GPUS:=4}"
+: "${ACTOR_GPUS_PER_NODE:=8}"
+: "${ROLLOUT_NUM_GPUS:=8}"
 
 : "${TENSOR_PARALLEL_SIZE:=2}"
 : "${CONTEXT_PARALLEL_SIZE:=2}"

@@ -158,9 +158,16 @@ python -m experiments.src.difficulty_filter.apply_filter \
 The output keeps every input line verbatim and appends a `difficulty` block, so
 it stays a drop-in `--prompt-data` while remaining traceable to its measurement.
 
-Use it by pointing a recipe at the filtered file:
+Use it by giving the filtered file its own dataset directory. `PROMPT_DATA` is
+fixed by `<task>/<dataset>/`, not overridden per run, so a filtered prompt set is
+a new dataset — which is also what keeps its checkpoints, its wandb project and
+its results separate from the unfiltered ones:
 
 ```bash
-experiments/submit_training.sh math_sync/dapo-math/qwen3-4b-instruct-2507 filtered-math \
-  --export=ALL,PROMPT_DATA=/data/dapo-math-17k/dapo-math-17k-p20-80.jsonl
+cp -r experiments/math_sync/dapo-math experiments/math_sync/dapo-math-p20-80
+# then in each run.sbatch of the copy:
+#   DATASET_TAG=dapo-math-p20-80
+#   PROMPT_DATA=/data/dapo-math-17k/dapo-math-17k-p20-80.jsonl
+
+experiments/submit_training.sh math_sync/dapo-math-p20-80/qwen3-4b-instruct-2507 filtered-math
 ```

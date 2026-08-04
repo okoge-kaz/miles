@@ -22,6 +22,7 @@ experiments/
   common/run_identity.sh        run name, config tag, checkpoint path
   common/placement.sh           derive + validate the GPU split, before srun
   common/ray_cluster.sh         multi-node ray bring-up
+  math_sync/<dataset>/          README.md + one directory per model
   math_sync/<dataset>/<model>/  single-turn math RL (GRPO, deepscaler reward)
   math_async/<dataset>/<model>/ the same task on the fully-async rollout
   tool_multiturn/<model>/       multi-turn tool-calling RL (ReTool v2 style)
@@ -37,6 +38,37 @@ model directory fixes the weights, the parallelism and the batch shape.
 Every level is a directory rather than a conditional inside a script: there is
 no `if` picking a dataset or an eval set at runtime, so the file that runs is
 the file you read.
+
+### Dataset directories
+
+**Every `<task>/<dataset>/` directory carries a `README.md`, and it has the same
+three parts in the same order.** A new dataset is not staged until its README
+exists — the point of the directory is that the numbers it is aiming at and the
+ranges it may be moved through are written down before any GPU time is spent.
+
+1. **Prior work.** A table of published reference points for this dataset or
+   task: system, base model, reported result, and an **arXiv link**. Then a short
+   paragraph on which of those papers actually determine the algorithm the
+   recipes run, and a provenance note separating what was read from the abstract
+   from what was taken from a paper's body and not re-verified.
+2. **Reference hyperparameters vs. this recipe.** A side-by-side of the leading
+   paper's settings and the recipe's defaults, so the gaps are explicit rather
+   than discovered later.
+3. **What to search, and over what range.** Per hyperparameter: the current
+   default, the range worth sweeping, and *why* — ideally naming the metric that
+   tells you whether the move worked. Grouped by class (batch shape,
+   optimization, generation, and whatever the task adds), ordered by expected
+   effect, because the run ladder moves one class at a time.
+
+A local baseline section — what this cluster actually measured — belongs between
+2 and 3 once it exists. Settings that are correctness rather than search space
+(`RM_TYPE` against a non-thinking checkpoint, for instance) go in a closing
+"not a hyperparameter" note so they are not swept by accident.
+
+`math_sync/dapo-math/README.md` and `math_async/dapo-math/README.md` are the
+worked examples. The two differ only where the task differs: the async one
+searches staleness and the actor/rollout split, the colocated one does not have
+those knobs at all.
 
 Each recipe is a pair: `run.sbatch` allocates the node and starts the
 container, `train.sh` runs inside it and holds the actual argument groups.
