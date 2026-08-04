@@ -74,6 +74,15 @@ whether the collector is enabled:
 | `dashboard_columns/` | A per-token column mirror, so the token view never has to load a whole `.pt` |
 | `trajectory/` | A raw conversation sidecar, written for session and multi turn runs |
 
+The train dumps are the expensive entry in that table, and the only one whose cost scales
+with the training world size: every rank writes its own file each rollout, `torch.save` runs
+inline on the training path, and tensor- and context-parallel ranks hold duplicate copies
+that are deduplicated only at read time. `--no-dump-train-data` drops them while keeping the
+collector, the rollout dumps and the trajectory sidecars, which is the cheap configuration
+for a long run. What it costs is the token view and every train-side column — `lp_diff`,
+`imp_ratio`, `advantages`, `returns`, `loss_mask`, entropy — since those exist only on the
+train side.
+
 `DumpReader.load_joined()` reunites the rollout and train sides: every rollout sample plus,
 where a train dump exists, its per-token training row, deduplicated across tensor-parallel
 duplicate rank files.
@@ -138,6 +147,7 @@ Cadence and scope can be tuned, though the defaults are appropriate for most run
 | `--dashboard-sglang-scrape-mode` | `auto` | `auto` scrapes `{router}/engine_metrics`, or each engine's `/metrics` under `--use-miles-router`. `router` and `direct` force one or the other |
 | `--dashboard-sglang-metrics` | whitelist | Comma separated override of the scraped sglang metric whitelist |
 | `--dashboard-forward-prometheus` | off | Also push dashboard gauges to the `--use-prometheus` collector for external Grafana |
+| `--no-dump-train-data` | off | Keep `--dump-details` and the collector, but skip the per-rank train dumps |
 
 A curated subset of the run's arguments, including the wandb identifiers, the parallelism
 layout, and the key sglang settings, is persisted into `meta.json` for the dashboard header.

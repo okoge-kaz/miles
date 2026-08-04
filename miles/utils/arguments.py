@@ -1898,6 +1898,20 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help=("Dump all details of training for post-hoc analysis and visualization."),
             )
             parser.add_argument(
+                "--dump-train-data",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help=(
+                    "Whether --dump-details also writes the per-rank training dumps. "
+                    "These are the expensive part of --dump-details: every rank saves its "
+                    "shard inline on the training path each rollout, and tensor- and "
+                    "context-parallel ranks hold duplicate copies. Pass "
+                    "--no-dump-train-data to keep the dashboard collector, the rollout "
+                    "dumps and the trajectory sidecars while dropping them; the token "
+                    "view and the train-side columns are unavailable without them."
+                ),
+            )
+            parser.add_argument(
                 "--dumper-enable",
                 action="store_true",
                 default=False,
@@ -2831,7 +2845,8 @@ def miles_validate_args(args):
 
     if args.dump_details is not None:
         args.save_debug_rollout_data = f"{args.dump_details}/rollout_data/{{rollout_id}}.pt"
-        args.save_debug_train_data = f"{args.dump_details}/train_data/{{rollout_id}}_{{rank}}.pt"
+        if args.dump_train_data:
+            args.save_debug_train_data = f"{args.dump_details}/train_data/{{rollout_id}}_{{rank}}.pt"
         args.save_debug_trajectory_data = f"{args.dump_details}/trajectory/{{rollout_id}}.jsonl"
         args.save_debug_event_data = f"{args.dump_details}/events"
 

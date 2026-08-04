@@ -239,6 +239,7 @@ Sections mirror the launch-script argument groups.
 | `--use-routing-replay` | flag | off | Forward/backward routing consistency. |
 | `--use-rollout-routing-replay` | flag | off | R3 — capture inference-side expert routing and replay it during training. |
 | `--calculate-per-token-loss` | flag | off | Per-token loss reduction. |
+| `--no-dump-train-data` | flag | off | With `--dump-details`, skip the per-rank train dumps (the expensive half). |
 | `--no-check-for-nan-in-loss-and-grad` | flag | off | Skip NaN/Inf guard (Megatron flag, debug only). |
 | `--true-on-policy-mode` | flag | off | Strict on-policy: reject samples from a prior policy. |
 
