@@ -87,11 +87,12 @@ Nothing errors — the sweep completes and reports a clean, entirely false
 | Qwen3-4B (hybrid thinking) | `deepscaler` or `math` |
 | **Qwen3-4B-Instruct-2507** (non-thinking) | **`math`** |
 
-This is not only a measurement concern. **The `math_sync` / `math_async` /
-`tool_multiturn` recipes ship `--rm-type deepscaler`**, so pointing one of them
-at a non-thinking checkpoint without changing `--rm-type` produces reward ≡ 0,
-zero advantage, and a run that looks like a model failing to learn rather than a
-misconfiguration.
+This is not only a measurement concern. **Every `math_sync` / `math_async` /
+`tool_multiturn` recipe ships `--rm-type deepscaler` except the
+`qwen3-4b-instruct-2507` pair, which defaults to `math` for exactly this
+reason.** Pointing any of the others at a non-thinking checkpoint without
+changing `--rm-type` produces reward ≡ 0, zero advantage, and a run that looks
+like a model failing to learn rather than a misconfiguration.
 
 `measure_pass_rate.py` therefore runs `verifier_preflight` before generating
 anything: it scores a correct boxed answer with and without a `</think>`

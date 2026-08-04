@@ -20,6 +20,11 @@
 # tools=; multi_turn.py:39 parses the model's native tool-call format).
 Qwen3-4B-Instruct-2507            | Qwen/Qwen3-4B-Instruct-2507                    | qwen3-4B-Instruct-2507
 #
+# Qwen3-1.7B is the smallest hybrid-thinking Qwen3: same MODEL_ARGS shape as
+# qwen3-4B (28 layers, hidden 2048), so it is the cheap end of the model sweep
+# and the fastest way to get a full math run through in one interactive slot.
+Qwen3-1.7B                        | Qwen/Qwen3-1.7B                                | qwen3-1.7B
+#
 # dense
 Qwen3-8B                          | Qwen/Qwen3-8B                                  | qwen3-8B
 Qwen3.5-9B                        | Qwen/Qwen3.5-9B                                | qwen3.5-9B

@@ -3,7 +3,10 @@
 #
 #   experiments/submit_training.sh <recipe>/<model> <run-name> [extra sbatch args...]
 #
-#   recipe/model: math_sync/qwen3-4b | math_async/qwen3-4b | tool_multiturn/qwen3-4b
+#   recipe/model: math_sync/<model> | math_async/<model> | tool_multiturn/<model>
+#   <model>:      qwen3-1.7b | qwen3-4b | qwen3-4b-instruct-2507 | qwen3-8b
+#                 | qwen3-30b-a3b
+#   (run with no arguments to list what actually exists on disk)
 #
 # Example — a real 24k-response colocated run, resumable across three 4 h jobs:
 #   experiments/submit_training.sh math_sync/qwen3-4b real-math-24k \

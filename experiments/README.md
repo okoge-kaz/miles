@@ -32,6 +32,57 @@ model to an existing task means one new subdirectory, not a new task.
 
 Each recipe is a pair: `run.sbatch` allocates the node and starts the
 container, `train.sh` runs inside it and holds the actual argument groups.
+`train.sh` is a full copy per model rather than a shared file with overrides —
+one file is the whole configuration, and a diff between two models shows every
+difference at once.
+
+### Models
+
+Both math tasks carry the same five checkpoints. Only the parallelism, the
+per-GPU token budget and the engine size differ; the RL settings are identical.
+
+| model | sync (8 GPU colocated) | async (4 train + 4 rollout) | verifier |
+|---|---|---|---|
+| `qwen3-1.7b` | TP1 CP4, 12288 tok/GPU | TP1 CP4, 12288 | `deepscaler` |
+| `qwen3-4b` | TP2 CP4, 9216 | TP2 CP2, 16384 | `deepscaler` |
+| `qwen3-4b-instruct-2507` | TP2 CP4, 9216 | TP2 CP2, 16384 | **`math`** |
+| `qwen3-8b` | TP4 CP2, 16384 | TP4 CP1, 32768 | `deepscaler` |
+| `qwen3-30b-a3b` | TP4 EP8, 32768, R3 | TP4 EP4, 32768, R3 | `deepscaler` |
+
+Two rules the table encodes:
+
+* `max_tokens_per_gpu × cp_size ≥ rollout_max_context_len`, because a single
+  sample has to fit in that budget
+  (`miles/backends/training_utils/data.py:473`). With the shared 32768 context
+  every row clears it.
+* **`qwen3-4b-instruct-2507` defaults to `--rm-type math`, not `deepscaler`.**
+  deepscaler returns 0 unless the response contains a `</think>` delimiter
+  (`rm_hub/deepscaler.py:36-44`), and this checkpoint is non-thinking, so under
+  deepscaler the entire run would score reward 0 without erroring anywhere.
+
+`qwen3-30b-a3b` is the only MoE and the only recipe with R3
+(`--use-rollout-routing-replay`), which replays the routing SGLang used during
+generation in the training forward pass. It also moves the fp32 Adam state to
+the host (`--optimizer-cpu-offload`), since 30B of optimizer state does not fit
+beside the weights on one node.
+
+### Off-policy control
+
+Both tasks pass `--num-steps-per-rollout` explicitly (default 1). That makes
+the number of optimizer steps taken per rollout batch a named knob instead of
+an implicit consequence of `--global-batch-size`, and it is what turns the
+four-knob invariant into a startup assert (`arguments.py:3056` only checks it
+when the flag is present).
+
+Dynamic sampling and partial rollout are **on by default** in both tasks
+(`DYNAMIC_SAMPLING=0`, `PARTIAL_ROLLOUT=0`, `MASK_OFFPOLICY=0` opt out). They
+belong together: over-sampling aborts whatever is still generating once enough
+groups have passed the filter, and without `--partial-rollout` that work is
+discarded rather than resumed.
+
+`math_async` additionally bounds staleness with `--max-weight-staleness`
+(default 2) — miles' own default is *no bound*, which lets an arbitrarily old
+group reach the optimizer — and corrects the remaining lag with `--use-tis`.
 
 ## Logs
 
@@ -90,19 +141,20 @@ experiments/setup/stage_model.sh Qwen3-4B-Instruct-2507
 Then the training recipes:
 
 ```bash
-# 4a. Math RL smoke test (colocated).
+# 4a. Math RL, colocated.
 sbatch -A $ACC experiments/math_sync/qwen3-4b/run.sbatch
 
-# 4b. Multi-turn tool RL.
-sbatch -A $ACC experiments/tool_multiturn/qwen3-4b/run.sbatch
+# 4b. The same task on the fully-async rollout.
+sbatch -A $ACC experiments/math_async/qwen3-4b/run.sbatch
 ```
 
-A fast smoke variant (a few rollouts, short responses):
+A fast smoke variant (a few rollouts, short responses). `qwen3-1.7b` is the
+cheapest place to check a change before spending a slot on a bigger model:
 
 ```bash
 sbatch -A $ACC -p interactive --time=01:00:00 \
   --export=ALL,NUM_ROLLOUT=3,ROLLOUT_BATCH_SIZE=8,N_SAMPLES_PER_PROMPT=8,GLOBAL_BATCH_SIZE=64,MAX_RESPONSE_LEN=1024 \
-  experiments/math_sync/qwen3-4b/run.sbatch
+  experiments/math_sync/qwen3-1.7b/run.sbatch
 ```
 
 Keep the four-knob invariant when changing batch sizes:
@@ -111,7 +163,10 @@ Keep the four-knob invariant when changing batch sizes:
 rollout_batch_size × n_samples_per_prompt = global_batch_size × num_steps_per_rollout
 ```
 
-miles aborts at startup if it does not hold.
+The recipes pass `--num-steps-per-rollout` (default 1), so miles checks this at
+startup and aborts if it does not hold. Change `GLOBAL_BATCH_SIZE` and
+`NUM_STEPS_PER_ROLLOUT` together — raising the step count is how a run is made
+deliberately off-policy, and the assert is what stops it happening by accident.
 
 ## Cluster facts these scripts assume
 
