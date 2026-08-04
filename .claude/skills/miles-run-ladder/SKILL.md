@@ -95,6 +95,17 @@ python -m miles.dashboard.serve --dump-details <dump-dir> --follow   # port 7788
 Set `CONFIG_TAG` on every tuning submission. Without it, each variant writes to
 the same checkpoint directory as the production run and pollutes it.
 
+For more than two or three points, use `experiments/sweep.py` instead of a loop:
+it derives a unique `CONFIG_TAG` per point, closes the four-knob invariant in
+whichever direction the grid leaves open, refuses to exceed `--max-jobs`, and
+records a manifest joining job ids to configurations. It prints the grid and
+stops unless `--submit` is passed.
+
+```bash
+experiments/sweep.py --sweep experiments/sweeps/offpolicy.txt \
+  --recipe math_async/dapo-math/qwen3-4b -- -N 2 -p batch_short --time=02:00:00
+```
+
 Change exactly one class of setting per job, and record the step time:
 
 **Training side.** `TENSOR_PARALLEL_SIZE`, `CONTEXT_PARALLEL_SIZE`,

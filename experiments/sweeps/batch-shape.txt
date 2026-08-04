@@ -1,0 +1,19 @@
+# Batch shape: the largest measured gap to DAPO (512 prompts x 16 samples here
+# against 32 x 8). With ~76% of groups zero-variance on this dataset, the
+# prompts-per-step count is what decides how much gradient signal a step has.
+#
+#   experiments/sweep.py --sweep experiments/sweeps/batch-shape.txt \
+#       --recipe math_sync/dapo-math/qwen3-4b-instruct-2507 \
+#       -- -N 2 -p batch_short --time=02:00:00
+#
+# 9 points. GLOBAL_BATCH_SIZE is pinned, so NUM_STEPS_PER_ROLLOUT is what gets
+# derived — the optimizer step stays the same size while the rollout grows, which
+# is how DAPO scales (512 prompts x 16 samples consumed in mini-batches). Pin
+# NUM_STEPS_PER_ROLLOUT instead if you want the opposite: one step per rollout,
+# growing.
+
+ROLLOUT_BATCH_SIZE      32 128 512
+N_SAMPLES_PER_PROMPT    8 16 32
+
+GLOBAL_BATCH_SIZE       256
+NUM_ROLLOUT             30

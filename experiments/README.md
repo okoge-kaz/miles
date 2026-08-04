@@ -18,6 +18,7 @@ experiments/
   setup/download_assets.sbatch  HF model + datasets
   setup/convert_checkpoint.sbatch  HF -> torch_dist (Megatron)
   setup/stage_model.sh          one model: download + convert, chained
+  sweep.py                      submit a grid of runs; sweeps/ holds the grids
   configs/eval_math.yaml        multi-benchmark eval (--eval-config)
   common/run_identity.sh        run name, config tag, checkpoint path
   common/placement.sh           derive + validate the GPU split, before srun
@@ -251,6 +252,48 @@ What each level gives you:
 Turn it on for a diagnostic run — is the train/rollout logprob gap spread out or
 one pathological sample, is the resumed partial-rollout prefix entering the loss
 where you think — and leave it off for the long ones.
+
+### Sweeping
+
+`sweep.py` submits a grid over any of the knobs above, for one model or several:
+
+```bash
+experiments/sweep.py --sweep experiments/sweeps/offpolicy.txt \
+  --recipe math_async/dapo-math/qwen3-4b-instruct-2507 \
+  -- -N 2 -p batch_short --time=02:00:00
+```
+
+It prints the grid and stops. `--submit` launches it; `--max-jobs` (32) is a
+deliberate ceiling. A grid file is one knob per line — several values enter the
+Cartesian product, a single value is applied to every point without appearing in
+the tag:
+
+```
+NUM_STEPS_PER_ROLLOUT   1 2 4
+MAX_WEIGHT_STALENESS    1 4
+NUM_ROLLOUT             30
+```
+
+Two things it takes care of that are easy to get wrong by hand:
+
+* **Every point gets its own `CONFIG_TAG`** (`sweep-<name>-step2-stale4`), so no
+  two points share a checkpoint directory or a wandb group. Submitting a grid
+  without this silently has each run resume from the previous one's optimizer
+  state.
+* **The four-knob invariant is closed per point.** miles asserts
+  `rollout_batch × n_samples = global_batch × num_steps` at startup, so a grid
+  over the batch shape has to recompute the other side. Whichever of
+  `GLOBAL_BATCH_SIZE` / `NUM_STEPS_PER_ROLLOUT` the file does not pin is derived;
+  pin both and they are checked. Pinning the global batch keeps the optimizer
+  step a fixed size while the rollout grows (DAPO's scaling); pinning the step
+  count grows it.
+
+Submitted points are recorded in `outputs/sweeps/<name>-<timestamp>.jsonl` with
+their job ids and full environment, so results can be joined back to their
+configuration.
+
+Sweep on `batch_short`, not `batch` — a grid is measurement, and the ranges
+worth covering are in each dataset's README.
 
 ### Running one
 
