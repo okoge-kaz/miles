@@ -178,21 +178,42 @@ is 2960 generations per eval interval.
 
 ### Telemetry
 
-`--dump-details` and `--use-miles-dashboard` are **on by default**
-(`DUMP_DETAILS=0`, `USE_DASHBOARD=0`, `ROLLOUT_ENTROPY=0` opt out). View a run,
-live or finished, from anywhere that can see the directory:
+The rule is: anything without overhead is always on, and the one expensive
+artifact is opt-in.
+
+Always on — wandb, `--dump-details` and `--use-miles-dashboard`. The collector is
+fire-and-forget (a few ms per step, nothing on the training path waits on it) and
+the rollout dumps are one file per step from a single writer. View a run, live or
+finished, from anywhere that can see the directory:
 
 ```bash
 python -m miles.dashboard.serve --dump-details <ckpt-path>/dump --follow
 ```
 
-The collector is fire-and-forget and costs a few ms per step. **The dumps are the
-part that costs**: one rollout dump plus one train dump *per rank* every rollout
-and every eval, `torch.save` inline on the training path, and no retention or
-interval knob anywhere. Per-step volume scales with the training world size, not
-with `dp`, because TP/CP ranks write duplicate copies that are deduplicated only
-at read time. Measure it on a tuning run before committing a production
-allocation to it.
+Off by default — `DUMP_TRAIN_DATA=1` turns it on. The per-rank train dumps are
+the expensive half of `--dump-details`: every rank writes its shard each rollout,
+`torch.save` runs inline on the training path, and TP/CP ranks write duplicate
+copies deduplicated only at read time, so the volume scales with the training
+world size rather than with `dp`. There is no retention or interval knob — every
+rollout and every eval, for the whole run.
+
+`--use-rollout-entropy` is tied to the same switch, because entropy is computed
+on the train side and has no consumer without the train dumps.
+
+What each level gives you:
+
+| | collector + rollout dumps (default) | `DUMP_TRAIN_DATA=1` |
+|---|---|---|
+| timeline, GPU util, engine metrics | yes | yes |
+| `dump/zero_std_group_frac`, `truncated_frac`, reward stats | yes | yes |
+| `weight_version`, `mixed_version` (staleness) | yes | yes |
+| conversation view | yes | yes |
+| `lp_diff`, `imp_ratio` per token and per sample | — | yes |
+| `advantages`, `returns`, `loss_mask`, entropy | — | yes |
+
+Turn it on for a diagnostic run — is the train/rollout logprob gap spread out or
+one pathological sample, is the resumed partial-rollout prefix entering the loss
+where you think — and leave it off for the long ones.
 
 ### Running one
 

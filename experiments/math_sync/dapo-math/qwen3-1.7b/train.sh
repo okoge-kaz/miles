@@ -41,15 +41,14 @@ ROLLOUT_ARGS=(
    --over-sampling-batch-size "${OVER_SAMPLING_BATCH_SIZE}"
 )
 
-TELEMETRY_ARGS=()
-if [[ "${DUMP_DETAILS}" != "0" ]]; then
-   TELEMETRY_ARGS+=(--dump-details "${CKPT_PATH}/dump")
-   if [[ "${USE_DASHBOARD}" != "0" ]]; then
-      TELEMETRY_ARGS+=(--use-miles-dashboard)
-   fi
-   if [[ "${ROLLOUT_ENTROPY}" != "0" ]]; then
-      TELEMETRY_ARGS+=(--use-rollout-entropy)
-   fi
+TELEMETRY_ARGS=(
+   --dump-details "${CKPT_PATH}/dump"
+   --use-miles-dashboard
+)
+if [[ "${DUMP_TRAIN_DATA}" == "0" ]]; then
+   TELEMETRY_ARGS+=(--no-dump-train-data)
+else
+   TELEMETRY_ARGS+=(--use-rollout-entropy)
 fi
 
 EVAL_ARGS=(

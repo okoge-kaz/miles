@@ -155,12 +155,13 @@ Before submitting:
   and shrink the per-rank batch; they do not by themselves make each step more
   informative. Raise `ROLLOUT_BATCH_SIZE` with the allocation, and keep the
   four-knob invariant.
-- **Disk budget for the dumps.** `--dump-details` writes one rollout dump plus one
-  train dump *per rank* every rollout and every eval, with no retention or
-  interval knob, and `torch.save` runs inline on the training path. The per-step
-  volume scales with the training world size. Estimate it from the stage 2 run
+- **Leave `DUMP_TRAIN_DATA` off.** The default keeps the collector and the rollout
+  dumps, which cost almost nothing. The per-rank train dumps scale with the
+  training world size and write inline on the training path, with no retention or
+  interval knob — they are for a short diagnostic run, not a production one. If a
+  run does need them, estimate the volume from a stage 2 run first
   (`du -sh <dump-dir>` divided by the step count) before multiplying by the
-  production step count; set `DUMP_DETAILS=0` if the answer is unaffordable.
+  production step count.
 - **`CONFIG_TAG` distinguishes this run from every other.** It names the
   checkpoint directory and is the only thing separating two settings that share a
   model and a dataset.
