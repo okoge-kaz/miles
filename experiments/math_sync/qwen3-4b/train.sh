@@ -1,9 +1,10 @@
 #!/bin/bash
 # Runs INSIDE the container. Single node, 8 GPUs, colocated.
 #
-# Qwen3-4B + DAPO-Math-17K, GRPO with the rule-based `deepscaler` verifier.
-# Adapted from scripts/run-qwen3-4B.sh; only the paths differ (lustre mounts
-# instead of /root/*), so diffs against upstream stay readable.
+# Hybrid-thinking Qwen3-4B on DAPO-Math-17K — the original baseline. Measured
+# to sit at its post-training RLVR fixed point on this dataset (raw_reward 0.84
+# flat, ~76% zero-variance groups), so treat it as a collapse detector rather
+# than a model with headroom. Adapted from scripts/run-qwen3-4B.sh.
 
 set -ex
 
@@ -34,10 +35,9 @@ ROLLOUT_ARGS=(
    --rollout-shuffle
    # deepscaler grades the boxed answer like `math`, but first requires a
    # `</think>` (or `###Response`) delimiter and returns 0 without one
-   # (rm_hub/deepscaler.py:36-44). Correct for Qwen3-4B (hybrid thinking); a
-   # NON-THINKING checkpoint such as Qwen3-4B-Instruct-2507 never emits the
-   # delimiter, so every response would score 0 and the run would look like a
-   # model that cannot learn. Use RM_TYPE=math for those.
+   # (rm_hub/deepscaler.py:36-44). Correct for this hybrid-thinking checkpoint; a
+   # NON-THINKING model never emits the delimiter, so every response would score 0
+   # and the run would look like a model that cannot learn.
    --rm-type "${RM_TYPE:-deepscaler}"
    --num-rollout "${NUM_ROLLOUT:-3000}"
    --rollout-batch-size "${ROLLOUT_BATCH_SIZE:-32}"
@@ -48,18 +48,42 @@ ROLLOUT_ARGS=(
 
    # invariant: rollout_batch_size * n_samples_per_prompt
    #            = global_batch_size * num_steps_per_rollout
+   # Passed explicitly so arguments.py:3056 actually checks it, and so the number
+   # of optimizer steps taken per rollout batch — i.e. how off-policy the later
+   # steps are — is a named knob rather than a side effect of global_batch_size.
    --global-batch-size "${GLOBAL_BATCH_SIZE:-256}"
+   --num-steps-per-rollout "${NUM_STEPS_PER_ROLLOUT:-1}"
    --balance-data
 )
 
 # Dynamic sampling (DAPO): drop groups whose reward has zero variance — all
 # correct or all wrong — and resample, so the batch keeps a usable advantage
-# signal. Without it, an easy dataset drives grad_norm toward zero.
-if [[ -n "${DYNAMIC_SAMPLING:-}" ]]; then
+# signal. In GRPO the advantage scales with sqrt(p*(1-p)), so a unanimous group
+# contributes nothing while costing a full group of generation; measured on
+# Qwen3-4B/DAPO-Math, 21.6 of 32 groups per batch were unanimous.
+#
+# ON by default. Set DYNAMIC_SAMPLING=0 to turn it off.
+#
+# --partial-rollout is part of the same setting, not an extra. Over-sampling
+# submits OVER_SAMPLING_BATCH_SIZE groups and aborts whatever is still in flight
+# once ROLLOUT_BATCH_SIZE groups have passed the filter
+# (inference_rollout_train.py:143). Without --partial-rollout those aborted
+# generations are dropped on the floor (inference_rollout_train.py:39); with it
+# they go back to the data buffer and resume next rollout.
+#
+# --mask-offpolicy-in-partial-rollout then zeroes the loss over the tokens a
+# resumed sample generated under the previous weights (sglang_rollout.py:313).
+# This recipe has no --use-tis, so masking is the only thing keeping those
+# carried-over tokens from entering the loss uncorrected.
+if [[ "${DYNAMIC_SAMPLING:-1}" != "0" ]]; then
    ROLLOUT_ARGS+=(
       --dynamic-sampling-filter-path miles.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
       --over-sampling-batch-size "${OVER_SAMPLING_BATCH_SIZE:-$(( ${ROLLOUT_BATCH_SIZE:-32} * 2 ))}"
    )
+   if [[ "${PARTIAL_ROLLOUT:-1}" != "0" ]]; then
+      ROLLOUT_ARGS+=(--partial-rollout)
+      [[ "${MASK_OFFPOLICY:-1}" != "0" ]] && ROLLOUT_ARGS+=(--mask-offpolicy-in-partial-rollout)
+   fi
 fi
 
 EVAL_ARGS=(
@@ -71,11 +95,11 @@ EVAL_ARGS=(
 )
 
 PERF_ARGS=(
-   --tensor-model-parallel-size 2
+   --tensor-model-parallel-size "${TENSOR_PARALLEL_SIZE:-2}"
    --sequence-parallel
    --pipeline-model-parallel-size 1
    --context-parallel-size "${CONTEXT_PARALLEL_SIZE:-4}"
-   --expert-model-parallel-size 1
+   --expert-model-parallel-size "${EXPERT_PARALLEL_SIZE:-1}"
    --expert-tensor-parallel-size 1
 
    --recompute-granularity full
@@ -84,8 +108,9 @@ PERF_ARGS=(
 
    --use-dynamic-batch-size
    # A single sample must fit in max_tokens_per_gpu * cp_size
-   # (miles/backends/training_utils/data.py:473), so long-response runs need
-   # context parallelism, a bigger budget, or both.
+   # (miles/backends/training_utils/data.py:473). With
+   # --rollout-max-context-len 32768 that is the floor this value has to clear:
+   #   9216 * 4 = 36864 >= 32768
    --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU:-9216}"
 )
 if [[ "${CONTEXT_PARALLEL_SIZE:-4}" -gt 1 ]]; then
@@ -112,7 +137,7 @@ OPTIMIZER_ARGS=(
 )
 
 SGLANG_ARGS=(
-   --rollout-num-gpus-per-engine 2
+   --rollout-num-gpus-per-engine "${ROLLOUT_NUM_GPUS_PER_ENGINE:-2}"
    --sglang-mem-fraction-static 0.7
 )
 

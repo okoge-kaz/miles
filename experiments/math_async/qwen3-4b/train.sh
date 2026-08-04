@@ -1,10 +1,13 @@
 #!/bin/bash
 # Runs INSIDE the container. Single node, 8 GPUs, DISAGGREGATED.
 #
-# Same task as math_sync/qwen3-4b (Qwen3-4B + DAPO-Math-17K + deepscaler
-# reward), but the fully-async rollout: a persistent background worker keeps
-# generating while the trainer consumes finished groups
-# (miles/rollout/fully_async_rollout.py).
+# Hybrid-thinking Qwen3-4B on DAPO-Math-17K — the original baseline. Measured
+# to sit at its post-training RLVR fixed point on this dataset (raw_reward 0.84
+# flat, ~76% zero-variance groups), so treat it as a collapse detector rather
+# than a model with headroom. Adapted from scripts/run-qwen3-4B.sh.
+#
+# Fully-async rollout: a persistent background worker keeps generating while the
+# trainer consumes finished groups (miles/rollout/fully_async_rollout.py).
 #
 # Three differences from the colocated recipe, per examples/fully_async/README.md:
 #   1. train_async.py instead of train.py
@@ -49,10 +52,9 @@ ROLLOUT_ARGS=(
    --rollout-shuffle
    # deepscaler grades the boxed answer like `math`, but first requires a
    # `</think>` (or `###Response`) delimiter and returns 0 without one
-   # (rm_hub/deepscaler.py:36-44). Correct for Qwen3-4B (hybrid thinking); a
-   # NON-THINKING checkpoint such as Qwen3-4B-Instruct-2507 never emits the
-   # delimiter, so every response would score 0 and the run would look like a
-   # model that cannot learn. Use RM_TYPE=math for those.
+   # (rm_hub/deepscaler.py:36-44). Correct for this hybrid-thinking checkpoint; a
+   # NON-THINKING model never emits the delimiter, so every response would score 0
+   # and the run would look like a model that cannot learn.
    --rm-type "${RM_TYPE:-deepscaler}"
    --num-rollout "${NUM_ROLLOUT:-3000}"
    --rollout-batch-size "${ROLLOUT_BATCH_SIZE:-32}"
@@ -60,29 +62,66 @@ ROLLOUT_ARGS=(
    --rollout-max-response-len "${MAX_RESPONSE_LEN:-24576}"
    --rollout-max-context-len "${ROLLOUT_MAX_CONTEXT_LEN:-32768}"
    --rollout-temperature 1
+
+   # invariant: rollout_batch_size * n_samples_per_prompt
+   #            = global_batch_size * num_steps_per_rollout
+   # Passed explicitly so arguments.py:3056 actually checks it, and so the number
+   # of optimizer steps taken per rollout batch — i.e. how off-policy the later
+   # steps are — is a named knob rather than a side effect of global_batch_size.
    --global-batch-size "${GLOBAL_BATCH_SIZE:-256}"
+   --num-steps-per-rollout "${NUM_STEPS_PER_ROLLOUT:-1}"
    --balance-data
 )
+
+# Dynamic sampling (DAPO). FullyAsyncRolloutFn applies the same filter at drain
+# time (fully_async_rollout.py:217); a dropped group is NOT recycled, since it
+# carries no usable gradient signal either way. ON by default; DYNAMIC_SAMPLING=0
+# turns it off.
+if [[ "${DYNAMIC_SAMPLING:-1}" != "0" ]]; then
+   ROLLOUT_ARGS+=(
+      --dynamic-sampling-filter-path miles.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
+   )
+fi
+
+# Partial rollout. A weight sync aborts whatever is generating at that moment;
+# the fully-async worker hands the group's prompt samples back to the data source
+# (fully_async_rollout.py:198), and because generate_and_rm mutates samples in
+# place those objects still carry the tokens produced so far, so the next
+# submission continues from them instead of restarting.
+#
+# --mask-offpolicy-in-partial-rollout zeroes the loss over that carried-over
+# prefix (sglang_rollout.py:313). It is what --partial-rollout gates here: the
+# continuation itself happens either way, but setting a loss_mask without
+# --partial-rollout trips the assert at sglang_rollout.py:282. --use-tis below
+# corrects the ratio for the tokens that ARE trained on; the prefix predates the
+# current weights entirely, so it is masked rather than reweighted.
+if [[ "${PARTIAL_ROLLOUT:-1}" != "0" ]]; then
+   ROLLOUT_ARGS+=(--partial-rollout)
+   [[ "${MASK_OFFPOLICY:-1}" != "0" ]] && ROLLOUT_ARGS+=(--mask-offpolicy-in-partial-rollout)
+fi
+
+# Off-policy bound. Groups whose oldest weight version lags the engine by more
+# than this are recycled instead of trained on (fully_async_rollout.py:202-213).
+# The miles default is None = no bound at all, which lets an arbitrarily stale
+# group reach the optimizer; 2 keeps generation overlapped across a weight sync
+# without letting a group survive more than two of them.
+ROLLOUT_ARGS+=(--max-weight-staleness "${MAX_WEIGHT_STALENESS:-2}")
 
 # Generation concurrency, decoupled from the training batch. Unset means the
 # legacy bound of rollout_batch_size * n_samples_per_prompt.
 if [[ -n "${ASYNC_MAX_CONCURRENT_SAMPLES:-}" ]]; then
    ROLLOUT_ARGS+=(--async-max-concurrent-samples "${ASYNC_MAX_CONCURRENT_SAMPLES}")
 fi
-# Off-policy bound: drop/recycle groups generated more than N weight versions ago.
-if [[ -n "${MAX_WEIGHT_STALENESS:-}" ]]; then
-   ROLLOUT_ARGS+=(--max-weight-staleness "${MAX_WEIGHT_STALENESS}")
-fi
 
 # Eval works under --fully-async. The flag only swaps the *rollout* function;
-# arguments.py:36 resolves eval_function_path before that override, so eval
-# falls back to the standard InferenceRolloutFn and train_async.py:59,105 calls
-# it exactly like train.py does. Kept identical to math_sync so the two recipes
+# arguments.py:36 resolves eval_function_path before that override, so eval falls
+# back to the standard InferenceRolloutFn and train_async.py:59,105 calls it
+# exactly like train.py does. Kept identical to math_sync so the two recipes
 # report the same AIME number.
 #
-# Caveat: the persistent fully-async worker keeps generating during eval, so
-# eval shares the SGLang engines with training rollout and takes longer here
-# than in the colocated recipe.
+# Caveat: the persistent fully-async worker keeps generating during eval, so eval
+# shares the SGLang engines with training rollout and takes longer here than in
+# the colocated recipe.
 EVAL_ARGS=(
    --eval-interval 20
    --eval-prompt-data aime /data/aime-2024/aime-2024.jsonl
@@ -92,11 +131,11 @@ EVAL_ARGS=(
 )
 
 PERF_ARGS=(
-   --tensor-model-parallel-size 2
+   --tensor-model-parallel-size "${TENSOR_PARALLEL_SIZE:-2}"
    --sequence-parallel
    --pipeline-model-parallel-size 1
    --context-parallel-size "${CONTEXT_PARALLEL_SIZE:-2}"
-   --expert-model-parallel-size 1
+   --expert-model-parallel-size "${EXPERT_PARALLEL_SIZE:-1}"
    --expert-tensor-parallel-size 1
 
    --recompute-granularity full
@@ -105,8 +144,9 @@ PERF_ARGS=(
 
    --use-dynamic-batch-size
    # A single sample must fit in max_tokens_per_gpu * cp_size
-   # (miles/backends/training_utils/data.py:473), so long-response runs need
-   # context parallelism, a bigger budget, or both.
+   # (miles/backends/training_utils/data.py:473). With
+   # --rollout-max-context-len 32768 that is the floor this value has to clear:
+   #   16384 * 2 = 32768 >= 32768
    --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU:-16384}"
 )
 if [[ "${CONTEXT_PARALLEL_SIZE:-2}" -gt 1 ]]; then
@@ -136,7 +176,7 @@ OPTIMIZER_ARGS=(
 )
 
 SGLANG_ARGS=(
-   --rollout-num-gpus-per-engine 1
+   --rollout-num-gpus-per-engine "${ROLLOUT_NUM_GPUS_PER_ENGINE:-1}"
    --sglang-mem-fraction-static 0.7
 )
 
