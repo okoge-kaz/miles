@@ -18,3 +18,7 @@ Index:
 > **Caution.** This directory lives inside a checkout of an open-source repo. Keep
 > internal endpoints, API keys, hostnames and verbatim internal discussion out of
 > it — reference the channel or ticket instead.
+- `off-policy-variables.md` — the variable space for the off-policy / async study:
+  what miles rejects at startup, the algorithm and importance-sampling surface,
+  what is swept, what is fixed, and what must be recorded to support a
+  sample-efficiency claim after the fact.

@@ -39,7 +39,6 @@ ROLLOUT_ARGS=(
    --num-steps-per-rollout "${NUM_STEPS_PER_ROLLOUT}"
    --balance-data
    --dynamic-sampling-filter-path miles.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
-   --partial-rollout
    --max-weight-staleness "${MAX_WEIGHT_STALENESS}"
 )
 

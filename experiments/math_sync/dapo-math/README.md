@@ -117,6 +117,13 @@ These change how fast a step is, never what it learns, so they are swept in the
 | `SGLANG_MEM_FRACTION` | 0.7 | **0.6–0.85** | KV cache size. The dashboard advisory panel reads `sglang_token_usage` and `sglang_cache_hit_rate` back. |
 | `SGLANG_MAX_RUNNING_REQUESTS`, `SGLANG_CUDA_GRAPH_MAX_BS` | unset | from the observed peak | Capturing CUDA graphs above the concurrency actually reached costs startup time and memory for nothing. |
 
+### The wider variable space
+
+The full catalogue for the off-policy study — including what miles rejects at
+startup, the algorithm/clip/IS surface, what is held fixed and why, and what has
+to be recorded for a sample-efficiency claim later — is in
+[`notes/off-policy-variables.md`](../../notes/off-policy-variables.md).
+
 ### Not a hyperparameter
 
 `RM_TYPE` is a correctness setting, not something to sweep. `deepscaler` returns
