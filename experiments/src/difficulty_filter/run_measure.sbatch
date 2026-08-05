@@ -21,6 +21,13 @@
 #   MAX_NEW_TOKENS   generation cap; MUST match the recipe    (24576)
 #                    --rollout-max-response-len
 #   CUSTOM_RM_PATH   dotted path to a custom verifier; wins over RM_TYPE
+#   TOOL_KEY         where per-row tools live               (tools)
+#                    Top-level `tools` is what --tool-key reads during training;
+#                    the Nemotron converters put them under metadata instead and
+#                    both are accepted. Tools missing from the rendered prompt
+#                    means there is no function to call, so every row scores 0.
+#   INPUT_KEY        prompt field                           (prompt)
+#   LABEL_KEY        label field                            (label)
 #   EXTRA_PIP        '+'-separated packages to install first (verifier deps)
 #   PREFLIGHT        strict | warn | off   (default strict)
 #   RM_TYPE          verifier; MUST match the recipe        (math)
@@ -140,6 +147,9 @@ python3 experiments/src/difficulty_filter/measure_pass_rate.py \
     ${PREFLIGHT:+--preflight ${PREFLIGHT}} \
     --policy ${MODEL_NAME} \
     ${REWARD_KEY:+--reward-key ${REWARD_KEY}} \
+    ${TOOL_KEY:+--tool-key ${TOOL_KEY}} \
+    ${INPUT_KEY:+--input-key ${INPUT_KEY}} \
+    ${LABEL_KEY:+--label-key ${LABEL_KEY}} \
     --n-samples ${N_SAMPLES} \
     --temperature ${TEMPERATURE} \
     --max-new-tokens ${MAX_NEW_TOKENS} \

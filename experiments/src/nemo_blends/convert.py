@@ -21,6 +21,7 @@ the next one is a dict entry, not a new script. Run with --list to see them.
 
 import argparse
 import glob
+import hashlib
 import json
 import os
 import string
@@ -60,6 +61,13 @@ def read_rows(paths):
             pf = pq.ParquetFile(p)
             for i in range(pf.num_row_groups):
                 yield from pf.read_row_group(i).to_pylist()
+        elif p.suffix == ".csv":
+            # GPQA ships as CSV. Questions contain embedded newlines and commas,
+            # so this goes through csv, never a split(',').
+            import csv
+
+            with p.open(newline="") as f:
+                yield from csv.DictReader(f)
         else:
             raise ValueError(f"unsupported input: {p}")
 
@@ -356,8 +364,56 @@ def adapt_mmlu_pro(row):
     }
 
 
+def adapt_gpqa(row):
+    """Idavidrein/gpqa (CSV) -> --rm-type gpqa. Eval only.
+
+    The source keeps the correct answer in its own column and the distractors in
+    three others, so the options have to be assembled and ordered here. The order
+    is a hash of the question rather than random: 'Correct Answer' first every
+    time would make 'A' a perfect strategy, and an unseeded shuffle would give a
+    different answer key on every conversion, so a re-run could not be compared
+    against an earlier one.
+    """
+    question = (row.get("Question") or "").strip()
+    correct = (row.get("Correct Answer") or "").strip()
+    distractors = [
+        (row.get(f"Incorrect Answer {i}") or "").strip() for i in (1, 2, 3)
+    ]
+    distractors = [d for d in distractors if d]
+    if not question or not correct or len(distractors) != 3:
+        return None
+
+    options = [correct] + distractors
+    # Deterministic per question, and stable across Python runs -- PYTHONHASHSEED
+    # randomises hash() for str, so this uses an explicit digest.
+    seed = int(hashlib.sha256(question.encode()).hexdigest()[:8], 16)
+    order = sorted(range(4), key=lambda i: (seed >> (i * 4)) & 0xF)
+    options = [options[i] for i in order]
+
+    letters = list(string.ascii_uppercase[:4])
+    answer = letters[options.index(correct)]
+    rendered = "\n".join(f"{ltr}. {opt}" for ltr, opt in zip(letters, options))
+    content = (
+        "Answer the following multiple choice question. The last line of your "
+        "response should be in the following format: 'Answer: A/B/C/D' "
+        f"(e.g. 'Answer: A').\n\n{question}\n\n{rendered}"
+    )
+    return {
+        "prompt": [{"role": "user", "content": content}],
+        "label": answer,
+        "metadata": {
+            "source": "gpqa",
+            "valid_letters": letters,
+            "choices": options,
+            "category": row.get("High-level domain") or row.get("Subdomain"),
+            "record_id": row.get("Record ID"),
+        },
+    }
+
+
 ADAPTERS = {
     "knowledge-mcqa": (adapt_knowledge_mcqa, "gpqa"),
+    "gpqa": (adapt_gpqa, "gpqa"),
     "skywork-or1-math": (adapt_skywork_or1_math, "math"),
     "reasoning-gym": (adapt_reasoning_gym, "custom:experiments.src.nemo_blends.rewards.reasoning_gym_reward"),
     "structured-outputs": (

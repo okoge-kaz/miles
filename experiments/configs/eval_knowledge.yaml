@@ -1,8 +1,12 @@
 # Knowledge MCQA eval, for the knowledge-mcqa recipe.
 #
 # MMLU-Pro is what every Qwen3 and Nemotron card reports, so a number here is
-# comparable to a published one. GPQA is deliberately absent: Idavidrein/gpqa is
-# gated on HuggingFace and cannot be staged without accepting its terms.
+# comparable to a published one.
+#
+# GPQA is commented out rather than absent: Idavidrein/gpqa is gated, so it needs
+# HF_TOKEN in .env and the terms accepted (see .env.example), then
+#   sbatch -A coreai_horizon_dilations experiments/setup/prepare_gpqa.sbatch
+# after which uncommenting the entry below is the whole change.
 #
 # Ten options per question rather than MMLU's four, so the chance floor is 0.1
 # and `--rm-type gpqa` needs the per-row valid_letters the converter writes into
@@ -22,3 +26,8 @@ eval:
   datasets:
     - name: mmlu_pro
       path: /data/mmlu-pro/mmlu-pro-miles-2k.jsonl
+
+    # 198 questions, so a single eval is noisy at n=4; the published number is
+    # what makes it worth carrying anyway.
+    # - name: gpqa_diamond
+    #   path: /data/gpqa/gpqa-diamond-miles.jsonl

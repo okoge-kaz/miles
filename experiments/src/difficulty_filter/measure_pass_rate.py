@@ -53,6 +53,9 @@ def parse_args():
     p.add_argument("--server-url", default="http://127.0.0.1:30000")
     p.add_argument("--input-key", default="prompt")
     p.add_argument("--label-key", default="label")
+    # Same name and default as the training flag, so a sweep and its recipe
+    # cannot disagree about where the per-row tools live.
+    p.add_argument("--tool-key", default="tools")
     # Must match the training recipe's --rm-type. `deepscaler` and `math` grade
     # the boxed answer identically; `deepscaler` additionally *requires* a
     # `</think>` (or `###Response`) delimiter and returns 0 without one
@@ -156,7 +159,7 @@ def write_meta(args):
     return meta
 
 
-def load_prompts(path, input_key, label_key, limit=None):
+def load_prompts(path, input_key, label_key, limit=None, tool_key="tools"):
     rows = []
     with open(path) as f:
         for i, line in enumerate(f):
@@ -167,12 +170,20 @@ def load_prompts(path, input_key, label_key, limit=None):
             # metadata rides along: gpqa reads valid_letters from it, ifbench reads
             # instruction_id_list/kwargs. rm_hub.async_rm forwards sample.metadata, so a
             # verifier needing more than a bare label gets it without a driver change.
+            metadata = dict(row.get("metadata") or {})
+            # A prompt file written for miles keeps its tools at the top level,
+            # because --tool-key reads them from there (data.py:211-217); the
+            # Nemotron converters happen to tuck them into metadata instead. Take
+            # either, or the tools silently vanish from the rendered prompt and
+            # every row scores 0 for want of a function to call.
+            if tool_key and tool_key in row and "tools" not in metadata:
+                metadata["tools"] = row[tool_key]
             rows.append(
                 {
                     "index": i,
                     "prompt": row[input_key],
                     "label": row.get(label_key),
-                    "metadata": row.get("metadata") or {},
+                    "metadata": metadata,
                 }
             )
             if limit is not None and len(rows) >= limit:
@@ -429,7 +440,7 @@ async def main_async(args):
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
 
-    rows = load_prompts(args.prompt_data, args.input_key, args.label_key, args.limit)
+    rows = load_prompts(args.prompt_data, args.input_key, args.label_key, args.limit, args.tool_key)
     await verifier_preflight(args, rows[0]["label"] if rows else None, rows[0].get("metadata") if rows else None)
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
     write_meta(args)
