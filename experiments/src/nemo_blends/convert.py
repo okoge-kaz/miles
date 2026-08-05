@@ -270,6 +270,92 @@ def adapt_fncall_pivot(row):
     return _adapt_expert_action(row, "fncall-pivot")
 
 
+def adapt_arc_agi(row):
+    """nvidia/Nemotron-RL-ARC-AGI-v1 (transductive) -> grid_and_ast.arc_agi_reward.
+
+    Deterministic and judge-free: the policy prints the output grid in
+    `\\boxed{}` and it is compared cell-for-cell. The row also carries a
+    continuous `difficulty` plus a bucket, so this is the one set where a
+    difficulty window can be cut without measuring anything first.
+    """
+    prompt = _chat_from_responses_create_params(row)
+    expected = row.get("expected_output")
+    if not prompt or not expected:
+        return None
+    return {
+        "prompt": prompt,
+        "label": json.dumps(expected),
+        "metadata": {
+            "source": "arc-agi",
+            "expected_output": expected,
+            "task_id": row.get("task_id"),
+            "difficulty": row.get("difficulty"),
+            "difficulty_bucket": row.get("difficulty_bucket"),
+        },
+    }
+
+
+def adapt_swe_pivot(row):
+    """nvidia/Nemotron-RL-Agentic-SWE-Pivot-v1 -> rewards.tool_call_match_reward.
+
+    The SWE stage that needs no container. NeMo-RL's own stage2_swe1.yaml runs
+    exactly this environment
+    (`swe_pivot_single_step_tool_use_with_argument_comparison`) and only stage 2.2
+    reaches for per-instance .sif images -- so the row is the same shape as
+    fncall-pivot, and the same verifier grades it.
+    """
+    return _adapt_expert_action(row, "swe-pivot")
+
+
+def adapt_competitive_coding(row):
+    """nvidia/Nemotron-RL-coding-competitive_coding -> code_exec.code_exec_reward."""
+    prompt = _chat_from_responses_create_params(row)
+    tests = (row.get("verifier_metadata") or {}).get("unit_tests")
+    if not prompt or not isinstance(tests, dict) or not tests.get("inputs"):
+        return None
+    return {
+        "prompt": prompt,
+        # The tests are the ground truth; the label is only for readability.
+        "label": f"{len(tests['inputs'])} tests",
+        "metadata": {
+            "source": "competitive-coding",
+            "unit_tests": tests,
+            "problem_id": (row.get("verifier_metadata") or {}).get("problem_id"),
+            "dataset": row.get("dataset"),
+        },
+    }
+
+
+def adapt_mmlu_pro(row):
+    """TIGER-Lab/MMLU-Pro -> --rm-type gpqa. Eval only.
+
+    Up to ten options, against MMLU's four, so the valid letters have to be
+    derived per row rather than assumed.
+    """
+    question = row.get("question")
+    options = list(row.get("options") or [])
+    answer = row.get("answer")
+    if not question or not options or not answer:
+        return None
+    letters = [string.ascii_uppercase[i] for i in range(len(options))]
+    rendered = "\n".join(f"{ltr}. {opt}" for ltr, opt in zip(letters, options))
+    content = (
+        "Answer the following multiple choice question. The last line of your "
+        f"response should be in the following format: 'Answer: {'/'.join(letters[:4])}...' "
+        f"(e.g. 'Answer: {letters[0]}').\n\n{question}\n\n{rendered}"
+    )
+    return {
+        "prompt": [{"role": "user", "content": content}],
+        "label": str(answer).strip().upper(),
+        "metadata": {
+            "source": "mmlu-pro",
+            "valid_letters": letters,
+            "choices": options,
+            "category": row.get("category"),
+        },
+    }
+
+
 ADAPTERS = {
     "knowledge-mcqa": (adapt_knowledge_mcqa, "gpqa"),
     "skywork-or1-math": (adapt_skywork_or1_math, "math"),
@@ -281,6 +367,10 @@ ADAPTERS = {
     "instruction-following": (adapt_instruction_following, "ifbench"),
     "conv-tooluse": (adapt_conv_tooluse, "custom:experiments.src.nemo_blends.rewards.tool_call_match_reward"),
     "fncall-pivot": (adapt_fncall_pivot, "custom:experiments.src.nemo_blends.rewards.tool_call_match_reward"),
+    "swe-pivot": (adapt_swe_pivot, "custom:experiments.src.nemo_blends.rewards.tool_call_match_reward"),
+    "arc-agi": (adapt_arc_agi, "custom:experiments.src.nemo_blends.grid_and_ast.arc_agi_reward"),
+    "competitive-coding": (adapt_competitive_coding, "custom:experiments.src.nemo_blends.code_exec.code_exec_reward"),
+    "mmlu-pro": (adapt_mmlu_pro, "gpqa"),
 }
 
 

@@ -306,7 +306,9 @@ def build_preflight_probes(label, metadata):
     metadata = metadata or {}
     source = metadata.get("source")
 
-    if source in ("conv-tooluse", "fncall-pivot"):
+    # All three pivot sets share the shape NeMo-RL grades with
+    # single_step_tool_use_with_argument_comparison, SWE included.
+    if source in ("conv-tooluse", "fncall-pivot", "swe-pivot"):
         signature = expected_action_signature(metadata.get("expected_action"))
         if signature is None:
             return None
