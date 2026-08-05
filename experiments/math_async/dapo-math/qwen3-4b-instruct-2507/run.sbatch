@@ -67,7 +67,15 @@ export RUN_NAME CONFIG_TAG CKPT_PATH
 
 source "${REPO_ROOT}/experiments/common/placement.sh"
 
-export RAY_HEAD_IP="$(hostname -I | awk '{print $1}')"
+RAY_HEAD_IP="$(getent hosts "$(hostname)" | awk '{print $1; exit}')"
+if [[ -z "${RAY_HEAD_IP}" || "${RAY_HEAD_IP}" == 169.254.* ]]; then
+    RAY_HEAD_IP="$(ip route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p')"
+fi
+if [[ -z "${RAY_HEAD_IP}" || "${RAY_HEAD_IP}" == 169.254.* ]]; then
+    echo "no routable address for the ray head on $(hostname): got '${RAY_HEAD_IP}'" >&2
+    exit 1
+fi
+export RAY_HEAD_IP
 export RAY_DONE_FLAG="/root/miles/experiments/outputs/.ray/${RUN_NAME}-${SLURM_JOB_ID}.done"
 mkdir -p "${OUTPUT_DIR}/.ray"
 rm -f "${OUTPUT_DIR}/.ray/${RUN_NAME}-${SLURM_JOB_ID}.done"
