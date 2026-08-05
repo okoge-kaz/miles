@@ -30,7 +30,8 @@ if [[ ! -f "experiments/${RECIPE}/run.sbatch" ]]; then
     exit 1
 fi
 
-LOG_DIR="experiments/outputs/training/${RUN_NAME}"
+# Mirror the recipe path, like the checkpoints do: math/<dataset>/<model>/.
+LOG_DIR="experiments/outputs/training/math/$(dirname "${RECIPE#*/}")/$(basename "${RECIPE}")"
 mkdir -p "${LOG_DIR}"
 
 jid=$(sbatch --parsable \

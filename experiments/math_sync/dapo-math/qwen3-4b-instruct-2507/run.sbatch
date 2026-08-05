@@ -6,7 +6,7 @@
 #SBATCH --gres=gpu:8
 #SBATCH --exclusive
 #SBATCH --time=04:00:00
-#SBATCH --output=experiments/outputs/training/%x-%j.log
+#SBATCH --output=experiments/outputs/training/math/dapo-math/qwen3-4b-instruct-2507/%x-%j.log
 
 set -euo pipefail
 

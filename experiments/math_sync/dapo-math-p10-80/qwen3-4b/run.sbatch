@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=miles-dapo-math-async-qwen3-4b
+#SBATCH --job-name=miles-dapo-math-p10-80-qwen3-4b
 #SBATCH --partition=interactive
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:8
 #SBATCH --exclusive
 #SBATCH --time=04:00:00
-#SBATCH --output=experiments/outputs/training/math/dapo-math/qwen3-4b/%x-%j.log
+#SBATCH --output=experiments/outputs/training/math/dapo-math-p10-80/qwen3-4b/%x-%j.log
 
 set -euo pipefail
 
@@ -16,29 +16,29 @@ source "${REPO_ROOT}/experiments/env.sh"
 : "${WANDB_API_KEY:?set WANDB_API_KEY, or put an api.wandb.ai entry in ~/.netrc}"
 
 MODEL_NAME=Qwen3-4B
-ROLLOUT_MODE=async-on
-DATASET_TAG=dapo-math
-PROMPT_DATA=/data/dapo-math-17k/dapo-math-17k.jsonl
+ROLLOUT_MODE=async-off
+DATASET_TAG=dapo-math-p10-80
+PROMPT_DATA=/data/dapo-math-p10-80/dapo-math-p10-80.jsonl
 
 : "${LR:=1e-6}"
 : "${MAX_RESPONSE_LEN:=24576}"
 : "${NUM_STEPS_PER_ROLLOUT:=1}"
 
-: "${ACTOR_NUM_NODES:=1}"
+: "${ACTOR_NUM_NODES:=2}"
 : "${ACTOR_GPUS_PER_NODE:=8}"
-: "${ROLLOUT_NUM_GPUS:=8}"
+: "${ROLLOUT_NUM_GPUS:=0}"
 
 : "${TENSOR_PARALLEL_SIZE:=2}"
-: "${CONTEXT_PARALLEL_SIZE:=2}"
+: "${CONTEXT_PARALLEL_SIZE:=4}"
 : "${EXPERT_PARALLEL_SIZE:=1}"
-: "${MAX_TOKENS_PER_GPU:=16384}"
+: "${MAX_TOKENS_PER_GPU:=9216}"
 
 : "${EVAL_INTERVAL:=20}"
 : "${N_SAMPLES_PER_EVAL_PROMPT:=16}"
 : "${EVAL_MAX_RESPONSE_LEN:=24576}"
 : "${SKIP_EVAL_BEFORE_TRAIN:=0}"
 
-: "${ROLLOUT_NUM_GPUS_PER_ENGINE:=1}"
+: "${ROLLOUT_NUM_GPUS_PER_ENGINE:=2}"
 : "${SGLANG_MEM_FRACTION:=0.7}"
 
 : "${ROLLOUT_BATCH_SIZE:=32}"
@@ -46,9 +46,6 @@ PROMPT_DATA=/data/dapo-math-17k/dapo-math-17k.jsonl
 : "${GLOBAL_BATCH_SIZE:=256}"
 : "${NUM_ROLLOUT:=3000}"
 : "${RM_TYPE:=deepscaler}"
-
-: "${MAX_WEIGHT_STALENESS:=2}"
-: "${PAUSE_GENERATION_MODE:=retract}"
 
 : "${DUMP_TRAIN_DATA:=0}"
 
@@ -59,7 +56,6 @@ export EVAL_INTERVAL N_SAMPLES_PER_EVAL_PROMPT EVAL_MAX_RESPONSE_LEN SKIP_EVAL_B
 export ROLLOUT_NUM_GPUS_PER_ENGINE SGLANG_MEM_FRACTION
 export ROLLOUT_BATCH_SIZE N_SAMPLES_PER_PROMPT GLOBAL_BATCH_SIZE NUM_ROLLOUT
 export RM_TYPE
-export MAX_WEIGHT_STALENESS PAUSE_GENERATION_MODE
 export DUMP_TRAIN_DATA
 
 source "${REPO_ROOT}/experiments/common/run_identity.sh"
@@ -91,4 +87,4 @@ srun \
     --container-writable \
     --no-container-mount-home \
     --export=ALL \
-    bash /root/miles/experiments/math_async/dapo-math/qwen3-4b/train.sh
+    bash /root/miles/experiments/math_sync/dapo-math-p10-80/qwen3-4b/train.sh

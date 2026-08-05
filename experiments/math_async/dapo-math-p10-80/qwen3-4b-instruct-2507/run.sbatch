@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=miles-dapo-math-async-qwen3-4b
+#SBATCH --job-name=miles-dapo-math-p10-80-async-qwen3-4b-instruct-2507
 #SBATCH --partition=interactive
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:8
 #SBATCH --exclusive
 #SBATCH --time=04:00:00
-#SBATCH --output=experiments/outputs/training/math/dapo-math/qwen3-4b/%x-%j.log
+#SBATCH --output=experiments/outputs/training/math/dapo-math-p10-80/qwen3-4b-instruct-2507/%x-%j.log
 
 set -euo pipefail
 
@@ -15,10 +15,10 @@ source "${REPO_ROOT}/experiments/env.sh"
 
 : "${WANDB_API_KEY:?set WANDB_API_KEY, or put an api.wandb.ai entry in ~/.netrc}"
 
-MODEL_NAME=Qwen3-4B
+MODEL_NAME=Qwen3-4B-Instruct-2507
 ROLLOUT_MODE=async-on
-DATASET_TAG=dapo-math
-PROMPT_DATA=/data/dapo-math-17k/dapo-math-17k.jsonl
+DATASET_TAG=dapo-math-p10-80
+PROMPT_DATA=/data/dapo-math-p10-80/dapo-math-p10-80.jsonl
 
 : "${LR:=1e-6}"
 : "${MAX_RESPONSE_LEN:=24576}"
@@ -45,7 +45,7 @@ PROMPT_DATA=/data/dapo-math-17k/dapo-math-17k.jsonl
 : "${N_SAMPLES_PER_PROMPT:=8}"
 : "${GLOBAL_BATCH_SIZE:=256}"
 : "${NUM_ROLLOUT:=3000}"
-: "${RM_TYPE:=deepscaler}"
+: "${RM_TYPE:=math}"
 
 : "${MAX_WEIGHT_STALENESS:=2}"
 : "${PAUSE_GENERATION_MODE:=retract}"
@@ -91,4 +91,4 @@ srun \
     --container-writable \
     --no-container-mount-home \
     --export=ALL \
-    bash /root/miles/experiments/math_async/dapo-math/qwen3-4b/train.sh
+    bash /root/miles/experiments/math_async/dapo-math-p10-80/qwen3-4b-instruct-2507/train.sh
