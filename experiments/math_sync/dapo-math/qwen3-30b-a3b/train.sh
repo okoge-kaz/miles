@@ -132,14 +132,17 @@ WANDB_ARGS=(
    --wandb-key "${WANDB_API_KEY}"
 )
 
-RUNTIME_ENV_JSON="{
-  \"env_vars\": {
-    \"PYTHONPATH\": \"/root/Megatron-LM/:/root/miles\",
-    \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
-    \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\",
-    \"no_proxy\": \"127.0.0.1\"
+RUNTIME_ENV_JSON=$(cat <<JSON
+{
+  "env_vars": {
+    "PYTHONPATH": "/root/Megatron-LM/:/root/miles",
+    "CUDA_DEVICE_MAX_CONNECTIONS": "1",
+    "NCCL_NVLS_ENABLE": "${HAS_NVLINK}",
+    "no_proxy": "127.0.0.1"
   }
-}"
+}
+JSON
+)
 
 ray job submit --address="http://127.0.0.1:8265" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
