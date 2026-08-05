@@ -29,16 +29,28 @@ Checked against the source, because several combinations are rejected at startup
 | `--fully-async` **rejects** `--colocate` | `arguments.py:53` |
 | `--use-miles-dashboard` **requires** `--dump-details` | `dashboard/args.py:69` |
 
-The first two are the awkward ones. **Partial rollout as an explicit flag exists
-only in the colocated path.** Under `--fully-async` the continuation happens
-anyway — a weight sync aborts a group, `_recycle()` hands the prompt samples back
-to the data source (`fully_async_rollout.py:198`), and because `generate_and_rm`
-mutates samples in place those objects still carry the tokens produced so far, so
-the next submission resumes from them. It is not switchable there.
+**Partial rollout as an explicit flag exists only in the colocated path**, but
+the equivalent question is answered in async by a different knob —
+`--pause-generation-mode`, which is what decides the fate of in-flight
+generation at a weight update:
 
-So the partial-rollout arm is a **colocated-only** comparison, and the
-"eliminate the train/rollout mismatch entirely" arm is likewise **colocated
-only**. Neither can be crossed with the async staleness axis in one run.
+| mode | in-flight requests | KV cache | tokens already generated |
+|---|---|---|---|
+| `retract` (**default**) | returned to SGLang's waiting queue | flushed, recomputed by prefill under the new weights | kept; the sample spans weight versions |
+| `in_place` | frozen, then resumed | **kept**, so the continuation attends to KV built by the *old* weights | kept |
+| `abort` | terminated | flushed | **discarded** — `_drain` recycles the group and `reset_for_retry()` clears `tokens`, `response` and `rollout_log_probs` (`types.py:236`), so it is regenerated from scratch |
+
+`_pause_and_prepare_engines` calls `flush_cache` for every mode except
+`in_place` (`update_weight/.../mixin.py:308-316`).
+
+So the three partial-rollout arms map onto `--pause-generation-mode` in the
+async task: `abort` = discard and regenerate, `retract` = continue with KV
+recompute, `in_place` = continue without it. `in_place` is the cheapest and the
+only one that introduces a *new* mismatch source, which makes it interesting
+next to the `--true-on-policy-mode` arm rather than redundant with it.
+
+The `--partial-rollout` flag itself, and the "eliminate the train/rollout
+mismatch entirely" arm, remain **colocated only**.
 
 ### Advantage estimator / algorithm
 
@@ -108,9 +120,10 @@ part of the configuration rather than a variable.
 
 | variable | flag / env | values | affects |
 |---|---|---|---|
-| weight staleness | `MAX_WEIGHT_STALENESS` | 1, 2, 4, unset (= unbounded) | both |
+| weight staleness | `MAX_WEIGHT_STALENESS` | 1, 2, 4, 1000000 (= effectively unbounded, see below) | both |
 | minibatch reuse | `NUM_STEPS_PER_ROLLOUT` | 1, 2, 4 | both |
 | generation concurrency | `ASYNC_MAX_CONCURRENT_SAMPLES` | 1×, 2×, 4× `rollout_batch × n` | both |
+| in-flight fate at weight update | `PAUSE_GENERATION_MODE` | `retract`, `in_place`, `abort` | both |
 | learning rate | `LR` | 5e-7, 1e-6, 2e-6 | quality |
 | rollout length | `MAX_RESPONSE_LEN` | 8192, 16384, 24576 | both |
 | algorithm + clip | `--advantage-estimator`, `--eps-clip-high`, `--eps-clip-c` | grpo/gspo × clip setting | quality |
@@ -132,7 +145,7 @@ off-policy looks better than it is. Compare at equal length, and record
 | variable | value | why |
 |---|---|---|
 | `GLOBAL_BATCH_SIZE`, `N_SAMPLES_PER_PROMPT`, `ROLLOUT_BATCH_SIZE` | prior-work values | see the dataset README; not a research question here |
-| dynamic sampling + over-sampling | always on | never switched off in a real workload, so an "unconfounded" arm without it would not describe anything anyone runs. Accepted as part of the environment, not a variable |
+| dynamic sampling | on, **without over-sampling** | the filter stays, but `--over-sampling-batch-size` is not passed, so it defaults to `rollout_batch_size` and the rollout loop submits exactly what it needs. Over-sampling would otherwise add a second, uncontrolled source of aborted generation on top of the weight-update one this study is measuring |
 | R3 (MoE) | always on | removes routing mismatch; MoE RL is known to collapse without it |
 | verifier (`RM_TYPE`) | per checkpoint | correctness, not a knob |
 | temperature, KL coefficient | 1.0, 0 | matches DAPO |
@@ -157,6 +170,12 @@ the fact**, or sample-efficiency claims cannot be made later without rerunning:
 The staleness bound is a *cap*, not the realised value — always report
 `avg_staleness` next to the setting, or a plateau in the results will be
 misread as insensitivity when it was actually the bound never binding.
+
+**The realised-staleness metrics are gated on the bound being set.**
+`fully_async_rollout.py:202` only measures staleness when
+`args.max_weight_staleness is not None`, so the "unbounded" arm would be the one
+run with no staleness measurement at all. Run that arm with a bound so large it
+never binds (`MAX_WEIGHT_STALENESS=1000000`) rather than unsetting it.
 
 ## Future work, deliberately out of scope
 

@@ -1,0 +1,29 @@
+# Apptainer sandbox provider overrides for mini_swe_agent_2.
+#
+# Composed on top of the provider's own config, i.e.
+#   gym env start \
+#       --config responses_api_agents/mini_swe_agent_2/configs/mini_swe_agent_2.yaml \
+#       --config nemo_gym/sandbox/providers/apptainer/configs/apptainer.yaml \
+#       --config <this file>
+#
+# Shape follows a working internal config posted in #hermes-oss-dev
+# (2026-07-02). VERIFY the key paths against the installed provider's README
+# before the first run -- Gym's config layout changed in the 0.4 redesign, and
+# a mistyped key is silently ignored rather than rejected.
+
+# One .sif per instance id. Produced by link_sifs.py, which normalizes the
+# per-publisher prefixes (xingyaoww_*, swebench_*) into a single naming.
+container_formatter: /lustre/fsw/portfolios/coreai/users/kfujii/sif_by_id/{instance_id}.sif
+
+sandbox_provider:
+  apptainer:
+    create:
+      extra_start_args:
+        # Unprivileged user namespaces instead of --fakeroot. --fakeroot fails
+        # inside an enroot container with
+        #   "could not use fakeroot: no mapping entry found in /etc/subuid"
+        - "--userns"
+        # Without this every task shares the launcher's CWD read-write, so
+        # `pip install` from one task corrupts the environment of the next.
+        - "--no-mount"
+        - "cwd"

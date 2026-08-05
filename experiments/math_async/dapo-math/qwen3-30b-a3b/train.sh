@@ -40,6 +40,7 @@ ROLLOUT_ARGS=(
    --balance-data
    --dynamic-sampling-filter-path miles.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
    --max-weight-staleness "${MAX_WEIGHT_STALENESS}"
+   --pause-generation-mode "${PAUSE_GENERATION_MODE}"
 )
 
 TELEMETRY_ARGS=(

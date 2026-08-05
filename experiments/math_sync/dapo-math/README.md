@@ -73,7 +73,6 @@ See [`miles-run-ladder`](../../../.claude/skills/miles-run-ladder/SKILL.md).
 | `N_SAMPLES_PER_PROMPT` | 8 | **8, 16, 32** | both | At n=8 a 1/8 or 7/8 group carries only `sqrt(0.125·0.875)=0.33` of the maximum advantage. 16 is DAPO's value: half the variance of the per-group estimate at 2× the generation cost. |
 | `GLOBAL_BATCH_SIZE` | 256 | derived | quality | Must equal `rollout_batch × n / num_steps`; the invariant is asserted at startup. Also has to be divisible by `dp`, which grows with the allocation. |
 | `NUM_STEPS_PER_ROLLOUT` (off-policy step) | 1 | **1, 2, 4** | both | >1 splits one rollout into several optimizer steps, so the later ones are off-policy. Throughput improves because generation is amortised over more updates, but this task has **no** `--use-tis`, so only PPO clipping absorbs the mismatch. Watch `dump/mean_abs_lp_diff` rise with it. |
-| `OVER_SAMPLING_BATCH_SIZE` | 2× rollout batch | **1.5×, 2×, 3×** | throughput | Higher means fewer resampling rounds but more aborted generations; partial rollout recovers those, so the cost is bounded. |
 
 ### Colocation
 

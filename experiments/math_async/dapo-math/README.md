@@ -73,7 +73,6 @@ See [`miles-run-ladder`](../../../.claude/skills/miles-run-ladder/SKILL.md).
 | `N_SAMPLES_PER_PROMPT` | 8 | **8, 16, 32** | both | At n=8 a 1/8 or 7/8 group carries only `sqrt(0.125·0.875)=0.33` of the maximum advantage. 16 is DAPO's value: half the variance of the per-group estimate at 2× the generation cost. |
 | `GLOBAL_BATCH_SIZE` | 256 | derived | quality | Must equal `rollout_batch × n / num_steps`; the invariant is asserted at startup. Also has to be divisible by `dp`, which grows with the allocation. |
 | `NUM_STEPS_PER_ROLLOUT` (off-policy step) | 1 | **1, 2, 4** | both | >1 splits one rollout into several optimizer steps, so the later ones are off-policy. Throughput improves because generation is amortised over more updates; `--use-tis` is on in this task, so the ratio is corrected. Watch `dump/mean_abs_lp_diff` rise with it. |
-| `OVER_SAMPLING_BATCH_SIZE` | 2× rollout batch | **1.5×, 2×, 3×** | throughput | Higher means fewer resampling rounds but more aborted generations; partial rollout recovers those, so the cost is bounded. |
 
 ### Async / off-policy — what this task exists to study
 
@@ -83,6 +82,7 @@ See [`miles-run-ladder`](../../../.claude/skills/miles-run-ladder/SKILL.md).
 | actor / rollout split | 1 node + 1 node | **1+1, 1+3, 2+2, 3+1** | throughput | Whichever side is starving decides. `async/queue_depth` growing means training is the bottleneck; sitting at 0 means rollout is. |
 | `ASYNC_MAX_CONCURRENT_SAMPLES` | unset (= one training batch) | **1×, 2×, 4× `rollout_batch × n`** | both | Decouples generation concurrency from the training batch. Raising it fills the engines but raises average staleness. |
 | `--use-tis` | on | on / off | quality | Off only as a controlled ablation, to measure what the correction is worth at a given staleness. |
+| `PAUSE_GENERATION_MODE` | `retract` | **`retract`, `in_place`, `abort`** | both | What happens to in-flight generation at a weight update, and the async equivalent of the partial-rollout question. `retract` returns the requests to the waiting queue and recomputes their KV cache under the new weights; `in_place` resumes on the KV cache built by the *old* weights, which is cheaper and adds a mismatch source; `abort` kills them, and `_recycle` then discards the tokens entirely (`types.py:236`) so the work is regenerated. Read `rollout/fully_async/aborted_groups_recycled` to see what `abort` costs. |
 
 ### Optimization
 

@@ -120,10 +120,18 @@ an implicit consequence of `--global-batch-size`, and it is what turns the
 four-knob invariant into a startup assert (`arguments.py:3056` only checks it
 when the flag is present).
 
-Dynamic sampling and partial rollout are **always on** — not toggles. They
-belong together: over-sampling aborts whatever is still generating once enough
-groups have passed the filter, and without `--partial-rollout` that work is
-discarded rather than resumed.
+Dynamic sampling is **always on**; `--over-sampling-batch-size` is deliberately
+**not** passed, so it defaults to `rollout_batch_size` and the rollout loop
+submits only what it needs. Over-sampling would add a second, uncontrolled
+source of aborted generation on top of the weight-update one the off-policy
+study is measuring.
+
+`--partial-rollout` is always on in `math_sync`, where groups dropped by the
+filter still leave requests in flight at the end of a rollout; without it that
+work is discarded rather than resumed. It does not exist in `math_async` —
+`--fully-async` rejects the flag (`arguments.py:54`); the equivalent question
+there is `PAUSE_GENERATION_MODE`, which decides what happens to in-flight
+generation at a weight update.
 
 `--mask-offpolicy-in-partial-rollout` is **never** passed. It zeroes the loss
 over everything a resumed sample produced under the previous weights, which

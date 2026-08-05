@@ -37,7 +37,6 @@ ROLLOUT_ARGS=(
    --num-steps-per-rollout "${NUM_STEPS_PER_ROLLOUT}"
    --balance-data
    --dynamic-sampling-filter-path miles.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
-   --over-sampling-batch-size "${OVER_SAMPLING_BATCH_SIZE}"
    --partial-rollout
 )
 
