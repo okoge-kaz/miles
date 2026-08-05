@@ -24,6 +24,7 @@ import glob
 import hashlib
 import json
 import os
+import random
 import string
 import sys
 from pathlib import Path
@@ -385,10 +386,15 @@ def adapt_gpqa(row):
 
     options = [correct] + distractors
     # Deterministic per question, and stable across Python runs -- PYTHONHASHSEED
-    # randomises hash() for str, so this uses an explicit digest.
-    seed = int(hashlib.sha256(question.encode()).hexdigest()[:8], 16)
-    order = sorted(range(4), key=lambda i: (seed >> (i * 4)) & 0xF)
-    options = [options[i] for i in order]
+    # randomises hash() for str, so the seed comes from an explicit digest.
+    #
+    # A seeded shuffle rather than a sort by derived key: sorting is stable, so
+    # equal keys keep their input order, and the correct answer is built first.
+    # With short keys that tie often it lands on A far more than a quarter of the
+    # time (measured 162/129/131/124 on the extended split), which hands a model
+    # free accuracy for always answering A.
+    seed = int(hashlib.sha256(question.encode()).hexdigest()[:16], 16)
+    random.Random(seed).shuffle(options)
 
     letters = list(string.ascii_uppercase[:4])
     answer = letters[options.index(correct)]
@@ -398,17 +404,34 @@ def adapt_gpqa(row):
         "response should be in the following format: 'Answer: A/B/C/D' "
         f"(e.g. 'Answer: A').\n\n{question}\n\n{rendered}"
     )
-    return {
-        "prompt": [{"role": "user", "content": content}],
-        "label": answer,
-        "metadata": {
-            "source": "gpqa",
-            "valid_letters": letters,
-            "choices": options,
-            "category": row.get("High-level domain") or row.get("Subdomain"),
-            "record_id": row.get("Record ID"),
-        },
+    # GPQA ships human difficulty, so a window can be cut without measuring one.
+    # Expert accuracy is the interesting axis: the questions PhDs in the field get
+    # wrong are the ones a model cannot reach by recall. Blank in some rows, so
+    # this is best-effort rather than required.
+    def _num(key):
+        try:
+            return float(row[key])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    metadata = {
+        "source": "gpqa",
+        "valid_letters": letters,
+        "choices": options,
+        "category": row.get("High-level domain") or row.get("Subdomain"),
+        "subdomain": row.get("Subdomain"),
+        "record_id": row.get("Record ID"),
     }
+    for key, name in (
+        ("Expert Validator Accuracy", "expert_accuracy"),
+        ("Non-Expert Validator Accuracy", "non_expert_accuracy"),
+        ("Writer's Difficulty Estimate", "writer_difficulty"),
+    ):
+        value = _num(key)
+        if value is not None:
+            metadata[name] = value
+
+    return {"prompt": [{"role": "user", "content": content}], "label": answer, "metadata": metadata}
 
 
 ADAPTERS = {

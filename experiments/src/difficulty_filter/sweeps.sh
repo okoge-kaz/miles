@@ -30,12 +30,18 @@ NB="experiments.src.nemo_blends"
 #
 # Verifier column: `rm:<x>` selects a built-in --rm-type, anything else is a
 # dotted --custom-rm-path.
+#
+# mmlu-pro, bfcl and gpqa-diamond are eval sets. They are here for the untrained
+# baseline and to prove the verifier works, not to be filtered and trained on --
+# cutting a difficulty window out of an eval set is how a benchmark stops meaning
+# anything.
 read -r -d '' SWEEPS <<EOF || true
 dapo-math-17k          | /data/dapo-math-17k/dapo-math-17k.jsonl                                  | rm:math                      |
 skywork-or1-math       | /data/skywork-or1-rl/skywork-or1-math-miles-20k.jsonl                    | rm:math                      |
 nemotron-math-v2       | /data/nemotron-rl-math-v2/nemotron-rl-math-v2-miles.jsonl                | rm:math                      |
 knowledge-mcqa         | /data/nemotron-rl-mcqa/knowledge-mcqa-miles-20k.jsonl                    | rm:gpqa                      |
 mmlu-pro               | /data/mmlu-pro/mmlu-pro-miles-2k.jsonl                                   | rm:gpqa                      |
+gpqa-diamond           | /data/gpqa/gpqa-diamond-miles.jsonl                                      | rm:gpqa                      |
 reasoning-gym          | /data/nemotron-rl-reasoninggym/reasoning-gym-miles.jsonl                 | ${NB}.rewards.reasoning_gym_reward      |
 structured-outputs     | /data/nemotron-rl-ifollow-struct/structured-outputs-miles.jsonl          | ${NB}.rewards.structured_output_reward  |
 instruction-following  | /data/nemotron-rl-ifollow/instruction-following-miles-20k.jsonl          | ${NB}.ifeval_g.ifeval_reward | EXTRA_PIP=nltk+langdetect+immutabledict+absl-py
@@ -51,7 +57,7 @@ EOF
 # budget is right for math; a tool call or a letter needs a fraction of it, and
 # the cap is what bounds wall-clock on a 20k-row sweep.
 declare -A MAX_TOKENS=(
-    [knowledge-mcqa]=4096  [mmlu-pro]=4096
+    [knowledge-mcqa]=4096  [mmlu-pro]=4096  [gpqa-diamond]=4096
     [fncall-pivot]=4096    [conv-tooluse]=4096  [swe-pivot]=4096  [bfcl]=4096
     [structured-outputs]=8192  [instruction-following]=8192
     [arc-agi]=16384        [competitive-coding]=16384

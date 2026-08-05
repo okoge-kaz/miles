@@ -71,13 +71,38 @@ for split in diamond main extended; do
 done
 
 echo
-echo "answer-letter balance (should be near-uniform; a spike means the options"
-echo "were not shuffled and the eval is guessable):"
+echo "answer-letter balance:"
 python3 - <<PY
-import collections, json
+import collections, json, sys
+
+# A skew here means always answering the popular letter beats the chance floor,
+# so the eval measures the converter rather than the model. This has already
+# happened once: ordering by a 4-bit derived key put the correct answer on A
+# 162/546 times, because sorting is stable and the correct option is built first.
+# chi-square against uniform, df=3, p<0.01.
+CRITICAL = 11.34
+worst = 0.0
 for split in ("diamond", "main", "extended"):
     labels = [json.loads(l)["label"] for l in open(f"/data/gpqa/gpqa-{split}-miles.jsonl")]
-    print(f"  {split:9s} n={len(labels):4d}  {dict(sorted(collections.Counter(labels).items()))}")
+    counts = collections.Counter(labels)
+    expected = len(labels) / 4
+    chi2 = sum((counts[k] - expected) ** 2 / expected for k in "ABCD")
+    worst = max(worst, chi2)
+    print(f"  {split:9s} n={len(labels):4d}  {dict(sorted(counts.items()))}  chi2={chi2:.2f}")
+if worst > CRITICAL:
+    print(f"ERROR: answer letters are not uniform (chi2={worst:.2f} > {CRITICAL}); the shuffle is biased.")
+    sys.exit(1)
+
+# And the label has to survive the shuffle: point it back at the option text.
+for split in ("diamond", "main", "extended"):
+    for line in open(f"/data/gpqa/gpqa-{split}-miles.jsonl"):
+        row = json.loads(line)
+        m = row["metadata"]
+        label = row["label"]
+        if label not in m["valid_letters"] or len(m["choices"]) != 4:
+            print("ERROR: malformed row in " + split + ": " + str(label))
+            sys.exit(1)
+print("balance and label/choice consistency: ok")
 PY
 '
 
