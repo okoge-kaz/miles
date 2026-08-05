@@ -54,14 +54,17 @@ else
 fi
 
 EVAL_ARGS=(
-   --eval-interval 20
-   --n-samples-per-eval-prompt 16
-   --eval-max-response-len 24576
+   --eval-interval "${EVAL_INTERVAL}"
+   --n-samples-per-eval-prompt "${N_SAMPLES_PER_EVAL_PROMPT}"
+   --eval-max-response-len "${EVAL_MAX_RESPONSE_LEN}"
    --eval-top-p 1
    --eval-prompt-data
    aime24 /data/aime-2024/aime-2024.jsonl
    aime25 /data/aime-2025/aime-2025.jsonl
 )
+if [[ "${SKIP_EVAL_BEFORE_TRAIN}" != "0" ]]; then
+   EVAL_ARGS+=(--skip-eval-before-train)
+fi
 
 PERF_ARGS=(
    --tensor-model-parallel-size "${TENSOR_PARALLEL_SIZE}"
