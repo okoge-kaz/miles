@@ -11,7 +11,7 @@ What it recovers, and from where:
 | quantity | source |
 |---|---|
 | per-prompt, per-rollout eval rewards | ``rollout_data/eval_<rid>.pt`` (needs ``--dump-details``) |
-| evaluation wall-clock | ``dashboard/metrics.jsonl`` record ``ts`` minus ``meta.json`` ``start_ts`` |
+| evaluation wall-clock | per-record deltas with inter-allocation gaps removed (``log_source.active_elapsed_hours``) |
 | collapse guards (entropy, KL, reward, truncation) | ``dashboard/metrics.jsonl`` |
 | realized policy lag P(L) | per-sample ``weight_versions`` in ``rollout_data/<rid>.pt`` |
 | GPU count for GPU-hours | ``meta.json`` args snapshot |
@@ -112,6 +112,7 @@ class RunExtract:
     prompt_level: dict[str, bool]
     guards: dict[str, list[float | None]]
     lag_steps: list[int]
+    time_report: dict[str, Any]
     factors: dict[str, str]
     factor_sources: dict[str, str]
     notes: list[str]
@@ -139,7 +140,7 @@ def read_meta(dump_dir: Path | None) -> dict[str, Any]:
     return json.loads(path.read_text())
 
 
-def read_metric_records(dump_dir: Path | None, slurm_log: Path | None) -> list[dict[str, Any]]:
+def read_metric_records(dump_dir: Path | None, slurm_logs: list[Path]) -> list[dict[str, Any]]:
     """Every ``tracking.log`` payload, with its wall-clock ``ts``.
 
     Prefers ``dashboard/metrics.jsonl`` -- a flat, unpartitioned stream, so one
@@ -151,11 +152,10 @@ def read_metric_records(dump_dir: Path | None, slurm_log: Path | None) -> list[d
     if dump_dir is not None:
         path = dump_dir / "dashboard" / "metrics.jsonl"
         if path.is_file():
-            return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
-    assert slurm_log is not None, (
-        "no dashboard/metrics.jsonl and no --slurm-log: there is no metric stream to read"
-    )
-    return log_source.merge_step_records(log_source.parse_log(slurm_log))
+            lines = [line for line in path.read_text().splitlines() if line.strip()]
+            return log_source.stitch([[json.loads(line) for line in lines]])
+    assert slurm_logs, "no dashboard/metrics.jsonl and no --slurm-log: there is no metric stream to read"
+    return log_source.stitch([log_source.merge_step_records(log_source.parse_log(p)) for p in slurm_logs])
 
 
 def eval_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -434,29 +434,38 @@ def resolve_factors(
 # --------------------------------------------------------------------------
 
 
-def _fallback_run_id(dump_dir: Path | None, slurm_log: Path | None) -> str:
-    """Name the extract after the config directory, or the job log, in that order."""
+def _fallback_run_id(dump_dir: Path | None, slurm_logs: list[Path]) -> str:
+    """Name the extract after the config directory, or the first job log."""
     if dump_dir is not None:
         return dump_dir.parent.name
-    assert slurm_log is not None
-    return slurm_log.stem
+    assert slurm_logs
+    return slurm_logs[0].stem
 
 
 def build_extract(args: argparse.Namespace) -> tuple[RunExtract, dict[str, dict[int, np.ndarray]], dict[str, np.ndarray]]:
     dump_dir = Path(args.dump_details) if args.dump_details else None
     meta = read_meta(dump_dir)
     records = read_metric_records(dump_dir, args.slurm_log)
+    wall_by_ts, time_report = log_source.active_elapsed_hours(records, args.max_step_gap_minutes * 60)
+    elapsed_of = {id(record): hours for record, hours in zip(records, wall_by_ts, strict=True)}
     eval_recs = eval_records(records)
     assert eval_recs, "the metric stream carries no eval/* records; nothing to measure"
 
     names = benchmark_names(eval_recs)
     steps = [int(r["metrics"].get(EVAL_STEP_KEY, r.get("step") or 0)) for r in eval_recs]
     stamps = [float(r["ts"]) for r in eval_recs]
-    start_ts = float(meta["start_ts"]) if "start_ts" in meta else log_source.run_start_ts(records)
-    wall_h = [(ts - start_ts) / 3600.0 for ts in stamps]
+    start_ts = log_source.run_start_ts(records)
+    # Never `ts - meta.start_ts`: the dashboard rewrites meta.json on every resume
+    # while metrics.jsonl appends, so that difference goes negative for every
+    # allocation but the last. active_elapsed_hours is resume-safe by construction.
+    wall_h = [elapsed_of[id(r)] for r in eval_recs]
     gpus = total_gpus(meta, args.total_gpus)
 
-    notes: list[str] = []
+    notes: list[str] = [
+        f"time base: {time_report['active_h']:.2f} active h over {time_report['n_allocations']} allocation(s); "
+        f"{time_report['excluded_h']:.2f} h of inter-allocation gaps excluded "
+        f"(span {time_report['span_h']:.2f} h)"
+    ]
     matrices: dict[str, dict[int, np.ndarray]] = {}
     if dump_dir is not None:
         matrices, notes = extract_eval_matrices(dump_dir, eval_recs, args.n_samples_per_eval_prompt)
@@ -500,6 +509,7 @@ def build_extract(args: argparse.Namespace) -> tuple[RunExtract, dict[str, dict[
         prompt_level={name: name in matrices for name in names},
         guards=guard_series_on_eval_grid(records, stamps),
         lag_steps=sorted({int(s) for s in lag_arrays.get("lag_step", [])}),
+        time_report=time_report,
         factors=factors,
         factor_sources=sources,
         notes=notes,
@@ -532,8 +542,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--slurm-log",
         type=Path,
-        default=None,
-        help="experiments/outputs/training/.../<job>.log; the metric source when there is no dump directory",
+        action="append",
+        default=[],
+        help="experiments/outputs/training/.../<job>.log; repeat once per allocation of a resumed run. "
+        "The metric source when there is no dump directory",
+    )
+    p.add_argument(
+        "--max-step-gap-minutes",
+        type=float,
+        default=log_source.DEFAULT_GAP_SECONDS / 60,
+        help="a hole longer than this in the metric stream is an inter-allocation gap, not training time",
     )
     p.add_argument("--out", required=True, help="extract root; one subdirectory per run")
     p.add_argument("--arm", required=True, help="arm label shared by the seeds of one configuration")
@@ -555,6 +573,9 @@ def main() -> int:
 
     print(f"run        {extract.run_id}  (arm={extract.arm}, seed={extract.seed})")
     print(f"gpus       {extract.total_gpus}")
+    print(f"time       {extract.time_report['active_h']:.2f} active h, "
+          f"{extract.time_report['n_allocations']} allocation(s), "
+          f"{extract.time_report['excluded_h']:.2f} h excluded")
     print(f"evals      {len(extract.eval_steps)} points, steps {extract.eval_steps[:3]}...{extract.eval_steps[-1:]}")
     print(f"benchmarks {', '.join(f'{n}({"per-prompt" if extract.prompt_level[n] else "mean-only"})' for n in extract.benchmarks)}")
     print(f"guards     {', '.join(sorted(extract.guards)) or 'none logged'}")

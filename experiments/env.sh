@@ -21,6 +21,38 @@ export CACHE_DIR="${WS}/cache"
 # The miles checkout that gets mounted over /root/miles inside the container.
 export MILES_REPO="${MILES_REPO:-/lustre/fs1/portfolios/coreai/projects/coreai_horizon_dilations/users/kfujii/src/miles}"
 
+# --- Secrets and local overrides --------------------------------------------
+# `$MILES_REPO/.env`, if present. $HOME is not mounted into the container
+# (--no-container-mount-home), so anything a job needs has to be resolved here on
+# the host and carried in by --export=ALL; .env is the one file that does that.
+# It is git-ignored (.gitignore:193) and must stay that way -- this is a checkout
+# of an open-source tree.
+#
+# Values already in the environment win, so a sweep can override a single key per
+# run without editing the file:
+#   TAU_USER_MODEL=other-model experiments/submit_training.sh ...
+#
+# See .env.example for the keys the recipes look for.
+if [[ -f "${MILES_REPO}/.env" ]]; then
+    while IFS= read -r _line || [[ -n "${_line}" ]]; do
+        _line="${_line%%$'\r'}"
+        # Skip blanks, comments, and anything that is not KEY=VALUE.
+        [[ -z "${_line}" || "${_line}" =~ ^[[:space:]]*# ]] && continue
+        [[ "${_line}" =~ ^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
+        _key="${BASH_REMATCH[2]}"
+        _val="${BASH_REMATCH[3]}"
+        # Strip one layer of matching quotes, so both KEY=v and KEY="v" work.
+        [[ "${_val}" == \"*\" || "${_val}" == \'*\' ]] && _val="${_val:1:${#_val}-2}"
+        # Already set in the environment? leave it alone.
+        [[ -n "${!_key:-}" ]] || export "${_key}=${_val}"
+    done < "${MILES_REPO}/.env"
+    unset _line _key _val
+fi
+
+# Inference Hub is OpenAI-compatible, so litellm reaches it as provider "openai"
+# with the base URL overridden rather than as a gemini/anthropic provider.
+export NVIDIA_INFERENCE_BASE_URL="${NVIDIA_INFERENCE_BASE_URL:-https://inference-api.nvidia.com/v1}"
+
 # Where sbatch logs land (stdout and stderr combined, one file per job).
 # The #SBATCH --output directives use the relative path experiments/outputs/,
 # so submit from the repo root. Git-ignored.

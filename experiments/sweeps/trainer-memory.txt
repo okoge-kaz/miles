@@ -1,0 +1,21 @@
+# Memory-for-speed on the training side, on the balanced async shape
+# (3 nodes, 8 train + 16 rollout), where train_wait was 0.4 s so the trainer is
+# the pacer and any saving shows up in the step time.
+#
+#   experiments/sweep.py --sweep experiments/sweeps/trainer-memory.txt \
+#     --recipe math_async/dapo-math-p10-80/qwen3-4b-instruct-2507 \
+#     -- -N 3 -p batch_short --time=00:40:00
+#
+# Read actor_train + log_probs, not just step_s: once the trainer gets fast
+# enough the shape turns rollout-bound and step_s stops moving.
+
+RECOMPUTE_GRANULARITY   full selective
+OVERLAP_COMM            0 1
+MAX_TOKENS_PER_GPU      16384 32768
+
+ACTOR_NUM_NODES         1
+ACTOR_GPUS_PER_NODE     8
+ROLLOUT_NUM_GPUS        16
+NUM_ROLLOUT             6
+SKIP_EVAL_BEFORE_TRAIN  1
+EVAL_INTERVAL           1000

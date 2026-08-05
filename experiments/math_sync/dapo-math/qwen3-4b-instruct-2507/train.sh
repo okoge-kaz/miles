@@ -17,8 +17,12 @@ CKPT_ARGS=(
    --ref-load      /ckpt/megatron/Qwen3-4B-Instruct-2507_torch_dist
    --load          "${CKPT_PATH}"
    --save          "${CKPT_PATH}"
-   --save-interval 20
+   --save-interval "${SAVE_INTERVAL}"
+   --save-retain-interval "${SAVE_RETAIN_INTERVAL}"
 )
+if [[ "${SAVE_HF}" != "0" ]]; then
+   CKPT_ARGS+=(--save-hf "${CKPT_PATH}/hf/{rollout_id}")
+fi
 
 ROLLOUT_ARGS=(
    --prompt-data "${PROMPT_DATA}"

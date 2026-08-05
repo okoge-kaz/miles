@@ -106,6 +106,12 @@ def check_recipe(recipe_dir: Path) -> None:
     if mtpg * cp < ctx:
         fail(rel, f"max_tokens_per_gpu {mtpg} * cp {cp} = {mtpg * cp} < context {ctx}")
 
+    save_int = knob(run_text, "SAVE_INTERVAL")
+    retain = knob(run_text, "SAVE_RETAIN_INTERVAL")
+    # Megatron asserts this at startup (training/arguments.py:841).
+    if save_int and retain and retain % save_int != 0:
+        fail(rel, f"save_retain_interval {retain} is not a multiple of save_interval {save_int}")
+
     rb = knob(run_text, "ROLLOUT_BATCH_SIZE")
     n = knob(run_text, "N_SAMPLES_PER_PROMPT")
     gbs = knob(run_text, "GLOBAL_BATCH_SIZE")

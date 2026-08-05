@@ -36,9 +36,10 @@ from __future__ import annotations
 
 import ast
 import re
+from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 # "[2026-08-04 21:58:08.454 rollout_manager] file.py:79 - <kind> <id>: {<dict>}"
@@ -119,6 +120,74 @@ def merge_step_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         else:
             merged[key]["metrics"].update(record["metrics"])
             merged[key]["ts"] = max(merged[key]["ts"], record["ts"])
+    return sorted(merged.values(), key=lambda r: r["ts"])
+
+
+# A run that is resumed across Slurm allocations leaves a hole in its metric
+# stream: the queue wait, plus model load, checkpoint restore and engine warmup
+# on the far side. Anything longer than this between consecutive records is
+# treated as such a hole rather than as training time.
+DEFAULT_GAP_SECONDS = 30 * 60
+
+
+def active_elapsed_hours(
+    records: list[dict[str, Any]], gap_seconds: float = DEFAULT_GAP_SECONDS
+) -> tuple[list[float], dict[str, Any]]:
+    """Elapsed hours per record, with inter-allocation holes removed.
+
+    ``experiments/submit_training.sh`` documents the normal mode as "resumable
+    across three 4 h jobs", so a converged on-policy math run on this cluster is
+    by construction several allocations. Two things then go wrong with a naive
+    ``ts - start``:
+
+    * the dashboard **overwrites** ``meta.json`` on every resume
+      (``collector.py:153``) while ``metrics.jsonl`` appends, so records from
+      earlier allocations sit *before* ``start_ts`` and come out negative;
+    * the queue wait between allocations -- unbounded, and nothing to do with the
+      method under test -- would be charged to the arm as training time.
+
+    Summing per-record deltas and dropping any delta above ``gap_seconds`` avoids
+    both, and needs no ``meta.json`` at all. What it measures is time in which the
+    run was producing metrics.
+
+    The known bias is stated rather than corrected: per-allocation startup
+    (model load, checkpoint restore, engine warmup) is excluded, as is the very
+    first startup. Every arm pays it in the same shape, so the *ratio*
+    tau_on/tau_m is close to unaffected; the absolute times are lower bounds and
+    are not comparable to a number measured any other way. ``excluded_h`` is
+    reported so the size of the exclusion is always visible.
+    """
+    assert records, "no metric records to place on a time axis"
+    stamps = [float(r["ts"]) for r in records]
+    elapsed, gaps = [0.0], []
+    for previous, current in zip(stamps, stamps[1:], strict=False):
+        delta = current - previous
+        if delta > gap_seconds:
+            gaps.append(delta)
+            delta = 0.0
+        elapsed.append(elapsed[-1] + max(delta, 0.0))
+    report = {
+        "n_allocations": len(gaps) + 1,
+        "excluded_h": sum(gaps) / 3600.0,
+        "span_h": (stamps[-1] - stamps[0]) / 3600.0,
+        "active_h": elapsed[-1] / 3600.0,
+        "gap_seconds": gap_seconds,
+    }
+    return [seconds / 3600.0 for seconds in elapsed], report
+
+
+def stitch(record_lists: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    """Merge several allocations' records, later allocations winning on ties.
+
+    A resumed run replays the steps between its last checkpoint and the
+    interruption, so the same step id appears in two logs. The later occurrence
+    is the one on the trajectory that survived; the earlier one is work that was
+    rolled back. Its *time* still counts -- it was really spent -- which is why
+    only the record is dropped and never the elapsed interval.
+    """
+    merged: dict[tuple[str, int], dict[str, Any]] = {}
+    for record in sorted((r for records in record_lists for r in records), key=lambda r: r["ts"]):
+        merged[(record["step_key"], record["step"])] = record
     return sorted(merged.values(), key=lambda r: r["ts"])
 
 

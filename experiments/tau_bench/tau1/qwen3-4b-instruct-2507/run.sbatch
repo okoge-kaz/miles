@@ -21,10 +21,12 @@
 # Requires:
 #   * tau-bench installed in the image and tau1_mock.py run once (see
 #     experiments/setup/prepare_tau_bench.sbatch)
-#   * a litellm-reachable user-simulator model. Pick the provider and supply its
-#     key; the example reads these env vars:
+#   * a user-simulator model. The default path is NVIDIA Inference Hub, reached
+#     as an OpenAI-compatible endpoint -- hence provider "openai" with the base
+#     URL overridden, not provider "gemini". Put NVIDIA_INFERENCE_API_KEY and
+#     TAU_USER_MODEL in the repo-root .env (see .env.example); env.sh loads it.
+#     Any other litellm provider still works:
 #       TAU_USER_MODEL_PROVIDER=gemini   TAU_USER_MODEL=gemini-2.5-flash-lite  GEMINI_API_KEY=...
-#       TAU_USER_MODEL_PROVIDER=deepseek TAU_USER_MODEL=deepseek-chat          DEEPSEEK_API_KEY=...
 #
 # No database server: tau-bench ships its domain data in-repo.
 
@@ -34,14 +36,27 @@ REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../
 source "${REPO_ROOT}/experiments/env.sh"
 
 : "${WANDB_API_KEY:?set WANDB_API_KEY, or put an api.wandb.ai entry in ~/.netrc}"
-: "${TAU_USER_MODEL_PROVIDER:=gemini}"
-: "${TAU_USER_MODEL:=gemini-2.5-flash-lite}"
+: "${TAU_USER_MODEL_PROVIDER:=openai}"
+: "${TAU_USER_MODEL:?set TAU_USER_MODEL to a model your Inference Hub key is scoped to}"
+
+# Inference Hub keys are scoped to the models chosen when the key was minted; an
+# unscoped key answers `key_model_access_denied` for everything but
+# 'default-models', so the model name is required rather than defaulted.
+if [[ "${TAU_USER_MODEL_PROVIDER}" == "openai" ]]; then
+    : "${OPENAI_API_KEY:=${NVIDIA_INFERENCE_API_KEY:-}}"
+    : "${OPENAI_BASE_URL:=${NVIDIA_INFERENCE_BASE_URL}}"
+    export OPENAI_API_KEY OPENAI_BASE_URL
+fi
 
 # Fail here rather than three hours in: the user simulator is called once per
 # turn, so a missing key turns every episode into an immediate zero and the run
 # looks like a policy that cannot converse.
 _key_var="$(echo "${TAU_USER_MODEL_PROVIDER}" | tr '[:lower:]' '[:upper:]')_API_KEY"
-[[ -n "${!_key_var:-}" ]] || { echo "set ${_key_var} for the tau-bench user simulator"; exit 1; }
+[[ -n "${!_key_var:-}" ]] || {
+    echo "set ${_key_var} for the tau-bench user simulator"
+    echo "  for Inference Hub: set NVIDIA_INFERENCE_API_KEY in the repo-root .env (see .env.example)"
+    exit 1
+}
 
 [[ -f "${DATASET_DIR}/tau-bench/tau1_train.jsonl" ]] || {
     echo "missing ${DATASET_DIR}/tau-bench/tau1_train.jsonl; run experiments/setup/prepare_tau_bench.sbatch"; exit 1; }
@@ -83,6 +98,7 @@ PROMPT_DATA=/data/tau-bench/tau1_train.jsonl
 
 export MODEL_NAME ROLLOUT_MODE DATASET_TAG PROMPT_DATA LR MAX_RESPONSE_LEN NUM_STEPS_PER_ROLLOUT
 export ROLLOUT_MAX_CONTEXT_LEN TAU_MAX_TURNS TAU_USER_MODEL_PROVIDER TAU_USER_MODEL
+export OPENAI_API_KEY OPENAI_BASE_URL
 export ACTOR_NUM_NODES ACTOR_GPUS_PER_NODE ROLLOUT_NUM_GPUS
 export TENSOR_PARALLEL_SIZE CONTEXT_PARALLEL_SIZE EXPERT_PARALLEL_SIZE MAX_TOKENS_PER_GPU
 export ROLLOUT_NUM_GPUS_PER_ENGINE SGLANG_MEM_FRACTION

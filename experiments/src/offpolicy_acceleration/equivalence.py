@@ -87,6 +87,7 @@ class ArmSamples:
     prompt_level: bool = True
     factors: dict[str, str] = field(default_factory=dict)
     seed_labels: tuple[str, ...] = ()
+    smooth_window: int = 1
 
     def __post_init__(self) -> None:
         s, t = self.rewards.shape[0], self.rewards.shape[1]
@@ -106,7 +107,7 @@ class ArmSamples:
 
     def observed_quality(self) -> np.ndarray:
         """(T,) the point estimate: mean over samples, prompts, then seeds."""
-        return self.rewards.mean(axis=(2, 3)).mean(axis=0)
+        return trailing_mean(self.rewards.mean(axis=(2, 3)).mean(axis=0), self.smooth_window)
 
     def observed_time(self, axis: Literal["wall_clock", "gpu_hours"]) -> np.ndarray:
         return (self.wall_clock_h if axis == "wall_clock" else self.gpu_hours).mean(axis=0)
@@ -182,7 +183,7 @@ def bootstrap_arm(arm: ArmSamples, prompt_draws: np.ndarray, spec: BootstrapSpec
         per_seed = picked.mean(axis=(2, 3))  # (S, T)
 
         seed_idx = rng.integers(0, n_seeds, size=n_seeds) if spec.resample_seeds else np.arange(n_seeds)
-        quality[rep] = per_seed[seed_idx].mean(axis=0)
+        quality[rep] = trailing_mean(per_seed[seed_idx].mean(axis=0), arm.smooth_window)
         wall[rep] = arm.wall_clock_h[seed_idx].mean(axis=0)
         gpuh[rep] = arm.gpu_hours[seed_idx].mean(axis=0)
 
@@ -272,6 +273,9 @@ class ConvergenceSpec:
     alpha: float = DEFAULT_ALPHA
 
 
+DEFAULT_CONVERGENCE = ConvergenceSpec()
+
+
 @dataclass(frozen=True)
 class ConvergenceReport:
     converged: bool
@@ -289,7 +293,7 @@ def detect_convergence(
     arm: ArmSamples,
     boot: ArmBootstrap,
     guard_series: dict[str, np.ndarray],
-    spec: ConvergenceSpec = ConvergenceSpec(),
+    spec: ConvergenceSpec = DEFAULT_CONVERGENCE,
     guards: tuple[GuardSpec, ...] = DEFAULT_GUARDS,
 ) -> ConvergenceReport:
     """Apply the pre-registered plateau test to the on-policy reference run.
@@ -591,6 +595,51 @@ def fit_saturating(t: np.ndarray, q: np.ndarray, *, grid: int = 60) -> Saturatin
 # --------------------------------------------------------------------------
 # small numerics
 # --------------------------------------------------------------------------
+
+
+def trailing_mean(q: np.ndarray, window: int) -> np.ndarray:
+    """Mean of the last ``window`` evaluations at every position, along the last axis.
+
+    This exists to make the two sides of Delta_m(t) = Q_m(t) - Q_on* symmetric.
+    Q_on* is a mean over a plateau of many evaluations, so it is far less noisy
+    than a single Q_m(t); differencing them puts the entire single-evaluation
+    noise of the arm into the LCB, and on a 30-prompt benchmark that noise
+    (~0.05 in avg@k) is larger than any practical equivalence margin. Smoothing
+    the arm the same way restores the comparison.
+
+    The cost is honest and one-sided: an arm's tau is delayed by up to
+    ``window - 1`` evaluations, because the trailing mean cannot reach a level
+    until most of the window is above it. Since every arm including the
+    reference pays the same delay, the *ratio* tau_on/tau_m is far less affected
+    than either time on its own. The first ``window - 1`` positions use an
+    expanding mean rather than dropping out, so the early curve is noisier than
+    the late one -- which is where quality is furthest from any target anyway.
+    """
+    if window <= 1:
+        return q
+    cumulative = np.cumsum(q, axis=-1)
+    padded = np.concatenate([np.zeros(q.shape[:-1] + (1,)), cumulative], axis=-1)
+    n = q.shape[-1]
+    counts = np.minimum(np.arange(1, n + 1), window)
+    lower = np.maximum(np.arange(1, n + 1) - window, 0)
+    return (padded[..., 1:] - np.take(padded, lower, axis=-1)) / counts
+
+
+def smallest_detectable_margin(lcb: np.ndarray, consecutive: int) -> float | None:
+    """The smallest delta at which this arm's LCB would ever clear -delta.
+
+    Run on the *reference against itself* it is a power check: if it comes back
+    at 0.06 and the study pre-registered delta = 0.02, then no arm can pass, the
+    on-policy run included, and every "not non-inferior" in the results is a
+    statement about the size of the held-out set rather than about the method.
+    Report it next to delta, always.
+    """
+    best = None
+    for start in range(len(lcb) - consecutive + 1):
+        floor = float(np.min(lcb[start : start + consecutive]))
+        if best is None or floor > best:
+            best = floor
+    return None if best is None else max(-best, 0.0)
 
 
 def _ols_slope(x: np.ndarray, y: np.ndarray) -> float:
