@@ -71,13 +71,17 @@ PERF_ARGS=(
    --expert-model-parallel-size "${EXPERT_PARALLEL_SIZE}"
    --expert-tensor-parallel-size 1
 
-   --recompute-granularity full
-   --recompute-method uniform
-   --recompute-num-layers 1
+   --recompute-granularity "${RECOMPUTE_GRANULARITY}"
 
    --use-dynamic-batch-size
    --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
 )
+if [[ "${RECOMPUTE_GRANULARITY}" == "full" ]]; then
+   PERF_ARGS+=(--recompute-method uniform --recompute-num-layers 1)
+fi
+if [[ "${OVERLAP_COMM}" != "0" ]]; then
+   PERF_ARGS+=(--overlap-grad-reduce --overlap-param-gather)
+fi
 if [[ "${CONTEXT_PARALLEL_SIZE}" -gt 1 ]]; then
    PERF_ARGS+=(--cp-comm-type a2a)
 fi
