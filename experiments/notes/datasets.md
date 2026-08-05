@@ -1,5 +1,9 @@
 # Datasets — where they live and how to look at them
 
+For the full staged inventory by genre — every path, row count, verifier and
+whether it has been verified — see [dataset-inventory.md](dataset-inventory.md).
+This document covers the math sets in use plus the mechanics of reading a JSONL.
+
 ## Location
 
 Host: `/lustre/fsw/portfolios/coreai/users/kfujii/datasets` → mounted at `/data`
@@ -7,8 +11,10 @@ inside the container.
 
 | Dataset | Path | Used by |
 |---|---|---|
-| DAPO-Math-17K | `/data/dapo-math-17k/dapo-math-17k.jsonl` | training prompts (both recipes) |
-| AIME-2024 | `/data/aime-2024/aime-2024.jsonl` | periodic eval |
+| DAPO-Math-17K | `/data/dapo-math-17k/dapo-math-17k.jsonl` | source for the difficulty-filtered set below |
+| DAPO-Math p10-80 | `/data/dapo-math-p10-80/dapo-math-p10-80.jsonl` | training prompts (both recipes). 3962 of 17398, pass rate 0.1–0.8 measured with Qwen3-4B-Instruct-2507 |
+| AIME-2025 | `/data/aime-2025/aime-2025.jsonl` | in-training eval, the only one |
+| AIME-2023 / 24 / 25 / 26 | `/data/aime-20{23,24,25,26}/…` | offline eval on saved checkpoints (`src/offline_eval`) |
 
 Both are pulled by `experiments/setup/download_assets.sbatch` from
 `zhuzilin/dapo-math-17k` and `zhuzilin/aime-2024` — the same repos the upstream

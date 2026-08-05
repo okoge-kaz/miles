@@ -11,7 +11,8 @@ Index:
 
 - [cluster.md](cluster.md) — cw-dfw partitions, node specs, what is and is not installed
 - [containers.md](containers.md) — docker image → `.sqsh`, pyxis flags, mount layout
-- [datasets.md](datasets.md) — where the data lives, how to inspect it, how miles reads it
+- [dataset-inventory.md](dataset-inventory.md) — what is staged, by genre: path, row count, verifier, whether it is verified
+- [datasets.md](datasets.md) — how miles reads a JSONL, how to inspect one
 - [checkpoints.md](checkpoints.md) — `hf/` `megatron/` `training/`, conversion, resume
 - [miles-architecture.md](miles-architecture.md) — the four objects, the directory map, the plug points
 
