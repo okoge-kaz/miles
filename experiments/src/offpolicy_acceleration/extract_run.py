@@ -69,7 +69,8 @@ GUARD_METRICS = (
     "train/train_rollout_logprob_abs_diff",
     "train/train_rollout_kl",
     "train/ppo_kl",
-    "train/ess_ratio",
+    "train/ess_ratio",  # inner-loop ESS, NOT the rollout-vs-train ESS -- see README
+    "train/tis",
     "train/pg_clipfrac",
     "train/tis_abs",
     "train/tis_clipfrac",

@@ -63,7 +63,6 @@ EVAL_ARGS=(
    --eval-max-response-len "${EVAL_MAX_RESPONSE_LEN}"
    --eval-top-p 1
    --eval-prompt-data
-   aime24 /data/aime-2024/aime-2024.jsonl
    aime25 /data/aime-2025/aime-2025.jsonl
 )
 if [[ "${SKIP_EVAL_BEFORE_TRAIN}" != "0" ]]; then

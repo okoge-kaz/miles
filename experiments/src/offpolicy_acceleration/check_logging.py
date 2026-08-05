@@ -184,7 +184,9 @@ def _drift_checks(metrics_seen) -> list[Check]:
     wanted = {
         "train/train_rollout_logprob_abs_diff": "the train/rollout mismatch floor, and drift above it",
         "train/train_rollout_kl": "KL(rollout || train), the distribution-level mismatch",
-        "train/ess_ratio": "effective sample size, the metric that falls first on long sequences",
+        "train/ess_ratio": "ESS of the PPO inner-loop weights only; identically 1.0 when "
+        "NUM_STEPS_PER_ROLLOUT=1, so it does NOT measure staleness",
+        "train/tis": "exp(train - rollout) per token: the importance weight staleness actually moves",
         "train/pg_clipfrac": "how much of the update the clip is discarding",
         "train/tis_abs": "the TIS correction's magnitude, when --use-tis is on",
     }

@@ -90,7 +90,7 @@ are insufficient in exactly the same ways.
 | quality vs time | `eval/<bench>` + the line's own timestamp | `Q(t)`, both time axes |
 | collapse guards | `rollout/raw_reward`, `rollout/truncated_ratio`, `rollout/repetition_frac`, `train/kl_loss`, `train/grad_norm` | the convergence definition |
 | **train/rollout mismatch** | `train/train_rollout_logprob_abs_diff`, `train/train_rollout_kl` | the numerical floor, and drift above it. Measured **0.0100** at zero staleness on the audited run — that is the constant to subtract before attributing drift to policy lag |
-| **IS correction behaviour** | `train/ess_ratio`, `train/tis`, `train/tis_abs`, `train/tis_clipfrac`, `train/ois`, `train/pg_clipfrac` | the "TIS is fine on short trajectories, ESS collapses on long ones" claim is directly testable from the standard log |
+| **staleness-induced drift** | `train/tis` = `exp(train_lp − rollout_lp)`, `train/tis_abs` = `|tis − 1|`, `train/tis_clipfrac` | the actual importance weight π_train/π_rollout. Measured `tis_abs` **0.0100**, `tis_clipfrac` **4.9e-6** on the audited run |
 | async pipeline shape | `perf/rollout_time`, `perf/train_wait_time`, `perf/wait_time_ratio`, `perf/tokens_per_gpu_per_sec` | *why* an arm is faster. The audited run sits at `wait_time_ratio` **0.83** — training idles 83% of the step, so rollout is the bottleneck and every group arrives fresh |
 | lag bracket | `rollout/weight_version/{min,mean,median,max}`, `…/mixed_version_ratio` | a bracket on the lag when the exact mean is missing |
 
@@ -100,7 +100,17 @@ staleness never bound.** Whatever `MAX_WEIGHT_STALENESS` said, that run trained
 on-policy. A results table that reported it as a staleness arm would be reporting
 robustness to a lag the run never experienced.
 
-### Seven gaps, and what each one blocks
+**`train/ess_ratio` does not measure staleness.** `ppo_kl = old_log_probs −
+log_probs` with `old_log_probs = batch["log_probs"]` (`losses.py:94,158`) — both
+are Megatron logprobs, so `ppo_kl` is the *PPO inner-loop* ratio across the
+`NUM_STEPS_PER_ROLLOUT` minibatch updates. At `NUM_STEPS_PER_ROLLOUT=1` the two
+forwards use identical weights, so `ppo_kl ≡ 0`, `pg_clipfrac ≡ 0` and
+`ess_ratio ≡ 1.0` **by construction, at any staleness**. The audited log shows
+exactly that triple. `--use-rollout-logprobs` would repoint it at the rollout
+policy but is mutually exclusive with `--use-tis` (`arguments.py:2823`). The ESS
+the off-policy literature means is gap 8 below.
+
+### Eight gaps, and what each one blocks
 
 **1. Per-prompt eval rewards are not logged.** `log_eval_rollout_data` reduces
 each benchmark to one mean before logging (`ray/rollout/metrics.py:38`). The
@@ -182,7 +192,17 @@ dedupe to the surviving trajectory. The residual bias — per-allocation startup
 is excluded — is identical in shape across arms, so `tau_on/tau_m` is nearly
 unaffected, but the absolute times are lower bounds.
 
-**A seventh, smaller one:** wasted generation is counted, not measured.
+**8. ESS of the rollout-vs-train importance weights is not logged.** `train/tis`
+and `train/tis_abs` give the *mean* of `π_train/π_rollout` and of `|ratio − 1|`,
+but ESS is a sequence-level nonlinear functional: a handful of catastrophic
+tokens can crater it while barely moving a mean. That is precisely why the
+literature reports ESS and not the mean, and precisely why "ESS collapses on long
+sequences" cannot be tested from `tis_abs`. The fix is small —
+`compute_ess_ratio_contribution` already exists and takes a `ppo_kl`-shaped
+tensor, so feeding it `rollout_log_probs − train_log_probs` yields the wanted
+quantity in about three lines next to `corrections.py:23`.
+
+**A ninth, smaller one:** wasted generation is counted, not measured.
 `stale_groups_recycled` / `aborted_groups_recycled` are group counts per drain
 (`fully_async_rollout.py:246`); the tokens thrown away are not recorded, so
 sample- and token-efficiency claims stay coarser than the wall-clock ones.
@@ -225,6 +245,7 @@ Two things it still will not give, worth deciding on up front:
 | where | change | unlocks |
 |---|---|---|
 | every recipe | `--observe-training-entropy` | the entropy collapse criterion (gap 4) |
+| `loss_hub/corrections.py` | ESS of the TIS weights, beside `tis_abs` | gap 8, the long-sequence claim |
 | every async recipe | `MAX_WEIGHT_STALENESS=1000000` for the unbounded arm | realized staleness on every arm (gap 2) |
 | every recipe | raise `--n-samples-per-eval-prompt`, or add a larger held-out set | a `δ` small enough to be interesting (gap 1) |
 | `common/run_identity.sh` | `SEED` in `CONFIG_TAG`, `--seed` / `--rollout-seed` in `train.sh` | seed replication at all |

@@ -19,6 +19,12 @@ nemotron-rl-comp-coding | nvidia/Nemotron-RL-coding-competitive_coding          
 nemotron-rl-ifollow    | nvidia/Nemotron-RL-instruction_following                    # verifiable constraints
 nemotron-rl-ifollow-struct | nvidia/Nemotron-RL-instruction_following-structured_outputs  # JSON schema
 nemotron-rl-mcqa       | nvidia/Nemotron-RL-knowledge-mcqa                           # MCQA
+#
+# --- eval sets and the remaining sandbox-free training sets ---
+mmlu-pro               | TIGER-Lab/MMLU-Pro                                     # knowledge MCQA eval
+nemotron-rl-arc-agi    | nvidia/Nemotron-RL-ARC-AGI-v1                          # abstract reasoning, train+validation
+bfcl                   | gorilla-llm/Berkeley-Function-Calling-Leaderboard      # tool-use eval (AST categories)
+nemotron-rl-swe-pivot  | nvidia/Nemotron-RL-Agentic-SWE-Pivot-v1                # SWE stage 1, no container
 math-500               | HuggingFaceH4/MATH-500                    # small eval
 aime-2024-maxwell      | Maxwell-Jia/AIME_2024                     # small eval
 aime-2025              | math-ai/aime25                            # small eval

@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=miles-dapo-math-p10-80-async-qwen3-1.7b
-#SBATCH --partition=interactive
+#SBATCH --partition=batch,batch_short
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:8
@@ -40,7 +40,7 @@ PROMPT_DATA=/data/dapo-math-p10-80/dapo-math-p10-80.jsonl
 : "${OVERLAP_COMM:=0}"
 
 : "${EVAL_INTERVAL:=20}"
-: "${N_SAMPLES_PER_EVAL_PROMPT:=16}"
+: "${N_SAMPLES_PER_EVAL_PROMPT:=8}"
 : "${EVAL_MAX_RESPONSE_LEN:=24576}"
 : "${SKIP_EVAL_BEFORE_TRAIN:=0}"
 

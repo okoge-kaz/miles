@@ -55,7 +55,10 @@ else
     rm -f "${CORPUS}"
     SRC="${DATASET_DIR}/wiki18-corpus/wiki-18.jsonl.gz"
     echo "decompressing wiki-18 corpus -> ${CORPUS}"
-    if gunzip -c "${SRC}" | head -c 512 | file - | grep -qi tar; then
+    # Ask tar directly. `file -` on a 512-byte fragment does not see the ustar
+    # magic reliably (it sits at offset 257 and needs the whole header block),
+    # which is how the first attempt silently took the plain-gunzip branch.
+    if tar -tzf "${SRC}" >/dev/null 2>&1; then
         echo "  (gzipped tar; extracting the jsonl member)"
         mkdir -p "${SEARCH_DIR}/_corpus_tmp"
         time tar -xzf "${SRC}" -C "${SEARCH_DIR}/_corpus_tmp"
@@ -68,7 +71,12 @@ else
         mv "${CORPUS}.partial" "${CORPUS}"
     fi
     du -h "${CORPUS}"
-    head -c 1 "${CORPUS}" | grep -q '{' || { echo "corpus does not start with JSON"; exit 1; }
+    # Remove the bad artifact rather than leaving it to look prepared next run.
+    head -c 1 "${CORPUS}" | grep -q '{' || {
+        echo "corpus does not start with JSON; removing ${CORPUS}"
+        rm -f "${CORPUS}"
+        exit 1
+    }
     echo "corpus lines: $(wc -l < "${CORPUS}")"
 fi
 
