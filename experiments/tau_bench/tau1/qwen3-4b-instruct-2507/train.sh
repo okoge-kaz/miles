@@ -35,11 +35,11 @@ CKPT_ARGS=(
 
 ROLLOUT_ARGS=(
    --prompt-data "${PROMPT_DATA}"
-   # tau1_mock.py emits one row per task: the task spec under `prompt`, the
-   # graded outcome under `label`. The episode itself is built by the generate
-   # function from tau-bench's env, not from the row.
-   --input-key prompt
-   --label-key label
+   # The "prompt" is a task *index*: generate_with_tau.py:140 does
+   # `task_index = int(sample.prompt)` and rebuilds the episode from tau-bench's
+   # own env. So no label key and no chat template -- the row carries an integer,
+   # not a conversation.
+   --input-key index
    --rollout-shuffle
    --num-rollout "${NUM_ROLLOUT}"
    --rollout-batch-size "${ROLLOUT_BATCH_SIZE}"
@@ -56,7 +56,9 @@ ROLLOUT_ARGS=(
    --num-steps-per-rollout "${NUM_STEPS_PER_ROLLOUT}"
    --balance-data
    --custom-generate-function-path generate_with_tau.generate
-   --custom-rm-path generate_with_tau.reward_func
+   # No --custom-rm-path: the generate function sets sample.reward itself from
+   # the environment's task-success check. Pointing a reward model at these
+   # samples would overwrite the only signal the episode produced.
 )
 if [[ "${DYNAMIC_SAMPLING:-1}" == "1" ]]; then
    ROLLOUT_ARGS+=(--dynamic-sampling-filter-path miles.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std)
@@ -72,15 +74,18 @@ else
    TELEMETRY_ARGS+=(--use-rollout-entropy)
 fi
 
-# tau-bench's own held-out task ids -- the same split every published TAU1
-# number uses, so this is a public benchmark rather than a split of our own.
+# tau-bench's own splits -- the same task ids every published TAU1 number uses,
+# so this is a public benchmark rather than a split of our own. Retail is the
+# training domain; airline is held out entirely, which makes it the transfer
+# measurement rather than an in-domain one.
 EVAL_ARGS=(
    --eval-interval 20
-   --n-samples-per-eval-prompt 4
+   --n-samples-per-eval-prompt 1
    --eval-max-response-len "${MAX_RESPONSE_LEN}"
+   --eval-input-key index
    --eval-prompt-data
-   tau1_retail  /data/tau-bench/tau1_retail_test.jsonl
-   tau1_airline /data/tau-bench/tau1_airline_test.jsonl
+   tau1_retail_test  /data/tau-bench/tau1_retail_test.jsonl
+   tau1_airline_test /data/tau-bench/tau1_airline_test.jsonl
 )
 
 PERF_ARGS=(

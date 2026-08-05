@@ -33,6 +33,11 @@ export PYTHONPATH="/root/miles/examples/experimental/search-r1:${PYTHONPATH:-}"
 # search as an empty observation, so a missing retriever does not crash the run,
 # it silently trains on unanswerable prompts.
 if [[ "${SLURM_NODEID:-0}" == "0" ]]; then
+    # Not in the image. faiss-cpu on purpose: the index is searched on CPU so the
+    # GPUs stay with the policy, and the GPU build would want its own CUDA stack.
+    pip install --no-input --quiet faiss-cpu fastapi uvicorn \
+        || { echo "retriever dep install failed"; exit 1; }
+
     python3 /root/miles/experiments/src/search_r1/retrieval_server.py \
         --index /data/search-r1/e5_Flat.index \
         --corpus /data/search-r1/wiki-18.jsonl \

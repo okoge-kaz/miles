@@ -45,13 +45,30 @@ else
 fi
 
 # --- 2. corpus: decompress ---------------------------------------------------
-if [[ -s "${CORPUS}" ]]; then
+# Despite the name, wiki-18.jsonl.gz is a gzipped *tar* (file(1): "POSIX tar
+# archive"), so `gunzip -c` yields tar framing rather than jsonl and every read
+# dies on a stray 0x80. Detect the container format instead of trusting the
+# extension.
+if [[ -s "${CORPUS}" ]] && head -c 1 "${CORPUS}" | grep -q '{'; then
     echo "skip corpus: ${CORPUS} exists ($(du -h "${CORPUS}" | cut -f1))"
 else
+    rm -f "${CORPUS}"
+    SRC="${DATASET_DIR}/wiki18-corpus/wiki-18.jsonl.gz"
     echo "decompressing wiki-18 corpus -> ${CORPUS}"
-    time gunzip -c "${DATASET_DIR}/wiki18-corpus/wiki-18.jsonl.gz" > "${CORPUS}.partial"
-    mv "${CORPUS}.partial" "${CORPUS}"
+    if gunzip -c "${SRC}" | head -c 512 | file - | grep -qi tar; then
+        echo "  (gzipped tar; extracting the jsonl member)"
+        mkdir -p "${SEARCH_DIR}/_corpus_tmp"
+        time tar -xzf "${SRC}" -C "${SEARCH_DIR}/_corpus_tmp"
+        MEMBER=$(find "${SEARCH_DIR}/_corpus_tmp" -type f -name "*.jsonl" | head -1)
+        [[ -n "${MEMBER}" ]] || { echo "no .jsonl inside the archive"; exit 1; }
+        mv "${MEMBER}" "${CORPUS}"
+        rm -rf "${SEARCH_DIR}/_corpus_tmp"
+    else
+        time gunzip -c "${SRC}" > "${CORPUS}.partial"
+        mv "${CORPUS}.partial" "${CORPUS}"
+    fi
     du -h "${CORPUS}"
+    head -c 1 "${CORPUS}" | grep -q '{' || { echo "corpus does not start with JSON"; exit 1; }
     echo "corpus lines: $(wc -l < "${CORPUS}")"
 fi
 

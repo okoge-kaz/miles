@@ -54,14 +54,29 @@ pip install --no-input --quiet -e . --no-deps
 pip install --no-input --quiet litellm
 
 cd /root/miles/examples/experimental/tau-bench
-# tau1_mock.py walks tau-bench own task lists and writes one row per task.
+# Generate beside the checkout, then copy out. Writing straight into /data made
+# get_env fail to find its task lists, so the proven invocation is kept and the
+# copy is a separate step; /root is ephemeral, hence the copy.
 python3 tau1_mock.py --local_dir /root/tau-bench/
 
+# tau1_mock.py names files per domain and split; the recipes want one training
+# file and one test file per domain. Retail is the larger domain and the one
+# tau-bench treats as canonical for training.
+mkdir -p /data/tau-bench
+cp -f /root/tau-bench/*_tasks.jsonl /data/tau-bench/
+cd /data/tau-bench
+cp -f retail_train_tasks.jsonl  tau1_train.jsonl
+cp -f retail_test_tasks.jsonl   tau1_retail_test.jsonl
+cp -f airline_test_tasks.jsonl  tau1_airline_test.jsonl
+
 echo "--- files produced ---"
-find /root/tau-bench -maxdepth 2 -name "*.jsonl" -newermt "-1 hour" -printf "  %8s %p\n"
+ls -la /data/tau-bench
+echo "--- one row ---"
+head -1 /data/tau-bench/tau1_train.jsonl | cut -c1-400
 '
 
 echo
-echo "copy the produced task files into ${TAU_DIR} and confirm:"
-echo "  tau1_train.jsonl  tau1_retail_test.jsonl  tau1_airline_test.jsonl"
-ls -la "${TAU_DIR}"
+for f in tau1_train.jsonl tau1_retail_test.jsonl tau1_airline_test.jsonl; do
+    [[ -s "${TAU_DIR}/${f}" ]] || { echo "MISSING ${TAU_DIR}/${f}"; exit 1; }
+    printf "  %-26s %6s rows\n" "${f}" "$(wc -l < "${TAU_DIR}/${f}")"
+done
