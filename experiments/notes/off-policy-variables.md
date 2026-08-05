@@ -182,6 +182,18 @@ off-policy looks better than it is. Compare at equal length, and record
 | temperature, KL coefficient | 1.0, 0 | matches DAPO |
 | parallelism, engine geometry, `MAX_TOKENS_PER_GPU`, `SGLANG_MEM_FRACTION` | tuned once per model, then frozen | throughput-only; moving them invalidates the wall-clock axis |
 
+### Seeds
+
+Run-to-run variance has not been measured, so no difference in this study can yet
+be called real. The **on-policy (colocated) runs carry the seed replicates**:
+several seeds at one configuration, from which the spread of the metric being
+compared is estimated once and applied to the whole sweep. Until that number
+exists, treat every ranking here as provisional — the throughput measurements in
+this session were five steps per configuration and already showed differences of
+that order between nominally identical shapes.
+
+`--seed` and `--rollout-seed` are the two knobs.
+
 ### Recorded, not swept
 
 The x-axis is wall-clock, since the question is GPU efficiency. Optimizer steps
