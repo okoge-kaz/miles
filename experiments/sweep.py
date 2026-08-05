@@ -70,6 +70,8 @@ TAG_ABBREV = {
     "ACTOR_NUM_NODES": "anodes",
     "ACTOR_GPUS_PER_NODE": "agpus",
     "ROLLOUT_NUM_GPUS": "rgpus",
+    "PAUSE_GENERATION_MODE": "pause",
+    "ADVANTAGE_ESTIMATOR": "adv",
 }
 
 _SAFE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -101,7 +103,10 @@ def tag_for(point: dict[str, str]) -> str:
     parts = []
     for name, value in point.items():
         abbrev = TAG_ABBREV.get(name, name.lower())
-        parts.append(f"{abbrev}{_SAFE.sub('-', value)}")
+        clean = _SAFE.sub("-", value)
+        # "lr1e-6" reads fine, "pausein_place" does not.
+        sep = "" if clean[:1].isdigit() else "-"
+        parts.append(f"{abbrev}{sep}{clean}")
     return "-".join(parts)
 
 
@@ -147,6 +152,9 @@ def resolve_batch_shape(env: dict[str, str], recipe: Path) -> str | None:
     if total % steps:
         return f"rollout_batch * n_samples = {total} is not divisible by num_steps {steps}"
     env["GLOBAL_BATCH_SIZE"] = str(total // steps)
+    # Recorded even when it came from the recipe's own default, so the printed
+    # grid and the manifest describe the whole batch shape rather than half of it.
+    env["NUM_STEPS_PER_ROLLOUT"] = str(steps)
     return None
 
 

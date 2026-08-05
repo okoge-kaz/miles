@@ -1,0 +1,24 @@
+# What happens to in-flight generation at a weight update. async only.
+#
+#   in_place   frozen and resumed on the KV cache built by the OLD weights.
+#              Pipeline-RL-style continuation: no re-prefill, cheapest, and the
+#              only mode that adds a mismatch source of its own.
+#   retract    returned to the waiting queue, KV flushed and recomputed under the
+#              new weights, generated tokens kept. miles' default.
+#   abort      terminated; _recycle -> reset_for_retry() discards the tokens
+#              (types.py:236) and the group is regenerated from scratch.
+#
+#   experiments/sweep.py --sweep experiments/sweeps/pause-mode.txt \
+#       --recipe math_async/dapo-math/qwen3-4b-instruct-2507 \
+#       -- -N 2 -p batch_short --time=02:00:00
+#
+# Crossed with the staleness bound, because the cost of a mode depends on how
+# often the interruption happens. 9 points.
+#
+# Read back per point: rollout/fully_async/{avg,max}_staleness,
+# aborted_groups_recycled, dump/mixed_version_frac, dump/mean_abs_lp_diff.
+
+PAUSE_GENERATION_MODE   in_place retract abort
+MAX_WEIGHT_STALENESS    1 2 1000000
+
+NUM_ROLLOUT             30

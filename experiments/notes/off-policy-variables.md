@@ -29,10 +29,32 @@ Checked against the source, because several combinations are rejected at startup
 | `--fully-async` **rejects** `--colocate` | `arguments.py:53` |
 | `--use-miles-dashboard` **requires** `--dump-details` | `dashboard/args.py:69` |
 
-**Partial rollout as an explicit flag exists only in the colocated path**, but
-the equivalent question is answered in async by a different knob —
-`--pause-generation-mode`, which is what decides the fate of in-flight
-generation at a weight update:
+### Two different interruptions, two different flags
+
+`--partial-rollout` and `--pause-generation-mode` are the same idea at two
+different boundaries, and they belong to two mutually exclusive execution modes.
+
+**`--partial-rollout` acts at the rollout-loop boundary, not at a weight
+update.** Once the colocated rollout loop has collected `rollout_batch_size`
+groups that passed the dynamic-sampling filter, it calls `abort()`
+(`inference_rollout_train.py:143`), which posts `/abort_request {abort_all:
+true}` to every engine and kills *all* remaining in-flight generation. What
+happens to those unfinished groups is the flag:
+
+* off — `continue`, the group is dropped on the floor
+  (`inference_rollout_train.py:39`)
+* on — `start_rollout_id` is stamped on every sample that has a response and the
+  group goes back into the data buffer (`:44-46`). Next rollout it is
+  resubmitted, and `generate_and_rm` continues from the tokens it already has,
+  because `sample.tokens` still contains the partial response
+
+Its trigger is *the rollout batch being satisfied*. It is cross-rollout-step
+carryover, and the KV cache is always gone by then (`abort_all`, plus
+`flush_cache` at the weight update), so a resumed sample always re-prefills.
+There is no `in_place` analogue in the colocated path.
+
+**`--pause-generation-mode` acts at the weight update, inside SGLang**, and is
+what decides the fate of in-flight generation there:
 
 | mode | in-flight requests | KV cache | tokens already generated |
 |---|---|---|---|
@@ -43,14 +65,23 @@ generation at a weight update:
 `_pause_and_prepare_engines` calls `flush_cache` for every mode except
 `in_place` (`update_weight/.../mixin.py:308-316`).
 
-So the three partial-rollout arms map onto `--pause-generation-mode` in the
-async task: `abort` = discard and regenerate, `retract` = continue with KV
-recompute, `in_place` = continue without it. `in_place` is the cheapest and the
-only one that introduces a *new* mismatch source, which makes it interesting
-next to the `--true-on-policy-mode` arm rather than redundant with it.
+Why the two never coexist:
 
-The `--partial-rollout` flag itself, and the "eliminate the train/rollout
-mismatch entirely" arm, remain **colocated only**.
+| | colocated (`math_sync`) | fully-async (`math_async`) |
+|---|---|---|
+| end of a rollout batch | `abort()` kills everything in flight; `--partial-rollout` decides carry-over vs discard | no such boundary — the worker generates continuously and nothing calls `abort()` |
+| weight update | nothing is generating by then, so the pause mode is moot | the *only* interruption; `--pause-generation-mode` decides |
+| flag available | `--partial-rollout` | `--pause-generation-mode` (`--partial-rollout` is rejected, `arguments.py:54`) |
+
+**Pipeline-RL-style continuation across a weight update is
+`--pause-generation-mode in_place`**: the request is frozen and resumed on the
+KV cache built by the previous weights, with no re-prefill. `retract` is the
+same continuation but pays a full KV recompute so the cache matches the new
+weights; `abort` throws the tokens away and regenerates. Those three are the
+arm, and they are **async-only** — the colocated path cannot express `in_place`
+at all, since its cache is flushed before any resumption.
+
+The "eliminate the train/rollout mismatch entirely" arm remains colocated only.
 
 ### Advantage estimator / algorithm
 
