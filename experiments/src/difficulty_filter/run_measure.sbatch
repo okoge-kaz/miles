@@ -21,7 +21,7 @@
 #   MAX_NEW_TOKENS   generation cap; MUST match the recipe    (24576)
 #                    --rollout-max-response-len
 #   CUSTOM_RM_PATH   dotted path to a custom verifier; wins over RM_TYPE
-#   EXTRA_PIP        comma-separated packages to install first (verifier deps)
+#   EXTRA_PIP        '+'-separated packages to install first (verifier deps)
 #   PREFLIGHT        strict | warn | off   (default strict)
 #   RM_TYPE          verifier; MUST match the recipe        (math)
 #                    `deepscaler` returns 0 unless the response contains
@@ -90,10 +90,11 @@ export PYTHONUNBUFFERED=1
 # allenai/IFBench at runtime and imports its evaluation_lib, which needs nltk and
 # friends; miles points at examples/eval_multi_task/requirements_ifbench.txt for
 # these but that file is not in this checkout, so they are named here instead.
-# Comma-separated: --export values cannot contain spaces, so sbatch would read a
-# space-separated list as a second argument and fail before the job is queued.
+# '+'-separated, not comma or space: sbatch --export treats commas as the
+# separator between VAR=VALUE pairs (a comma list silently delivers only the
+# first package) and a space ends the argument entirely.
 if [[ -n "\${EXTRA_PIP:-}" ]]; then
-    _pkgs=\$(echo \${EXTRA_PIP} | tr ',' ' ')
+    _pkgs=\$(echo \${EXTRA_PIP} | tr '+' ' ')
     echo \"installing verifier deps: \${_pkgs}\"
     pip install --no-input --quiet \${_pkgs} || { echo 'verifier dep install failed'; exit 1; }
 fi
