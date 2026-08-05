@@ -1,0 +1,47 @@
+# Multi-benchmark eval for the Search-R1 recipe.
+#
+#   --eval-config /root/miles/experiments/configs/eval_search_r1.yaml
+#
+# The seven QA sets Search-R1 itself reports, so a number here is comparable to
+# a published one rather than to a split of our own. All come from the staged
+# FlashRAG release; `golden_answers` is a list, which qa_em_format scores by
+# exact match against any member.
+#
+# Split roles:
+#   in-domain      nq, hotpotqa      -- the training distribution
+#   out-of-domain  triviaqa, popqa, 2wiki, musique, bamboogle
+# A run that lifts nq while bamboogle stays flat has learned the retriever's
+# quirks on the training distribution, not multi-hop QA.
+#
+# Cost: eval shares the training engines, and every sample is a multi-turn
+# episode with retrieval between turns, so this is far dearer per prompt than a
+# math eval. Hence avg@1 on capped subsets.
+#   7 sets x 500 x 1 = 3500 episodes per eval interval
+
+eval:
+  defaults:
+    n_samples_per_eval_prompt: 1
+    max_response_len: 512
+    top_p: 1.0
+    input_key: question
+    label_key: golden_answers
+    custom_generate_function_path: generate_with_search.generate
+    rm_type: null
+
+  datasets:
+    - name: nq
+      path: /data/flashrag-datasets/nq/test.jsonl@[0:500]
+    - name: hotpotqa
+      path: /data/flashrag-datasets/hotpotqa/dev.jsonl@[0:500]
+    - name: triviaqa
+      path: /data/flashrag-datasets/triviaqa/test.jsonl@[0:500]
+    - name: popqa
+      path: /data/flashrag-datasets/popqa/test.jsonl@[0:500]
+    - name: 2wikimultihopqa
+      path: /data/flashrag-datasets/2wikimultihopqa/dev.jsonl@[0:500]
+    - name: musique
+      path: /data/flashrag-datasets/musique/dev.jsonl@[0:500]
+    # 125 questions total, no cap. The hardest of the seven and the one that
+    # moves last.
+    - name: bamboogle
+      path: /data/flashrag-datasets/bamboogle/test.jsonl

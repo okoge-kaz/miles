@@ -24,6 +24,8 @@ the dataset ships them), over the first 1500 rows.
 | tool (conversational) | conv-tooluse (96,968) | BFCL, τ-bench | context only | dense | 3,365 / 4,368 / 7,005 | 96 / 260 / 121 | 0.314 | 88.0% |
 | SWE | SWE-Pivot-v1 | — | context only | dense | — | — | — | — |
 | code | competitive_coding (~41k) | LiveCodeBench-v6 | no | sparse: all tests pass | — | — | — | — |
+| **search QA** | searchr1-nq-hotpotqa | NQ, HotpotQA, TriviaQA, PopQA, 2Wiki, Musique, Bamboogle | **yes, true** | sparse: EM on the final answer | short question | ~512/turn | — | — |
+| **tau-bench** | tau1 retail + airline | tau1 retail/airline test | **yes, true** | sparse: end-of-episode task success | long policy doc | ~2k/turn | — | — |
 
 ## What "multi-turn" means here, and why it matters
 
@@ -50,6 +52,24 @@ dapo-math-17k, ReTool multi-turn    →  tool_multiturn recipe, --generate-max-t
 Same prompts, same answer, same verifier family — only the turn structure
 differs. Sweeping `--generate-max-turns` gives turn count as a clean independent
 variable.
+
+### Three shapes of "the environment answers"
+
+All three go through the same mechanism — `tool_call_utils.py:58-64` appends the
+observation's tokens with `loss_mask 0` and decoding resumes — but what comes
+back differs enough to change the rollout's cost profile entirely:
+
+| recipe | observation | length | rollout is bound by |
+|---|---|---|---|
+| ReTool | Python stdout | short (a number, a traceback) | decode |
+| Search-R1 | 3 wiki passages | **long** | **prefill** |
+| tau-bench | a user-simulator turn + mock tool rows | medium | **an external API round-trip** |
+
+The consequence for staleness: observations are not trained on, so the fraction
+of a trajectory that carries gradient falls as observations grow. Search-R1 is
+the extreme — most of the trajectory is retrieved text the policy never
+produced — and it is the only way to vary that ratio without also varying the
+task.
 
 ## Reward density, ordered
 
