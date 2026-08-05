@@ -87,15 +87,15 @@ fi
 
 GRPO_ARGS=(
    --advantage-estimator grpo
-   --use-kl-loss
-   --kl-loss-coef 0.00
-   --kl-loss-type low_var_kl
    --entropy-coef 0.00
    --eps-clip 0.2
    --eps-clip-high 0.28
    --use-tis
    --use-rollout-routing-replay
 )
+if awk "BEGIN{exit !(${KL_LOSS_COEF} != 0)}"; then
+   GRPO_ARGS+=(--use-kl-loss --kl-loss-coef "${KL_LOSS_COEF}" --kl-loss-type low_var_kl)
+fi
 
 OPTIMIZER_ARGS=(
    --optimizer adam
