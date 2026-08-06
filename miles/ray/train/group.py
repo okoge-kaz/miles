@@ -244,11 +244,15 @@ class RayTrainGroup:
         )
         return [item for sublist in cell_results for item in sublist]
 
-    async def save_model(self, rollout_id: int, force_sync: bool = False):
+    async def save_model(
+        self, rollout_id: int, force_sync: bool = False, *, write_dist: bool = True, write_hf: bool = True
+    ):
         """Save actor model. Only cell 0 saves to avoid file write conflicts."""
         # Catch with vanilla retry: cells w/ exceptions are auto marked errored, thus retry will find the next one
         await retry(
-            lambda _: self._execute_first_alive("save_model", rollout_id, force_sync=force_sync),
+            lambda _: self._execute_first_alive(
+                "save_model", rollout_id, force_sync=force_sync, write_dist=write_dist, write_hf=write_hf
+            ),
             max_attempts=_RETRY_MAX_ATTEMPTS,
         )
 

@@ -229,6 +229,31 @@ def should_run_periodic_action(
     return (step % interval == 0) or (num_rollout_per_epoch is not None and step % num_rollout_per_epoch == 0)
 
 
+def checkpoint_artifacts_due(
+    rollout_id: int,
+    *,
+    save_interval: int | None,
+    hf_save_interval: int | None,
+    num_rollout_per_epoch: int | None = None,
+    num_rollout: int | None = None,
+    external_save: bool = False,
+) -> tuple[bool, bool]:
+    """Which checkpoint artifacts this rollout owes: ``(write_dist, write_hf)``.
+
+    HF exports follow ``save_interval`` unless ``hf_save_interval`` is set, which
+    decouples them so an inference-only checkpoint can be exported far more often
+    than the much larger resumable distributed checkpoint. An external save
+    trigger forces the distributed checkpoint only -- it exists to make the run
+    resumable on demand.
+    """
+    write_dist = external_save or should_run_periodic_action(
+        rollout_id, save_interval, num_rollout_per_epoch, num_rollout
+    )
+    if hf_save_interval is None:
+        return write_dist, write_dist
+    return write_dist, should_run_periodic_action(rollout_id, hf_save_interval, num_rollout_per_epoch, num_rollout)
+
+
 async def as_completed_async(tasks):
     for coro in asyncio.as_completed(tasks):
         yield await coro

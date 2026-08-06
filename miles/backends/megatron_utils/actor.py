@@ -634,7 +634,16 @@ class MegatronTrainRayActor(TrainRayActor):
                 ray.get(get_multi_lora_controller().free_slot.remote(name))
 
     @timer
-    def save_model(self, rollout_id: int, force_sync: bool = False) -> None:
+    def save_model(
+        self, rollout_id: int, force_sync: bool = False, *, write_dist: bool = True, write_hf: bool = True
+    ) -> None:
+        """Write this rollout's checkpoint artifacts.
+
+        ``write_dist`` and ``write_hf`` select the artifacts independently so
+        ``--hf-save-interval`` can export inference checkpoints on a denser cadence
+        than the resumable distributed checkpoint. An HF-only save skips the
+        post-save hook, which is documented to receive a distributed checkpoint dir.
+        """
         self._heartbeat.bump()
         if self.args.debug_rollout_only:
             return
@@ -644,23 +653,24 @@ class MegatronTrainRayActor(TrainRayActor):
 
             maybe_finalize_async_save(blocking=True)
 
-        if is_multi_lora_enabled(self.args):
-            from miles.backends.megatron_utils.multi_lora_utils import save_due_adapter_checkpoints
+        if write_dist:
+            if is_multi_lora_enabled(self.args):
+                from miles.backends.megatron_utils.multi_lora_utils import save_due_adapter_checkpoints
 
-            if not save_due_adapter_checkpoints(self.args, self.model):
-                return
-        else:
-            save(rollout_id, self.model, self.optimizer, self.opt_param_scheduler)
+                if not save_due_adapter_checkpoints(self.args, self.model):
+                    return
+            else:
+                save(rollout_id, self.model, self.optimizer, self.opt_param_scheduler)
 
-        if force_sync and self.args.async_save:
-            maybe_finalize_async_save(blocking=True)
+            if force_sync and self.args.async_save:
+                maybe_finalize_async_save(blocking=True)
 
-        if self.args.save_hf is not None and self.role == "actor":
+        if write_hf and self.args.save_hf is not None and self.role == "actor":
             from miles.backends.megatron_utils.model import save_hf_model
 
             save_hf_model(self.args, rollout_id, self.model)
 
-        if self.args.custom_megatron_post_save_hook_path is not None and dist.get_rank() == 0:
+        if write_dist and self.args.custom_megatron_post_save_hook_path is not None and dist.get_rank() == 0:
             if self.args.async_save:
                 maybe_finalize_async_save(blocking=True)
 
@@ -671,7 +681,7 @@ class MegatronTrainRayActor(TrainRayActor):
             checkpoint_dir = get_checkpoint_name(self.args.save, rollout_id, return_base_dir=True)
             hf_checkpoint_dir = (
                 self.args.save_hf.format(rollout_id=rollout_id)
-                if self.args.save_hf is not None and self.role == "actor"
+                if write_hf and self.args.save_hf is not None and self.role == "actor"
                 else None
             )
             post_save_hook = load_function(self.args.custom_megatron_post_save_hook_path)

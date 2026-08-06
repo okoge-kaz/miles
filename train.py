@@ -13,7 +13,7 @@ from miles.utils.debug_utils.periodic_py_spy import maybe_start_periodic_pyspy_d
 from miles.utils.ft_utils.control_server.server import start_control_server
 from miles.utils.ft_utils.mini_ft_controller import maybe_start_mini_ft_controller
 from miles.utils.logging_utils import configure_logger
-from miles.utils.misc import should_run_periodic_action
+from miles.utils.misc import checkpoint_artifacts_due, should_run_periodic_action
 from miles.utils.tracking_utils.tracking import finish_tracking, init_tracking
 
 logger = logging.getLogger(__name__)
@@ -74,13 +74,13 @@ async def train(args):
         else:
             await actor_model.clear_memory()
 
-    async def save(rollout_id, force_sync=False):
+    async def save(rollout_id, force_sync=False, *, write_dist=True, write_hf=True):
         force_sync = force_sync or rollout_id == args.num_rollout - 1
 
         async def save_training_model(model):
             if args.use_critic and args.offload_train:
                 await model.onload()
-            await model.save_model(rollout_id, force_sync=force_sync)
+            await model.save_model(rollout_id, force_sync=force_sync, write_dist=write_dist, write_hf=write_hf)
             if args.use_critic and args.offload_train:
                 await model.offload()
 
@@ -88,7 +88,9 @@ async def train(args):
             await save_training_model(actor_model)
         if args.use_critic:
             await save_training_model(critic_model)
-        await rollout_manager.save.remote(rollout_id)
+        # Buffer state is only meaningful next to a resumable checkpoint.
+        if write_dist:
+            await rollout_manager.save.remote(rollout_id)
 
     # train loop.
     # note that for async training, one can change the position of the sync operation(ray.get).
@@ -119,10 +121,16 @@ async def train(args):
         remove_rollout_data_refs(args, rollout_data_pack)
 
         external_save = args.save_trigger_sentinel is not None and os.path.exists(args.save_trigger_sentinel)
-        if external_save or should_run_periodic_action(
-            rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout
-        ):
-            await save(rollout_id, force_sync=external_save)
+        write_dist, write_hf = checkpoint_artifacts_due(
+            rollout_id,
+            save_interval=args.save_interval,
+            hf_save_interval=args.hf_save_interval,
+            num_rollout_per_epoch=num_rollout_per_epoch,
+            num_rollout=args.num_rollout,
+            external_save=external_save,
+        )
+        if write_dist or write_hf:
+            await save(rollout_id, force_sync=external_save, write_dist=write_dist, write_hf=write_hf)
             if external_save:
                 os.remove(args.save_trigger_sentinel)
 

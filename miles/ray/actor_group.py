@@ -108,9 +108,11 @@ class RayTrainGroup:
             external_data=external_data,
         )
 
-    async def save_model(self, rollout_id, force_sync=False):
+    async def save_model(self, rollout_id, force_sync=False, *, write_dist=True, write_hf=True):
         """Save actor model"""
-        await self._broadcast("save_model", rollout_id, force_sync=force_sync)
+        await self._broadcast(
+            "save_model", rollout_id, force_sync=force_sync, write_dist=write_dist, write_hf=write_hf
+        )
 
     async def update_weights(self, rollout_id: int | None = None):
         """Broadcast weights from rank 0 to all other ranks."""

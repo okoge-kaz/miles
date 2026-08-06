@@ -1158,6 +1158,17 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--hf-save-interval",
+                type=int,
+                default=None,
+                help=(
+                    "Rollout interval for HuggingFace exports, independent of `--save-interval`. "
+                    "When unset, HF exports follow `--save-interval` as before. Set it lower than "
+                    "`--save-interval` to get frequent inference-only checkpoints without paying for "
+                    "the much larger resumable distributed checkpoint at the same cadence."
+                ),
+            )
+            parser.add_argument(
                 "--save-trigger-sentinel",
                 type=str,
                 default=None,
@@ -1909,6 +1920,20 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "--no-dump-train-data to keep the dashboard collector, the rollout "
                     "dumps and the trajectory sidecars while dropping them; the token "
                     "view and the train-side columns are unavailable without them."
+                ),
+            )
+            parser.add_argument(
+                "--dump-policy-loss-debug",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help=(
+                    "Whether --dump-details also writes the per-call policy-loss tensors "
+                    "under policy_loss_debug/. One file per micro-batch per rank, so it "
+                    "scales with training calls rather than rollout steps and dominates "
+                    "the dump: measured 1.17 GB in 2512 files over 12 rollout steps of a "
+                    "4B run, against 287 MB for the rollout dumps over the same steps. "
+                    "Pass --no-dump-policy-loss-debug when the run is not being debugged "
+                    "for a loss-level discrepancy."
                 ),
             )
             parser.add_argument(
@@ -2755,6 +2780,9 @@ def miles_validate_args(args):
     if args.save_interval is not None:
         assert args.save is not None, "'--save' is required when save_interval is set."
 
+    if args.hf_save_interval is not None:
+        assert args.save_hf is not None, "'--save-hf' is required when hf_save_interval is set."
+
     if args.save_trigger_sentinel is not None:
         assert args.save is not None, "'--save' is required when save_trigger_sentinel is set."
 
@@ -3207,6 +3235,7 @@ def _maybe_apply_dumper_overrides(args) -> None:
     args.save = None
     args.save_interval = None
     args.save_retain_interval = None
+    args.hf_save_interval = None
 
 
 def hf_validate_args(args, hf_config):
