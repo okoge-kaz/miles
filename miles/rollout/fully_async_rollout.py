@@ -58,31 +58,54 @@ def group_oldest_weight_version(group: Group) -> int | None:
     return min(versions) if versions else None
 
 
+# The endpoint carrying weight_version has been renamed twice across SGLang
+# versions, and a router that does not serve one answers 404 rather than
+# erroring, so the name has to be discovered instead of assumed. Newest first;
+# the one that answers is remembered.
+WEIGHT_VERSION_ENDPOINTS = ("/get_model_info", "/model_info", "/get_weight_version")
+
+
 class _CachedWeightVersion:
-    """Throttled query of the current engine weight version via the router's /model_info."""
+    """Throttled query of the current engine weight version via the router."""
 
     def __init__(self, ttl: float = 1.0):
         self._ttl = ttl
         self._value: int | None = None
         self._last_query = float("-inf")
         self._failures = 0
+        self._endpoint: str | None = None
 
     async def get(self, args) -> int | None:
         # Throttles failures too: the drain queries once per group, and an unreachable
         # router would otherwise cost every one of them the full timeout.
         if (time.monotonic() - self._last_query) < self._ttl:
             return self._value
-        url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/model_info"
+        base = f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
+        candidates = (self._endpoint,) if self._endpoint else WEIGHT_VERSION_ENDPOINTS
+        last_error: Exception | None = None
         try:
-            data = await asyncio.wait_for(get(url), timeout=WEIGHT_VERSION_QUERY_TIMEOUT_SECS)
-            self._value = int(data["weight_version"])
-            self._failures = 0
-        except (httpx.HTTPError, asyncio.TimeoutError, KeyError, TypeError, ValueError) as e:
-            # KeyError/TypeError/ValueError cover a /model_info payload without a usable
-            # weight_version: that is a configuration failure, not a transient one, and
-            # letting it raise here would take the whole drain down.
+            for endpoint in candidates:
+                try:
+                    data = await asyncio.wait_for(
+                        get(f"{base}{endpoint}"), timeout=WEIGHT_VERSION_QUERY_TIMEOUT_SECS
+                    )
+                    self._value = int(data["weight_version"])
+                    self._endpoint = endpoint
+                    self._failures = 0
+                    return self._value
+                except (httpx.HTTPStatusError, KeyError, TypeError, ValueError) as e:
+                    # The endpoint answered but is not the right one: a 404 for a name
+                    # this build does not serve, or a payload with no usable
+                    # weight_version. Both mean "try the next name".
+                    last_error = e
+                except (httpx.HTTPError, asyncio.TimeoutError) as e:
+                    # The router itself is unreachable, so every other name is too.
+                    # Probing them would multiply the timeout by the endpoint count on
+                    # a path that already runs once per group.
+                    last_error = e
+                    break
             self._failures += 1
-            self._warn_on_failure(url, e)
+            self._warn_on_failure(f"{base}{{{','.join(candidates)}}}", last_error)
         finally:
             # Stamped on completion, so a router slower than the TTL still gets throttled.
             self._last_query = time.monotonic()

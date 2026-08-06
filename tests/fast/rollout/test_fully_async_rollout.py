@@ -187,6 +187,36 @@ async def test_wasted_token_accounting(monkeypatch):
     assert output.metrics["rollout/fully_async/wasted_token_frac"] == pytest.approx(0.5)
 
 
+async def test_weight_version_endpoint_is_discovered_not_assumed(monkeypatch):
+    """A 404 on one endpoint name must fall through to the next.
+
+    SGLang renamed this endpoint twice, and a router that does not serve a given
+    name answers 404 rather than erroring. Assuming one name made the cap silently
+    unenforceable on a build that serves another: job 15204795 logged 285 failures
+    against /model_info while /get_model_info returned weight_version fine.
+    """
+    seen = []
+
+    async def only_get_model_info(url, *args, **kwargs):
+        seen.append(url)
+        if url.endswith("/get_model_info"):
+            return {"weight_version": "4"}
+        raise httpx.HTTPStatusError("404", request=None, response=None)
+
+    monkeypatch.setattr(fully_async, "get", only_get_model_info)
+    cache = fully_async._CachedWeightVersion()
+    args = make_args(max_weight_staleness=2)
+
+    assert await cache.get(args) == 4
+    assert any(u.endswith("/get_model_info") for u in seen)
+
+    # The working name is remembered, so later queries do not re-probe the others.
+    cache._last_query = float("-inf")
+    seen.clear()
+    assert await cache.get(args) == 4
+    assert [u.rsplit("/", 1)[-1] for u in seen] == ["get_model_info"]
+
+
 async def test_unreachable_router_disables_the_cap_loudly(monkeypatch, caplog):
     """A router that never answers must not fail silently.
 
@@ -364,6 +394,8 @@ async def test_weight_version_throttles_failed_queries(monkeypatch):
     monkeypatch.setattr(fully_async, "get", unreachable_router)
     args = make_args()
 
+    # One probe, not one per candidate endpoint: an unreachable router means every
+    # name is unreachable, so discovery stops at the first connection error.
     throttled = fully_async._CachedWeightVersion(ttl=60.0)
     assert await throttled.get(args) is None
     assert await throttled.get(args) is None
