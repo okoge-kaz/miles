@@ -162,6 +162,66 @@ async def test_stale_group_recycled(monkeypatch):
     assert data_source.recycled == [stale]
     assert output.metrics["rollout/fully_async/stale_groups_recycled"] == 1
     assert output.metrics["rollout/fully_async/max_staleness"] == 5
+    # The reference version the staleness is a difference against: without it, a
+    # missing staleness metric cannot be told apart from a router that never answered.
+    assert output.metrics["rollout/fully_async/current_weight_version"] == 10
+    # Two groups were examined: the scripted one at version 5, then a fresh one at 10.
+    assert output.metrics["rollout/fully_async/staleness_num_groups"] == 2
+    assert output.metrics["rollout/fully_async/staleness_p50"] == pytest.approx(2.5)
+    assert output.metrics["rollout/fully_async/staleness_frac_zero"] == pytest.approx(0.5)
+    assert output.metrics["rollout/fully_async/staleness_frac_at_bound"] == pytest.approx(0.5)
+    # Tokens counted before reset_for_retry cleared them.
+    assert output.metrics["rollout/fully_async/stale_tokens"] == N_SAMPLES_PER_PROMPT
+
+
+async def test_wasted_token_accounting(monkeypatch):
+    aborted = make_group(1, status=Sample.Status.ABORTED)
+    data_source = FakeDataSource(scripted=[aborted])
+    fn = make_fn(monkeypatch, make_args(rollout_batch_size=1), data_source)
+
+    output = await fn(RolloutFnTrainInput(rollout_id=0))
+
+    # response_length is 1 per sample in make_group, so the counts are sample counts.
+    assert output.metrics["rollout/fully_async/aborted_tokens"] == N_SAMPLES_PER_PROMPT
+    assert output.metrics["rollout/fully_async/kept_tokens"] == N_SAMPLES_PER_PROMPT
+    assert output.metrics["rollout/fully_async/wasted_token_frac"] == pytest.approx(0.5)
+
+
+async def test_unreachable_router_disables_the_cap_loudly(monkeypatch, caplog):
+    """A router that never answers must not fail silently.
+
+    ``_CachedWeightVersion.get`` returning None skips the staleness branch entirely,
+    so ``--max-weight-staleness`` enforces nothing and no staleness metric is emitted.
+    A run then looks like a staleness arm while training fully on-policy.
+    """
+
+    async def unreachable(url, *args, **kwargs):
+        raise httpx.ConnectError("no router")
+
+    monkeypatch.setattr(fully_async, "get", unreachable)
+    fn = make_fn(monkeypatch, make_args(rollout_batch_size=1, max_weight_staleness=2), FakeDataSource())
+
+    with caplog.at_level("WARNING"):
+        output = await fn(RolloutFnTrainInput(rollout_id=0))
+
+    assert "--max-weight-staleness cannot be enforced" in caplog.text
+    assert "rollout/fully_async/avg_staleness" not in output.metrics
+    assert "rollout/fully_async/current_weight_version" not in output.metrics
+
+
+async def test_malformed_model_info_does_not_kill_the_drain(monkeypatch):
+    """A /model_info payload without weight_version used to raise KeyError out of
+    the drain; it is a configuration failure and must degrade, not crash."""
+
+    async def no_version(url, *args, **kwargs):
+        return {}
+
+    monkeypatch.setattr(fully_async, "get", no_version)
+    fn = make_fn(monkeypatch, make_args(rollout_batch_size=1, max_weight_staleness=2), FakeDataSource())
+
+    output = await fn(RolloutFnTrainInput(rollout_id=0))
+
+    assert len(output.samples) == 1
 
 
 async def test_worker_error_propagates(monkeypatch):

@@ -20,6 +20,7 @@ import time
 from collections.abc import Iterator
 
 import httpx
+import numpy as np
 
 from miles.rollout.base_types import RolloutFnConstructorInput, RolloutFnInput, RolloutFnOutput, RolloutFnTrainOutput
 from miles.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter
@@ -64,6 +65,7 @@ class _CachedWeightVersion:
         self._ttl = ttl
         self._value: int | None = None
         self._last_query = float("-inf")
+        self._failures = 0
 
     async def get(self, args) -> int | None:
         # Throttles failures too: the drain queries once per group, and an unreachable
@@ -74,13 +76,69 @@ class _CachedWeightVersion:
         try:
             data = await asyncio.wait_for(get(url), timeout=WEIGHT_VERSION_QUERY_TIMEOUT_SECS)
             self._value = int(data["weight_version"])
-        except (httpx.HTTPError, asyncio.TimeoutError) as e:
-            # Transient router unavailability; the staleness filter is best-effort.
-            logger.debug(f"Failed to query engine weight version: {e}")
+            self._failures = 0
+        except (httpx.HTTPError, asyncio.TimeoutError, KeyError, TypeError, ValueError) as e:
+            # KeyError/TypeError/ValueError cover a /model_info payload without a usable
+            # weight_version: that is a configuration failure, not a transient one, and
+            # letting it raise here would take the whole drain down.
+            self._failures += 1
+            self._warn_on_failure(url, e)
         finally:
             # Stamped on completion, so a router slower than the TTL still gets throttled.
             self._last_query = time.monotonic()
         return self._value
+
+    def _warn_on_failure(self, url: str, error: Exception) -> None:
+        """Loud while no version has ever been read, quiet once one has.
+
+        Until the first success there is no reference version, so
+        ``--max-weight-staleness`` silently enforces nothing and no staleness metric
+        is emitted -- a run can look like a staleness arm while training fully
+        on-policy. That is worth a warning every time. After a success the cached
+        value keeps the filter working across a blip, so back off to avoid a warning
+        per group.
+        """
+        if self._value is None:
+            logger.warning(
+                f"Cannot read the engine weight version from {url} ({error!r}). "
+                "--max-weight-staleness cannot be enforced and no staleness metric will be "
+                "emitted until this succeeds."
+            )
+        elif self._failures & (self._failures - 1) == 0:  # 1, 2, 4, 8, ... consecutive
+            logger.warning(f"Weight version query failed {self._failures}x, using cached value: {error!r}")
+
+
+def group_response_tokens(group: Group) -> int:
+    """Response tokens generated for a group.
+
+    Call it *before* recycling: ``Sample.reset_for_retry`` clears ``tokens`` and
+    ``response`` (``types.py:236``), so a count taken afterwards is always zero.
+    """
+    return sum(sample.response_length for sample in _iter_samples(group))
+
+
+def _staleness_metrics(values: list[int], bound: int | None) -> dict[str, float]:
+    """P(L) reduced to bounded scalars: the logger takes scalars, not histograms.
+
+    Percentiles rather than a mean alone because the tail is the quantity of
+    interest -- a mean of 0.4 with a p99 of 12 and a mean of 0.4 with a p99 of 1
+    are different training regimes. ``frac_at_bound`` says whether the configured
+    cap is binding at all; a plateau in a results table is otherwise easy to read
+    as insensitivity to staleness when the run was simply never stale.
+    """
+    array = np.asarray(values, dtype=float)
+    metrics = {
+        "avg_staleness": float(array.mean()),
+        "max_staleness": float(array.max()),
+        "staleness_p50": float(np.percentile(array, 50)),
+        "staleness_p90": float(np.percentile(array, 90)),
+        "staleness_p99": float(np.percentile(array, 99)),
+        "staleness_frac_zero": float((array <= 0).mean()),
+        "staleness_num_groups": float(array.size),
+    }
+    if bound is not None:
+        metrics["staleness_frac_at_bound"] = float((array >= bound).mean())
+    return metrics
 
 
 class FullyAsyncRolloutFn:
@@ -186,6 +244,13 @@ class FullyAsyncRolloutFn:
         aborted_groups_recycled = 0
         stale_groups_recycled = 0
         staleness_values: list[int] = []
+        current_version: int | None = None
+        # Generation that was produced and then thrown away. Counted in tokens, not
+        # groups, because that is the unit a sample-efficiency claim is made in, and
+        # because the three ways to waste generation cost wildly different amounts.
+        aborted_tokens = 0
+        stale_tokens = 0
+        filtered_tokens = 0
         metric_gatherer = MetricGatherer()
         do_print = True
 
@@ -195,6 +260,7 @@ class FullyAsyncRolloutFn:
 
             # A weight update paused generation mid-group: return it for re-sampling.
             if any(s.status == Sample.Status.ABORTED for s in _iter_samples(group)):
+                aborted_tokens += group_response_tokens(group)
                 self._recycle(prompt_group)
                 aborted_groups_recycled += 1
                 continue
@@ -202,10 +268,13 @@ class FullyAsyncRolloutFn:
             if args.max_weight_staleness is not None:
                 oldest = group_oldest_weight_version(group)
                 current = await self._weight_version.get(args)
+                if current is not None:
+                    current_version = current
                 if oldest is not None and current is not None:
                     staleness = current - oldest
                     staleness_values.append(staleness)
                     if staleness > args.max_weight_staleness:
+                        stale_tokens += group_response_tokens(group)
                         self._recycle(prompt_group)
                         stale_groups_recycled += 1
                         logger.info(
@@ -217,6 +286,7 @@ class FullyAsyncRolloutFn:
             filter_output = call_dynamic_filter(self._dynamic_filter, args, group)
             if not filter_output.keep:
                 # Dropped, not recycled: no usable gradient signal.
+                filtered_tokens += group_response_tokens(group)
                 metric_gatherer.on_dynamic_filter_drop(reason=filter_output.reason)
                 continue
 
@@ -241,15 +311,31 @@ class FullyAsyncRolloutFn:
         if self._sample_filter is not None:
             self._sample_filter(args, data)
 
+        kept_tokens = sum(group_response_tokens(group) for group in data)
+        wasted_tokens = aborted_tokens + stale_tokens + filtered_tokens
         metrics = {
             "rollout/fully_async/queue_size": self._output.qsize(),
             "rollout/fully_async/aborted_groups_recycled": aborted_groups_recycled,
             "rollout/fully_async/stale_groups_recycled": stale_groups_recycled,
+            "rollout/fully_async/aborted_tokens": aborted_tokens,
+            "rollout/fully_async/stale_tokens": stale_tokens,
+            "rollout/fully_async/dynamic_filter_tokens": filtered_tokens,
+            "rollout/fully_async/kept_tokens": kept_tokens,
+            "rollout/fully_async/wasted_token_frac": (
+                wasted_tokens / (wasted_tokens + kept_tokens) if wasted_tokens + kept_tokens else 0.0
+            ),
             **metric_gatherer.collect(),
         }
+        if current_version is not None:
+            # Logged next to the staleness itself: staleness is a difference against
+            # this version, and without it a missing staleness metric is impossible to
+            # tell apart from a router that never answered.
+            metrics["rollout/fully_async/current_weight_version"] = current_version
         if staleness_values:
-            metrics["rollout/fully_async/avg_staleness"] = sum(staleness_values) / len(staleness_values)
-            metrics["rollout/fully_async/max_staleness"] = max(staleness_values)
+            metrics |= {
+                f"rollout/fully_async/{name}": value
+                for name, value in _staleness_metrics(staleness_values, args.max_weight_staleness).items()
+            }
 
         return RolloutFnTrainOutput(samples=data, metrics=metrics)
 

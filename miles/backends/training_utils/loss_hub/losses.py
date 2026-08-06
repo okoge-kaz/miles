@@ -88,6 +88,12 @@ def policy_loss_function(
         "entropy_loss", "pg_clipfrac", "ppo_kl". Additional keys "kl_loss",
         "tis", "ois", "tis_clipfrac" are included when the respective features
         are enabled.
+
+        Two ESS metrics are reported and they answer different questions.
+        "ess_ratio" is built from `ppo_kl` and so covers the PPO inner loop over
+        `--num-steps-per-rollout` minibatch updates; at one step per rollout it is
+        identically 1.0. "rollout_ess_ratio" is built from
+        `pi_train / pi_rollout` and is the one that responds to policy lag.
     """
     parallel_state = get_parallel_state()
     advantages = torch.cat(batch["advantages"], dim=0)
@@ -311,8 +317,32 @@ def policy_loss_function(
     train_scored_log_probs = old_log_probs
     train_rollout_logprob_abs_diff = None
     train_rollout_kl = None
+    rollout_ess_ratio = None
     if "rollout_log_probs" in batch and batch["rollout_log_probs"]:
         rollout_log_probs = torch.cat(batch["rollout_log_probs"], dim=0)
+
+        # ESS of w = pi_train / pi_rollout, the importance weights policy lag actually
+        # moves. Distinct from "ess_ratio" above, which is built from ppo_kl and so
+        # measures the PPO inner loop across --num-steps-per-rollout minibatch updates;
+        # at one step per rollout that is identically 1.0 no matter how stale the
+        # weights were. ESS is reported rather than the mean ratio because it is a
+        # sequence-level nonlinear functional: a few catastrophic tokens collapse it
+        # while barely moving "tis_abs".
+        rollout_neg_log_ratio = torch.where(
+            active_tokens,
+            torch.nan_to_num(rollout_log_probs - train_scored_log_probs, nan=0.0, posinf=0.0, neginf=0.0),
+            rollout_log_probs.new_zeros(()),
+        )
+        rollout_ess_ratio = compute_ess_ratio_contribution(
+            ppo_kl=rollout_neg_log_ratio,
+            loss_masks=batch["loss_masks"],
+            total_lengths=total_lengths,
+            response_lengths=response_lengths,
+            qkv_format=args.qkv_format,
+            max_seq_lens=max_seq_lens,
+            calculate_per_token_loss=args.calculate_per_token_loss,
+        ).squeeze()
+
         abs_diff = (train_scored_log_probs - rollout_log_probs).abs()
         abs_diff = torch.where(
             active_tokens,
@@ -343,6 +373,8 @@ def policy_loss_function(
         reported_loss["train_rollout_logprob_abs_diff"] = train_rollout_logprob_abs_diff.clone().detach()
     if train_rollout_kl is not None:
         reported_loss["train_rollout_kl"] = train_rollout_kl.clone().detach()
+    if rollout_ess_ratio is not None:
+        reported_loss["rollout_ess_ratio"] = rollout_ess_ratio.clone().detach()
 
     if args.use_kl_loss:
         reported_loss["kl_loss"] = kl_loss.clone().detach()

@@ -27,6 +27,22 @@ _SNAPSHOT_KEYS = (
     "hf_checkpoint",
     "sglang_max_running_requests",
     "sglang_mem_fraction_static",
+    # Off-policy knobs. A run has to be attributable to a cell of an experiment
+    # grid from its own artifacts; without these the only record of what a run
+    # was is its directory name, which is built from a subset of them.
+    "seed",
+    "rollout_seed",
+    "lr",
+    "max_weight_staleness",
+    "pause_generation_mode",
+    "num_steps_per_rollout",
+    "rollout_max_response_len",
+    "advantage_estimator",
+    "eps_clip",
+    "eps_clip_high",
+    "use_tis",
+    "fully_async",
+    "true_on_policy_mode",
 )
 
 
