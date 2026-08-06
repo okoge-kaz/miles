@@ -3,9 +3,18 @@
 #   --eval-config /root/miles/experiments/configs/eval_search_r1.yaml
 #
 # The seven QA sets Search-R1 itself reports, so a number here is comparable to
-# a published one rather than to a split of our own. All come from the staged
-# FlashRAG release; `golden_answers` is a list, which qa_em_format scores by
-# exact match against any member.
+# a published one rather than to a split of our own.
+#
+# These point at files built by `src/search_r1/build_eval.py`, not at the raw
+# FlashRAG jsonl. The raw files carry a bare `question` and a bare
+# `golden_answers` list, and both are wrong here:
+#   * generate_with_search sends `sample.prompt` verbatim -- no template is
+#     applied in the rollout -- so a bare question never mentions <search> and
+#     the retriever is silently never used.
+#   * reward_func reads label["ground_truth"]["target"]; a bare list raises
+#     TypeError: list indices must be integers or slices, not str.
+# The converter emits the training parquet's exact shape, so eval renders its
+# prompts the same way training does.
 #
 # Split roles:
 #   in-domain      nq, hotpotqa      -- the training distribution
@@ -23,25 +32,27 @@ eval:
     n_samples_per_eval_prompt: 1
     max_response_len: 512
     top_p: 1.0
-    input_key: question
-    label_key: golden_answers
+    # Same keys as training -- an eval that reads different fields is measuring
+    # a different task.
+    input_key: prompt
+    label_key: reward_model
     custom_generate_function_path: generate_with_search.generate
     rm_type: null
 
   datasets:
     - name: nq
-      path: /data/flashrag-datasets/nq/test.jsonl@[0:500]
+      path: /data/search-r1/eval/nq-miles.jsonl
     - name: hotpotqa
-      path: /data/flashrag-datasets/hotpotqa/dev.jsonl@[0:500]
+      path: /data/search-r1/eval/hotpotqa-miles.jsonl
     - name: triviaqa
-      path: /data/flashrag-datasets/triviaqa/test.jsonl@[0:500]
+      path: /data/search-r1/eval/triviaqa-miles.jsonl
     - name: popqa
-      path: /data/flashrag-datasets/popqa/test.jsonl@[0:500]
+      path: /data/search-r1/eval/popqa-miles.jsonl
     - name: 2wikimultihopqa
-      path: /data/flashrag-datasets/2wikimultihopqa/dev.jsonl@[0:500]
+      path: /data/search-r1/eval/2wikimultihopqa-miles.jsonl
     - name: musique
-      path: /data/flashrag-datasets/musique/dev.jsonl@[0:500]
+      path: /data/search-r1/eval/musique-miles.jsonl
     # 125 questions total, no cap. The hardest of the seven and the one that
     # moves last.
     - name: bamboogle
-      path: /data/flashrag-datasets/bamboogle/test.jsonl
+      path: /data/search-r1/eval/bamboogle-miles.jsonl

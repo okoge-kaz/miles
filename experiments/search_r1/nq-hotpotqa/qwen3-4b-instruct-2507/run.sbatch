@@ -49,6 +49,11 @@ PROMPT_DATA=/data/searchr1-nq-hotpotqa/train.parquet
 
 : "${SEARCH_MAX_TURNS:=3}"
 : "${SEARCH_TOPK:=3}"
+# Searches in flight against the retriever. The upstream default is 256, which is
+# far past what one uvicorn worker doing brute-force search over a 21M-vector flat
+# index can accept: the listen backlog overflows and aiohttp reports it as
+# ECONNREFUSED / ECONNRESET, i.e. as empty observations rather than as an error.
+: "${SEARCH_CONCURRENCY:=16}"
 : "${RETRIEVER_PORT:=8000}"
 
 : "${ACTOR_NUM_NODES:=1}"
@@ -71,14 +76,16 @@ PROMPT_DATA=/data/searchr1-nq-hotpotqa/train.parquet
 : "${NUM_ROLLOUT:=3000}"
 : "${DYNAMIC_SAMPLING:=1}"
 : "${DUMP_TRAIN_DATA:=0}"
+# Raise on a bring-up run: eval here is the whole benchmark, not a sample of it.
+: "${EVAL_INTERVAL:=20}"
 
 export MODEL_NAME ROLLOUT_MODE DATASET_TAG PROMPT_DATA LR MAX_RESPONSE_LEN NUM_STEPS_PER_ROLLOUT
-export ROLLOUT_MAX_CONTEXT_LEN SEARCH_MAX_TURNS SEARCH_TOPK RETRIEVER_PORT
+export ROLLOUT_MAX_CONTEXT_LEN SEARCH_MAX_TURNS SEARCH_TOPK SEARCH_CONCURRENCY RETRIEVER_PORT
 export ACTOR_NUM_NODES ACTOR_GPUS_PER_NODE ROLLOUT_NUM_GPUS
 export TENSOR_PARALLEL_SIZE CONTEXT_PARALLEL_SIZE EXPERT_PARALLEL_SIZE MAX_TOKENS_PER_GPU
 export ROLLOUT_NUM_GPUS_PER_ENGINE SGLANG_MEM_FRACTION
 export ROLLOUT_BATCH_SIZE N_SAMPLES_PER_PROMPT GLOBAL_BATCH_SIZE NUM_ROLLOUT
-export DYNAMIC_SAMPLING DUMP_TRAIN_DATA
+export DYNAMIC_SAMPLING DUMP_TRAIN_DATA EVAL_INTERVAL
 
 source "${REPO_ROOT}/experiments/common/run_identity.sh"
 export RUN_NAME CONFIG_TAG CKPT_PATH

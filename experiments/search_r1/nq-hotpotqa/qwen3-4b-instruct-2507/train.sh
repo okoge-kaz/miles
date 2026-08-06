@@ -32,6 +32,10 @@ export PYTHONPATH="/root/miles/examples/experimental/search-r1:${PYTHONPATH:-}"
 # It has to be up before the first rollout: generate_with_search treats a failed
 # search as an empty observation, so a missing retriever does not crash the run,
 # it silently trains on unanswerable prompts.
+# The address the rollout uses. RAY_HEAD_IP is node 0's routable address, which
+# is what a Ray actor can reach; loopback is not, even co-located.
+RETRIEVER_HOST="${RAY_HEAD_IP:-127.0.0.1}"
+
 if [[ "${SLURM_NODEID:-0}" == "0" ]]; then
     # Not in the image. faiss-cpu on purpose: the index is searched on CPU so the
     # GPUs stay with the policy, and the GPU build would want its own CUDA stack.
@@ -47,13 +51,33 @@ if [[ "${SLURM_NODEID:-0}" == "0" ]]; then
     RETRIEVER_PID=$!
     trap 'kill ${RETRIEVER_PID} 2>/dev/null || true' EXIT
 
-    echo "waiting for retriever on :${RETRIEVER_PORT}"
+    echo "waiting for retriever on ${RETRIEVER_HOST}:${RETRIEVER_PORT}"
     for _ in $(seq 1 240); do
-        curl -sf "http://127.0.0.1:${RETRIEVER_PORT}/health" >/dev/null 2>&1 && break
+        curl -sf "http://${RETRIEVER_HOST}:${RETRIEVER_PORT}/health" >/dev/null 2>&1 && break
         kill -0 "${RETRIEVER_PID}" 2>/dev/null || { echo "retriever died during startup"; exit 1; }
         sleep 10
     done
-    curl -sf "http://127.0.0.1:${RETRIEVER_PORT}/health" >/dev/null || { echo "retriever never came up"; exit 1; }
+    curl -sf "http://${RETRIEVER_HOST}:${RETRIEVER_PORT}/health" >/dev/null || { echo "retriever never came up"; exit 1; }
+
+    # /health only says the process is alive. Probe the real endpoint on the
+    # address the rollout will use, and require passages back.
+    #
+    # This check exists because the failure it catches is silent: a bring-up run
+    # on 2026-08-05 had a healthy retriever that the Ray actors could not reach
+    # (loopback bind), and every search returned an empty observation. The run
+    # completed, dynamic sampling was happy, and reward came back 0.328 -- earned
+    # entirely from the model's parametric memory, with the retriever unused.
+    # Without this probe that looks like a working Search-R1 run.
+    _probe=$(curl -sf -X POST "http://${RETRIEVER_HOST}:${RETRIEVER_PORT}/retrieve" \
+        -H 'Content-Type: application/json' \
+        -d '{"queries": ["who won the nobel prize in physics 1901"], "topk": 3}' || true)
+    case "${_probe}" in
+        *contents*|*document*|*text*) echo "retriever probe ok" ;;
+        *) echo "retriever returned no passages from ${RETRIEVER_HOST}:${RETRIEVER_PORT}"
+           echo "  response: ${_probe:0:300}"
+           echo "  a reachable-but-useless retriever trains on unanswerable prompts silently"
+           exit 1 ;;
+    esac
 fi
 
 CKPT_ARGS=(
@@ -67,8 +91,11 @@ CKPT_ARGS=(
 ROLLOUT_ARGS=(
    --prompt-data "${PROMPT_DATA}"
    # Search-R1's parquet carries the question under `prompt` and the answer set
-   # under `reward_model`, and the prompt is already a plain templated string --
-   # hence no --apply-chat-template here.
+   # under `reward_model`. `prompt` is a one-message chat *list*, not a string,
+   # so --apply-chat-template is required: without it data.py hands the raw list
+   # through untouched (data.py:220-226) and generate_with_search tokenizes a
+   # Python list as if it were text.
+   --apply-chat-template
    --input-key prompt
    --label-key reward_model
    --rollout-shuffle
@@ -96,6 +123,14 @@ fi
 TELEMETRY_ARGS=(
    --dump-details "${CKPT_PATH}/dump"
    --use-miles-dashboard
+   # Training-side entropy is a constant 0 without this: calculate_entropy is
+   # `entropy_coef != 0 or observe_training_entropy` (loss_hub/losses.py) and the
+   # coefficient is 0 here. Forward-only and detached, so no backward cost.
+   --observe-training-entropy
+   # policy_loss_debug/ is one file per micro-batch per rank, so it scales with
+   # training calls rather than rollout steps: 1.17 GB in 2512 files over 12
+   # rollout steps, against 287 MB of rollout dumps. Only a loss-level debug reads it.
+   --no-dump-policy-loss-debug
 )
 if [[ "${DUMP_TRAIN_DATA}" == "0" ]]; then
    TELEMETRY_ARGS+=(--no-dump-train-data)
@@ -106,9 +141,14 @@ fi
 # The seven FlashRAG QA sets Search-R1 reports, so the numbers are comparable to
 # published ones instead of to a held-out split of our own.
 EVAL_ARGS=(
-   --eval-interval 20
+   --eval-interval "${EVAL_INTERVAL}"
    --eval-config /root/miles/experiments/configs/eval_search_r1.yaml
 )
+# miles evaluates once before the first training step regardless of the interval,
+# so a bring-up run reaches the eval path before it has proved the training one.
+if [[ "${SKIP_EVAL_BEFORE_TRAIN:-0}" != "0" ]]; then
+   EVAL_ARGS+=(--skip-eval-before-train)
+fi
 
 PERF_ARGS=(
    --tensor-model-parallel-size "${TENSOR_PARALLEL_SIZE}"
@@ -173,10 +213,11 @@ RUNTIME_ENV_JSON="{
     \"PYTHONPATH\": \"/root/Megatron-LM/:/root/miles:/root/miles/examples/experimental/search-r1\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
     \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\",
-    \"SEARCH_R1_SEARCH_URL\": \"http://127.0.0.1:${RETRIEVER_PORT}/retrieve\",
+    \"SEARCH_R1_SEARCH_URL\": \"http://${RETRIEVER_HOST}:${RETRIEVER_PORT}/retrieve\",
     \"SEARCH_R1_MAX_TURNS\": \"${SEARCH_MAX_TURNS}\",
     \"SEARCH_R1_TOPK\": \"${SEARCH_TOPK}\",
-    \"no_proxy\": \"127.0.0.1\"
+    \"SEARCH_R1_SEARCH_CONCURRENCY\": \"${SEARCH_CONCURRENCY}\",
+    \"no_proxy\": \"${RETRIEVER_HOST},127.0.0.1,localhost\"
   }
 }"
 

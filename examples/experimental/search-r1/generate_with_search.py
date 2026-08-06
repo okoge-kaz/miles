@@ -2,6 +2,7 @@
 # This is a unified version supporting both local search and Google search, with optional log probability collection
 
 import asyncio
+import os
 import re
 
 from qa_em_format import compute_score_em
@@ -37,6 +38,29 @@ SEARCH_R1_CONFIGS = {
     "format_score": 0.2,
 }
 
+
+# Environment overrides, applied at import.
+#
+# Without these the dict above is the only way to configure a run, which means a
+# recipe cannot say where its retriever is: the URL stays 127.0.0.1 no matter what
+# the job exports. That is not a loud failure -- `search()` turns an unreachable
+# retriever into an empty observation, so the rollout completes, rewards come back
+# non-zero from the model's own knowledge, and nothing in the metrics says the
+# retriever was never used.
+def _env_int(name, default):
+    try:
+        return int(os.environ[name])
+    except (KeyError, ValueError):
+        return default
+
+
+SEARCH_R1_CONFIGS["max_turns"] = _env_int("SEARCH_R1_MAX_TURNS", SEARCH_R1_CONFIGS["max_turns"])
+SEARCH_R1_CONFIGS["topk"] = _env_int("SEARCH_R1_TOPK", SEARCH_R1_CONFIGS["topk"])
+SEARCH_R1_CONFIGS["search_concurrency"] = _env_int(
+    "SEARCH_R1_SEARCH_CONCURRENCY", SEARCH_R1_CONFIGS["search_concurrency"]
+)
+if os.environ.get("SEARCH_R1_SEARCH_URL"):
+    SEARCH_R1_CONFIGS["local"]["search_url"] = os.environ["SEARCH_R1_SEARCH_URL"]
 
 SEMAPHORE = asyncio.Semaphore(SEARCH_R1_CONFIGS["search_concurrency"])
 

@@ -124,7 +124,11 @@ def main():
     ap.add_argument("--corpus", required=True)
     ap.add_argument("--encoder", required=True)
     ap.add_argument("--port", type=int, default=8000)
-    ap.add_argument("--host", default="127.0.0.1")
+    # 0.0.0.0, not loopback. Ray actors did not reach a loopback-bound server
+    # even co-located on one node, and binding loopback also rules out ever
+    # putting the trainer on more than one node. The port is inside the job's
+    # container network, not on a public interface.
+    ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--topk", type=int, default=3)
     ap.add_argument("--encoder-device", default="cpu")
     ap.add_argument("--faiss-threads", type=int, default=32)

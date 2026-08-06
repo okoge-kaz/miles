@@ -67,6 +67,14 @@ fi
 TELEMETRY_ARGS=(
    --dump-details "${CKPT_PATH}/dump"
    --use-miles-dashboard
+   # Training-side entropy is a constant 0 without this: calculate_entropy is
+   # `entropy_coef != 0 or observe_training_entropy` (loss_hub/losses.py) and the
+   # coefficient is 0 here. Forward-only and detached, so no backward cost.
+   --observe-training-entropy
+   # policy_loss_debug/ is one file per micro-batch per rank, so it scales with
+   # training calls rather than rollout steps: 1.17 GB in 2512 files over 12
+   # rollout steps, against 287 MB of rollout dumps. Only a loss-level debug reads it.
+   --no-dump-policy-loss-debug
 )
 if [[ "${DUMP_TRAIN_DATA}" == "0" ]]; then
    TELEMETRY_ARGS+=(--no-dump-train-data)
@@ -79,7 +87,7 @@ fi
 # training domain; airline is held out entirely, which makes it the transfer
 # measurement rather than an in-domain one.
 EVAL_ARGS=(
-   --eval-interval 20
+   --eval-interval "${EVAL_INTERVAL}"
    --n-samples-per-eval-prompt 1
    --eval-max-response-len "${MAX_RESPONSE_LEN}"
    --eval-input-key index
@@ -87,6 +95,11 @@ EVAL_ARGS=(
    tau1_retail_test  /data/tau-bench/tau1_retail_test.jsonl
    tau1_airline_test /data/tau-bench/tau1_airline_test.jsonl
 )
+# miles evaluates once before the first training step regardless of the interval,
+# so a bring-up run reaches the eval path before it has proved the training one.
+if [[ "${SKIP_EVAL_BEFORE_TRAIN:-0}" != "0" ]]; then
+   EVAL_ARGS+=(--skip-eval-before-train)
+fi
 
 PERF_ARGS=(
    --tensor-model-parallel-size "${TENSOR_PARALLEL_SIZE}"
