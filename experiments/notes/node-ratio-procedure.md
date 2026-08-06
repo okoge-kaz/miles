@@ -84,8 +84,17 @@ training, so
 
     dp = 8 * (T + R) / (TP * CP * PP)      must divide the global batch
 
-with T the train node count. A larger model needs a larger T, and the adoptable
-set moves with it: at T=1 it is R ∈ {1, 3, 7}, at T=2 it is R ∈ {0, 2, 6}.
+with T the train node count. `T + R` must be a power of two, so the set moves
+with both T, which grows with the model, and the total node budget, which goes to
+16 for the larger models:
+
+| T | adoptable R, `T + R <= 16` |
+|---|---|
+| 1 | 1, 3, 7, 15 |
+| 2 | 2, 6, 14 |
+| 4 | 4, 12 |
+| 8 | 8 |
+
 Re-derive it for every model. R ∈ {2, 4} are measured here for the appendix and
 cannot be shipped.
 
