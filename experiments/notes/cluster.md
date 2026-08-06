@@ -47,6 +47,77 @@ Runs longer than 4 h are handled by resuming rather than by a longer partition:
 `--load`/`--save` point at the same directory, so a follow-up job with the same
 `RUN_NAME` continues where the previous one stopped.
 
+### Partition QOS, and why the recipes say `--partition=batch` alone
+
+Behind each GPU partition sits a partition QOS with its own caps:
+
+| partition | QOS | GrpTRES (all users) | MaxTRESPU (per user) |
+|---|---|---|---|
+| `batch` | `p_batch` | unlimited | node=768 |
+| `batch_short` | `p_batch_short` | node=20 | **node=4** |
+
+Two reasons the production recipes name only `batch`, the first of which is a
+hard failure rather than a slowdown:
+
+1. **The 4-node per-user cap is enforced at submission.**
+   `sbatch --partition=batch,batch_short --nodes=5` is *rejected outright* with
+   `QOSMaxNodePerUserLimit` — it does not fall back to `batch`. With the async
+   node balance heading past 4 nodes, listing `batch_short` in a production
+   recipe would stop the sweep before it started.
+2. `batch_short` maxes out at 2 h against the recipes' 4 h, so it could never
+   take a production job anyway.
+
+For short verification runs at ≤4 nodes, add it back at submit time, where it
+does help: `sbatch --partition=batch,batch_short --time=00:40:00 --nodes=3 ...`.
+
+For a multi-partition job the pending reason names whichever partition was
+evaluated last, so `QOSGrpNodeLimit`/`QOSMaxNodePerUserLimit` naming
+`batch_short` is **not** proof the job is locked out of `batch`. And the per-user
+cap serialises verification work: one running 3-node job leaves only 1 node of
+your own `batch_short` allowance, so sibling jobs queue behind it.
+
+### Editing recipes while jobs are queued
+
+`sbatch` snapshots `run.sbatch` at submit time, but `train.sh` is read live from
+the lustre mount when the job starts, and the snapshotted `run.sbatch` resolves
+the *path* to `train.sh` at run time too.
+
+- Adding a variable to `train.sh` breaks every already-queued job that predates
+  the matching default in `run.sbatch` (seen as
+  `--save-interval: invalid int value: ''`). Guard new flags:
+  `if [[ -n "${VAR:-}" ]]; then ARGS+=(--flag "${VAR}"); fi`.
+- **Renaming a recipe directory kills every queued and running job.** The
+  `dapo-math-p10-80` → `dapo-math-p10-90` rename took out four at once with
+  `train.sh: No such file or directory` and exit 127. Drain the queue first.
+- **Editing an optimizer setting breaks the resume of any run in flight.**
+  Megatron checks the scheduler state against the checkpoint and asserts on a
+  mismatch:
+
+      OptimizerParamScheduler: class input value 0.01 and checkpoint value 0.1
+      for start weight decay do not match
+
+  The same guard covers the total iteration count, so `--num-rollout` is frozen
+  for a run's lifetime too — a run cannot be extended later by raising it. Since
+  a production run is 3–4 chained jobs over ~10 h, `--weight-decay`, `--lr`, the
+  decay style, warmup and `--num-rollout` must all be settled *before* the first
+  job of a sweep point is submitted.
+
+### A wall-clock kill during a save is safe
+
+Megatron writes the checkpoint files, then the tracker, then deletes the
+previous iteration. A job killed between the first two leaves the tracker
+pointing at the last *complete* iteration, so the resume loads a good checkpoint
+and the partial directory is simply ahead of it. Observed directly: phase A of
+the resume test was cut mid-save of `iter_0000003`, and
+
+    tracker -> 1
+    dist    : iter_0000001 iter_0000003
+
+The orphan is not leaked — the resumed run passes through that iteration again
+and overwrites it — but disk is temporarily doubled (114 GB where a single
+checkpoint plus its HF copy is ~61 GB), which matters when a sweep has many
+points in flight.
+
 ## Container runtime
 
 - **`enroot` + pyxis only.** `docker`, `podman`, `apptainer`, `singularity` are

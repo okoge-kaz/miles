@@ -176,7 +176,7 @@ off-policy looks better than it is. Compare at equal length, and record
 | variable | value | why |
 |---|---|---|
 | `GLOBAL_BATCH_SIZE`, `N_SAMPLES_PER_PROMPT`, `ROLLOUT_BATCH_SIZE` | prior-work values | see the dataset README; not a research question here |
-| dynamic sampling | on, **without over-sampling** | the filter stays, but `--over-sampling-batch-size` is not passed, so it defaults to `rollout_batch_size` and the rollout loop submits exactly what it needs. Over-sampling would otherwise add a second, uncontrolled source of aborted generation on top of the weight-update one this study is measuring |
+| dynamic sampling | **off**, and no over-sampling | `--dynamic-sampling-filter-path` is not passed, and `--over-sampling-batch-size` is left to default to `rollout_batch_size`. The prompt set is already filtered offline to a 10–80% pass-rate window (`dapo-math-p10-90`, see `src/difficulty_filter/`), which is where the online filter's value went. Keeping it off also removes the only source of discarded generation from the colocated reference arm: the rollout loop tops up by a whole `over_sampling_batch_size` whenever the filter rejects a group (`inference_rollout_train.py:101-104`), and the surplus is what `abort()` throws away at the batch boundary. With the filter off, `pendings` drains to zero, `abort()` has nothing to discard, and the reference arm's wall-clock contains no wasted generation for the off-policy arms to be compared against |
 | R3 (MoE) | always on | removes routing mismatch; MoE RL is known to collapse without it |
 | verifier (`RM_TYPE`) | per checkpoint | correctness, not a knob |
 | temperature, KL coefficient | 1.0, 0 | matches DAPO |
@@ -204,7 +204,7 @@ the fact**, or sample-efficiency claims cannot be made later without rerunning:
 |---|---|
 | wall-clock per phase | dashboard `phases` stream (`rollout`, `actor_train`, `update_weights`, `train_wait`) |
 | optimizer steps | `rollout_id × num_steps_per_rollout` |
-| samples consumed | `rollout_batch × n_samples` per rollout, plus what dynamic sampling discarded — the drop counters in `MetricGatherer` |
+| samples consumed | `rollout_batch × n_samples` per rollout. With dynamic sampling off there is nothing else to add on the colocated side; on the fully-async side, generation is still discarded by the staleness bound and by weight-update aborts, counted in tokens by `rollout/fully_async/{stale,aborted,dynamic_filter}_tokens` and `wasted_token_frac` |
 | tokens generated | `dump/response_length_mean × samples`, and `perf/*` from `ray/rollout/metrics.py` |
 | realised staleness | `dump/mixed_version_frac`, `rollout/fully_async/avg_staleness`, `max_staleness` |
 | realised drift | `dump/mean_abs_lp_diff`, per-sample `mean_imp_ratio` |
@@ -232,3 +232,194 @@ never binds (`MAX_WEIGHT_STALENESS=1000000`) rather than unsetting it.
   throughput and the numerics, on separate axes from staleness.
 - **Multi-turn / agentic rollouts** — turn count is a third source of lag;
   `generate_hub/multi_turn.py:32` rejects partial rollout outright.
+
+## Run identity: what makes a checkpoint path unique (2026-08-05)
+
+`experiments/common/run_identity.sh` builds the only thing that separates two
+runs on disk. `--load` and `--save` are the same directory, so **two runs that
+produce the same `CKPT_PATH` do not collide loudly -- the second one resumes the
+first.** Any swept knob missing from the path is a silent data corruption.
+
+```
+/ckpt/training/math/<DATASET_TAG>/<MODEL_NAME>/<RL_ALGORITHM>/<PLACEMENT>/
+    <POLICY_REGIME>/max-weight-staleness-<S>/<CONFIG_TAG>
+
+CONFIG_TAG = rollout-length-<N>k-lr<LR>-rbs<RBS>-gbs<GBS>
+             -tseed<TRAIN_SEED>-rseed<ROLLOUT_SEED>
+```
+
+Every axis of the main grid appears exactly once. Three are absent on purpose:
+
+* `N_SAMPLES_PER_PROMPT` is fixed at 8 for this study but is written into the tag
+  anyway, because it is what makes `NUM_STEPS_PER_ROLLOUT` derivable (below).
+  With `n` present, `rbs`, `gbs` and `n` pin the whole batch shape.
+* `PAUSE_GENERATION_MODE` is not in the grid -- like the deterministic-kernel
+  check it is verified in a separate, targeted experiment. **That experiment must
+  pass `CONFIG_TAG` explicitly**, because its three modes are otherwise identical
+  configurations and would share one directory.
+* `NUM_STEPS_PER_ROLLOUT` is not independent. miles asserts
+  `rollout_batch * n_samples == global_batch * num_steps` at startup, so
+  `rbs`, `gbs` and `n` -- all three in the tag -- determine it exactly. Writing it
+  as well would let a typo produce two names for one configuration. It still does
+  work: it is one of the two inputs to `POLICY_REGIME`. It just is not
+  identifying information.
+
+### `RL_ALGORITHM` is derived, not declared
+
+```
+grpo-clip0.2-0.28-tis2.0        # the current recipe
+grpo-clip0.2-0.28-notis         # USE_TIS=0
+grpo-clip0.2-0.28-tis0.5-2.0    # TIS_CLIP_LOW set
+```
+
+It is computed from `ADVANTAGE_ESTIMATOR`, `EPS_CLIP`, `EPS_CLIP_HIGH`,
+`USE_TIS`, `TIS_CLIP`, `TIS_CLIP_LOW` and `KL_LOSS_COEF` -- the same variables
+`train.sh` passes to miles -- so the name cannot drift from the run. A
+hand-written label like `dapo` could, and the estimator alone cannot separate
+DAPO from plain GRPO (DAPO *is* `grpo` plus clip-higher).
+
+TIS belongs in the name rather than in `CONFIG_TAG` because it is not a nuisance
+parameter: it is the off-policy correction itself, so whether an arm survives at
+a given staleness is largely its doing. Leaving `--tis-clip` on argparse's
+default would have put an unrecorded knob directly on the axis being measured.
+
+**Correction (2026-08-05).** An earlier revision of this section claimed that
+`--tis-clip` interacts strongly with the response-length axis, on the grounds
+that the ESS of the importance weights decays exponentially in sequence length.
+**That argument does not apply to this implementation.** `--use-tis` dispatches
+to `vanilla_tis_function` (`loss_hub/corrections.py:7`), which is *token-level*:
+
+```python
+tis = torch.exp(old_log_probs - rollout_log_probs)      # elementwise, per token
+tis_weights = torch.clamp(tis, min=args.tis_clip_low, max=args.tis_clip)
+pg_loss = pg_loss * tis_weights
+```
+
+There is no product over the sequence, so `Var(log w) ∝ T` -- the sequence-level
+statement -- is simply not what is being clipped. A per-token ratio's
+distribution is set by how far training has drifted from rollout, not by how many
+tokens follow it. To first order `tis_clipfrac` should be flat in response
+length.
+
+Two weaker length effects remain, and their net sign is not obvious a priori:
+drift can compound *along* a sequence because a late token is conditioned on a
+prefix that is itself off-distribution, which pushes clipfrac up with position;
+while `sum_of_sample_mean` averages the per-token weights over more tokens in a
+long sample, which pulls sample-level variance down.
+
+So this is an empirical question, not a design constraint, and the instrument
+already exists: `train/tis_clipfrac`, `train/tis` and `train/tis_abs` are logged
+per step. **Read clipfrac across the response-length arms before deciding
+anything.** If it is flat, `TIS_CLIP` stays fixed at 2.0 and there is no
+interaction to design around. Crossing `TIS_CLIP` with response length ahead of
+that measurement would multiply the grid on a mechanism that has not been shown
+to exist.
+
+### The off-policy correction surface miles actually has
+
+Verified against the source, because the checkpoint name only distinguishes what
+it encodes. Four families, and they are orthogonal to each other:
+
+**1. Importance-sampling weights on the train/rollout ratio.**
+
+| entry point | level | what it does |
+|---|---|---|
+| `--use-tis` + `--tis-clip` / `--tis-clip-low` | **token** | `clamp(exp(train-rollout), lo, hi)` multiplied into `pg_loss` (`corrections.py:7`) |
+| `icepop_function` (`corrections.py:35`) | token | clip-or-*pop*: zeroes tokens outside the band and passes the in-range ratio through **unweighted** |
+| `--custom-tis-function-path .../mis.py:compute_mis_weights_with_cp` | token **or sequence** | the full MIS surface, configured by YAML rather than by flags |
+
+MIS's YAML is where the real variety lives: `tis_level` token/sequence,
+`tis_mode` truncate/clip/mask (not a tuning detail -- mask *drops* the token),
+`tis_upper_bound` / `tis_lower_bound`, `tis_batch_normalize`, plus rejection
+sampling `use_rs` / `rs_level` / `rs_veto_threshold` (one catastrophic token can
+veto a whole sample).
+
+**2. Sequence masking.** `--use-opsm` / `--opsm-delta` (default 1e-4) --
+Off-Policy Sequence Masking, `math_utils.py:183`. Drops an entire sequence whose
+log-prob deviation exceeds the threshold, rather than reweighting it.
+
+**3. What the ratio denominator even is.** `arguments.py:3204` requires exactly
+one of these, and they are three different corrections, not three spellings:
+
+* default / `--use-tis` -- denominator recomputed by the current actor
+* `--use-rollout-logprobs` -- the engine's own log probs are the denominator
+* `--keep-old-actor` -- the rollout-time weights are kept and used to recompute it
+
+**4. Clipping.** `--eps-clip` / `--eps-clip-high` (DAPO clip-higher), and
+`--eps-clip-c` for Dual-clip PPO ([arXiv:1912.09729](https://arxiv.org/pdf/1912.09729)),
+off by default. `--advantage-estimator gspo` moves the *policy* ratio to sequence
+level, which is a different thing from a sequence-level *mismatch* weight.
+
+M2PO, CISPO and VCPO are **not** in miles.
+
+### How `RL_ALGORITHM` encodes all of it
+
+Every correction above is a separate directory, and each part is **omitted at its
+default**, so the common case stays short and any deviation is visible:
+
+```
+<estimator>-clip<lo>-<hi>[-dualclip<c>][-<denominator>]-<is-correction>[-opsm<delta>][-kl<coef>]
+```
+
+| configuration | name |
+|---|---|
+| the current recipe | `grpo-clip0.2-0.28-tis2.0` |
+| no IS correction | `grpo-clip0.2-0.28-nois` |
+| IcePop | `grpo-clip0.2-0.28-icepop2.0` |
+| MIS, sequence level | `grpo-clip0.2-0.28-mis-seq-truncate-2.0` |
+| MIS, token level + mask | `grpo-clip0.2-0.28-mis-token-mask-2.0` |
+| two-sided TIS bounds | `grpo-clip0.2-0.28-tis0.5-2.0` |
+| Dual-clip PPO | `grpo-clip0.2-0.28-dualclip3.0-tis2.0` |
+| OPSM | `grpo-clip0.2-0.28-tis2.0-opsm1e-4` |
+| engine log probs as denominator | `grpo-clip0.2-0.28-rolloutlp-nois` |
+| rollout-time weights as denominator | `grpo-clip0.2-0.28-oldactor-nois` |
+| GSPO | `gspo-clip0.2-0.28-tis2.0` |
+
+Driven by `IS_CORRECTION` (`none｜tis｜icepop｜mis`), `RATIO_DENOMINATOR`
+(`actor｜rollout-logprobs｜old-actor`), `EPS_CLIP_C`, `USE_OPSM`/`OPSM_DELTA`,
+`TIS_CLIP`/`TIS_CLIP_LOW` and `MIS_PROFILE` -- the same variables `train.sh`
+turns into flags, so the name still cannot drift from the run.
+
+**MIS is named by profile, not by parameters.** Its knobs arrive through
+`--custom-config-path` as a YAML that `arguments.py:3143` merges into `args`, so
+`run_identity.sh` cannot see them. `MIS_PROFILE` names a file under
+`experiments/configs/mis/<profile>.yaml`; the file is in git, so the profile name
+is a stable identifier for its whole contents. Name profiles after what they do
+(`seq-truncate-2.0`, `token-mask-2.0`), because that string is the only record in
+the path.
+
+Two impossible combinations are rejected rather than silently mis-named:
+`RATIO_DENOMINATOR=rollout-logprobs` with any IS correction (`arguments.py:2851`
+rejects it outright), and `IS_CORRECTION=mis` without a `MIS_PROFILE`.
+
+### `POLICY_REGIME`
+
+`on-policy` iff `MAX_WEIGHT_STALENESS == 0` **and** `NUM_STEPS_PER_ROLLOUT == 1`.
+Those are the two ways a sample goes off-policy: generated under older weights,
+or reused across more than one optimizer step. The test is placement-independent
+-- an async run pinned to staleness 0 with one step per rollout is genuinely
+on-policy, and a colocated run at 4 steps per rollout genuinely is not.
+
+### `PLACEMENT`
+
+`colocated` or `async`. `math_sync` passes `--colocate` and never passes
+`--max-weight-staleness` or `--pause-generation-mode`, so `run_identity.sh`
+forces those to `0` and `none` and *errors* if the caller set them -- otherwise
+a colocated point in a staleness sweep would land in a directory claiming a
+staleness the run never had.
+
+### Seeds
+
+`TRAIN_SEED` (`--seed`) and `ROLLOUT_SEED` (`--rollout-seed`) are separate and
+both are in the tag. The variance decomposition needs them moved independently:
+`ROLLOUT_SEED` drives prompt shuffling and sampling, `TRAIN_SEED` drives
+initialisation and data order inside the optimizer step. Tying them to one value
+would confound rollout-sampling variance with training-seed variance and leave no
+way to attribute a spread in `Q(t)` to either.
+
+### `sweep.py`
+
+Unaffected: it overrides `CONFIG_TAG` with `sweep-<name>-<tag_for(point)>`, which
+encodes exactly the knobs that point varies. The directory levels above
+`CONFIG_TAG` are still derived per point, so a sweep over staleness or algorithm
+still fans out across directories.

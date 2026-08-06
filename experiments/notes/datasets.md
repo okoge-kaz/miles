@@ -16,9 +16,17 @@ inside the container.
 | AIME-2025 | `/data/aime-2025/aime-2025.jsonl` | in-training eval, the only one |
 | AIME-2023 / 24 / 25 / 26 | `/data/aime-20{23,24,25,26}/…` | offline eval on saved checkpoints (`src/offline_eval`) |
 
-Both are pulled by `experiments/setup/download_assets.sbatch` from
-`zhuzilin/dapo-math-17k` and `zhuzilin/aime-2024` — the same repos the upstream
-miles scripts use, so the field names match what `run-qwen3-4B.sh` expects.
+DAPO-Math-17K is pulled by `experiments/setup/download_assets.sbatch` from
+`zhuzilin/dapo-math-17k` — the same repo the upstream miles scripts use, so the
+field names match what `run-qwen3-4B.sh` expects. The p10-80 file is produced from
+it by `experiments/src/difficulty_filter`.
+
+The AIME years are staged by `experiments/src/offline_eval/prepare_aime.py`, which
+cross-checks every answer against a second AoPS-derived source and asserts that the
+instruction wrapper is byte-identical across years. That assert exists because
+AIME-2024 was staged without the wrapper until 2026-08-05: the verifier grades a
+boxed answer, and that year alone was never asking for one. Each year's directory
+carries a `README.md` with its provenance.
 
 ## Inspecting the files
 

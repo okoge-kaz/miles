@@ -44,7 +44,7 @@ set in use.
 | eval (spare) | `/data/aime-2023/aime-2023.jsonl`, `/data/amc-2023/` | 30, parquet | `math` | not in a config |
 
 Eval config: `configs/eval_math.yaml` (aime24/25/26 + math500).
-Recipes: `math_sync/dapo-math-p10-80/<model>/`, `math_async/dapo-math-p10-80/<model>/`
+Recipes: `math_sync/dapo-math-p10-90/qwen3-4b-instruct-2507/`, `math_async/dapo-math-p10-90/qwen3-4b-instruct-2507/` (the only surviving pair; the other four models were deleted unrun on 2026-08-05)
 for qwen3-1.7b / 4b / 4b-instruct-2507 / 8b / 30b-a3b.
 
 **`--rm-type math`, not `deepscaler`.** `deepscaler.py:36-44` gates on the

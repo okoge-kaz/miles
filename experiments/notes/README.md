@@ -15,6 +15,12 @@ Index:
 - [datasets.md](datasets.md) — how miles reads a JSONL, how to inspect one
 - [checkpoints.md](checkpoints.md) — `hf/` `megatron/` `training/`, conversion, resume
 - [miles-architecture.md](miles-architecture.md) — the four objects, the directory map, the plug points
+- [parallelism.md](parallelism.md) — why every recipe is CP=1, the measured cost of context parallelism, per-model memory headroom
+- [rollout-scaling.md](rollout-scaling.md) — the two floors under rollout time, and when adding rollout GPUs stops helping
+- [telemetry.md](telemetry.md) — what the runs record to wandb, what the analysis needs, and the three gaps
+
+Recipes under `experiments/math_*/` carry settings only; the reasoning for any
+setting lives in the notes above. See `.claude/rules/experiment-recipes.md`.
 
 > **Caution.** This directory lives inside a checkout of an open-source repo. Keep
 > internal endpoints, API keys, hostnames and verbatim internal discussion out of
