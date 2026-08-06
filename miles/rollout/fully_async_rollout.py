@@ -58,10 +58,16 @@ def group_oldest_weight_version(group: Group) -> int | None:
     return min(versions) if versions else None
 
 
-# The endpoint carrying weight_version has been renamed twice across SGLang
-# versions, and a router that does not serve one answers 404 rather than
-# erroring, so the name has to be discovered instead of assumed. Newest first;
-# the one that answers is remembered.
+# Router and engine disagree about this endpoint's name, so it has to be
+# discovered rather than assumed:
+#
+#   engine  /model_info is current; /get_model_info logs a deprecation notice
+#   router  /get_model_info is the only one that resolves; /model_info is 404
+#
+# The router proxies to an engine, which is why querying it emits the engine's
+# deprecation warning. Ordered for the router, since that is who we ask, and a
+# 404 costs a round trip while the wrong guess costs the whole staleness cap.
+# The name that answers is remembered.
 WEIGHT_VERSION_ENDPOINTS = ("/get_model_info", "/model_info", "/get_weight_version")
 
 
