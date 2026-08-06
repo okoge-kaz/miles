@@ -34,6 +34,9 @@ logger = logging.getLogger(__name__)
 OUTPUT_QUEUE_MAX_GROUPS = 1000
 NO_PROGRESS_WARN_SECS = 30.0
 WEIGHT_VERSION_QUERY_TIMEOUT_SECS = 2.0
+# Realized lag is a small integer; anything past this goes in one overflow bucket
+# so the metric count stays bounded no matter how far behind a run drifts.
+STALENESS_HISTOGRAM_MAX = 8
 
 # A finished group is list[Sample], or list[list[Sample]] when a generate function
 # returns multiple samples per trajectory (e.g. multi-agent).
@@ -176,6 +179,19 @@ def _staleness_metrics(values: list[int], bound: int | None) -> dict[str, float]
     }
     if bound is not None:
         metrics["staleness_frac_at_bound"] = float((array >= bound).mean())
+
+    # The full histogram, not just moments. Realized lag is a small integer, so
+    # P(L) fits in a handful of scalars, and the shape is the result: percentiles
+    # cannot say whether lag 4 happened twice or two hundred times, and that is
+    # what decides whether a bound of 4 is a real constraint or a formality.
+    # Counts are observations, not distinct groups -- a recycled group is counted
+    # again when it is regenerated, which is the honest denominator for "how often
+    # did the pipeline produce a sample this stale".
+    for level in range(STALENESS_HISTOGRAM_MAX + 1):
+        metrics[f"staleness_count_{level}"] = float((array == level).sum())
+    metrics[f"staleness_count_ge_{STALENESS_HISTOGRAM_MAX + 1}"] = float(
+        (array > STALENESS_HISTOGRAM_MAX).sum()
+    )
     return metrics
 
 

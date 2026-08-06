@@ -187,6 +187,26 @@ async def test_wasted_token_accounting(monkeypatch):
     assert output.metrics["rollout/fully_async/wasted_token_frac"] == pytest.approx(0.5)
 
 
+def test_staleness_histogram_reports_the_shape_not_just_moments():
+    """Percentiles cannot distinguish a rare tail from a common one.
+
+    A bound is only a real constraint if samples actually reach it, and
+    ``staleness_p99`` alone cannot say whether lag 4 happened twice or two
+    hundred times.
+    """
+    values = [0] * 90 + [1] * 8 + [4, 12]
+    m = fully_async._staleness_metrics(values, bound=2)
+
+    assert m["staleness_count_0"] == 90
+    assert m["staleness_count_1"] == 8
+    assert m["staleness_count_4"] == 1
+    assert m["staleness_count_ge_9"] == 1  # 12 lands in the overflow bucket
+    assert sum(m[f"staleness_count_{i}"] for i in range(9)) + m["staleness_count_ge_9"] == len(values)
+    # The moments still agree with the histogram.
+    assert m["max_staleness"] == 12
+    assert m["staleness_frac_zero"] == 0.9
+
+
 async def test_weight_version_endpoint_is_discovered_not_assumed(monkeypatch):
     """A 404 on one endpoint name must fall through to the next.
 
