@@ -49,7 +49,27 @@ def analyse(path: Path) -> dict | None:
         if t.group(1) == "train":
             steps.append(cur)
             cur = {}
-    steady = steps[1:]
+    # Two prefixes have to come off, not one.
+    #
+    # Step 1 carries the cold-start cost. Everyone drops that. But the several
+    # minutes of startup are minutes the rollout engines spend generating, so by
+    # the time the first optimizer step runs there is already a buffer of ready
+    # groups. The next few steps drain it at train_wait ~= 0.4s, which is not a
+    # throughput measurement -- it is the trainer running unobstructed against
+    # work that was produced while it was still booting. Steady state begins when
+    # the buffer is gone and train_wait rises to the rate the engines can
+    # actually sustain.
+    #
+    # Measured on six replicates: 3n drained for four steps at 0.4-0.5s and then
+    # jumped to 33s; 4n drained for one and settled at 15-19s. Averaging across
+    # the transition reported 65-77s per step where the sustained value is
+    # 74-90s, and inverted the 3n/4n ranking.
+    DRAIN_WAIT_S = 2.0
+    tail = steps[1:]
+    n_drained = 0
+    while n_drained < len(tail) and tail[n_drained].get("train_wait", 0.0) < DRAIN_WAIT_S:
+        n_drained += 1
+    steady = tail[n_drained:]
     if not steady:
         return None
 
@@ -79,6 +99,7 @@ def analyse(path: Path) -> dict | None:
         "train_gpus": train_gpus,
         "rollout_gpus": rollout_gpus,
         "steps": len(steady),
+        "drained": n_drained,
         "step_s": step_s,
         "train_wait": mean("train_wait"),
         "actor_train": mean("actor_train"),
@@ -111,22 +132,32 @@ def main() -> int:
 
     rows.sort(key=lambda r: r["step_s"])
     hdr = (
-        f"{'run':<22}{'train':>6}{'roll':>5}{'n':>3}{'step_s':>8}{'wait':>7}"
-        f"{'actor':>7}{'logp':>6}{'ref':>6}{'req/eng':>8}{'kv':>6}{'tok/s/eng':>10}{'tok/s/gpu':>10}"
+        f"{'run':<22}{'train':>6}{'roll':>5}{'n':>3}{'drn':>4}{'step_s':>8}{'wait':>7}"
+        f"{'actor':>7}{'logp':>6}{'ref':>6}{'req/eng':>8}{'kv':>6}{'tok/s/eng':>10}{'steps/h/gpu':>12}"
     )
     print(hdr)
     print("-" * len(hdr))
+    thin = False
     for r in rows:
-        agg = r["tok_s_engine"] * r["rollout_gpus"] if r["rollout_gpus"] else r["tok_s_engine"] * r["train_gpus"]
+        thin = thin or r["steps"] < 3
         print(
-            f"{r['name'][:22]:<22}{r['train_gpus']:>6}{r['rollout_gpus']:>5}{r['steps']:>3}"
+            f"{r['name'][:22]:<22}{r['train_gpus']:>6}{r['rollout_gpus']:>5}{r['steps']:>3}{r['drained']:>4}"
             f"{r['step_s']:>8.1f}{r['train_wait']:>7.1f}{r['actor_train']:>7.1f}"
             f"{r['log_probs']:>6.1f}{r['ref_log_probs']:>6.1f}"
-            f"{r['run_req']:>8.1f}{r['kv_use']:>6.2f}{r['tok_s_engine']:>10.0f}{agg / r['total_gpus']:>10.0f}"
+            f"{r['run_req']:>8.1f}{r['kv_use']:>6.2f}{r['tok_s_engine']:>10.0f}"
+            f"{3600 / r['step_s'] / r['total_gpus']:>12.2f}"
         )
     print()
-    print("step_s = train_wait + train.  wait>0 means the trainer is starved (rollout-bound);")
-    print("wait~0 with the rollout node saturated means the trainer is the pacer.")
+    print("n   = steady steps kept.  drn = leading steps dropped as buffer drain")
+    print("      (train_wait < 2s: the trainer eating groups the engines produced during startup).")
+    print("steps/h/gpu is the number to rank configurations on -- wall clock alone rewards")
+    print("      throwing GPUs at the problem.")
+    print("wait>0 at steady state means the trainer is starved and rollout is the pacer;")
+    print("      making training faster then buys nothing until the balance is changed.")
+    if thin:
+        print()
+        print("WARNING: a run has fewer than 3 steady steps. The job was too short to")
+        print("         measure sustained throughput -- treat its numbers as indicative only.")
     return 0
 
 

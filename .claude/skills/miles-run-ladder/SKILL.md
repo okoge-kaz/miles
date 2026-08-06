@@ -42,7 +42,7 @@ Cut the work down so a failure surfaces in minutes, not hours:
 ```bash
 sbatch -A coreai_horizon_dilations -N 2 --time=01:00:00 \
   --export=ALL,NUM_ROLLOUT=3,ROLLOUT_BATCH_SIZE=8,N_SAMPLES_PER_PROMPT=8,GLOBAL_BATCH_SIZE=64,MAX_RESPONSE_LEN=1024,EVAL_INTERVAL=1 \
-  experiments/math_sync/dapo-math/qwen3-1.7b/run.sbatch
+  experiments/math_sync/dapo-math-p10-80/qwen3-1.7b/run.sbatch
 ```
 
 Keep the four-knob invariant when shrinking:
@@ -87,7 +87,7 @@ Enable telemetry and read it rather than guessing:
 ```bash
 sbatch -A coreai_horizon_dilations -p batch_short -N 2 --time=02:00:00 \
   --export=ALL,NUM_ROLLOUT=10,CONFIG_TAG=tune-<what-you-changed> \
-  experiments/math_sync/dapo-math/qwen3-4b/run.sbatch
+  experiments/math_sync/dapo-math-p10-80/qwen3-4b/run.sbatch
 
 python -m miles.dashboard.serve --dump-details <dump-dir> --follow   # port 7788
 ```
@@ -103,7 +103,7 @@ stops unless `--submit` is passed.
 
 ```bash
 experiments/sweep.py --sweep experiments/sweeps/offpolicy.txt \
-  --recipe math_async/dapo-math/qwen3-4b -- -N 2 -p batch_short --time=02:00:00
+  --recipe math_async/dapo-math-p10-80/qwen3-4b -- -N 2 -p batch_short --time=02:00:00
 ```
 
 Change exactly one class of setting per job, and record the step time:
@@ -150,7 +150,7 @@ fast a step is.
 ## Stage 3 — production on `batch`
 
 ```bash
-experiments/submit_training.sh math_sync/dapo-math/qwen3-8b <run-name> \
+experiments/submit_training.sh math_sync/dapo-math-p10-80/qwen3-8b <run-name> \
   -p batch -N 8 --time=04:00:00 --export=ALL,SAVE_INTERVAL=5
 ```
 
