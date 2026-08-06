@@ -78,31 +78,16 @@ Effective generation time and the resulting wait:
 
 ## Step 3 — pick R, two-sided
 
-Adoptable R is only {1, 3, 7} **for Qwen3-4B-Instruct-2507 at this batch
-shape**. The colocated arm runs at the same total GPU count with every GPU
+Adoptable R is only {1, 3, 7} **for Qwen3-4B-Instruct-2507**, which trains on
+one node. The colocated arm runs at the same total GPU count with every GPU
 training, so
 
-    dp = 8 * (1 + R) / (TP * CP * PP)      must divide the global batch
+    dp = 8 * (T + R) / (TP * CP * PP)      must divide the global batch
 
-R ∈ {2, 4} are measured for the appendix and cannot be shipped.
-
-The set is not a property of the model, and it is worth being precise about
-where the model does enter, because "bigger model, different R" is the obvious
-guess and it is wrong for the stated reason:
-
-* **It comes from 2048 being a power of two.** With every parallel degree also a
-  power of two, `dp` divides `gbs` exactly when `1 + R` is a power of two, so
-  R ∈ {1, 3, 7, 15, ...} whatever TP is. Checked at TP ∈ {1, 2, 4, 8}: the set
-  does not move. Change the global batch to something with an odd factor —
-  1536 = 2^9·3 — and R ∈ {2, 5} become adoptable instead.
-* **The model enters through feasibility, not divisibility.** A larger model
-  needs larger `TP * CP * PP`, which shrinks `dp` and raises the samples per
-  rank; a smaller one raises `dp` until `gbs / dp` gets too small to fill a
-  micro-batch. Both bound which R can actually run, separately from whether the
-  arithmetic divides.
-
-So re-derive this table for any model or batch shape that is added. Do not carry
-{1, 3, 7} across.
+with T the train node count. A larger model needs a larger T, and the adoptable
+set moves with it: at T=1 it is R ∈ {1, 3, 7}, at T=2 it is R ∈ {0, 2, 6}.
+Re-derive it for every model. R ∈ {2, 4} are measured here for the appendix and
+cannot be shipped.
 
 Choose the **smallest** adoptable R satisfying both:
 
