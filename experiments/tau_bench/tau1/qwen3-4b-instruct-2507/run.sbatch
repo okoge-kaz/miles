@@ -62,11 +62,25 @@ _key_var="$(echo "${TAU_USER_MODEL_PROVIDER}" | tr '[:lower:]' '[:upper:]')_API_
     echo "missing ${DATASET_DIR}/tau-bench/tau1_train.jsonl; run experiments/setup/prepare_tau_bench.sbatch"; exit 1; }
 
 MODEL_NAME=Qwen3-4B-Instruct-2507
-ROLLOUT_MODE=async-off
+PLACEMENT=colocated
 DATASET_TAG=tau-bench-tau1
 PROMPT_DATA=/data/tau-bench/tau1_train.jsonl
 
+: "${ADVANTAGE_ESTIMATOR:=grpo}"
+: "${ENTROPY_COEF:=0.00}"
+: "${EPS_CLIP:=0.2}"
+: "${EPS_CLIP_HIGH:=0.28}"
+: "${EPS_CLIP_C:=}"
+: "${RATIO_DENOMINATOR:=actor}"
+: "${IS_CORRECTION:=none}"
+: "${TIS_CLIP:=2.0}"
+: "${TIS_CLIP_LOW:=0}"
+: "${MIS_PROFILE:=}"
+: "${USE_OPSM:=0}"
+: "${OPSM_DELTA:=1e-4}"
 : "${LR:=1e-6}"
+: "${TRAIN_SEED:=1234}"
+: "${ROLLOUT_SEED:=42}"
 # Per turn. Episodes are long in turns, not in tokens per turn.
 : "${MAX_RESPONSE_LEN:=2048}"
 # Whole episode: system policy document + every user turn + every tool result.
@@ -98,7 +112,7 @@ PROMPT_DATA=/data/tau-bench/tau1_train.jsonl
 # Raise on a bring-up run: eval here is the whole benchmark, not a sample of it.
 : "${EVAL_INTERVAL:=20}"
 
-export MODEL_NAME ROLLOUT_MODE DATASET_TAG PROMPT_DATA LR MAX_RESPONSE_LEN NUM_STEPS_PER_ROLLOUT
+export ADVANTAGE_ESTIMATOR ENTROPY_COEF EPS_CLIP EPS_CLIP_HIGH EPS_CLIP_C RATIO_DENOMINATOR IS_CORRECTION TIS_CLIP TIS_CLIP_LOW MIS_PROFILE USE_OPSM OPSM_DELTA TRAIN_SEED ROLLOUT_SEED MODEL_NAME PLACEMENT DATASET_TAG PROMPT_DATA LR MAX_RESPONSE_LEN NUM_STEPS_PER_ROLLOUT
 export ROLLOUT_MAX_CONTEXT_LEN TAU_MAX_TURNS TAU_USER_MODEL_PROVIDER TAU_USER_MODEL
 export OPENAI_API_KEY OPENAI_BASE_URL
 export ACTOR_NUM_NODES ACTOR_GPUS_PER_NODE ROLLOUT_NUM_GPUS

@@ -22,6 +22,9 @@ CKPT_ARGS=(
 )
 if [[ "${SAVE_HF}" != "0" ]]; then
    CKPT_ARGS+=(--save-hf "${CKPT_PATH}/hf/{rollout_id}")
+   if [[ -n "${HF_SAVE_INTERVAL:-}" ]]; then
+      CKPT_ARGS+=(--hf-save-interval "${HF_SAVE_INTERVAL}")
+   fi
 fi
 
 ROLLOUT_ARGS=(
@@ -37,16 +40,18 @@ ROLLOUT_ARGS=(
    --rollout-max-response-len "${MAX_RESPONSE_LEN}"
    --rollout-max-context-len 32768
    --rollout-temperature 1
+   --rollout-top-p 1
+   --rollout-top-k -1
    --global-batch-size "${GLOBAL_BATCH_SIZE}"
    --num-steps-per-rollout "${NUM_STEPS_PER_ROLLOUT}"
    --balance-data
-   --dynamic-sampling-filter-path miles.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
-   --partial-rollout
 )
 
 TELEMETRY_ARGS=(
    --dump-details "${CKPT_PATH}/dump"
    --use-miles-dashboard
+   --observe-training-entropy
+   --no-dump-policy-loss-debug
 )
 if [[ "${DUMP_TRAIN_DATA}" == "0" ]]; then
    TELEMETRY_ARGS+=(--no-dump-train-data)
@@ -90,22 +95,47 @@ if [[ "${CONTEXT_PARALLEL_SIZE}" -gt 1 ]]; then
 fi
 
 GRPO_ARGS=(
-   --advantage-estimator grpo
-   --entropy-coef 0.00
-   --eps-clip 0.2
-   --eps-clip-high 0.28
+   --seed         "${TRAIN_SEED}"
+   --rollout-seed "${ROLLOUT_SEED}"
+   --advantage-estimator "${ADVANTAGE_ESTIMATOR}"
+   --entropy-coef "${ENTROPY_COEF}"
+   --eps-clip "${EPS_CLIP}"
+   --eps-clip-high "${EPS_CLIP_HIGH}"
 )
+TIS_BOUNDS=(--tis-clip "${TIS_CLIP}" --tis-clip-low "${TIS_CLIP_LOW}")
+case "${IS_CORRECTION}" in
+   none)   ;;
+   tis)    GRPO_ARGS+=(--use-tis "${TIS_BOUNDS[@]}") ;;
+   icepop) GRPO_ARGS+=(--use-tis "${TIS_BOUNDS[@]}"
+                       --custom-tis-function-path miles.backends.training_utils.loss_hub.corrections.icepop_function) ;;
+   mis)    GRPO_ARGS+=(--use-tis
+                       --custom-tis-function-path examples.infra_features.train_infer_mismatch_helper.mis.compute_mis_weights_with_cp
+                       --custom-config-path "/root/miles/experiments/configs/mis/${MIS_PROFILE}.yaml") ;;
+esac
+case "${RATIO_DENOMINATOR}" in
+   actor)            ;;
+   rollout-logprobs) GRPO_ARGS+=(--use-rollout-logprobs) ;;
+   old-actor)        GRPO_ARGS+=(--keep-old-actor) ;;
+esac
+if [[ -n "${EPS_CLIP_C}" ]]; then
+   GRPO_ARGS+=(--eps-clip-c "${EPS_CLIP_C}")
+fi
+if [[ "${USE_OPSM}" != "0" ]]; then
+   GRPO_ARGS+=(--use-opsm --opsm-delta "${OPSM_DELTA}")
+fi
 if awk "BEGIN{exit !(${KL_LOSS_COEF} != 0)}"; then
    GRPO_ARGS+=(--use-kl-loss --kl-loss-coef "${KL_LOSS_COEF}" --kl-loss-type low_var_kl)
 fi
 
 OPTIMIZER_ARGS=(
    --optimizer adam
+   --clip-grad 1.0
    --lr "${LR}"
    --lr-decay-style constant
-   --weight-decay 0.1
+   --weight-decay 0.0
    --adam-beta1 0.9
-   --adam-beta2 0.98
+   --adam-beta2 0.999
+   --adam-eps 1e-8
 )
 
 SGLANG_ARGS=(

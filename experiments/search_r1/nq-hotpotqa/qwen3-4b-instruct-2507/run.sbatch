@@ -35,11 +35,25 @@ for asset in "${DATASET_DIR}/search-r1/e5_Flat.index" "${DATASET_DIR}/search-r1/
 done
 
 MODEL_NAME=Qwen3-4B-Instruct-2507
-ROLLOUT_MODE=async-off
+PLACEMENT=colocated
 DATASET_TAG=search-r1-nq-hotpotqa
 PROMPT_DATA=/data/searchr1-nq-hotpotqa/train.parquet
 
+: "${ADVANTAGE_ESTIMATOR:=grpo}"
+: "${ENTROPY_COEF:=0.00}"
+: "${EPS_CLIP:=0.2}"
+: "${EPS_CLIP_HIGH:=0.28}"
+: "${EPS_CLIP_C:=}"
+: "${RATIO_DENOMINATOR:=actor}"
+: "${IS_CORRECTION:=none}"
+: "${TIS_CLIP:=2.0}"
+: "${TIS_CLIP_LOW:=0}"
+: "${MIS_PROFILE:=}"
+: "${USE_OPSM:=0}"
+: "${OPSM_DELTA:=1e-4}"
 : "${LR:=1e-6}"
+: "${TRAIN_SEED:=1234}"
+: "${ROLLOUT_SEED:=42}"
 # Per turn. The policy writes a query or a short answer; the passages it reads
 # back are far longer than anything it writes.
 : "${MAX_RESPONSE_LEN:=512}"
@@ -79,7 +93,7 @@ PROMPT_DATA=/data/searchr1-nq-hotpotqa/train.parquet
 # Raise on a bring-up run: eval here is the whole benchmark, not a sample of it.
 : "${EVAL_INTERVAL:=20}"
 
-export MODEL_NAME ROLLOUT_MODE DATASET_TAG PROMPT_DATA LR MAX_RESPONSE_LEN NUM_STEPS_PER_ROLLOUT
+export ADVANTAGE_ESTIMATOR ENTROPY_COEF EPS_CLIP EPS_CLIP_HIGH EPS_CLIP_C RATIO_DENOMINATOR IS_CORRECTION TIS_CLIP TIS_CLIP_LOW MIS_PROFILE USE_OPSM OPSM_DELTA TRAIN_SEED ROLLOUT_SEED MODEL_NAME PLACEMENT DATASET_TAG PROMPT_DATA LR MAX_RESPONSE_LEN NUM_STEPS_PER_ROLLOUT
 export ROLLOUT_MAX_CONTEXT_LEN SEARCH_MAX_TURNS SEARCH_TOPK SEARCH_CONCURRENCY RETRIEVER_PORT
 export ACTOR_NUM_NODES ACTOR_GPUS_PER_NODE ROLLOUT_NUM_GPUS
 export TENSOR_PARALLEL_SIZE CONTEXT_PARALLEL_SIZE EXPERT_PARALLEL_SIZE MAX_TOKENS_PER_GPU

@@ -170,14 +170,37 @@ if [[ "${CONTEXT_PARALLEL_SIZE}" -gt 1 ]]; then
 fi
 
 GRPO_ARGS=(
-   --advantage-estimator grpo
+   --seed         "${TRAIN_SEED}"
+   --rollout-seed "${ROLLOUT_SEED}"
+   --advantage-estimator "${ADVANTAGE_ESTIMATOR}"
    --use-kl-loss
    --kl-loss-coef 0.00
    --kl-loss-type low_var_kl
-   --entropy-coef 0.00
-   --eps-clip 0.2
-   --eps-clip-high 0.28
+   --entropy-coef "${ENTROPY_COEF}"
+   --eps-clip "${EPS_CLIP}"
+   --eps-clip-high "${EPS_CLIP_HIGH}"
 )
+TIS_BOUNDS=(--tis-clip "${TIS_CLIP}" --tis-clip-low "${TIS_CLIP_LOW}")
+case "${IS_CORRECTION}" in
+   none)   ;;
+   tis)    GRPO_ARGS+=(--use-tis "${TIS_BOUNDS[@]}") ;;
+   icepop) GRPO_ARGS+=(--use-tis "${TIS_BOUNDS[@]}"
+                       --custom-tis-function-path miles.backends.training_utils.loss_hub.corrections.icepop_function) ;;
+   mis)    GRPO_ARGS+=(--use-tis
+                       --custom-tis-function-path examples.infra_features.train_infer_mismatch_helper.mis.compute_mis_weights_with_cp
+                       --custom-config-path "/root/miles/experiments/configs/mis/${MIS_PROFILE}.yaml") ;;
+esac
+case "${RATIO_DENOMINATOR}" in
+   actor)            ;;
+   rollout-logprobs) GRPO_ARGS+=(--use-rollout-logprobs) ;;
+   old-actor)        GRPO_ARGS+=(--keep-old-actor) ;;
+esac
+if [[ -n "${EPS_CLIP_C}" ]]; then
+   GRPO_ARGS+=(--eps-clip-c "${EPS_CLIP_C}")
+fi
+if [[ "${USE_OPSM}" != "0" ]]; then
+   GRPO_ARGS+=(--use-opsm --opsm-delta "${OPSM_DELTA}")
+fi
 
 OPTIMIZER_ARGS=(
    --optimizer adam

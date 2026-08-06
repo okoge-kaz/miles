@@ -2,7 +2,7 @@
 """Submit a grid of training jobs for one or more recipes.
 
     experiments/sweep.py --sweep experiments/sweeps/<name>.txt \\
-        --recipe math_async/dapo-math/qwen3-4b [--recipe ...] \\
+        --recipe math_async/dapo-math-p10-90/qwen3-4b-instruct-2507 [--recipe ...] \\
         [-- <extra sbatch args>]
 
 Prints the grid and exits. Add --submit to actually submit.
@@ -72,6 +72,19 @@ TAG_ABBREV = {
     "ROLLOUT_NUM_GPUS": "rgpus",
     "PAUSE_GENERATION_MODE": "pause",
     "ADVANTAGE_ESTIMATOR": "adv",
+    "EPS_CLIP": "clip",
+    "EPS_CLIP_HIGH": "cliphigh",
+    "EPS_CLIP_C": "dualclip",
+    "RATIO_DENOMINATOR": "denom",
+    "IS_CORRECTION": "is",
+    "TIS_CLIP": "tisclip",
+    "TIS_CLIP_LOW": "tiscliplow",
+    "MIS_PROFILE": "mis",
+    "USE_OPSM": "opsm",
+    "OPSM_DELTA": "opsmdelta",
+    "ENTROPY_COEF": "ent",
+    "TRAIN_SEED": "tseed",
+    "ROLLOUT_SEED": "rseed",
 }
 
 _SAFE = re.compile(r"[^A-Za-z0-9._-]+")

@@ -31,7 +31,7 @@ experiments/
   outputs/                      job logs (git-ignored)
 ```
 
-A recipe is `<task>/<dataset>/<model>/`, e.g. `math_sync/dapo-math/qwen3-4b/`.
+A recipe is `<task>/<dataset>/<model>/`, e.g. `math_sync/dapo-math-p10-90/qwen3-4b-instruct-2507/`.
 The task directory fixes the RL setup (rollout mode, reward, generate function),
 the dataset directory fixes the prompt file and the eval benchmarks, and the
 model directory fixes the weights, the parallelism and the batch shape.
@@ -71,7 +71,7 @@ A local baseline section — what this cluster actually measured — belongs bet
 (`RM_TYPE` against a non-thinking checkpoint, for instance) go in a closing
 "not a hyperparameter" note so they are not swept by accident.
 
-`math_sync/dapo-math/README.md` and `math_async/dapo-math/README.md` are the
+`math_sync/dapo-math-p10-90/README.md` and `math_async/dapo-math-p10-90/README.md` are the
 worked examples. The two differ only where the task differs: the async one
 searches staleness and the actor/rollout split, the colocated one does not have
 those knobs at all.
@@ -84,33 +84,25 @@ difference at once.
 
 ### Models
 
-Both math tasks carry the same five checkpoints. Only the parallelism, the
-per-GPU token budget and the engine size differ; the RL settings are identical.
+Both math tasks carry **one** checkpoint. The 1.7b / 4b / 8b / 30b-a3b recipes
+were deleted on 2026-08-05: none of them had ever been run, so their parallelism
+and token budgets were unverified, and a stale recipe is worse than no recipe.
+Re-add one by copying the surviving pair and measuring it.
 
-| model | sync (8 GPU colocated) | async (4 train + 4 rollout) | verifier |
+| model | sync (16 GPU colocated) | async (8 train + 8 rollout) | verifier |
 |---|---|---|---|
-| `qwen3-1.7b` | TP1 CP4, 12288 tok/GPU | TP1 CP4, 12288 | `deepscaler` |
-| `qwen3-4b` | TP2 CP4, 9216 | TP2 CP2, 16384 | `deepscaler` |
-| `qwen3-4b-instruct-2507` | TP2 CP4, 9216 | TP2 CP2, 16384 | **`math`** |
-| `qwen3-8b` | TP4 CP2, 16384 | TP4 CP1, 32768 | `deepscaler` |
-| `qwen3-30b-a3b` | TP4 EP8, 32768, R3 | TP4 EP4, 32768, R3 | `deepscaler` |
+| `qwen3-4b-instruct-2507` | TP2 CP4, 9216 tok/GPU | TP2 CP1, 32768 | **`math`** |
 
-Two rules the table encodes:
+Two rules the row encodes:
 
 * `max_tokens_per_gpu × cp_size ≥ rollout_max_context_len`, because a single
   sample has to fit in that budget
   (`miles/backends/training_utils/data.py:473`). With the shared 32768 context
-  every row clears it.
+  the row clears it.
 * **`qwen3-4b-instruct-2507` defaults to `--rm-type math`, not `deepscaler`.**
   deepscaler returns 0 unless the response contains a `</think>` delimiter
   (`rm_hub/deepscaler.py:36-44`), and this checkpoint is non-thinking, so under
   deepscaler the entire run would score reward 0 without erroring anywhere.
-
-`qwen3-30b-a3b` is the only MoE and the only recipe with R3
-(`--use-rollout-routing-replay`), which replays the routing SGLang used during
-generation in the training forward pass. It also moves the fp32 Adam state to
-the host (`--optimizer-cpu-offload`), since 30B of optimizer state does not fit
-beside the weights on one node.
 
 ### Off-policy control
 
@@ -120,15 +112,22 @@ an implicit consequence of `--global-batch-size`, and it is what turns the
 four-knob invariant into a startup assert (`arguments.py:3056` only checks it
 when the flag is present).
 
-Dynamic sampling is **always on**; `--over-sampling-batch-size` is deliberately
-**not** passed, so it defaults to `rollout_batch_size` and the rollout loop
-submits only what it needs. Over-sampling would add a second, uncontrolled
-source of aborted generation on top of the weight-update one the off-policy
-study is measuring.
+Dynamic sampling is **off**: no `--dynamic-sampling-filter-path`, and difficulty
+is handled once, offline, by `experiments/src/difficulty_filter` — which is what
+the `p10-90` in the dataset name is. The online filter drops a variable number of
+groups per step, so the generation cost of a step depends on the policy rather
+than on the configuration; with wall-clock as the study's primary axis, that is
+uncontrolled variance in the metric being reported. Measured, it also tripled
+rollout time (253 s → 761 s). `--over-sampling-batch-size` is likewise not
+passed, so the rollout loop submits exactly what it needs.
 
-`--partial-rollout` is always on in `math_sync`, where groups dropped by the
-filter still leave requests in flight at the end of a rollout; without it that
-work is discarded rather than resumed. It does not exist in `math_async` —
+The offline filter is keyed to a *policy*: `dapo-math-p10-90` is the 0.1–0.9 pass
+rate window measured with Qwen3-4B-Instruct-2507. Another model needs its own
+measurement and its own dataset directory — and with the online filter gone there
+is no safety net when the window is stale.
+
+`--partial-rollout` is on in `math_sync`, to carry over generation still in flight
+when a rollout batch closes. It does not exist in `math_async` —
 `--fully-async` rejects the flag (`arguments.py:54`); the equivalent question
 there is `PAUSE_GENERATION_MODE`, which decides what happens to in-flight
 generation at a weight update.
@@ -150,7 +149,7 @@ any of it on the command line — the `:=` form means an exported value wins:
 ```bash
 sbatch -A $ACC -N 4 \
   --export=ALL,ACTOR_NUM_NODES=2,ACTOR_GPUS_PER_NODE=8,ROLLOUT_NUM_GPUS=16 \
-  experiments/math_async/dapo-math/qwen3-8b/run.sbatch
+  experiments/math_async/dapo-math-p10-90/qwen3-4b-instruct-2507/run.sbatch
 ```
 
 Nothing is inferred from the allocation. `-N 4` allocates four nodes;
@@ -178,35 +177,57 @@ shrink the per-rank batch; raise `ROLLOUT_BATCH_SIZE` with the allocation.
 Checkpoints are keyed by configuration, not by job id:
 
 ```
-/ckpt/training/<task>/<dataset>/<model>/<config>
-/ckpt/training/math/dapo-math-17k/Qwen3-4B/async-off-1step-rollout-length-24k-lr1e-6
+/ckpt/training/<task>/<dataset>/<model>/<rl-algorithm>/<placement>/<policy-regime>/max-weight-staleness-<s>/<config>
+
+/ckpt/training/math/dapo-math-p10-90/Qwen3-4B/grpo-clip0.2-0.28-tis2.0/
+    colocated/on-policy/max-weight-staleness-0/
+    rollout-length-32k-lr1e-6-rbs256-gbs2048-tseed1234-rseed42
 ```
 
+`RL_ALGORITHM` is *derived* from the loss knobs (`ADVANTAGE_ESTIMATOR`,
+`EPS_CLIP`, `EPS_CLIP_HIGH`, `USE_TIS`, `TIS_CLIP`, `TIS_CLIP_LOW`,
+`KL_LOSS_COEF`), never set by hand, so the directory name cannot drift from what
+the run passes. `POLICY_REGIME` is `on-policy` only when
+`MAX_WEIGHT_STALENESS == 0` *and* `NUM_STEPS_PER_ROLLOUT == 1` -- the two ways a
+sample goes off-policy. `PLACEMENT=colocated` refuses a non-zero staleness or a
+pause mode, because neither flag exists on that path. The pause mode is not in
+the tag -- it is checked off-grid, so that experiment sets `CONFIG_TAG` itself.
+
 The run name carries the same information —
-`math-dapo-math-17k-Qwen3-4B-async-off-1step-rollout-length-24k-lr1e-6` — so the
+`math-dapo-math-p10-90-Qwen3-4B-dapo-async-off-1step-rollout-length-32k-lr1e-6-tseed1234-rseed42` — so the
 wandb group, the log and the checkpoint directory all name the same thing.
 `common/run_identity.sh` computes all of it once and is sourced by both
 `run.sbatch` and `train.sh`, so the two cannot disagree.
 
 A resumed run therefore finds its own history and two settings never share a `--load`.
 `CONFIG_TAG` defaults to the rollout mode, the steps per rollout, the response
-length and the learning rate; set it explicitly for anything that default does
-not encode — a filtered prompt file, dynamic sampling turned off, a tuning job.
+length, the learning rate and both seeds; `RL_ALGORITHM` is a directory level
+above it. `TRAIN_SEED` (`--seed`) and `ROLLOUT_SEED` (`--rollout-seed`) move
+independently so replicates can separate training-seed variance from
+rollout-sampling variance. Set `CONFIG_TAG` explicitly for anything that default
+does not encode — the staleness bound, the pause mode, the batch shape, a
+filtered prompt file, a tuning job.
 The dump directory follows the same path.
 
 wandb is always on and keyed the same way: project `off-policy-<dataset>` (e.g.
-`off-policy-dapo-math`), group `RUN_NAME`. `run.sbatch` fails at submit time if
+`off-policy-dapo-math-p10-90`), group `RUN_NAME`. `run.sbatch` fails at submit time if
 `WANDB_API_KEY` is unset rather than quietly running without logging; `env.sh`
 resolves it from `~/.netrc`.
 
 ### Eval
 
 `--eval-prompt-data` takes name/path pairs and accepts as many as you give it, so
-several benchmarks each report their own series. The `dapo-math` recipes evaluate
-**AIME-2024 and AIME-2025**: same size and difficulty, but 2025 is outside the
-2024 contamination window, so a gap between the two is the cheapest memorisation
-signal available. The pairs are written out in `train.sh` — a different eval set
-is a different dataset directory, not a branch.
+several benchmarks each report their own series. The `dapo-math-p10-90` recipes
+evaluate **AIME-2025 only**, at `n=8`. In-training eval sits on the critical path
+of a wall-clock measurement, so it is kept small deliberately: it exists to show
+that a run is learning, not to produce a reported number. The pairs are written
+out in `train.sh` — a different eval set is a different dataset directory, not a
+branch.
+
+Reported numbers come from `experiments/src/offline_eval/run_eval.sbatch` instead:
+every AIME year at `n=16` and a 32768 generation budget, run against the HF
+snapshots `--save-hf` leaves behind, in a separate job that costs the training run
+nothing. See `math_async/dapo-math-p10-90/README.md` §2.
 
 Everything listed must already be in `prompt`/`label` shape, since the global
 `--input-key`/`--label-key` apply to eval too. `setup/build_math_jsonl.py`
@@ -267,7 +288,7 @@ where you think — and leave it off for the long ones.
 
 ```bash
 experiments/sweep.py --sweep experiments/sweeps/offpolicy.txt \
-  --recipe math_async/dapo-math/qwen3-4b-instruct-2507 \
+  --recipe math_async/dapo-math-p10-90/qwen3-4b-instruct-2507 \
   -- -N 2 -p batch_short --time=02:00:00
 ```
 
@@ -383,19 +404,19 @@ Then the training recipes:
 
 ```bash
 # 4a. Math RL, colocated.
-sbatch -A $ACC experiments/math_sync/dapo-math/qwen3-4b/run.sbatch
+sbatch -A $ACC experiments/math_sync/dapo-math-p10-90/qwen3-4b-instruct-2507/run.sbatch
 
 # 4b. The same task on the fully-async rollout.
-sbatch -A $ACC experiments/math_async/dapo-math/qwen3-4b/run.sbatch
+sbatch -A $ACC experiments/math_async/dapo-math-p10-90/qwen3-4b-instruct-2507/run.sbatch
 ```
 
-A fast smoke variant (a few rollouts, short responses). `qwen3-1.7b` is the
-cheapest place to check a change before spending a slot on a bigger model:
+A fast smoke variant (a few rollouts, short responses), for checking a change
+before spending a slot on a full run:
 
 ```bash
 sbatch -A $ACC -p interactive --time=01:00:00 \
   --export=ALL,NUM_ROLLOUT=3,ROLLOUT_BATCH_SIZE=8,N_SAMPLES_PER_PROMPT=8,GLOBAL_BATCH_SIZE=64,MAX_RESPONSE_LEN=1024 \
-  experiments/math_sync/dapo-math/qwen3-1.7b/run.sbatch
+  experiments/math_sync/dapo-math-p10-90/qwen3-4b-instruct-2507/run.sbatch
 ```
 
 Keep the four-knob invariant when changing batch sizes:

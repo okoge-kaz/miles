@@ -1,17 +1,106 @@
 #!/bin/bash
-# Needs MODEL_NAME, ROLLOUT_MODE, DATASET_TAG, LR, MAX_RESPONSE_LEN,
-# NUM_STEPS_PER_ROLLOUT. Sets CONFIG_TAG, RUN_NAME, CKPT_PATH.
+# Needs MODEL_NAME, DATASET_TAG, PLACEMENT, ADVANTAGE_ESTIMATOR, EPS_CLIP,
+# EPS_CLIP_HIGH, EPS_CLIP_C, RATIO_DENOMINATOR, IS_CORRECTION, TIS_CLIP,
+# TIS_CLIP_LOW, MIS_PROFILE, USE_OPSM, OPSM_DELTA, KL_LOSS_COEF, LR,
+# MAX_RESPONSE_LEN, NUM_STEPS_PER_ROLLOUT, ROLLOUT_BATCH_SIZE,
+# GLOBAL_BATCH_SIZE, N_SAMPLES_PER_PROMPT, TRAIN_SEED, ROLLOUT_SEED, and for PLACEMENT=async also
+# MAX_WEIGHT_STALENESS.
+# Sets RL_ALGORITHM, POLICY_REGIME, CONFIG_TAG, RUN_NAME, CKPT_PATH.
 # Sourced by both run.sbatch and train.sh so the two cannot disagree.
 
 : "${MODEL_NAME:?}"
-: "${ROLLOUT_MODE:?}"
 : "${DATASET_TAG:?}"
+: "${PLACEMENT:?}"
+: "${ADVANTAGE_ESTIMATOR:?}"
+: "${EPS_CLIP:?}"
+: "${EPS_CLIP_HIGH:?}"
+: "${RATIO_DENOMINATOR:?}"
+: "${IS_CORRECTION:?}"
+: "${TIS_CLIP:?}"
+: "${TIS_CLIP_LOW:?}"
+: "${USE_OPSM:?}"
+: "${OPSM_DELTA:?}"
+: "${KL_LOSS_COEF:?}"
 : "${LR:?}"
 : "${MAX_RESPONSE_LEN:?}"
 : "${NUM_STEPS_PER_ROLLOUT:?}"
+: "${ROLLOUT_BATCH_SIZE:?}"
+: "${GLOBAL_BATCH_SIZE:?}"
+: "${N_SAMPLES_PER_PROMPT:?}"
+: "${TRAIN_SEED:?}"
+: "${ROLLOUT_SEED:?}"
+
+case "${PLACEMENT}" in
+    colocated)
+        # Neither flag exists on this path; a non-default value would be silently dropped.
+        [[ "${MAX_WEIGHT_STALENESS:-0}" == 0 && "${PAUSE_GENERATION_MODE:-none}" == none ]] ||
+            { echo "PLACEMENT=colocated cannot carry MAX_WEIGHT_STALENESS/PAUSE_GENERATION_MODE" >&2; exit 1; }
+        MAX_WEIGHT_STALENESS=0
+        PAUSE_GENERATION_MODE=none
+        ;;
+    async)
+        : "${MAX_WEIGHT_STALENESS:?}"
+        ;;
+    *)
+        echo "PLACEMENT must be colocated or async, got '${PLACEMENT}'" >&2
+        exit 1
+        ;;
+esac
 
 TASK_FAMILY=math
 
-CONFIG_TAG="${CONFIG_TAG:-${ROLLOUT_MODE}-${NUM_STEPS_PER_ROLLOUT}step-rollout-length-$(( MAX_RESPONSE_LEN / 1024 ))k-lr${LR}}"
-RUN_NAME="${RUN_NAME:-${TASK_FAMILY}-${DATASET_TAG}-${MODEL_NAME}-${CONFIG_TAG}}"
-CKPT_PATH="/ckpt/training/${TASK_FAMILY}/${DATASET_TAG}/${MODEL_NAME}/${CONFIG_TAG}"
+# The two ways a sample can be off-policy: generated under older weights, or
+# reused across more than one optimizer step.
+if [[ "${MAX_WEIGHT_STALENESS}" -eq 0 && "${NUM_STEPS_PER_ROLLOUT}" -eq 1 ]]; then
+    POLICY_REGIME=on-policy
+else
+    POLICY_REGIME=off-policy
+fi
+
+# RL_ALGORITHM names the whole loss configuration, so every correction that can
+# be swept is a different directory. Each part is omitted at its default, which
+# keeps the common case short and makes any deviation visible in the name.
+if [[ "${TIS_CLIP_LOW}" == "0" ]]; then
+    BOUNDS="${TIS_CLIP}"
+else
+    BOUNDS="${TIS_CLIP_LOW}-${TIS_CLIP}"
+fi
+case "${IS_CORRECTION}" in
+    none)   IS_TAG=nois ;;
+    tis)    IS_TAG="tis${BOUNDS}" ;;
+    icepop) IS_TAG="icepop${BOUNDS}" ;;
+    mis)    : "${MIS_PROFILE:?IS_CORRECTION=mis needs MIS_PROFILE}"; IS_TAG="mis-${MIS_PROFILE}" ;;
+    *)      echo "IS_CORRECTION must be none|tis|icepop|mis, got '${IS_CORRECTION}'" >&2; exit 1 ;;
+esac
+
+case "${RATIO_DENOMINATOR}" in
+    actor)            DENOM_TAG="" ;;
+    rollout-logprobs) DENOM_TAG="-rolloutlp" ;;
+    old-actor)        DENOM_TAG="-oldactor" ;;
+    *) echo "RATIO_DENOMINATOR must be actor|rollout-logprobs|old-actor, got '${RATIO_DENOMINATOR}'" >&2; exit 1 ;;
+esac
+# arguments.py:2851 rejects the combination outright.
+[[ "${RATIO_DENOMINATOR}" != rollout-logprobs || "${IS_CORRECTION}" == none ]] ||
+    { echo "RATIO_DENOMINATOR=rollout-logprobs cannot be combined with IS_CORRECTION=${IS_CORRECTION}" >&2; exit 1; }
+
+RL_ALGORITHM="${ADVANTAGE_ESTIMATOR}-clip${EPS_CLIP}-${EPS_CLIP_HIGH}"
+[[ -z "${EPS_CLIP_C}" ]] || RL_ALGORITHM="${RL_ALGORITHM}-dualclip${EPS_CLIP_C}"
+RL_ALGORITHM="${RL_ALGORITHM}${DENOM_TAG}-${IS_TAG}"
+[[ "${USE_OPSM}" == "0" ]] || RL_ALGORITHM="${RL_ALGORITHM}-opsm${OPSM_DELTA}"
+if awk "BEGIN{exit !(${KL_LOSS_COEF} != 0)}"; then
+    RL_ALGORITHM="${RL_ALGORITHM}-kl${KL_LOSS_COEF}"
+fi
+
+CONFIG_TAG="${CONFIG_TAG:-rollout-length-$(( MAX_RESPONSE_LEN / 1024 ))k-lr${LR}-rbs${ROLLOUT_BATCH_SIZE}-gbs${GLOBAL_BATCH_SIZE}-n${N_SAMPLES_PER_PROMPT}-tseed${TRAIN_SEED}-rseed${ROLLOUT_SEED}}"
+STALENESS_TAG="max-weight-staleness-${MAX_WEIGHT_STALENESS}"
+
+# RUN_NAME is the wandb group and the log directory, not a path, and wandb
+# rejects a group name over 128 characters. It therefore carries the same
+# identity as CKPT_PATH in an abbreviated form, and is hashed if it still does
+# not fit. The hash is deterministic so a resumed job lands in the same group.
+_regime=$([[ "${POLICY_REGIME}" == on-policy ]] && echo onp || echo offp)
+RUN_NAME="${RUN_NAME:-${MODEL_NAME}-${PLACEMENT}-${_regime}-s${MAX_WEIGHT_STALENESS}-${CONFIG_TAG}-${RL_ALGORITHM}}"
+if (( ${#RUN_NAME} > 128 )); then
+    RUN_NAME="${RUN_NAME:0:119}-$(printf '%s' "${RUN_NAME}" | md5sum | cut -c1-8)"
+fi
+CKPT_PATH="/ckpt/training/${TASK_FAMILY}/${DATASET_TAG}/${MODEL_NAME}/${RL_ALGORITHM}/${PLACEMENT}/${POLICY_REGIME}/${STALENESS_TAG}/${CONFIG_TAG}"
