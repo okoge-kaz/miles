@@ -58,17 +58,21 @@ def group_oldest_weight_version(group: Group) -> int | None:
     return min(versions) if versions else None
 
 
-# Router and engine disagree about this endpoint's name, so it has to be
-# discovered rather than assumed:
+# Which name carries weight_version depends on the router, so it is discovered
+# rather than assumed. Checked against sglang 0.5.17:
 #
-#   engine  /model_info is current; /get_model_info logs a deprecation notice
-#   router  /get_model_info is the only one that resolves; /model_info is 404
+#   engine (uvicorn)  /model_info is canonical; /get_model_info delegates to it
+#                     with a deprecation notice; /get_weight_version raises
+#                     (http_server.py:727-733), so it can never answer
+#   sglang_router     has its own /model_info route, which 404s; /get_model_info
+#                     is not a route, falls through to the engine, and answers
+#   MilesRouter       proxies everything (router.py:71), so both reach the engine
 #
-# The router proxies to an engine, which is why querying it emits the engine's
-# deprecation warning. Ordered for the router, since that is who we ask, and a
-# 404 costs a round trip while the wrong guess costs the whole staleness cap.
-# The name that answers is remembered.
-WEIGHT_VERSION_ENDPOINTS = ("/get_model_info", "/model_info", "/get_weight_version")
+# Canonical name first: it is the one that survives, and it is right for
+# --use-miles-router and for any router that proxies. The fallback covers
+# sglang_router as it stands. A wrong first guess costs one 404 round trip, once,
+# because the name that answers is remembered.
+WEIGHT_VERSION_ENDPOINTS = ("/model_info", "/get_model_info")
 
 
 class _CachedWeightVersion:
@@ -87,7 +91,12 @@ class _CachedWeightVersion:
         if (time.monotonic() - self._last_query) < self._ttl:
             return self._value
         base = f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
-        candidates = (self._endpoint,) if self._endpoint else WEIGHT_VERSION_ENDPOINTS
+        # Remembered name first, then the rest: preferring it costs nothing, and
+        # keeping the others behind it means a router replaced under a resumed run
+        # recovers within the same query instead of after another TTL.
+        candidates = WEIGHT_VERSION_ENDPOINTS
+        if self._endpoint:
+            candidates = (self._endpoint, *(e for e in candidates if e != self._endpoint))
         last_error: Exception | None = None
         try:
             for endpoint in candidates:

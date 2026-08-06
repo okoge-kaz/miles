@@ -210,11 +210,35 @@ async def test_weight_version_endpoint_is_discovered_not_assumed(monkeypatch):
     assert await cache.get(args) == 4
     assert any(u.endswith("/get_model_info") for u in seen)
 
+    # The canonical name is tried first even though it is the one that 404s here.
+    assert seen[0].endswith("/model_info")
+
     # The working name is remembered, so later queries do not re-probe the others.
     cache._last_query = float("-inf")
     seen.clear()
     assert await cache.get(args) == 4
     assert [u.rsplit("/", 1)[-1] for u in seen] == ["get_model_info"]
+
+
+@pytest.mark.asyncio
+async def test_remembered_endpoint_is_dropped_when_it_stops_answering(monkeypatch):
+    """A router swapped under a resumed run must not pin the cache to a dead name."""
+    serving = {"name": "/get_model_info"}
+
+    async def only_current(url, *args, **kwargs):
+        if url.endswith(serving["name"]):
+            return {"weight_version": "7"}
+        raise httpx.HTTPStatusError("404", request=None, response=None)
+
+    monkeypatch.setattr(fully_async, "get", only_current)
+    cache = fully_async._CachedWeightVersion(ttl=0.0)
+    args = make_args(max_weight_staleness=2)
+    assert await cache.get(args) == 7
+    assert cache._endpoint == "/get_model_info"
+
+    serving["name"] = "/model_info"  # router replaced
+    assert await cache.get(args) == 7
+    assert cache._endpoint == "/model_info"
 
 
 async def test_unreachable_router_disables_the_cap_loudly(monkeypatch, caplog):
