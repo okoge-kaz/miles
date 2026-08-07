@@ -32,7 +32,7 @@ stage_models() {
         [[ -z "$name" ]] && continue
 
         local dl_dep="" cv_dep=""
-        if [[ -f "${HF_CKPT_DIR:-/lustre/fsw/portfolios/coreai/users/kfujii/checkpoints/hf}/${name}/.download_complete" ]]; then
+        if [[ -f "${HF_CKPT_DIR:?source experiments/env.sh first}/${name}/.download_complete" ]]; then
             echo "skip download ${name} (complete)"
         else
             dl=$(sbatch --parsable -A "$ACCOUNT" \
@@ -42,7 +42,7 @@ stage_models() {
             dl_dep="afterok:${dl}"
         fi
 
-        local tracker="${MEGATRON_CKPT_DIR:-/lustre/fsw/portfolios/coreai/users/kfujii/checkpoints/megatron}/${name}_torch_dist/latest_checkpointed_iteration.txt"
+        local tracker="${MEGATRON_CKPT_DIR:?source experiments/env.sh first}/${name}_torch_dist/latest_checkpointed_iteration.txt"
         if [[ -z "$dl_dep" && -f "$tracker" && "$(cat "$tracker" 2>/dev/null)" == "release" ]]; then
             echo "skip ${name} (already downloaded and converted)"
             continue

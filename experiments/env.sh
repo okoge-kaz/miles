@@ -3,23 +3,38 @@
 # Source this from an sbatch script; it defines paths only, no side effects.
 
 # --- Slurm ------------------------------------------------------------------
-export SLURM_ACCOUNT_NAME="coreai_horizon_dilations"
+export SLURM_ACCOUNT_NAME="${SLURM_ACCOUNT_NAME:-coreai_horizon_dilations}"
 export GPU_PARTITION="${GPU_PARTITION:-batch}"       # batch 4h / batch_long 8h / batch_large_long 14d
 export CPU_PARTITION="${CPU_PARTITION:-cpu}"         # cpu 1d / cpu_long 7d
 export GPUS_PER_NODE=8                               # every pool0-* node is H100 x8, 128 CPUs
 
 # --- Workspace on lustre ----------------------------------------------------
-export WS="/lustre/fsw/portfolios/coreai/users/kfujii"
-export DATASET_DIR="${WS}/datasets"
+# Split by whether a job READS or WRITES the directory.
+#
+# Read-only assets are shared from one workspace so that a second person does not
+# re-download 8 GB of weights or re-run the difficulty filter to get a
+# byte-identical prompt file. They are world-readable and stay put.
+export SHARED_WS="${SHARED_WS:-/lustre/fsw/portfolios/coreai/users/kfujii}"
+export DATASET_DIR="${SHARED_WS}/datasets"           # prompt files, eval benchmarks
+export HF_CKPT_DIR="${SHARED_WS}/checkpoints/hf"     # HuggingFace-format weights
+export MEGATRON_CKPT_DIR="${SHARED_WS}/checkpoints/megatron"  # torch_dist weights
+export CONTAINER_DIR="${SHARED_WS}/container"        # miles-latest.sqsh
+
+# Written directories are per-user. Sharing them would be worse than a
+# permissions problem: CKPT_PATH is derived from the configuration, so two people
+# running the same config would land on the same directory, and since --load and
+# --save are the same path the second run would silently resume the first
+# (see notes/off-policy-variables.md, "Run identity").
+export WS="${WS:-/lustre/fsw/portfolios/coreai/users/${USER}}"
 export CKPT_ROOT="${WS}/checkpoints"
-export HF_CKPT_DIR="${CKPT_ROOT}/hf"                 # HuggingFace-format weights
-export MEGATRON_CKPT_DIR="${CKPT_ROOT}/megatron"     # torch_dist (Megatron) weights
 export TRAIN_CKPT_DIR="${CKPT_ROOT}/training"        # checkpoints written during training
-export CONTAINER_DIR="${WS}/container"
-export CACHE_DIR="${WS}/cache"
+export CACHE_DIR="${WS}/cache"                       # compile / JIT caches
 
 # The miles checkout that gets mounted over /root/miles inside the container.
-export MILES_REPO="${MILES_REPO:-/lustre/fs1/portfolios/coreai/projects/coreai_horizon_dilations/users/kfujii/src/miles}"
+# Derived from this file's own location, so a second checkout mounts itself
+# rather than whichever path happened to be baked in. A hardcoded default here is
+# the worst kind of wrong: the job runs, but against someone else's code.
+export MILES_REPO="${MILES_REPO:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." &>/dev/null && pwd)}"
 
 # --- Secrets and local overrides --------------------------------------------
 # `$MILES_REPO/.env`, if present. $HOME is not mounted into the container
@@ -79,8 +94,14 @@ ${MEGATRON_CKPT_DIR}:/ckpt/megatron,\
 ${TRAIN_CKPT_DIR}:/ckpt/training,\
 ${CACHE_DIR}:/root/.cache"
 
-mkdir -p "${DATASET_DIR}" "${HF_CKPT_DIR}" "${MEGATRON_CKPT_DIR}" "${TRAIN_CKPT_DIR}" \
-         "${CONTAINER_DIR}" "${CACHE_DIR}" "${OUTPUT_DIR}"
+# Only the directories this user owns. The shared ones are read-only to everyone
+# else, and creating them here would mask a missing asset as a silent empty
+# directory rather than failing where it is staged.
+mkdir -p "${TRAIN_CKPT_DIR}" "${CACHE_DIR}" "${OUTPUT_DIR}"
+for _shared in "${DATASET_DIR}" "${HF_CKPT_DIR}" "${MEGATRON_CKPT_DIR}" "${CONTAINER_DIR}"; do
+    [[ -d "${_shared}" ]] || echo "env.sh: missing shared asset ${_shared} (see experiments/setup/)" >&2
+done
+unset _shared
 
 # --- Compile / JIT caches ---------------------------------------------------
 # $HOME is /root in the container and is not mounted, so anything writing to
