@@ -85,10 +85,12 @@ speedup profile over `q_p`, and the realized `P(L)` histogram — the last one
 because the configured bound and the realized lag are different quantities, and
 conflating them is the specific gap this study exists to close.
 
-## The on-policy reference is invariant to the IS correction (2026-08-07)
+## The on-policy reference is invariant to ICEPOP, but not to MIS (2026-08-07)
 
-Tier 2 compares TIS, ICEPOP and sequence-level MIS. It carries no s=0 arm,
-because on the colocated on-policy run all three are the same loss.
+Tier 2 compares TIS, ICEPOP and sequence-level MIS. It carries no s=0 **icepop**
+arm, because at token level TIS and ICEPOP are the same loss on the colocated
+on-policy run. It does carry a s=0 **mis** arm -- see the sequence-level section
+below, which is why.
 
 Measured on job 15290984 (colocated, lr 1e-6, 32k), first four training steps:
 
@@ -107,8 +109,39 @@ as well -- the tiers share lr 1e-6 and 32k, so the comparison is exact.
 This removes the two most expensive arms in the study: a colocated arm runs
 60-71 h against the async arms' 25-35 h.
 
-**A larger caveat comes with it.** The same statistic is flat across the
-staleness axis at this learning rate:
+### Sequence-level does not follow from token-level
+
+The per-token log-ratio is not zero-mean noise. It is a systematic -5.1e-04,
+identical on every arm including the on-policy one, and it multiplies by the
+sequence length:
+
+| arm | length | per-token log-ratio | sequence log-ratio | sequence ratio |
+|---|---|---|---|---|
+| s=0 colocated | 6309 | -5.117e-04 | -3.23 | 0.040 |
+| s=1 async | 6748 | -5.071e-04 | -3.42 | 0.033 |
+| s=2 async | 7114 | -5.022e-04 | -3.57 | 0.028 |
+| s=4 async | 7066 | -4.906e-04 | -3.47 | 0.031 |
+
+(from `rollout/log_probs - rollout/rollout_log_probs` times
+`rollout/response_lengths`.)
+
+Against `seq-mask.yaml`'s `[0.5, 2.0]` those raw ratios are two orders of
+magnitude low, so **unnormalized sequence-level masking would mask every
+sequence and zero the loss**. It gets worse as responses lengthen: -2.48 at 4737
+tokens, -3.57 at 7114, and around -16 at 32k. `tis_batch_normalize: true`
+divides out exactly this batch-common component and is therefore not optional --
+it is what makes the profile runnable at all. **Verify on a short run that the
+normalized sequence ratios land inside the bounds before spending tier 2 on it.**
+
+Because the effect is the framework's numerical mismatch rather than staleness,
+it is present on the on-policy arm at full strength. A sequence-level correction
+therefore does something on the s=0 arm that a token-level one does not, and the
+s=0 mis arm is not redundant with the s=0 tis arm.
+
+### A caveat on the staleness axis, still unresolved
+
+The token-level statistic is flat across the staleness axis at this learning
+rate:
 
 | arm | tis mean | tis_abs max | clipfrac max |
 |---|---|---|---|
@@ -119,8 +152,17 @@ staleness axis at this learning rate:
 
 At lr 1e-6 the policy moves so little per step that a lag of 4 still leaves
 `pi_train / pi_rollout` within 1% of unity, and the clip fraction does not
-separate the arms at all. An IS correction that never fires cannot distinguish
-itself from another one that never fires, so **tier 2 may return a null result at
-this learning rate by construction**. If tier 1 confirms the pattern, tier 2 is
-worth more at lr 5e-6 (tier 4's upper point) than at 1e-6, and the tier order
-should be revisited rather than run as scheduled.
+separate the arms at all.
+
+**This is measured over rollouts 0-11 of 300 and is not yet evidence about the
+run.** Off-policy divergence is expected to appear later, not now: early on the
+advantages are weak so each step moves the policy little, the entropy is still
+high so the distribution is flat, and the responses are short. All three trend
+the other way as training proceeds -- `response_len/mean` has already gone
+4737 -> 7114. The right time to ask whether the corrections separate is when
+`tis_clipfrac` starts to move, which has not happened yet.
+
+Watch `train/tis_clipfrac` and `train/tis_abs` over tier 1. If they are still at
+5e-06 and 1% at rollout 100-150, then tier 2 at lr 1e-6 would compare three
+corrections that never fire, and it is worth more at lr 5e-6. Do not reorder the
+tiers before that evidence exists.
