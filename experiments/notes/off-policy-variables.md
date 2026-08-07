@@ -484,3 +484,32 @@ Unaffected: it overrides `CONFIG_TAG` with `sweep-<name>-<tag_for(point)>`, whic
 encodes exactly the knobs that point varies. The directory levels above
 `CONFIG_TAG` are still derived per point, so a sweep over staleness or algorithm
 still fans out across directories.
+
+## The acceleration is conditional on the node ratio (2026-08-07)
+
+Recycling cost shows up in wall-clock only when rollout capacity is scarce.
+Measured at 1 train + 3 rollout, jobs 15288337 (bound 1) and 15288347 (bound 2):
+
+| step | s1 `wasted_token_frac` | s1 `train_wait` | s2 `wasted_token_frac` | s2 `train_wait` |
+|---|---|---|---|---|
+| 3 | 0.2556 | 177.5 s | 0.0000 | 79.9 s |
+| 4 | 0.1162 | 69.1 s | 0.0147 | 13.0 s |
+| 5 | 0.2301 | -- | 0.0081 | -- |
+
+The bound-1 arm discards roughly a quarter of the tokens it generates and stays
+rollout-bound; the bound-2 arm returns to train-bound. That difference *is* the
+mechanism by which a looser bound accelerates training -- but its magnitude is
+set by R. With rollout capacity to spare the recycling is absorbed and costs no
+wall-clock at all; with R tight it is fully exposed.
+
+So "staleness s buys T seconds per step" is a statement about this ratio, and
+the paper has to say so. It is a systems claim, not an algorithmic constant.
+
+R=5 (N=6) is the next ratio the batch shape allows: the colocated arm trains on
+all N nodes at `dp = 4N`, and `4N | 3072` needs `N | 768`, so N ∈ {2,3,4,6,8,12,16}
+and N=5 is not available. Extrapolating the observed times at `tau_roll x 3/5`,
+R=5 is 16-37% faster in wall-clock but costs more node-seconds in three of the
+four measured steps: once a step is train-bound, extra rollout nodes are pure
+cost. R=3 stands unless `train_wait` exceeds ~100 s for three consecutive steps
+while `response_len/mean` is still climbing, which would mean length growth has
+made the starvation structural rather than a transient of the lag ramp.

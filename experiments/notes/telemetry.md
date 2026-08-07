@@ -190,3 +190,44 @@ and generation is truncated at the remaining budget. Raising the context would
 force `MAX_TOKENS_PER_GPU` up with it (`mtpg * cp >= context`), and that is a
 frozen throughput parameter -- moving it for one arm would break wall-clock
 comparability across arms.
+
+## `max_staleness` is the offered lag, not the trained lag (2026-08-07)
+
+`rollout/fully_async/{avg,max}_staleness` and the `staleness_count_k` histogram
+count every group **as it is offered**, including the ones the bound then throws
+away. `fully_async_rollout.py:328-339` appends before it filters:
+
+```python
+staleness = current - oldest
+staleness_values.append(staleness)          # recorded here
+if staleness > args.max_weight_staleness:
+    self._recycle(prompt_group)             # discarded here
+    continue
+```
+
+So a run with `--max-weight-staleness 1` legitimately logs `max_staleness = 3`.
+The bound is not violated; the metric simply is not measuring what its name
+suggests.
+
+Measured on job 15288337 (bound 1) and 15288347 (bound 2), rollout 4:
+
+| | L=0 | L=1 | L=2 | L=3 | offered | recycled | trained on |
+|---|---|---|---|---|---|---|---|
+| bound 1 | 96 | 96 | 14 | 1 | 207 | 15 | 192 |
+| bound 2 | 88 | 66 | 38 | 2 | 194 | 2 | 192 |
+
+The accounting closes exactly: offered − recycled = 192 = `rollout_batch_size`,
+and nothing above the bound survives. `staleness_num_groups` exceeds 192 because
+a recycled prompt is re-offered and counted again.
+
+Consequences for the analysis:
+
+- **The realized lag P(L) must be taken from `staleness_count_k` truncated at
+  `k <= bound`**, not from `avg_staleness`. At bound 1 the logged mean was 0.75
+  against a trained mean of 0.495 -- a 50% overstatement, and it is worst exactly
+  where the bound bites hardest.
+- A wandb chart of `max_staleness` across arms compares *offered* lag, which is a
+  property of the node ratio and is nearly identical across bounds. It is not
+  the study's independent variable.
+- `wasted_token_frac` is the honest companion metric: it is the cost of the gap
+  between offered and trained lag.
