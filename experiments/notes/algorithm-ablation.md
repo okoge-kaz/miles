@@ -84,3 +84,43 @@ Per arm, against its own algorithm's reference: `tau_m(delta)`, `S_m(delta)`, th
 speedup profile over `q_p`, and the realized `P(L)` histogram — the last one
 because the configured bound and the realized lag are different quantities, and
 conflating them is the specific gap this study exists to close.
+
+## The on-policy reference is invariant to the IS correction (2026-08-07)
+
+Tier 2 compares TIS, ICEPOP and sequence-level MIS. It carries no s=0 arm,
+because on the colocated on-policy run all three are the same loss.
+
+Measured on job 15290984 (colocated, lr 1e-6, 32k), first four training steps:
+
+```
+train/tis           0.9999980     mean importance weight
+train/tis_abs       0.00941       mean |ratio - 1|
+train/tis_clipfrac  4.85e-06      fraction of tokens the clip touched
+```
+
+TIS clips five tokens in a million. ICEPOP masks tokens outside a band and MIS
+masks whole sequences; against a ratio distribution this tight, all three pass
+every token through. The three on-policy curves would differ only by the
+framework's own numerical noise, so tier 1's s=0 run is the reference for tier 2
+as well -- the tiers share lr 1e-6 and 32k, so the comparison is exact.
+
+This removes the two most expensive arms in the study: a colocated arm runs
+60-71 h against the async arms' 25-35 h.
+
+**A larger caveat comes with it.** The same statistic is flat across the
+staleness axis at this learning rate:
+
+| arm | tis mean | tis_abs max | clipfrac max |
+|---|---|---|---|
+| s=0 colocated | 0.9999980 | 0.00941 | 4.85e-06 |
+| s=1 async | 0.9999999 | 0.01021 | 4.86e-06 |
+| s=2 async | 1.0000033 | 0.01060 | 4.59e-06 |
+| s=4 async | 0.9999988 | 0.01032 | 4.74e-06 |
+
+At lr 1e-6 the policy moves so little per step that a lag of 4 still leaves
+`pi_train / pi_rollout` within 1% of unity, and the clip fraction does not
+separate the arms at all. An IS correction that never fires cannot distinguish
+itself from another one that never fires, so **tier 2 may return a null result at
+this learning rate by construction**. If tier 1 confirms the pattern, tier 2 is
+worth more at lr 5e-6 (tier 4's upper point) than at 1e-6, and the tier order
+should be revisited rather than run as scheduled.

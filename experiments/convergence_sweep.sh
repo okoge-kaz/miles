@@ -31,17 +31,18 @@ LOG_DIR="${OUTPUT_DIR}/training/math/dapo-math-p10-90/qwen3-4b-instruct-2507"
 : "${TRAIN_SEED:=1234}"
 : "${ROLLOUT_SEED:=42}"
 
+# Tier 2 carries no s=0 arm: the on-policy reference is invariant to the IS
+# correction, so tier 1's s=0 run serves it. See notes/algorithm-ablation.md.
+#
 # tier | staleness | IS_CORRECTION | MIS_PROFILE | LR | MAX_RESPONSE_LEN
 ARMS=$(cat <<'EOF'
 1 0 tis    -        1e-6 32768
 1 1 tis    -        1e-6 32768
 1 2 tis    -        1e-6 32768
 1 4 tis    -        1e-6 32768
-2 0 icepop -        1e-6 32768
 2 1 icepop -        1e-6 32768
 2 2 icepop -        1e-6 32768
 2 4 icepop -        1e-6 32768
-2 0 mis    seq-mask 1e-6 32768
 2 1 mis    seq-mask 1e-6 32768
 2 2 mis    seq-mask 1e-6 32768
 2 4 mis    seq-mask 1e-6 32768
