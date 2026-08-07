@@ -532,3 +532,32 @@ fed by that distribution would recycle most of what it generates, so raising R
 makes the tight-bound arms worse, not better. The starvation of the low-staleness
 arms at a fixed node budget is the phenomenon under study, not an artifact of
 under-provisioning.
+
+## Positioning against VCPO (arXiv:2602.17616, 2026-08-07)
+
+"Stable Asynchrony: Variance-Controlled Off-Policy RL for LLMs" (MIT Han lab +
+NVIDIA) reports "matches the best synchronous accuracy 2.5x faster (~42h vs
+~105h)", which reads at first like the question this study asks. It is not, and
+the settings are worth recording precisely because the difference is in the
+setup rather than in the headline.
+
+| | VCPO | this study |
+|---|---|---|
+| response length | **2048** for GSM8K / MATH / Countdown; 12,288 only for the tool-use task | 32k primary, 4k as a swept axis |
+| model | **Qwen2-1.5B Base**, **Qwen2.5-7B Base** | Qwen3-4B-Instruct-2507 |
+| learning rate | 1e-6 fixed; "without learning-rate sweeps" is offered as a *feature* | 1e-7 / 1e-6 / 5e-6 swept |
+| convergence | the string "converg" appears **once** in the paper, in an aside | time to non-inferiority against a converged reference is the measurement |
+| staleness | configured k in {2, 10, 12, 128}; realized lag never measured | configured bound and realized lag measured separately |
+| training steps | 400 (GSM8K/MATH), 200 (tool-use) | 300 at 32k |
+
+The 2.5x number is a **single point**: the tool-use task at k=2, response length
+12,288, 200 steps. On math the paper asks whether training collapses at k=10/12/
+128, not how long anything takes. There is no statistical definition of
+non-inferiority and no check that the synchronous baseline had converged -- the
+comparison point is read off the synchronous curve by eye.
+
+So the framing survives: VCPO shows an algorithm that does not collapse at 2k
+response length on base models, and this study measures when an off-policy run
+becomes non-inferior to a converged reference, as a function of learning rate,
+response length and realized lag. Do not weaken the claim; do cite VCPO as the
+closest prior wall-clock result and state the three setting differences.

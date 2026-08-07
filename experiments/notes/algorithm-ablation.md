@@ -166,3 +166,27 @@ Watch `train/tis_clipfrac` and `train/tis_abs` over tier 1. If they are still at
 5e-06 and 1% at rollout 100-150, then tier 2 at lr 1e-6 would compare three
 corrections that never fire, and it is worth more at lr 5e-6. Do not reorder the
 tiers before that evidence exists.
+
+### seq-mask's bounds are wrong, and the failure is documented (2026-08-07)
+
+`experiments/configs/mis/seq-mask.yaml` carries `tis_lower_bound: 0.5` /
+`tis_upper_bound: 2.0`. Those are token-level numbers and they will mask
+everything.
+
+Two independent confirmations:
+
+- **Measured here.** The sequence-level ratio on the running arms is 0.03-0.08
+  (`notes/telemetry.md`), two orders below 0.5, and it deepens with length --
+  -2.48 at 4737 tokens, -3.57 at 7114.
+- **Observed in VCPO** (arXiv:2602.17616, Figure 4): "Most baselines lead to
+  training collapse (or crash, e.g. **Geometric MIS masks all sequences and has
+  no loss**)" -- at 2048 tokens, where the effect is roughly a third of ours.
+
+VCPO's own sweep (Appendix E.2) settles on **sequence-level TIS with c = 8.0**
+as the threshold that survives longest among masking/clipping methods. That is
+the order of magnitude to start from, not 2.0.
+
+Fix the bounds against arXiv:2512.02556 section 3.1 before tier 2, and check
+whether `tis_batch_normalize: true` is what the DeepSeek formulation actually
+does -- if it divides out the batch-common component, the bound applies to a
+normalized ratio and the numbers above do not transfer directly.
