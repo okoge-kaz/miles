@@ -15,8 +15,9 @@ Checks per recipe:
      at the node count its own #SBATCH --nodes declares
   4. max_tokens_per_gpu * cp >= rollout_max_context_len
   5. the four-knob invariant holds at the defaults
-  6. flag hygiene: --partial-rollout is colocated-only (--fully-async rejects
-     it), async carries the staleness bound and the pause mode, MoE carries R3
+  6. flag hygiene: --partial-rollout appears nowhere (--fully-async rejects
+     it), async carries the staleness bound and the pause mode, every recipe
+     carries --use-tis, MoE carries R3
 """
 
 from __future__ import annotations
@@ -120,16 +121,23 @@ def check_recipe(recipe_dir: Path) -> None:
         fail(rel, f"four-knob invariant: {rb} * {n} != {gbs} * {steps}")
 
     # 6. flag hygiene
-    has_partial = "--partial-rollout" in train_text
-    if is_async and has_partial:
-        fail(rel, "--fully-async rejects --partial-rollout (arguments.py:54)")
-    if not is_async and not has_partial:
-        fail(rel, "colocated recipe lost --partial-rollout")
-    for flag in ("--max-weight-staleness", "--pause-generation-mode", "--use-tis"):
+    # --partial-rollout must appear nowhere. --fully-async rejects it outright
+    # (arguments.py:54), and the colocated arm dropped it on purpose: it recycles
+    # in-flight generations that then resume against a newer policy, so every
+    # sample it collects is off-policy by construction -- which contradicts the
+    # colocated arm's role as the on-policy reference. See notes/telemetry.md.
+    if "--partial-rollout" in train_text:
+        fail(rel, "--partial-rollout: rejected by --fully-async, and off-policy by construction under --colocate")
+    for flag in ("--max-weight-staleness", "--pause-generation-mode"):
         if is_async and flag not in train_text:
             fail(rel, f"async recipe is missing {flag}")
         if not is_async and flag in train_text:
             fail(rel, f"colocated recipe should not carry {flag}")
+    # --use-tis belongs in both. It corrects the Megatron/SGLang numerical
+    # mismatch, which the colocated arm has as well, and the on-policy reference
+    # has to run the same loss as the arms it is the reference for.
+    if "--use-tis" not in train_text:
+        fail(rel, "recipe is missing --use-tis")
     if "30b-a3b" in rel and "--use-rollout-routing-replay" not in train_text:
         fail(rel, "MoE recipe is missing R3")
     if "instruct-2507" in rel and "RM_TYPE:=math" not in run_text:

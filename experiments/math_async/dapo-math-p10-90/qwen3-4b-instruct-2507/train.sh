@@ -91,6 +91,9 @@ PERF_ARGS=(
 
    --use-dynamic-batch-size
    --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
+
+   # trainer only: the sglang engines keep the default allocator
+   --train-env-vars '{"PYTORCH_CUDA_ALLOC_CONF":"expandable_segments:True"}'
 )
 if [[ "${RECOMPUTE_GRANULARITY}" == "full" ]]; then
    PERF_ARGS+=(--recompute-method uniform --recompute-num-layers 1)
