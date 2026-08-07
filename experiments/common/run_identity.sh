@@ -98,9 +98,15 @@ STALENESS_TAG="max-weight-staleness-${MAX_WEIGHT_STALENESS}"
 # rejects a group name over 128 characters. It therefore carries the same
 # identity as CKPT_PATH in an abbreviated form, and is hashed if it still does
 # not fit. The hash is deterministic so a resumed job lands in the same group.
+#
+# The budget is not 128: wandb_utils.py:52 appends "_" and an 8-character id to
+# the group when --wandb-random-suffix is on, which it is by default, so the
+# group runs nine characters longer than RUN_NAME. 115 keeps a few characters
+# spare rather than landing exactly on the limit; identity comes from the hash,
+# so the truncation point is free.
 _regime=$([[ "${POLICY_REGIME}" == on-policy ]] && echo onp || echo offp)
 RUN_NAME="${RUN_NAME:-${MODEL_NAME}-${PLACEMENT}-${_regime}-s${MAX_WEIGHT_STALENESS}-${CONFIG_TAG}-${RL_ALGORITHM}}"
-if (( ${#RUN_NAME} > 128 )); then
-    RUN_NAME="${RUN_NAME:0:119}-$(printf '%s' "${RUN_NAME}" | md5sum | cut -c1-8)"
+if (( ${#RUN_NAME} > 115 )); then
+    RUN_NAME="${RUN_NAME:0:106}-$(printf '%s' "${RUN_NAME}" | md5sum | cut -c1-8)"
 fi
 CKPT_PATH="/ckpt/training/${TASK_FAMILY}/${DATASET_TAG}/${MODEL_NAME}/${RL_ALGORITHM}/${PLACEMENT}/${POLICY_REGIME}/${STALENESS_TAG}/${CONFIG_TAG}"
