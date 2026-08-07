@@ -424,7 +424,9 @@ async def measure_one(session, args, tokenizer, row, sampling_params, sem, out_f
                 dump_file.flush()
                 counters["dumped"] += 1
             counters["done"] += 1
-            if counters["done"] % 200 == 0:
+            # Every 10% rather than every 200: an eval benchmark is 30 prompts,
+            # so a fixed stride of 200 prints nothing at all and the run looks hung.
+            if counters["done"] % max(1, counters["total"] // 10) == 0:
                 elapsed = time.time() - counters["t0"]
                 rate = counters["done"] / max(1e-9, elapsed)
                 remaining = (counters["total"] - counters["done"]) / max(1e-9, rate)

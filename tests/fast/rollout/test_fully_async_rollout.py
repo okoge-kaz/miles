@@ -9,6 +9,7 @@ from dataclasses import replace
 
 import httpx
 import pytest
+from types import SimpleNamespace
 
 import miles.rollout.fully_async_rollout as fully_async
 from miles.rollout.base_types import RolloutFnConstructorInput, RolloutFnEvalInput, RolloutFnTrainInput
@@ -161,17 +162,79 @@ async def test_stale_group_recycled(monkeypatch):
 
     assert data_source.recycled == [stale]
     assert output.metrics["rollout/fully_async/stale_groups_recycled"] == 1
-    assert output.metrics["rollout/fully_async/max_staleness"] == 5
     # The reference version the staleness is a difference against: without it, a
     # missing staleness metric cannot be told apart from a router that never answered.
     assert output.metrics["rollout/fully_async/current_weight_version"] == 10
-    # Two groups were examined: the scripted one at version 5, then a fresh one at 10.
-    assert output.metrics["rollout/fully_async/staleness_num_groups"] == 2
-    assert output.metrics["rollout/fully_async/staleness_p50"] == pytest.approx(2.5)
-    assert output.metrics["rollout/fully_async/staleness_frac_zero"] == pytest.approx(0.5)
-    assert output.metrics["rollout/fully_async/staleness_frac_at_bound"] == pytest.approx(0.5)
+
+    # The unprefixed metrics are the lag the loss saw. The group at 5 exceeded the
+    # bound of 2 and was recycled, so only the fresh group at 10 -- lag 0 -- was
+    # trained on. A reader plotting "max_staleness" against a bound of 2 must never
+    # see a 5 there.
+    assert output.metrics["rollout/fully_async/max_staleness"] == 0
+    assert output.metrics["rollout/fully_async/staleness_num_groups"] == 1
+    assert output.metrics["rollout/fully_async/staleness_frac_zero"] == pytest.approx(1.0)
+    assert output.metrics["rollout/fully_async/staleness_count_0"] == 1
+    assert output.metrics["rollout/fully_async/staleness_count_5"] == 0
+
+    # The offered distribution keeps both: it is the natural lag of this node
+    # ratio, and the gap between the two is what recycling cost.
+    assert output.metrics["rollout/fully_async/offered/max_staleness"] == 5
+    assert output.metrics["rollout/fully_async/offered/staleness_num_groups"] == 2
+    assert output.metrics["rollout/fully_async/offered/staleness_p50"] == pytest.approx(2.5)
+    assert output.metrics["rollout/fully_async/offered/staleness_frac_zero"] == pytest.approx(0.5)
+    assert output.metrics["rollout/fully_async/offered/staleness_frac_at_bound"] == pytest.approx(0.5)
+
     # Tokens counted before reset_for_retry cleared them.
     assert output.metrics["rollout/fully_async/stale_tokens"] == N_SAMPLES_PER_PROMPT
+
+
+async def test_trained_staleness_excludes_dynamic_filter_drops(monkeypatch):
+    """A group the filter drops never reached the loss, so it is not trained lag.
+
+    The bound is the obvious way a group leaves the batch; the dynamic filter is
+    the one that is easy to forget, because it runs *after* the staleness check
+    and drops rather than recycles.
+    """
+    stale_but_allowed = make_group(1, weight_versions=["9"])
+    data_source = FakeDataSource(scripted=[stale_but_allowed])
+
+    original_make = data_source.get_samples
+
+    def get_samples_with_fresh_versions(num_samples):
+        groups = original_make(num_samples)
+        for group in groups:
+            for sample in group:
+                if not sample.weight_versions:
+                    sample.weight_versions = ["10"]
+        return groups
+
+    data_source.get_samples = get_samples_with_fresh_versions
+
+    fn = make_fn(monkeypatch, make_args(rollout_batch_size=1, max_weight_staleness=4), data_source)
+
+    class FakeWeightVersion:
+        async def get(self, args):
+            return 10
+
+    fn._weight_version = FakeWeightVersion()
+
+    # Drop the scripted group -- lag 1, comfortably inside the bound of 4 -- and
+    # keep the fresh one that replaces it.
+    def reject_the_stale_one(args, group, **kwargs):
+        keep = group[0].group_index != 1
+        return DynamicFilterOutput(keep=keep, reason=None if keep else "rejected")
+
+    fn._dynamic_filter = reject_the_stale_one
+
+    output = await fn(RolloutFnTrainInput(rollout_id=0))
+
+    # It was offered at lag 1 and the bound did not stop it...
+    assert output.metrics["rollout/fully_async/offered/staleness_count_1"] == 1
+    assert output.metrics["rollout/fully_async/stale_groups_recycled"] == 0
+    # ...but the filter dropped it, so the loss only ever saw the lag-0 group.
+    assert output.metrics["rollout/fully_async/staleness_count_1"] == 0
+    assert output.metrics["rollout/fully_async/staleness_count_0"] == 1
+    assert output.metrics["rollout/fully_async/staleness_num_groups"] == 1
 
 
 async def test_wasted_token_accounting(monkeypatch):

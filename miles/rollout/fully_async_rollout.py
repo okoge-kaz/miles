@@ -297,7 +297,14 @@ class FullyAsyncRolloutFn:
         data: list[Group] = []
         aborted_groups_recycled = 0
         stale_groups_recycled = 0
-        staleness_values: list[int] = []
+        # Two populations, because they answer different questions and only one of
+        # them is the study's variable. ``offered`` is every group the pipeline
+        # handed over, including those the bound then sent back -- that is the
+        # *natural* lag of this node ratio. ``trained`` is what survived into the
+        # batch, and is what the loss actually saw. They diverge exactly where the
+        # bound bites, which is where a reader is most likely to be misled.
+        trained_staleness: list[int] = []
+        offered_staleness: list[int] = []
         current_version: int | None = None
         # Generation that was produced and then thrown away. Counted in tokens, not
         # groups, because that is the unit a sample-efficiency claim is made in, and
@@ -319,6 +326,7 @@ class FullyAsyncRolloutFn:
                 aborted_groups_recycled += 1
                 continue
 
+            group_staleness: int | None = None
             if args.max_weight_staleness is not None:
                 oldest = group_oldest_weight_version(group)
                 current = await self._weight_version.get(args)
@@ -326,7 +334,8 @@ class FullyAsyncRolloutFn:
                     current_version = current
                 if oldest is not None and current is not None:
                     staleness = current - oldest
-                    staleness_values.append(staleness)
+                    group_staleness = staleness
+                    offered_staleness.append(staleness)
                     if staleness > args.max_weight_staleness:
                         stale_tokens += group_response_tokens(group)
                         self._recycle(prompt_group)
@@ -352,6 +361,8 @@ class FullyAsyncRolloutFn:
                 )
                 do_print = False
 
+            if group_staleness is not None:
+                trained_staleness.append(group_staleness)
             data.append(group)
 
         sample = _first_sample(data[-1])
@@ -385,10 +396,18 @@ class FullyAsyncRolloutFn:
             # this version, and without it a missing staleness metric is impossible to
             # tell apart from a router that never answered.
             metrics["rollout/fully_async/current_weight_version"] = current_version
-        if staleness_values:
+        # The unprefixed names are the lag the loss saw. The offered distribution
+        # keeps its own prefix rather than the short name it used to own: a chart
+        # of "staleness" against a bound is read as what was trained on.
+        if trained_staleness:
             metrics |= {
                 f"rollout/fully_async/{name}": value
-                for name, value in _staleness_metrics(staleness_values, args.max_weight_staleness).items()
+                for name, value in _staleness_metrics(trained_staleness, args.max_weight_staleness).items()
+            }
+        if offered_staleness:
+            metrics |= {
+                f"rollout/fully_async/offered/{name}": value
+                for name, value in _staleness_metrics(offered_staleness, args.max_weight_staleness).items()
             }
 
         return RolloutFnTrainOutput(samples=data, metrics=metrics)
