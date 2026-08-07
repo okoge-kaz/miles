@@ -15,6 +15,67 @@ reuse inside one rollout batch, where the lag is deterministic (`0..N-1`
 gradient steps) rather than a distribution over generation latency. Both are
 swept; they are not the same axis.
 
+## The realized lag has a hard ceiling, and a hard-coded constant sets it (2026-08-07)
+
+Over-provisioning rollout does not send the lag off to infinity. Production is
+bounded on two sides in `fully_async_rollout.py`:
+
+```python
+OUTPUT_QUEUE_MAX_GROUPS = 1000                                  # :34
+self._output = asyncio.Queue(maxsize=OUTPUT_QUEUE_MAX_GROUPS)   # :224
+
+def _max_in_flight_groups(self):                                # :230
+    if (x := self.args.async_max_concurrent_samples) is not None:
+        return max(1, x // self.args.n_samples_per_prompt)
+    return self.args.rollout_batch_size
+
+async def _worker_loop(self):                                   # :256
+    ...
+    await self._output.put(task.result())                       # :265  blocks when full
+```
+
+`await put` is backpressure: with the queue full the worker stops submitting, so
+the engines stall rather than the queue growing. Run-ahead is therefore at most
+`OUTPUT_QUEUE_MAX_GROUPS + rollout_batch_size` groups, and the trainer drains
+`rollout_batch_size` per step, so
+
+    ceiling(L) ~ OUTPUT_QUEUE_MAX_GROUPS / rollout_batch_size + O(1)
+               = 1000 / 192 + 1 ~ 6
+
+Measured, T=1, gbs 3072, n 16, rbs 192, 12 rollouts, uncapped (`MAX_WEIGHT_STALENESS=64`):
+
+| R | queue_size trajectory | mean L | max L | P(L>2) |
+|---|---|---|---|---|
+| 1 | 0 throughout | 0.45–0.50 | 3 | 0.001–0.005 |
+| 2 | 0 throughout | 0.63–0.64 | 3 | 0.001–0.002 |
+| 3 | 0–2 (one excursion to 14) | 0.86–1.41 | 4 | 0.013–0.109 |
+| 5 | 10 → 827, still rising | 2.72–2.80 | 6 | 0.60–0.64 |
+| 7 | 3 → **1000** (saturated) → 980 | 3.19 | 6 | 0.68 |
+
+R=7 reaches the queue bound at step 10 and `max L` stops at 6, as predicted.
+R=1/2/3 keep an empty queue, so their lag comes from generation latency alone and
+settles immediately.
+
+Two consequences.
+
+**The "natural" staleness of an over-provisioned run is a property of the
+framework, not of the workload.** At `OUTPUT_QUEUE_MAX_GROUPS = 100` the ceiling
+would be ~0.5; at 10000, ~52. The constant has to be reported alongside any
+realized-lag histogram, and a staleness level above the ceiling is bit-for-bit
+the uncapped run.
+
+**Raising the queue is a way to induce lag, and it is not free.** It costs no GPU
+time — it converts engine stall into stale samples — but the queue holds whole
+`Sample` objects in the rollout manager's CPU memory: `tokens` (`list[int]`),
+`rollout_log_probs` (`list[float]`), `response`, `loss_mask`. At the measured
+6.4k mean response that is order 8 MB per group of 16, so ~8 GB at 1000 groups,
+scaling linearly with the queue and with response length as training lengthens
+responses. The larger cost is methodological: enlarging the buffer to reach a
+target lag *is* imposing staleness artificially, which is the practice this study
+exists to distinguish itself from. `ASYNC_MAX_CONCURRENT_SAMPLES` bounds the
+other side and is already a swept variable; `OUTPUT_QUEUE_MAX_GROUPS` is not an
+argument and would need a code change.
+
 ## What miles actually implements
 
 Checked against the source, because several combinations are rejected at startup.
