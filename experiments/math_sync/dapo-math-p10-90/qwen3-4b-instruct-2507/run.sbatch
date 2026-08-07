@@ -40,14 +40,14 @@ PROMPT_DATA=/data/dapo-math-p10-90/dapo-math-p10-90.jsonl
 # training hyperparameters
 : "${LR:=1e-6}"
 : "${MAX_RESPONSE_LEN:=32768}"
-: "${NUM_ROLLOUT:=400}"
+: "${NUM_ROLLOUT:=300}"
 : "${TRAIN_SEED:=1234}"
 : "${ROLLOUT_SEED:=42}"
 
 # batch shape: miles asserts rollout_batch * n_samples == global_batch * num_steps
-: "${ROLLOUT_BATCH_SIZE:=256}"
-: "${N_SAMPLES_PER_PROMPT:=8}"
-: "${GLOBAL_BATCH_SIZE:=2048}"
+: "${ROLLOUT_BATCH_SIZE:=192}"
+: "${N_SAMPLES_PER_PROMPT:=16}"
+: "${GLOBAL_BATCH_SIZE:=3072}"
 : "${NUM_STEPS_PER_ROLLOUT:=1}"
 
 # distributed setting
@@ -75,10 +75,10 @@ PROMPT_DATA=/data/dapo-math-p10-90/dapo-math-p10-90.jsonl
 : "${SKIP_EVAL_BEFORE_TRAIN:=0}"
 
 # checkpointing: torch_dist for resume, hf for offline eval, on separate cadences
-: "${SAVE_INTERVAL:=20}"
+: "${SAVE_INTERVAL:=10}"
 : "${SAVE_RETAIN_INTERVAL:=100}"
 : "${SAVE_HF:=1}"
-: "${HF_SAVE_INTERVAL:=10}"
+: "${HF_SAVE_INTERVAL:=5}"
 
 # diagnostics
 : "${DUMP_TRAIN_DATA:=0}"

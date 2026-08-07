@@ -101,6 +101,7 @@ GRPO_ARGS=(
    --entropy-coef "${ENTROPY_COEF}"
    --eps-clip "${EPS_CLIP}"
    --eps-clip-high "${EPS_CLIP_HIGH}"
+   --calculate-per-token-loss
 )
 TIS_BOUNDS=(--tis-clip "${TIS_CLIP}" --tis-clip-low "${TIS_CLIP_LOW}")
 case "${IS_CORRECTION}" in
