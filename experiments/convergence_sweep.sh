@@ -31,38 +31,49 @@ LOG_DIR="${OUTPUT_DIR}/training/math/dapo-math-p10-90/qwen3-4b-instruct-2507"
 : "${TRAIN_SEED:=1234}"
 : "${ROLLOUT_SEED:=42}"
 
-# Tier 2 carries no s=0 icepop arm: at token level the on-policy reference is
-# invariant to the correction, so tier 1's s=0 run serves it. It does carry a
-# s=0 mis arm, because sequence-level masking is not invariant the same way.
-# See notes/algorithm-ablation.md.
+# The third column selects the correction and, with it, the bounds the source
+# paper uses; the fourth is the OPSM threshold, "-" for off. Neither the bounds
+# nor the threshold are free parameters -- see notes/algorithm-ablation.md.
 #
-# tier | staleness | IS_CORRECTION | MIS_PROFILE | LR | MAX_RESPONSE_LEN
+# Tier 2 carries no s=0 arm. Every correction here exists to mitigate
+# off-policyness, so on-policy it has nothing to act on and tier 1's s=0 run is
+# the reference for all of them.
+#
+# tier | staleness | IS_CORRECTION | OPSM_DELTA | LR | MAX_RESPONSE_LEN
 ARMS=$(cat <<'EOF'
-1 0 tis    -        1e-6 32768
-1 1 tis    -        1e-6 32768
-1 2 tis    -        1e-6 32768
-1 4 tis    -        1e-6 32768
-2 1 icepop -        1e-6 32768
-2 2 icepop -        1e-6 32768
-2 4 icepop -        1e-6 32768
-2 0 mis    seq-mask 1e-6 32768
-2 1 mis    seq-mask 1e-6 32768
-2 2 mis    seq-mask 1e-6 32768
-2 4 mis    seq-mask 1e-6 32768
-3 0 tis    -        1e-6 4096
-3 1 tis    -        1e-6 4096
-3 2 tis    -        1e-6 4096
-3 4 tis    -        1e-6 4096
-4 0 tis    -        5e-6 32768
-4 1 tis    -        5e-6 32768
-4 2 tis    -        5e-6 32768
-4 4 tis    -        5e-6 32768
-4 0 tis    -        1e-7 32768
-4 1 tis    -        1e-7 32768
-4 2 tis    -        1e-7 32768
-4 4 tis    -        1e-7 32768
+1 0 tis    -   1e-6 32768
+1 1 tis    -   1e-6 32768
+1 2 tis    -   1e-6 32768
+1 4 tis    -   1e-6 32768
+2 1 icepop -   1e-6 32768
+2 2 icepop -   1e-6 32768
+2 4 icepop -   1e-6 32768
+2 1 tis    TBD 1e-6 32768
+2 2 tis    TBD 1e-6 32768
+2 4 tis    TBD 1e-6 32768
+3 0 tis    -   1e-6 4096
+3 1 tis    -   1e-6 4096
+3 2 tis    -   1e-6 4096
+3 4 tis    -   1e-6 4096
+4 0 tis    -   5e-6 32768
+4 1 tis    -   5e-6 32768
+4 2 tis    -   5e-6 32768
+4 4 tis    -   5e-6 32768
+4 0 tis    -   1e-7 32768
+4 1 tis    -   1e-7 32768
+4 2 tis    -   1e-7 32768
+4 4 tis    -   1e-7 32768
 EOF
 )
+
+# The bounds each correction's source paper actually uses. TIS keeps miles'
+# one-sided truncation; IcePop is two-sided.
+bounds_of() {  # is_correction -> "low high"
+    case "$1" in
+        icepop) echo "0.5 5.0" ;;
+        *)      echo "0 2.0" ;;
+    esac
+}
 
 TIER=""; STALENESS=""; SUBMIT=0; FORCE=0
 while (( $# )); do
@@ -84,17 +95,19 @@ arms_of_tier() {
 
 # CKPT_PATH is derived by common/run_identity.sh, so asking it is the only way to
 # be sure the guard checks the directory the job will actually write to.
-ckpt_path_of() {  # staleness is_correction mis_profile lr max_response_len
+ckpt_path_of() {  # staleness is_correction opsm_delta lr max_response_len
     (
         set -euo pipefail
         MODEL_NAME=Qwen3-4B-Instruct-2507 DATASET_TAG=dapo-math-p10-90
         ADVANTAGE_ESTIMATOR=grpo ENTROPY_COEF=0.00 KL_LOSS_COEF=0.00
         EPS_CLIP=0.2 EPS_CLIP_HIGH=0.28 EPS_CLIP_C= RATIO_DENOMINATOR=actor
-        TIS_CLIP=2.0 TIS_CLIP_LOW=0 USE_OPSM=0 OPSM_DELTA=1e-4
+        read -r TIS_CLIP_LOW TIS_CLIP < <(bounds_of "$2")
+        if [[ "$3" == "-" ]]; then USE_OPSM=0; OPSM_DELTA=1e-4
+        else USE_OPSM=1; OPSM_DELTA=$3; fi
         ROLLOUT_BATCH_SIZE=192 N_SAMPLES_PER_PROMPT=16 GLOBAL_BATCH_SIZE=3072
         NUM_STEPS_PER_ROLLOUT=1
         MAX_WEIGHT_STALENESS=$1 IS_CORRECTION=$2 LR=$4 MAX_RESPONSE_LEN=$5
-        MIS_PROFILE=$([[ "$3" == "-" ]] && echo "" || echo "$3")
+        MIS_PROFILE=
         TRAIN_SEED="${TRAIN_SEED}" ROLLOUT_SEED="${ROLLOUT_SEED}"
         if (( $1 == 0 )); then PLACEMENT=colocated; unset MAX_WEIGHT_STALENESS
         else PLACEMENT=async; PAUSE_GENERATION_MODE=in_place; fi
@@ -108,7 +121,7 @@ host_ckpt() { sed "s#^/ckpt/training#${TRAIN_CKPT_DIR}#" <<<"$1"; }
 if [[ -z "${TIER}" ]]; then
     echo "pass --tier N. Tiers, in submission order:"
     echo "  1  primary: lr 1e-6, 32k, GRPO + DAPO clip-higher + TIS 2.0, token-level loss"
-    echo "  2  algorithm: ICEPOP (token-level mask) and MIS seq-mask (sequence-level)"
+    echo "  2  algorithm: IcePop token-level mask [0.5, 5.0], and DeepSeek-V3.2 OPSM"
     echo "  3  response length: 4k"
     echo "  4  learning rate: 5e-6 and 1e-7"
     echo
@@ -125,7 +138,7 @@ printf '%d rollouts per arm, seeds tseed %s / rseed %s\n\n' \
     "${TOTAL_ROLLOUT}" "${TRAIN_SEED}" "${ROLLOUT_SEED}"
 
 dirty=0
-printf '  %-3s %-7s %-9s %-6s %-6s %-9s %s\n' s IS profile lr len place "checkpoint state"
+printf '  %-3s %-7s %-9s %-6s %-6s %-9s %s\n' s IS opsm lr len place "checkpoint state"
 while read -r tier s isc prof lr len; do
     IFS=$'\t' read -r cpath rname < <(ckpt_path_of "${s}" "${isc}" "${prof}" "${lr}" "${len}")
     host=$(host_ckpt "${cpath}")
@@ -149,6 +162,13 @@ if (( SUBMIT == 0 )); then
     exit 0
 fi
 
+if grep -qw TBD < <(arms_of_tier); then
+    echo
+    echo "refusing: an arm has OPSM_DELTA=TBD. The DeepSeek-V3.2 threshold is not" >&2
+    echo "in the paper; measure opsm_clipfrac first. See notes/algorithm-ablation.md" >&2
+    exit 1
+fi
+
 if (( dirty == 1 && FORCE == 0 )); then
     echo
     echo "refusing: an arm above already has a checkpoint and would resume from it" >&2
@@ -168,11 +188,13 @@ while read -r tier s isc prof lr len; do
         recipe="${ASYNC_RECIPE}"
         placement_env="ACTOR_NUM_NODES=1,ROLLOUT_NUM_GPUS=$(( (NODES - 1) * 8 )),MAX_WEIGHT_STALENESS=${s},PAUSE_GENERATION_MODE=in_place"
     fi
-    mis_env=$([[ "${prof}" == "-" ]] && echo "" || echo ",MIS_PROFILE=${prof}")
+    read -r tclow tchigh < <(bounds_of "${isc}")
+    algo_env="TIS_CLIP_LOW=${tclow},TIS_CLIP=${tchigh}"
+    [[ "${prof}" == "-" ]] || algo_env="${algo_env},USE_OPSM=1,OPSM_DELTA=${prof}"
 
     dep=""
     for (( k = 1; k <= n_jobs; k++ )); do
-        name="conv-s${s}-${isc}${prof/-/}-lr${lr}-${len}-p${k}"
+            name="conv-s${s}-${isc}$([[ "${prof}" == "-" ]] || echo "-opsm")-lr${lr}-${len}-p${k}"
         # Every job in the chain gets identical arguments. NUM_ROLLOUT feeds
         # train_iters and so lr_decay_steps (megatron_utils/model.py:78-80), and
         # OptimizerParamScheduler.load_state_dict asserts the checkpoint's value
@@ -185,7 +207,7 @@ while read -r tier s isc prof lr len; do
             --job-name="${name}" \
             --nodes="${NODES}" --time="${WALL}" \
             --output="${LOG_DIR}/${name}-%j.log" \
-            --export="ALL,RUN_NAME=${rname},NUM_ROLLOUT=${TOTAL_ROLLOUT},LR=${lr},MAX_RESPONSE_LEN=${len},IS_CORRECTION=${isc},TRAIN_SEED=${TRAIN_SEED},ROLLOUT_SEED=${ROLLOUT_SEED},${placement_env}${mis_env}" \
+            --export="ALL,RUN_NAME=${rname},NUM_ROLLOUT=${TOTAL_ROLLOUT},LR=${lr},MAX_RESPONSE_LEN=${len},IS_CORRECTION=${isc},TRAIN_SEED=${TRAIN_SEED},ROLLOUT_SEED=${ROLLOUT_SEED},${placement_env},${algo_env}" \
             "${REPO_ROOT}/${recipe}")
         printf '%s  %-46s%s\n' "${jid}" "${name}" \
             "$([[ -n "${dep}" ]] && echo "  after ${dep##*:}")"
