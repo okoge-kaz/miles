@@ -281,3 +281,46 @@ critical path. That removes the exclusion entirely and buys a better eval
 (more samples, more benchmarks) than 30 prompts x 8 affords -- `eval/aime25` at
 n=8 on 30 prompts has se ~0.032, which is wider than the effects being chased.
 Do not switch tier 1 mid-run; switch a whole tier at once or not at all.
+
+### The eval also perturbs the independent variable (2026-08-07)
+
+Excluding eval from the *time* axis is not sufficient. An in-run eval injects a
+backlog that drives the realized lag up and triggers a recycling storm, and it
+does so unequally across the staleness arms.
+
+Job 15288347 (bound 2), around the eval that completed after rollout 19:
+
+| rollout | L=0 | L=1 | L=2 | L=3 | offered | recycled | meanL | queue | `rollout_time` | `train_wait` | waste |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 19 | 88 | 72 | 32 | 0 | 192 | 0 | 0.71 | 0 | 377.5 | 27.7 | 0.0000 |
+| 20 | 82 | 70 | 40 | 0 | 192 | 0 | 0.78 | 0 | 332.1 | **1028.1** | 0.0000 |
+| 21 | 66 | 97 | 29 | 2 | 194 | 2 | 0.83 | **427** | 20.2 | 1.8 | 0.0329 |
+| 22 | 0 | 151 | 41 | 1 | 193 | 1 | 1.22 | 433 | 14.8 | 2.1 | 0.0167 |
+| 23 | 0 | 0 | 192 | 4 | 196 | 4 | 2.02 | 431 | 22.0 | -- | 0.0378 |
+| 24 | 0 | 39 | 153 | **359** | 552 | **360** | 2.58 | 99 | 22.1 | -- | **0.7398** |
+
+The mechanism is structural, not incidental. `_worker_loop` is a background
+`asyncio.create_task` (`fully_async_rollout.py:225`), so while the manager awaits
+the eval the trainer gets no batch -- `train_wait` 1028 s -- but generation keeps
+running and fills the output queue to 427 groups, about 2.2 batches. Draining
+that backlog costs no generation time (`rollout_time` collapses to ~20 s), so the
+trainer advances one weight version per step against samples that were all
+produced before the stall. The queue ages one version per step: L=0 disappears
+entirely by rollout 22, and by rollout 24 the offered lag has walked past the
+bound and **74% of generated tokens are discarded**, against 3% in steady state.
+
+**This biases the arms unequally and in the direction of the effect under study.**
+A tight bound recycles the aged backlog; a loose one absorbs it. The bound-4 arm
+would take a lag-2.5 backlog without discarding anything, while the bound-1 arm
+would discard nearly all of it. So the instrument penalises exactly the arms the
+study is asking about.
+
+Consequences:
+
+- The exclusion window applies to `staleness_count_*`, `avg_staleness` and
+  `wasted_token_frac` as well as to wall-clock. Drop rollouts from the eval until
+  `queue_size` returns to its steady value -- 5 rollouts in the case above.
+- Moving evaluation offline (`experiments/src/offline_eval/run_eval.sbatch`, over
+  the `HF_SAVE_INTERVAL=5` exports) removes the perturbation rather than
+  correcting for it, and is the right configuration for tier 2 onward. It is
+  still not something to change inside a running tier.
