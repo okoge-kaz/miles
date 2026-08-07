@@ -152,3 +152,38 @@ No proxy variables are set in the environment.
   teams (evals silently broke when TMPDIR moved).
 - Default `ulimit -n` is 131072, which is comfortable for servers that hold many
   sockets.
+
+## The wandb group budget, and why 36 jobs burned (2026-08-07)
+
+Tier 1 of the convergence sweep was handed to another user and every job died in
+`init_tracking`:
+
+```
+wandb: ERROR invalid parameters: 128 limit exceeded for GroupName
+```
+
+`wandb_utils.py:52` appends `"_"` plus an 8-character id to the group whenever
+`--wandb-random-suffix` is on, which is the default, so the group runs nine
+characters longer than `RUN_NAME`. The real budget is 119, not 128.
+`common/run_identity.sh` checked against 128 and truncated to 128, so both the
+guard and its fallback were wrong; the derived names came out at 124-127 and all
+four arms failed. Fixed in d7cb38fc, which budgets 115 and leaves a few
+characters spare.
+
+Two things turned one bug into 36 dead jobs.
+
+**The derived name had never been run.** Every node-ratio sweep passed
+`RUN_NAME=noderatio-s64-t1r3-rs42` on the command line, about 23 characters, so
+months of tuning never exercised the branch that builds the name from
+`MODEL_NAME`, `CONFIG_TAG` and `RL_ALGORITHM`. The first submission to use it was
+the production one.
+
+**`--dependency=afterany` walked the chain.** Each job failed after ~100 seconds
+and released the next, so `squeue` showed jobs starting and finishing on a
+two-minute cycle, which reads as progress. Two arms had spent all ten links
+before anyone looked at `sacct`.
+
+`experiments/validate.py` checks recipe shape but not the length of the names a
+submission derives. Adding that check is the mechanical fix; the procedural one
+is in `.claude/skills/miles-run-ladder/SKILL.md` under "Handing the command to
+someone else".

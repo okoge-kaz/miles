@@ -182,10 +182,50 @@ While running, the questions worth asking are about learning, not speed:
 `dump/mixed_version_frac` is the staleness that matters in async runs; a gap
 opening between AIME-2024 and AIME-2025 means memorisation rather than learning.
 
+## Handing the command to someone else
+
+Before another person runs a submission command, run that command yourself once,
+end to end, shrunk to fit `interactive`. Not the recipe — **the command**, by the
+path they will invoke it through, with every variable resolved the way it will
+resolve for them.
+
+The trap is anything the submission *derives* rather than receives. Tuning
+sweeps usually override the derived names with short job names, so the derived
+path is the one thing a long tuning campaign never exercises, and it fails on the
+first production submission instead:
+
+```bash
+# What the sweeps ran: RUN_NAME supplied, ~23 characters.
+--export=ALL,RUN_NAME=noderatio-s64-t1r3-rs42,…
+# What a production submission runs: RUN_NAME derived, ~124 characters, and
+# wandb appends "_" + an 8-character id to the group on top of that.
+```
+
+Shrink only what does not feed a derived name or path — `NUM_ROLLOUT`,
+`MAX_RESPONSE_LEN`, the batch (keeping the four-knob invariant). Hold the
+learning rate, the algorithm knobs, the staleness bound and the placement at
+their production values, because those are what `common/run_identity.sh` turns
+into `RL_ALGORITHM`, `CONFIG_TAG`, `CKPT_PATH` and `RUN_NAME`.
+
+The smoke run has to get past three points, in order:
+
+1. `init_tracking` — the wandb group is accepted. This is the first thing that
+   touches a derived name, and it fails about 100 seconds in.
+2. The placement and checkpoint lines echoed by `run.sbatch` name the directory
+   the production run will write to, not a sweep's.
+3. One save and one resume, because production spans several jobs.
+
+**Do not chain jobs with `--dependency=afterany` until one link is known to
+work.** `afterany` releases the next job on failure too, so a command that dies
+during startup walks the whole chain in minutes and reports it as scheduling
+activity rather than as a failure.
+
 ## Rules
 
 - One stage, one class of change. A run that moves parallelism and learning rate
   together has produced no usable information.
+- Never hand out a command that has not been run once at `interactive` scale
+  with its derived variables left to derive.
 - `interactive` for correctness, `batch_short` for speed, `batch` for results.
   Never tune on `batch` — it is slower to schedule and the result is not the
   point of that lane.
