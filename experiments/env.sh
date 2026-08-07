@@ -27,7 +27,10 @@ export CONTAINER_DIR="${SHARED_WS}/container"        # miles-latest.sqsh
 # (see notes/off-policy-variables.md, "Run identity").
 export WS="${WS:-/lustre/fsw/portfolios/coreai/users/${USER}}"
 export CKPT_ROOT="${WS}/checkpoints"
-export TRAIN_CKPT_DIR="${CKPT_ROOT}/training"        # checkpoints written during training
+# Overridable so offline evaluation can read another user's run: point it at
+their checkpoints/training and the container mount follows. Read-only in
+practice -- the mkdir below is a no-op on a directory that already exists.
+export TRAIN_CKPT_DIR="${TRAIN_CKPT_DIR:-${CKPT_ROOT}/training}"
 export CACHE_DIR="${WS}/cache"                       # compile / JIT caches
 
 # The miles checkout that gets mounted over /root/miles inside the container.
