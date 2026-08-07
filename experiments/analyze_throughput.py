@@ -67,8 +67,12 @@ def analyse(path: Path) -> dict | None:
     DRAIN_WAIT_S = 2.0
     tail = steps[1:]
     n_drained = 0
-    while n_drained < len(tail) and tail[n_drained].get("train_wait", 0.0) < DRAIN_WAIT_S:
-        n_drained += 1
+    # Only a prefix that ends counts as drain. Where rollout is provisioned ahead
+    # of training, train_wait stays under the threshold for the whole run and is
+    # the steady state, not a transient -- draining it would throw away every step.
+    if any(s.get("train_wait", 0.0) >= DRAIN_WAIT_S for s in tail):
+        while n_drained < len(tail) and tail[n_drained].get("train_wait", 0.0) < DRAIN_WAIT_S:
+            n_drained += 1
     steady = tail[n_drained:]
     if not steady:
         return None
