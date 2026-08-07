@@ -89,7 +89,29 @@ Cost: job 15288321 (`conv-s0-tis-lr1e-6-32768-p1`) FAILED at 4:36, and
 `afterany` released p2 into the same failure before it could be cancelled.
 `validate.py` now rejects `expandable_segments` in any non-async recipe.
 
-Open: whether the colocated arm needs fragmentation relief at all. It has never
-been run at n=16 / gbs 3072 / 32k without it. If it OOMs, the levers that do not
-conflict with torch_memory_saver are a lower `MAX_TOKENS_PER_GPU` and
-`--log-probs-chunk-size`, not the allocator.
+Resolved (job 15290984, colocated 4 nodes, n=16, gbs 3072, 32k): it does not
+OOM, but the margin is thin and does not improve with scale.
+
+| | alloc | device free | headroom after |
+|---|---|---|---|
+| production dp16 | 9.43 GiB | 9.54 GiB | **0.113 GiB** |
+| production dp16 | 9.43 GiB | 10.30 GiB | 0.873 GiB |
+| 2-node smoke dp8 | 9.28 GiB | 10.16 GiB | 0.875 GiB |
+| 2-node smoke dp8 | 9.28 GiB | 9.37 GiB | **0.086 GiB** |
+
+torch_memory_saver declines the allocation because granting it would breach its
+1 GiB margin; torch's caching allocator then releases cached blocks and the
+allocation succeeds. `CUDA out of memory` count is 0 in both runs.
+
+Two corrections to what was expected here. Going dp8 -> dp16 was expected to free
+~3 GB per GPU through the distributed optimizer; it does not show up as device
+free at this instant, because torch holds it as cache -- the observed headroom is
+the same in both. And the peak does **not** grow as responses lengthen:
+`10122952704 / (151936 * 4 / 2) = 33313` tokens, which is
+`--rollout-max-context-len 32768` plus padding, so the allocation is already at
+its ceiling. Thin, but bounded.
+
+If it ever does OOM, the levers that do not conflict with torch_memory_saver are
+a lower `MAX_TOKENS_PER_GPU` and `--log-probs-chunk-size`, not the allocator --
+and either one has to be applied to every arm, since both cost throughput and
+the study compares arms on wall-clock.
