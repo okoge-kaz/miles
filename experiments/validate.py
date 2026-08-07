@@ -151,6 +151,12 @@ def check_recipe(recipe_dir: Path) -> None:
     # has to run the same loss as the arms it is the reference for.
     if "--use-tis" not in train_text:
         fail(rel, "recipe is missing --use-tis")
+    # --colocate implies offload_train (arguments.py:2985), which LD_PRELOADs
+    # torch_memory_saver into the trainer (ray/train/actor_factory.py:44), and
+    # that refuses to initialise under an expandable allocator. See
+    # notes/parallelism.md.
+    if not is_async and "expandable_segments" in train_text:
+        fail(rel, "colocated recipe cannot set expandable_segments: torch_memory_saver rejects it")
     if "30b-a3b" in rel and "--use-rollout-routing-replay" not in train_text:
         fail(rel, "MoE recipe is missing R3")
     if "instruct-2507" in rel and "RM_TYPE:=math" not in run_text:

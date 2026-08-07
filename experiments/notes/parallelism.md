@@ -62,3 +62,34 @@ There is no train:rollout split to tune under `--colocate` -- the same GPUs do
 both, in sequence. So the colocated arm of the study does not depend on the
 async balance experiments and can proceed in parallel with them. The only shared
 dependency was CP, and that is now settled.
+
+## The expandable allocator is async-only (2026-08-07)
+
+`--train-env-vars '{"PYTORCH_CUDA_ALLOC_CONF":"expandable_segments:True"}'` fixed
+the trainer OOM in `_VocabParallelEntropy.forward` (a 9.24 GiB fp32 logits copy
+for one 32k sample, with 8.72 GiB free and 15.16 GiB fragmented). It belongs to
+the async recipe only.
+
+Under `--colocate` the trainer dies at startup:
+
+```
+RuntimeError: TorchMemorySaver is disabled for the current process because
+expandable_segments is not supported yet.
+```
+
+`--colocate` sets `offload_train=True` (`arguments.py:2985`), and
+`ray/train/actor_factory.py:44-49` then LD_PRELOADs
+`torch_memory_saver_hook_mode_preload` into the trainer actor with
+`TMS_INIT_ENABLE=1`. torch_memory_saver replaces the allocator's segment
+handling to pause/resume HBM around the rollout phase, which is the same
+mechanism `expandable_segments` claims, so the two are mutually exclusive. The
+async trainer never sets `offload_train`, gets no LD_PRELOAD, and is unaffected.
+
+Cost: job 15288321 (`conv-s0-tis-lr1e-6-32768-p1`) FAILED at 4:36, and
+`afterany` released p2 into the same failure before it could be cancelled.
+`validate.py` now rejects `expandable_segments` in any non-async recipe.
+
+Open: whether the colocated arm needs fragmentation relief at all. It has never
+been run at n=16 / gbs 3072 / 32k without it. If it OOMs, the levers that do not
+conflict with torch_memory_saver are a lower `MAX_TOKENS_PER_GPU` and
+`--log-probs-chunk-size`, not the allocator.
