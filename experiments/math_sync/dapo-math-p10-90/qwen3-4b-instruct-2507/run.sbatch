@@ -69,7 +69,7 @@ PROMPT_DATA=/data/dapo-math-p10-90/dapo-math-p10-90.jsonl
 : "${RM_TYPE:=math}"
 
 # evaluation during training; the reported numbers come from src/offline_eval
-: "${EVAL_INTERVAL:=20}"
+: "${EVAL_INTERVAL:=0}"       # 0 disables in-run eval; score HF exports offline
 : "${N_SAMPLES_PER_EVAL_PROMPT:=8}"
 : "${EVAL_MAX_RESPONSE_LEN:=32768}"
 : "${SKIP_EVAL_BEFORE_TRAIN:=0}"

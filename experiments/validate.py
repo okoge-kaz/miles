@@ -161,6 +161,15 @@ def check_recipe(recipe_dir: Path) -> None:
         fail(rel, "MoE recipe is missing R3")
     if "instruct-2507" in rel and "RM_TYPE:=math" not in run_text:
         fail(rel, "non-thinking checkpoint must default to RM_TYPE=math")
+    # In-run eval is off by default: it costs ~20 min a time, and in async it
+    # stalls the handoff while generation keeps filling the queue, so the batches
+    # after it are stale enough to trigger a recycling storm. Both perturb what
+    # the study measures. See notes/telemetry.md.
+    if 'EVAL_INTERVAL:=0' not in run_text.replace('"', "").replace("{", "").replace("}", ""):
+        fail(rel, "in-run eval must default to off (EVAL_INTERVAL:=0); score HF exports offline")
+    # ... and the guard is only real if train.sh honours 0 by passing nothing.
+    if "--eval-interval" in train_text and 'EVAL_INTERVAL}" != "0"' not in train_text:
+        fail(rel, "train.sh passes --eval-interval unconditionally, so EVAL_INTERVAL=0 would not disable it")
 
     print(f"  {rel:<50} -N {nodes}  tp{tp} cp{cp}  ok")
 

@@ -67,16 +67,22 @@ else
    TELEMETRY_ARGS+=(--use-rollout-entropy)
 fi
 
-EVAL_ARGS=(
-   --eval-interval "${EVAL_INTERVAL}"
-   --n-samples-per-eval-prompt "${N_SAMPLES_PER_EVAL_PROMPT}"
-   --eval-max-response-len "${EVAL_MAX_RESPONSE_LEN}"
-   --eval-top-p 1
-   --eval-prompt-data
-   aime25 /data/aime-2025/aime-2025.jsonl
-)
-if [[ "${SKIP_EVAL_BEFORE_TRAIN}" != "0" ]]; then
-   EVAL_ARGS+=(--skip-eval-before-train)
+# EVAL_INTERVAL=0 passes no --eval-interval at all, which is what leaves
+# args.eval_interval None and turns both eval sites off (train.py:98,144).
+# See notes/telemetry.md for why in-run eval is off by default.
+EVAL_ARGS=()
+if [[ "${EVAL_INTERVAL}" != "0" ]]; then
+   EVAL_ARGS=(
+      --eval-interval "${EVAL_INTERVAL}"
+      --n-samples-per-eval-prompt "${N_SAMPLES_PER_EVAL_PROMPT}"
+      --eval-max-response-len "${EVAL_MAX_RESPONSE_LEN}"
+      --eval-top-p 1
+      --eval-prompt-data
+      aime25 /data/aime-2025/aime-2025.jsonl
+   )
+   if [[ "${SKIP_EVAL_BEFORE_TRAIN}" != "0" ]]; then
+      EVAL_ARGS+=(--skip-eval-before-train)
+   fi
 fi
 
 PERF_ARGS=(

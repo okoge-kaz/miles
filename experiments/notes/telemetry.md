@@ -324,3 +324,30 @@ Consequences:
   the `HF_SAVE_INTERVAL=5` exports) removes the perturbation rather than
   correcting for it, and is the right configuration for tier 2 onward. It is
   still not something to change inside a running tier.
+
+### In-run evaluation is off by default from 2026-08-07
+
+`EVAL_INTERVAL` defaults to `0` in both recipes, and `train.sh` then passes no
+`--eval-interval` at all, which leaves `args.eval_interval` None and turns off
+both call sites (`train.py:98` before-train, `train.py:144` periodic). Quality is
+read by scoring the `HF_SAVE_INTERVAL=5` exports offline.
+
+Three reasons, in order of how much they distort the measurement:
+
+1. **It perturbs the independent variable.** The backlog an eval injects walks the
+   realized lag past the bound and produced a 74% recycling storm on the bound-2
+   arm -- see the table above -- and it hurts a tight bound more than a loose one.
+2. **It perturbs the reported time**, ~20 min a call, 15 calls, 10-17% of an arm,
+   and unequally: sequential under `--colocate`, concurrent under `--fully-async`.
+3. **It was the weaker measurement anyway.** 30 prompts at n=8 on one year gives
+   se ~0.061; aime24/25/26 at n=16 gives ~0.033, and against a fixed prompt set
+   the step-to-step term falls from 0.032 to 0.013.
+
+`validate.py` enforces both halves: the default is 0, and `train.sh` honours 0 by
+emitting nothing. A recipe that passes `--eval-interval` unconditionally fails,
+because there the default would be decorative.
+
+**Tier 1 keeps its in-run eval.** Those chains were submitted against the old
+default, and an arm that stops evaluating halfway is no longer comparable with one
+that did not -- the wall-clock being compared would change under it. Do not
+`git pull` into a clone with a running tier. The switch applies from tier 2.
