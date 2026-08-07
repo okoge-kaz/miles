@@ -94,19 +94,25 @@ fi
 CONFIG_TAG="${CONFIG_TAG:-rollout-length-$(( MAX_RESPONSE_LEN / 1024 ))k-lr${LR}-rbs${ROLLOUT_BATCH_SIZE}-gbs${GLOBAL_BATCH_SIZE}-n${N_SAMPLES_PER_PROMPT}-tseed${TRAIN_SEED}-rseed${ROLLOUT_SEED}}"
 STALENESS_TAG="max-weight-staleness-${MAX_WEIGHT_STALENESS}"
 
-# RUN_NAME is the wandb group and the log directory, not a path, and wandb
-# rejects a group name over 128 characters. It therefore carries the same
-# identity as CKPT_PATH in an abbreviated form, and is hashed if it still does
-# not fit. The hash is deterministic so a resumed job lands in the same group.
-#
-# The budget is not 128: wandb_utils.py:52 appends "_" and an 8-character id to
-# the group when --wandb-random-suffix is on, which it is by default, so the
-# group runs nine characters longer than RUN_NAME. 115 keeps a few characters
-# spare rather than landing exactly on the limit; identity comes from the hash,
-# so the truncation point is free.
+# RUN_NAME is the wandb group and the log directory, not a path. It shows the
+# axes this study varies and closes over the rest with a hash; the full identity
+# is in CKPT_PATH and in the config wandb logs from the arguments anyway, so
+# spelling it out here only bought length. The hash is deterministic, so a
+# resumed job rejoins its group, and two configurations that share the visible
+# part still differ.
 _regime=$([[ "${POLICY_REGIME}" == on-policy ]] && echo onp || echo offp)
-RUN_NAME="${RUN_NAME:-${MODEL_NAME}-${PLACEMENT}-${_regime}-s${MAX_WEIGHT_STALENESS}-${CONFIG_TAG}-${RL_ALGORITHM}}"
-if (( ${#RUN_NAME} > 115 )); then
-    RUN_NAME="${RUN_NAME:0:106}-$(printf '%s' "${RUN_NAME}" | md5sum | cut -c1-8)"
+_identity="${MODEL_NAME}-${PLACEMENT}-${_regime}-s${MAX_WEIGHT_STALENESS}-${CONFIG_TAG}-${RL_ALGORITHM}"
+RUN_NAME="${RUN_NAME:-${MODEL_NAME}-${PLACEMENT}-${_regime}-s${MAX_WEIGHT_STALENESS}-$(( MAX_RESPONSE_LEN / 1024 ))k-lr${LR}-$(printf '%s' "${_identity}" | md5sum | cut -c1-8)}"
+
+# wandb_utils.py:52 appends "_" and an 8-character id to the group whenever
+# --wandb-random-suffix is on, which is its default, so the group runs nine
+# characters longer than this. Fail here, at submission, rather than 100 seconds
+# into an allocation where the whole chain is already queued behind it.
+WANDB_GROUP_LIMIT=128
+WANDB_GROUP_SUFFIX=9
+if (( ${#RUN_NAME} + WANDB_GROUP_SUFFIX > WANDB_GROUP_LIMIT )); then
+    echo "RUN_NAME is ${#RUN_NAME} chars, so the wandb group would be" \
+         "$(( ${#RUN_NAME} + WANDB_GROUP_SUFFIX )) > ${WANDB_GROUP_LIMIT}: ${RUN_NAME}" >&2
+    exit 1
 fi
 CKPT_PATH="/ckpt/training/${TASK_FAMILY}/${DATASET_TAG}/${MODEL_NAME}/${RL_ALGORITHM}/${PLACEMENT}/${POLICY_REGIME}/${STALENESS_TAG}/${CONFIG_TAG}"

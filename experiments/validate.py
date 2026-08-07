@@ -99,6 +99,19 @@ def check_recipe(recipe_dir: Path) -> None:
     if r.returncode:
         fail(rel, f"placement rejected at -N {nodes}: {(r.stderr or r.stdout).strip()}")
 
+    # 3b. the identity the recipe derives. run_identity.sh refuses a RUN_NAME
+    # that would overflow the wandb group; that refusal has to happen here and
+    # not 100 seconds into an allocation. Feed it the plain assignments as well
+    # as the := defaults, since MODEL_NAME and PLACEMENT are plain.
+    identity_env = "\n".join(
+        line
+        for line in run_text.splitlines()
+        if re.match(r'^: "\$\{[A-Z_0-9]+:=', line) or re.match(r"^[A-Z_0-9]+=\S*$", line)
+    )
+    r = sh(f"set -e\n{identity_env}\nsource experiments/common/run_identity.sh >/dev/null\n")
+    if r.returncode:
+        fail(rel, f"run_identity.sh rejected the defaults: {(r.stderr or r.stdout).strip()}")
+
     # 4/5. batch shape and the token budget
     tp = knob(run_text, "TENSOR_PARALLEL_SIZE")
     cp = knob(run_text, "CONTEXT_PARALLEL_SIZE")
