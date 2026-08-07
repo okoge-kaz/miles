@@ -510,6 +510,25 @@ all N nodes at `dp = 4N`, and `4N | 3072` needs `N | 768`, so N ∈ {2,3,4,6,8,1
 and N=5 is not available. Extrapolating the observed times at `tau_roll x 3/5`,
 R=5 is 16-37% faster in wall-clock but costs more node-seconds in three of the
 four measured steps: once a step is train-bound, extra rollout nodes are pure
-cost. R=3 stands unless `train_wait` exceeds ~100 s for three consecutive steps
-while `response_len/mean` is still climbing, which would mean length growth has
-made the starvation structural rather than a transient of the lag ramp.
+cost. Through rollout 8 the two arms have separated permanently, and the driver is
+recycling rather than response length:
+
+| step | s1 `tau_roll` | s1 wait | s1 waste | s2 `tau_roll` | s2 wait | s2 waste |
+|---|---|---|---|---|---|---|
+| 5 | 421.6 | 83.3 | 0.2301 | 280.2 | 10.7 | 0.0081 |
+| 6 | 430.7 | 138.2 | 0.2195 | 208.5 | 1.6 | 0.0038 |
+| 7 | 410.7 | -- | 0.2606 | 183.4 | -- | 0.0115 |
+
+s2 settled at `tau_roll` 183-280 s against `tau_train` ~320 s: train-bound, as
+the split was designed for. s1 sits at 410-430 s and stays rollout-bound.
+`response_len/mean` is flat-to-falling over these steps (6748, 6005, 6426, 5885),
+so length growth is not the cause; a recycled group is regenerated from scratch,
+so discarding a quarter of the tokens inflates effective `tau_roll` by ~1.33x and
+the arm cannot climb out.
+
+This does **not** argue for R=5. The uncapped table above shows R=5 running a
+queue of 827 groups and a natural lag of mean 2.7 / P(L>2) = 0.6. A bound-1 arm
+fed by that distribution would recycle most of what it generates, so raising R
+makes the tight-bound arms worse, not better. The starvation of the low-staleness
+arms at a fixed node budget is the phenomenon under study, not an artifact of
+under-provisioning.
