@@ -25,6 +25,12 @@ export CONTAINER_DIR="${SHARED_WS}/container"        # miles-latest.sqsh
 # running the same config would land on the same directory, and since --load and
 # --save are the same path the second run would silently resume the first
 # (see notes/off-policy-variables.md, "Run identity").
+# Two people run arms of the same study and read each other's checkpoints for
+# offline evaluation, so a private umask makes another user's run unreadable --
+# and it fails late, inside the inference engine, as a FileNotFoundError on a
+# safetensors shard whose config.json loaded fine.
+umask 0022
+
 export WS="${WS:-/lustre/fsw/portfolios/coreai/users/${USER}}"
 export CKPT_ROOT="${WS}/checkpoints"
 # Overridable so offline evaluation can read another user's run: point it at
