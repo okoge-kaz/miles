@@ -231,3 +231,53 @@ Consequences for the analysis:
   the study's independent variable.
 - `wasted_token_frac` is the honest companion metric: it is the cost of the gap
   between offered and trained lag.
+
+## Reported training time excludes evaluation (2026-08-07)
+
+**The paper reports training wall-clock with evaluation removed.** Evaluation is
+instrumentation, not training: it does not change the policy, its cost is a
+choice of `--eval-interval` and `--n-samples-per-eval-prompt`, and charging it to
+the arms would put a fixed instrument cost inside the quantity under test.
+
+It is not a rounding error. The first in-run eval on job 15288347 took ~20 min
+against a 344 s rollout, and at `EVAL_INTERVAL=20` there are 15 of them in a
+300-rollout run -- about 5 h, or 10-17% of an arm.
+
+### Subtraction does not work, and the two placements differ
+
+Under `--colocate` the same GPUs evaluate, then generate, then train, so eval is
+a clean additive span. Under `--fully-async` the eval runs on the rollout engines
+**concurrently** with training generation: it does not stop the trainer, it slows
+the rollout. There is no eval span to subtract -- the cost appears as inflated
+`perf/rollout_time` in the rollouts around it.
+
+`timer("eval_rollout")` exists (`ray/rollout/rollout_manager.py:156`) but its
+value is never logged, so there is no recorded eval duration to subtract even
+where subtraction would be valid.
+
+### The method
+
+Work from the per-rollout timestamps of `metrics.py:79 - perf <id>` and **drop
+the intervals that overlap an eval**, then take the mean of the rest. An eval
+completes at the `metrics.py:53 - eval <id>` line and is triggered at
+`rollout_id % eval_interval == 0`, so the affected window is bounded and
+identifiable; how many rollouts it spans is measured, not assumed.
+
+Two rules that go with it:
+
+- **Never change `--eval-interval` mid-tier.** The comparison is between arms on
+  wall-clock; giving one arm fewer evals changes the measured quantity, even
+  though it changes nothing about the learning.
+- Report the discarded fraction alongside the result, the same way
+  `active_elapsed_hours` reports `excluded_h` for inter-allocation gaps
+  (`experiments/src/offpolicy_acceleration/log_source.py:133`). The two
+  exclusions compose: queue gaps between jobs, and eval windows within a job.
+
+### The alternative worth taking for later tiers
+
+`HF_SAVE_INTERVAL=5` already exports an HF checkpoint every 5 rollouts, and
+`experiments/src/offline_eval/run_eval.sbatch` can score them off the training
+critical path. That removes the exclusion entirely and buys a better eval
+(more samples, more benchmarks) than 30 prompts x 8 affords -- `eval/aime25` at
+n=8 on 30 prompts has se ~0.032, which is wider than the effects being chased.
+Do not switch tier 1 mid-run; switch a whole tier at once or not at all.
