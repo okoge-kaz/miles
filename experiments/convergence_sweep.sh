@@ -5,6 +5,7 @@
 #     experiments/convergence_sweep.sh --tier 1
 #     experiments/convergence_sweep.sh --tier 1 --submit
 #     experiments/convergence_sweep.sh --tier 1 --submit --force   # ignore a dirty CKPT_PATH
+#     experiments/convergence_sweep.sh --tier 1 --staleness 0      # one arm, to resubmit it alone
 #
 # The split is fixed by notes/node-ratio-procedure.md: 4 nodes everywhere, async
 # arms as 1 train + 3 rollout, the staleness-0 arm colocated across all 4.
@@ -59,17 +60,23 @@ ARMS=$(cat <<'EOF'
 EOF
 )
 
-TIER=""; SUBMIT=0; FORCE=0
+TIER=""; STALENESS=""; SUBMIT=0; FORCE=0
 while (( $# )); do
     case "$1" in
-        --tier)   TIER="$2"; shift 2 ;;
-        --submit) SUBMIT=1; shift ;;
-        --force)  FORCE=1; shift ;;
+        --tier)      TIER="$2"; shift 2 ;;
+        --staleness) STALENESS="$2"; shift 2 ;;   # comma-separated, e.g. 0 or 1,2,4
+        --submit)    SUBMIT=1; shift ;;
+        --force)     FORCE=1; shift ;;
         *) echo "unknown argument: $1" >&2; exit 1 ;;
     esac
 done
 
-arms_of_tier() { awk -v t="${TIER}" 'NF && ($1==t || t=="")' <<<"${ARMS}"; }
+arms_of_tier() {
+    awk -v t="${TIER}" -v s="${STALENESS}" '
+        BEGIN { if (s != "") { n = split(s, a, ","); for (i = 1; i <= n; i++) keep[a[i]] = 1 } }
+        NF && ($1 == t || t == "") && (s == "" || $2 in keep)
+    ' <<<"${ARMS}"
+}
 
 # CKPT_PATH is derived by common/run_identity.sh, so asking it is the only way to
 # be sure the guard checks the directory the job will actually write to.
