@@ -89,6 +89,21 @@ EOF
 
 # The bounds each correction's source paper actually uses. TIS keeps miles'
 # one-sided truncation; IcePop is two-sided.
+# Chain length per arm. The slower the arm, the more 4 h jobs it takes to reach
+# NUM_ROLLOUT, and a chain that ends early needs a manual top-up. Surplus is
+# nearly free: a job whose run has already reached NUM_ROLLOUT resumes, finds
+# nothing to do and exits in ~4 minutes (measured), so it costs one node-job, not
+# one node-4-hours. Sized off the measured steady-state step times at lr 1e-6 --
+# s0 604 s, s1 431 s, s2 346 s, s4 345 s -- with margin, because 5e-6 lengthens
+# responses faster and no measurement of it exists yet.
+n_jobs_of() {  # staleness -> chained job count
+    case "$1" in
+        0) echo $(( N_JOBS + 8 )) ;;   # colocated: no rollout/train overlap at all
+        1) echo $(( N_JOBS + 5 )) ;;   # tightest bound, so the most recycling waste
+        *) echo "${N_JOBS}" ;;
+    esac
+}
+
 bounds_of() {  # is_correction -> "low high"
     case "$1" in
         icepop) echo "0.5 5.0" ;;
@@ -160,8 +175,8 @@ fi
 n_jobs=${N_JOBS}
 n_arms=$(arms_of_tier | wc -l)
 
-printf 'tier %s: %d arms x %d chained jobs x %d nodes, %s wall each\n' \
-    "${TIER}" "${n_arms}" "${n_jobs}" "${NODES}" "${WALL}"
+printf 'tier %s: %d arms x %d-%d chained jobs x %d nodes, %s wall each\n' \
+    "${TIER}" "${n_arms}" "${n_jobs}" "$(( n_jobs + 8 ))" "${NODES}" "${WALL}"
 printf '%d rollouts per arm, seeds tseed %s / rseed %s\n\n' \
     "${TOTAL_ROLLOUT}" "${TRAIN_SEED}" "${ROLLOUT_SEED}"
 
@@ -181,8 +196,10 @@ while read -r tier s isc denom prof lr len; do
 done < <(arms_of_tier)
 
 echo
-printf 'at most %d node-hours; measured 335 s/step gives ~%.0f h per arm\n' \
-    "$(( n_arms * n_jobs * NODES * ${WALL%%:*} ))" \
+total_jobs=0
+while read -r _ s_ _ _ _ _ _; do total_jobs=$(( total_jobs + $(n_jobs_of "${s_}") )); done < <(arms_of_tier)
+printf '%d jobs total; at most %d node-hours; measured 335 s/step gives ~%.0f h per arm\n' \
+    "${total_jobs}" "$(( total_jobs * NODES * ${WALL%%:*} ))" \
     "$(awk -v n="${TOTAL_ROLLOUT}" 'BEGIN{print n*335/3600}')"
 
 if (( SUBMIT == 0 )); then
@@ -222,7 +239,8 @@ while read -r tier s isc denom prof lr len; do
     [[ "${prof}" == "-" ]] || algo_env="${algo_env},USE_OPSM=1,OPSM_DELTA=${prof}"
 
     dep=""
-    for (( k = 1; k <= n_jobs; k++ )); do
+    arm_jobs=$(n_jobs_of "${s}")
+    for (( k = 1; k <= arm_jobs; k++ )); do
             name="conv-s${s}-${isc}$([[ "${denom}" == actor ]] || echo "-rolloutlp")$([[ "${prof}" == "-" ]] || echo "-opsm")-lr${lr}-${len}-p${k}"
         # Every job in the chain gets identical arguments. NUM_ROLLOUT feeds
         # train_iters and so lr_decay_steps (megatron_utils/model.py:78-80), and
