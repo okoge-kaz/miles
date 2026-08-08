@@ -170,22 +170,55 @@ async def test_stale_group_recycled(monkeypatch):
     # bound of 2 and was recycled, so only the fresh group at 10 -- lag 0 -- was
     # trained on. A reader plotting "max_staleness" against a bound of 2 must never
     # see a 5 there.
-    assert output.metrics["rollout/fully_async/max_staleness"] == 0
-    assert output.metrics["rollout/fully_async/staleness_num_groups"] == 1
-    assert output.metrics["rollout/fully_async/staleness_frac_zero"] == pytest.approx(1.0)
-    assert output.metrics["rollout/fully_async/staleness_count_0"] == 1
-    assert output.metrics["rollout/fully_async/staleness_count_5"] == 0
+    assert output.metrics["staleness/max"] == 0
+    # Upstream's own key keeps upstream's meaning: the offered lag, before the
+    # bound check. Two miles runs must not plot different quantities under it.
+    assert output.metrics["rollout/fully_async/max_staleness"] == 5
+    assert output.metrics["staleness/num_groups"] == 1
+    assert output.metrics["staleness/frac_zero"] == pytest.approx(1.0)
+    assert output.metrics["staleness/count_0"] == 1
+    assert output.metrics["staleness/count_5"] == 0
 
     # The offered distribution keeps both: it is the natural lag of this node
     # ratio, and the gap between the two is what recycling cost.
-    assert output.metrics["rollout/fully_async/offered/max_staleness"] == 5
-    assert output.metrics["rollout/fully_async/offered/staleness_num_groups"] == 2
-    assert output.metrics["rollout/fully_async/offered/staleness_p50"] == pytest.approx(2.5)
-    assert output.metrics["rollout/fully_async/offered/staleness_frac_zero"] == pytest.approx(0.5)
-    assert output.metrics["rollout/fully_async/offered/staleness_frac_at_bound"] == pytest.approx(0.5)
+    assert output.metrics["staleness/offered/max"] == 5
+    assert output.metrics["staleness/offered/num_groups"] == 2
+    assert output.metrics["staleness/offered/p50"] == pytest.approx(2.5)
+    assert output.metrics["staleness/offered/frac_zero"] == pytest.approx(0.5)
+    assert output.metrics["staleness/offered/frac_at_bound"] == pytest.approx(0.5)
 
     # Tokens counted before reset_for_retry cleared them.
     assert output.metrics["rollout/fully_async/stale_tokens"] == N_SAMPLES_PER_PROMPT
+
+    # Named for the cause, under the section that owns it, so the bound's cost does
+    # not have to be reconstructed by differencing group counts -- which would fold
+    # in the dynamic-filter drops.
+    assert output.metrics["staleness/bound_exceeded_groups"] == 1
+    assert output.metrics["staleness/bound_exceeded_tokens"] == N_SAMPLES_PER_PROMPT
+
+    # The recycled group was regenerated, so its retry counter advanced. The group
+    # that trained this step was never recycled.
+    assert all(sample.retry_count == 1 for sample in stale)
+    assert output.metrics["staleness/retry_count_max"] == 0
+    assert output.metrics["staleness/retry_frac_nonzero"] == pytest.approx(0.0)
+
+
+def test_retry_count_survives_the_reset_that_increments_it():
+    """`reset_for_retry` wipes the generated output; the counter is not output.
+
+    It counts calls to that method, so resetting it there would pin it at zero --
+    and the failure is silent, because every other field it touches *should* be
+    cleared.
+    """
+    sample = Sample(prompt="p", tokens=[1, 2, 3], response="r", response_length=3, retry_count=2)
+    sample.reset_for_retry()
+
+    assert sample.retry_count == 2
+    assert sample.tokens == [] and sample.response == "" and sample.weight_versions == []
+
+    # It also has to survive the dump round trip, which is where the offline
+    # analysis reads it from.
+    assert Sample.from_dict(sample.to_dict()).retry_count == 2
 
 
 async def test_trained_staleness_excludes_dynamic_filter_drops(monkeypatch):
@@ -229,12 +262,12 @@ async def test_trained_staleness_excludes_dynamic_filter_drops(monkeypatch):
     output = await fn(RolloutFnTrainInput(rollout_id=0))
 
     # It was offered at lag 1 and the bound did not stop it...
-    assert output.metrics["rollout/fully_async/offered/staleness_count_1"] == 1
+    assert output.metrics["staleness/offered/count_1"] == 1
     assert output.metrics["rollout/fully_async/stale_groups_recycled"] == 0
     # ...but the filter dropped it, so the loss only ever saw the lag-0 group.
-    assert output.metrics["rollout/fully_async/staleness_count_1"] == 0
-    assert output.metrics["rollout/fully_async/staleness_count_0"] == 1
-    assert output.metrics["rollout/fully_async/staleness_num_groups"] == 1
+    assert output.metrics["staleness/count_1"] == 0
+    assert output.metrics["staleness/count_0"] == 1
+    assert output.metrics["staleness/num_groups"] == 1
 
 
 async def test_wasted_token_accounting(monkeypatch):
@@ -260,14 +293,14 @@ def test_staleness_histogram_reports_the_shape_not_just_moments():
     values = [0] * 90 + [1] * 8 + [4, 12]
     m = fully_async._staleness_metrics(values, bound=2)
 
-    assert m["staleness_count_0"] == 90
-    assert m["staleness_count_1"] == 8
-    assert m["staleness_count_4"] == 1
-    assert m["staleness_count_ge_9"] == 1  # 12 lands in the overflow bucket
-    assert sum(m[f"staleness_count_{i}"] for i in range(9)) + m["staleness_count_ge_9"] == len(values)
+    assert m["count_0"] == 90
+    assert m["count_1"] == 8
+    assert m["count_4"] == 1
+    assert m["count_ge_9"] == 1  # 12 lands in the overflow bucket
+    assert sum(m[f"count_{i}"] for i in range(9)) + m["count_ge_9"] == len(values)
     # The moments still agree with the histogram.
-    assert m["max_staleness"] == 12
-    assert m["staleness_frac_zero"] == 0.9
+    assert m["max"] == 12
+    assert m["frac_zero"] == 0.9
 
 
 async def test_weight_version_endpoint_is_discovered_not_assumed(monkeypatch):

@@ -67,6 +67,10 @@ class Sample:
     generate_function_path: str | None = None
     # metadata used during training, e.g., what loss to use for this sample.
     train_metadata: dict | None = None
+    # How many times this prompt has been regenerated from scratch. Identity, not
+    # output: `reset_for_retry` must leave it alone or the count resets on the very
+    # event it is counting.
+    retry_count: int = 0
 
     # MultiLoRA: which adapter this sample trains/infers with
     adapter: AdapterRef | None = None
@@ -237,8 +241,11 @@ class Sample:
         """Reset generated outputs so the original prompt can be re-sampled.
 
         Keeps identity / prompt fields (group_index, index, prompt, label,
-        multimodal_inputs, metadata, generate_function_path, routing_key) and
-        restores everything else to dataclass defaults.
+        multimodal_inputs, metadata, generate_function_path, routing_key,
+        retry_count) and restores everything else to dataclass defaults.
+
+        `retry_count` is deliberately not reset: it counts calls to this method,
+        so zeroing it here would make it permanently zero.
         """
         self.tokens = []
         self.multimodal_train_inputs = None

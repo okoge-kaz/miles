@@ -169,16 +169,19 @@ def _staleness_metrics(values: list[int], bound: int | None) -> dict[str, float]
     """
     array = np.asarray(values, dtype=float)
     metrics = {
-        "avg_staleness": float(array.mean()),
-        "max_staleness": float(array.max()),
-        "staleness_p50": float(np.percentile(array, 50)),
-        "staleness_p90": float(np.percentile(array, 90)),
-        "staleness_p99": float(np.percentile(array, 99)),
-        "staleness_frac_zero": float((array <= 0).mean()),
-        "staleness_num_groups": float(array.size),
+        "mean": float(array.mean()),
+        "max": float(array.max()),
+        "p50": float(np.percentile(array, 50)),
+        "p90": float(np.percentile(array, 90)),
+        "p99": float(np.percentile(array, 99)),
+        "frac_zero": float((array <= 0).mean()),
+        "num_groups": float(array.size),
     }
     if bound is not None:
-        metrics["staleness_frac_at_bound"] = float((array >= bound).mean())
+        # `>=`, not `>`: a group exactly at the bound is kept. This is "how often
+        # did the pipeline reach the cap", not the rejection rate -- for that, see
+        # `staleness/bound_exceeded_groups`.
+        metrics["frac_at_bound"] = float((array >= bound).mean())
 
     # The full histogram, not just moments. Realized lag is a small integer, so
     # P(L) fits in a handful of scalars, and the shape is the result: percentiles
@@ -188,8 +191,8 @@ def _staleness_metrics(values: list[int], bound: int | None) -> dict[str, float]
     # again when it is regenerated, which is the honest denominator for "how often
     # did the pipeline produce a sample this stale".
     for level in range(STALENESS_HISTOGRAM_MAX + 1):
-        metrics[f"staleness_count_{level}"] = float((array == level).sum())
-    metrics[f"staleness_count_ge_{STALENESS_HISTOGRAM_MAX + 1}"] = float(
+        metrics[f"count_{level}"] = float((array == level).sum())
+    metrics[f"count_ge_{STALENESS_HISTOGRAM_MAX + 1}"] = float(
         (array > STALENESS_HISTOGRAM_MAX).sum()
     )
     return metrics
@@ -396,23 +399,47 @@ class FullyAsyncRolloutFn:
             # this version, and without it a missing staleness metric is impossible to
             # tell apart from a router that never answered.
             metrics["rollout/fully_async/current_weight_version"] = current_version
-        # The unprefixed names are the lag the loss saw. The offered distribution
-        # keeps its own prefix rather than the short name it used to own: a chart
-        # of "staleness" against a bound is read as what was trained on.
+        # `rollout/fully_async/{avg,max}_staleness` are upstream's and keep
+        # upstream's meaning: the lag as *offered*, counted before the bound check.
+        # Redefining them to the trained lag would leave two miles runs plotting
+        # the same key against different quantities.
+        if offered_staleness:
+            metrics["rollout/fully_async/avg_staleness"] = sum(offered_staleness) / len(offered_staleness)
+            metrics["rollout/fully_async/max_staleness"] = max(offered_staleness)
+
+        # Everything this study adds lives under `staleness/`. Unprefixed there is
+        # the lag the loss actually trained on; `staleness/offered/` is the
+        # pre-filter distribution the bound was applied to.
         if trained_staleness:
             metrics |= {
-                f"rollout/fully_async/{name}": value
+                f"staleness/{name}": value
                 for name, value in _staleness_metrics(trained_staleness, args.max_weight_staleness).items()
             }
         if offered_staleness:
             metrics |= {
-                f"rollout/fully_async/offered/{name}": value
+                f"staleness/offered/{name}": value
                 for name, value in _staleness_metrics(offered_staleness, args.max_weight_staleness).items()
             }
+        # Named for the reason rather than the mechanism: `stale_groups_recycled`
+        # is what happened, `bound_exceeded` is why. Split from the dynamic-filter
+        # drops, which land in the same recycled/dropped bucket if only totals are
+        # compared.
+        metrics["staleness/bound_exceeded_groups"] = stale_groups_recycled
+        metrics["staleness/bound_exceeded_tokens"] = stale_tokens
+
+        # How many times a group that reached training had to be regenerated. The
+        # per-sample counter survives `reset_for_retry`, so this is cumulative over
+        # the group's whole life, not just this rollout.
+        retries = [max(sample.retry_count for sample in _iter_samples(group)) for group in data]
+        if retries:
+            metrics["staleness/retry_count_mean"] = sum(retries) / len(retries)
+            metrics["staleness/retry_count_max"] = float(max(retries))
+            metrics["staleness/retry_frac_nonzero"] = sum(1 for r in retries if r) / len(retries)
 
         return RolloutFnTrainOutput(samples=data, metrics=metrics)
 
     def _recycle(self, prompt_group: list[Sample]) -> None:
         for sample in prompt_group:
+            sample.retry_count += 1
             sample.reset_for_retry()
         self.data_source.add_samples([prompt_group])
