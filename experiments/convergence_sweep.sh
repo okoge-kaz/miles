@@ -6,6 +6,7 @@
 #     experiments/convergence_sweep.sh --tier 1 --submit
 #     experiments/convergence_sweep.sh --tier 1 --submit --force   # ignore a dirty CKPT_PATH
 #     experiments/convergence_sweep.sh --tier 1 --staleness 0      # one arm, to resubmit it alone
+#     experiments/convergence_sweep.sh --tier 3 --lr 1e-6          # half of tier 3, to stage it
 #
 # The split is fixed by notes/node-ratio-procedure.md: 4 nodes everywhere, async
 # arms as 1 train + 3 rollout, the staleness-0 arm colocated across all 4.
@@ -32,37 +33,57 @@ LOG_DIR="${OUTPUT_DIR}/training/math/dapo-math-p10-90/qwen3-4b-instruct-2507"
 : "${ROLLOUT_SEED:=42}"
 
 # The third column selects the correction and, with it, the bounds the source
-# paper uses; the fourth is the OPSM threshold, "-" for off. Neither the bounds
-# nor the threshold are free parameters -- see notes/algorithm-ablation.md.
+# paper uses; the fourth is the PPO ratio denominator; the fifth is the OPSM
+# threshold, "-" for off. None of the three are free parameters -- see
+# notes/algorithm-ablation.md.
 #
-# Tier 2 carries no s=0 arm. Every correction here exists to mitigate
+# Tier 2 carries no s=0 arm. Every correction there exists to mitigate
 # off-policyness, so on-policy it has nothing to act on and tier 1's s=0 run is
 # the reference for all of them.
 #
-# tier | staleness | IS_CORRECTION | OPSM_DELTA | LR | MAX_RESPONSE_LEN
+# lr 5e-6 is the primary. At 1e-6 the corrections do not fire -- measured
+# `tis_clipfrac` 5e-06, IcePop 7.8e-06 -- so an algorithm sweep there compares
+# methods that never act. See notes/algorithm-ablation.md.
+#
+# The two DeepSeek-V3.2 rows per staleness are a pair: OPSM needs the behaviour
+# policy as the denominator, and miles rejects that alongside TIS, so the OPSM
+# arm differs from tier 1 in two ways at once. The "-" row is the control that
+# separates them.
+#
+# Tier 5 is not part of the plan. It is a rescue, run only for an arm that has
+# already collapsed at a higher learning rate, and only for that arm -- never as
+# a block. Submit it with --staleness to name the arm.
+#
+# tier | staleness | IS_CORRECTION | RATIO_DENOMINATOR | OPSM_DELTA | LR | LEN
 ARMS=$(cat <<'EOF'
-1 0 tis    -   1e-6 32768
-1 1 tis    -   1e-6 32768
-1 2 tis    -   1e-6 32768
-1 4 tis    -   1e-6 32768
-2 1 icepop -   1e-6 32768
-2 2 icepop -   1e-6 32768
-2 4 icepop -   1e-6 32768
-2 1 tis    TBD 1e-6 32768
-2 2 tis    TBD 1e-6 32768
-2 4 tis    TBD 1e-6 32768
-3 0 tis    -   1e-6 4096
-3 1 tis    -   1e-6 4096
-3 2 tis    -   1e-6 4096
-3 4 tis    -   1e-6 4096
-4 0 tis    -   5e-6 32768
-4 1 tis    -   5e-6 32768
-4 2 tis    -   5e-6 32768
-4 4 tis    -   5e-6 32768
-4 0 tis    -   1e-7 32768
-4 1 tis    -   1e-7 32768
-4 2 tis    -   1e-7 32768
-4 4 tis    -   1e-7 32768
+1 0 tis    actor            -    5e-6 32768
+1 1 tis    actor            -    5e-6 32768
+1 2 tis    actor            -    5e-6 32768
+1 4 tis    actor            -    5e-6 32768
+2 1 icepop actor            -    5e-6 32768
+2 2 icepop actor            -    5e-6 32768
+2 4 icepop actor            -    5e-6 32768
+2 1 m2po   rollout-logprobs -    5e-6 32768
+2 2 m2po   rollout-logprobs -    5e-6 32768
+2 4 m2po   rollout-logprobs -    5e-6 32768
+2 1 none   rollout-logprobs 1e-4 5e-6 32768
+2 2 none   rollout-logprobs 1e-4 5e-6 32768
+2 4 none   rollout-logprobs 1e-4 5e-6 32768
+2 1 none   rollout-logprobs -    5e-6 32768
+2 2 none   rollout-logprobs -    5e-6 32768
+2 4 none   rollout-logprobs -    5e-6 32768
+3 0 tis    actor            -    1e-6 32768
+3 1 tis    actor            -    1e-6 32768
+3 2 tis    actor            -    1e-6 32768
+3 4 tis    actor            -    1e-6 32768
+4 0 tis    actor            -    5e-6 4096
+4 1 tis    actor            -    5e-6 4096
+4 2 tis    actor            -    5e-6 4096
+4 4 tis    actor            -    5e-6 4096
+5 0 tis    actor            -    1e-7 32768
+5 1 tis    actor            -    1e-7 32768
+5 2 tis    actor            -    1e-7 32768
+5 4 tis    actor            -    1e-7 32768
 EOF
 )
 
@@ -71,15 +92,17 @@ EOF
 bounds_of() {  # is_correction -> "low high"
     case "$1" in
         icepop) echo "0.5 5.0" ;;
+        m2po)   echo "0 0" ;;      # unused: M2PO derives its bounds per step
         *)      echo "0 2.0" ;;
     esac
 }
 
-TIER=""; STALENESS=""; SUBMIT=0; FORCE=0
+TIER=""; STALENESS=""; LR_FILTER=""; SUBMIT=0; FORCE=0
 while (( $# )); do
     case "$1" in
         --tier)      TIER="$2"; shift 2 ;;
         --staleness) STALENESS="$2"; shift 2 ;;   # comma-separated, e.g. 0 or 1,2,4
+        --lr)        LR_FILTER="$2"; shift 2 ;;   # comma-separated, e.g. 1e-6
         --submit)    SUBMIT=1; shift ;;
         --force)     FORCE=1; shift ;;
         *) echo "unknown argument: $1" >&2; exit 1 ;;
@@ -87,26 +110,29 @@ while (( $# )); do
 done
 
 arms_of_tier() {
-    awk -v t="${TIER}" -v s="${STALENESS}" '
-        BEGIN { if (s != "") { n = split(s, a, ","); for (i = 1; i <= n; i++) keep[a[i]] = 1 } }
-        NF && ($1 == t || t == "") && (s == "" || $2 in keep)
+    awk -v t="${TIER}" -v s="${STALENESS}" -v l="${LR_FILTER}" '
+        BEGIN {
+            if (s != "") { n = split(s, a, ","); for (i = 1; i <= n; i++) keep[a[i]] = 1 }
+            if (l != "") { n = split(l, b, ","); for (i = 1; i <= n; i++) keeplr[b[i]] = 1 }
+        }
+        NF && ($1 == t || t == "") && (s == "" || $2 in keep) && (l == "" || $6 in keeplr)
     ' <<<"${ARMS}"
 }
 
 # CKPT_PATH is derived by common/run_identity.sh, so asking it is the only way to
 # be sure the guard checks the directory the job will actually write to.
-ckpt_path_of() {  # staleness is_correction opsm_delta lr max_response_len
+ckpt_path_of() {  # staleness is_correction ratio_denominator opsm_delta lr max_response_len
     (
         set -euo pipefail
         MODEL_NAME=Qwen3-4B-Instruct-2507 DATASET_TAG=dapo-math-p10-90
         ADVANTAGE_ESTIMATOR=grpo ENTROPY_COEF=0.00 KL_LOSS_COEF=0.00
-        EPS_CLIP=0.2 EPS_CLIP_HIGH=0.28 EPS_CLIP_C= RATIO_DENOMINATOR=actor
+        EPS_CLIP=0.2 EPS_CLIP_HIGH=0.28 EPS_CLIP_C= RATIO_DENOMINATOR=$3
         read -r TIS_CLIP_LOW TIS_CLIP < <(bounds_of "$2")
-        if [[ "$3" == "-" ]]; then USE_OPSM=0; OPSM_DELTA=1e-4
-        else USE_OPSM=1; OPSM_DELTA=$3; fi
+        if [[ "$4" == "-" ]]; then USE_OPSM=0; OPSM_DELTA=1e-4
+        else USE_OPSM=1; OPSM_DELTA=$4; fi
         ROLLOUT_BATCH_SIZE=192 N_SAMPLES_PER_PROMPT=16 GLOBAL_BATCH_SIZE=3072
         NUM_STEPS_PER_ROLLOUT=1
-        MAX_WEIGHT_STALENESS=$1 IS_CORRECTION=$2 LR=$4 MAX_RESPONSE_LEN=$5
+        MAX_WEIGHT_STALENESS=$1 IS_CORRECTION=$2 LR=$5 MAX_RESPONSE_LEN=$6
         MIS_PROFILE=
         TRAIN_SEED="${TRAIN_SEED}" ROLLOUT_SEED="${ROLLOUT_SEED}"
         if (( $1 == 0 )); then PLACEMENT=colocated; unset MAX_WEIGHT_STALENESS
@@ -120,10 +146,12 @@ host_ckpt() { sed "s#^/ckpt/training#${TRAIN_CKPT_DIR}#" <<<"$1"; }
 
 if [[ -z "${TIER}" ]]; then
     echo "pass --tier N. Tiers, in submission order:"
-    echo "  1  primary: lr 1e-6, 32k, GRPO + DAPO clip-higher + TIS 2.0, token-level loss"
-    echo "  2  algorithm: IcePop token-level mask [0.5, 5.0], and DeepSeek-V3.2 OPSM"
-    echo "  3  response length: 4k"
-    echo "  4  learning rate: 5e-6 and 1e-7"
+    echo "  1  primary: lr 5e-6, 32k, GRPO + DAPO clip-higher + TIS 2.0, token-level loss"
+    echo "  2  algorithm: IcePop, M2PO, DeepSeek-V3.2 OPSM (+ its denominator control)"
+    echo "  3  learning rate: 1e-6 -- the slower reference, not the primary"
+    echo "  4  response length: 4k"
+    echo "  5  RESCUE ONLY: lr 1e-7, for an arm that collapsed above. Not a block;"
+    echo "     name the arm with --staleness."
     echo
     awk 'NF{c[$1]++} END{for(t in c) printf "  tier %s: %d arms\n", t, c[t]}' <<<"${ARMS}" | sort
     exit 0
@@ -138,9 +166,9 @@ printf '%d rollouts per arm, seeds tseed %s / rseed %s\n\n' \
     "${TOTAL_ROLLOUT}" "${TRAIN_SEED}" "${ROLLOUT_SEED}"
 
 dirty=0
-printf '  %-3s %-7s %-9s %-6s %-6s %-9s %s\n' s IS opsm lr len place "checkpoint state"
-while read -r tier s isc prof lr len; do
-    IFS=$'\t' read -r cpath rname < <(ckpt_path_of "${s}" "${isc}" "${prof}" "${lr}" "${len}")
+printf '  %-3s %-7s %-17s %-5s %-6s %-6s %-9s %s\n' s IS denom opsm lr len place "checkpoint state"
+while read -r tier s isc denom prof lr len; do
+    IFS=$'\t' read -r cpath rname < <(ckpt_path_of "${s}" "${isc}" "${denom}" "${prof}" "${lr}" "${len}")
     host=$(host_ckpt "${cpath}")
     place=$([[ "${s}" == 0 ]] && echo colocated || echo "async 1+3")
     if compgen -G "${host}/iter_*" >/dev/null 2>&1; then
@@ -149,7 +177,7 @@ while read -r tier s isc prof lr len; do
     else
         state="clean"
     fi
-    printf '  %-3s %-7s %-9s %-6s %-6s %-9s %s\n' "${s}" "${isc}" "${prof}" "${lr}" "${len}" "${place}" "${state}"
+    printf '  %-3s %-7s %-17s %-5s %-6s %-6s %-9s %s\n' "${s}" "${isc}" "${denom}" "${prof}" "${lr}" "${len}" "${place}" "${state}"
 done < <(arms_of_tier)
 
 echo
@@ -177,8 +205,8 @@ if (( dirty == 1 && FORCE == 0 )); then
 fi
 
 echo
-while read -r tier s isc prof lr len; do
-    IFS=$'\t' read -r cpath rname < <(ckpt_path_of "${s}" "${isc}" "${prof}" "${lr}" "${len}")
+while read -r tier s isc denom prof lr len; do
+    IFS=$'\t' read -r cpath rname < <(ckpt_path_of "${s}" "${isc}" "${denom}" "${prof}" "${lr}" "${len}")
     if (( s == 0 )); then
         recipe="${COLO_RECIPE}"
         # Both are set explicitly: --export=ALL would otherwise leak whatever the
@@ -190,11 +218,12 @@ while read -r tier s isc prof lr len; do
     fi
     read -r tclow tchigh < <(bounds_of "${isc}")
     algo_env="TIS_CLIP_LOW=${tclow},TIS_CLIP=${tchigh}"
+    algo_env="${algo_env},RATIO_DENOMINATOR=${denom}"
     [[ "${prof}" == "-" ]] || algo_env="${algo_env},USE_OPSM=1,OPSM_DELTA=${prof}"
 
     dep=""
     for (( k = 1; k <= n_jobs; k++ )); do
-            name="conv-s${s}-${isc}$([[ "${prof}" == "-" ]] || echo "-opsm")-lr${lr}-${len}-p${k}"
+            name="conv-s${s}-${isc}$([[ "${denom}" == actor ]] || echo "-rolloutlp")$([[ "${prof}" == "-" ]] || echo "-opsm")-lr${lr}-${len}-p${k}"
         # Every job in the chain gets identical arguments. NUM_ROLLOUT feeds
         # train_iters and so lr_decay_steps (megatron_utils/model.py:78-80), and
         # OptimizerParamScheduler.load_state_dict asserts the checkpoint's value

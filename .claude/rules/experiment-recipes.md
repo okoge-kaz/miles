@@ -31,6 +31,30 @@ This:
 
 with the table, the job IDs and the reasoning in `experiments/notes/parallelism.md`.
 
+## Read the notes before you touch anything under `experiments/`
+
+The rule above is only half of it. A note is written so the next person does not
+repeat the measurement — which only works if it is read.
+
+**Before changing a recipe, submitting a job, or answering a question about how
+this study is configured, check `experiments/notes/README.md` for a relevant
+note and read it.** The index is one screen; reading it costs nothing next to
+re-deriving a finding or re-running a job that already answered the question.
+
+Specifically:
+
+- Changing a parallelism, memory or recompute knob → `notes/parallelism.md`
+- Submitting, queueing, or hitting a QOS limit → `notes/cluster.md`
+- Adding, renaming or interpreting a logged metric → `notes/telemetry.md`
+- Scoring a checkpoint → `notes/offline-eval.md`
+- Choosing an algorithm arm or an IS correction → `notes/algorithm-ablation.md`
+- Reading or writing a checkpoint path → `notes/checkpoints.md`
+
+If the note contradicts what you were about to do, the note is evidence and your
+plan is a guess — reconcile them before acting. If the note is out of date,
+**update it in the same change**; a stale note is worse than none, because it is
+trusted.
+
 ## Why
 
 - A recipe is read to answer "what is this run configured as". Ten lines of

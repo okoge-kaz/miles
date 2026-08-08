@@ -70,6 +70,9 @@ GUARD_METRICS = (
     "train/train_rollout_kl",
     "train/ppo_kl",
     "train/ess_ratio",  # inner-loop ESS, NOT the rollout-vs-train ESS -- see README
+    # Both are ESS of pi_train/pi_rollout; they differ in the population.
+    "train/rollout_token_level_ess",  # over tokens within a sequence
+    "train/rollout_sequence_level_ess",  # over sequences in the batch (VCPO eq. 4)
     "train/tis",
     "train/pg_clipfrac",
     "train/tis_abs",
@@ -78,13 +81,29 @@ GUARD_METRICS = (
     "rollout/weight_version/min",
     "rollout/weight_version/max",
     "rollout/weight_version/mean",
+    "rollout/weight_version/p90",
     "rollout/weight_version/mixed_version_ratio",
+    "rollout/fully_async/current_weight_version",
     "rollout/fully_async/avg_staleness",
     "rollout/fully_async/max_staleness",
+    "rollout/fully_async/staleness_p50",
+    "rollout/fully_async/staleness_p90",
+    "rollout/fully_async/staleness_p99",
+    "rollout/fully_async/staleness_frac_zero",
+    "rollout/fully_async/staleness_frac_at_bound",
+    "rollout/fully_async/staleness_num_groups",
     "rollout/fully_async/stale_groups_recycled",
     "rollout/fully_async/aborted_groups_recycled",
+    # wasted generation, in tokens
+    "rollout/fully_async/aborted_tokens",
+    "rollout/fully_async/stale_tokens",
+    "rollout/fully_async/dynamic_filter_tokens",
+    "rollout/fully_async/kept_tokens",
+    "rollout/fully_async/wasted_token_frac",
     # throughput, for the wall-clock story behind a speedup
     "rollout/response_len/mean",
+    "rollout/response_len/p90",
+    "rollout/response_len/p99",
     "perf/rollout_time",
     "perf/train_wait_time",
     "perf/wait_time_ratio",

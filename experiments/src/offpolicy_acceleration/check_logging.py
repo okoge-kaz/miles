@@ -187,6 +187,8 @@ def _drift_checks(metrics_seen) -> list[Check]:
         "train/ess_ratio": "ESS of the PPO inner-loop weights only; identically 1.0 when "
         "NUM_STEPS_PER_ROLLOUT=1, so it does NOT measure staleness",
         "train/tis": "exp(train - rollout) per token: the importance weight staleness actually moves",
+        "train/rollout_token_level_ess": "ESS over tokens within a sequence",
+        "train/rollout_sequence_level_ess": "ESS over sequences in the batch -- VCPO eq. 4",
         "train/pg_clipfrac": "how much of the update the clip is discarding",
         "train/tis_abs": "the TIS correction's magnitude, when --use-tis is on",
     }
@@ -203,15 +205,39 @@ def _drift_checks(metrics_seen) -> list[Check]:
 
 def _lag_checks(dump_dir: Path | None, metrics_seen) -> list[Check]:
     exact = "rollout/fully_async/avg_staleness" in metrics_seen
+    distribution = "rollout/fully_async/staleness_p90" in metrics_seen
     checks = [
+        Check(
+            "realized lag distribution (logged)",
+            "PASS" if distribution else "WARN",
+            "staleness percentiles logged" if distribution else "only avg/max, no percentiles",
+            "P(L) without reading any dump",
+            "" if distribution else "requires the staleness-percentile metrics in fully_async_rollout.py",
+        ),
+        Check(
+            "staleness reference version",
+            "PASS" if "rollout/fully_async/current_weight_version" in metrics_seen else "WARN",
+            "current_weight_version logged" if "rollout/fully_async/current_weight_version" in metrics_seen
+            else "absent: a missing staleness metric is indistinguishable from a dead router query",
+            "telling 'never stale' apart from 'never measured'",
+        ),
+        Check(
+            "wasted generation (tokens)",
+            "PASS" if "rollout/fully_async/wasted_token_frac" in metrics_seen else "WARN",
+            "token-level waste logged" if "rollout/fully_async/wasted_token_frac" in metrics_seen
+            else "only group counts, no token volume",
+            "sample- and token-efficiency claims alongside the wall-clock ones",
+        ),
         Check(
             "realized staleness (exact mean)",
             "PASS" if exact else "FAIL",
             "avg_staleness logged" if exact else "avg_staleness never logged",
             "reporting realized lag next to the configured bound",
-            "" if exact else "set --max-weight-staleness; fully_async_rollout.py:202 only measures "
-            "staleness when a bound exists. Use a bound so large it never binds (1000000) for the "
-            "unbounded arm rather than leaving it unset",
+            "" if exact else "two independent causes: --max-weight-staleness must be set at all "
+            "(use 1000000 for the unbounded arm, not unset), AND the router /model_info query must "
+            "succeed -- when it does not, `current` is None, the cap silently enforces nothing and "
+            "no staleness metric is emitted. Check the log for "
+            "'--max-weight-staleness cannot be enforced'",
         ),
         Check(
             "version bracket",

@@ -115,6 +115,7 @@ case "${IS_CORRECTION}" in
    tis)    GRPO_ARGS+=(--use-tis "${TIS_BOUNDS[@]}") ;;
    icepop) GRPO_ARGS+=(--use-tis "${TIS_BOUNDS[@]}"
                        --custom-tis-function-path miles.backends.training_utils.loss_hub.corrections.icepop_function) ;;
+   m2po)   GRPO_ARGS+=(--use-m2po --m2po-budget "${M2PO_BUDGET}") ;;
    mis)    GRPO_ARGS+=(--use-tis
                        --custom-tis-function-path examples.infra_features.train_infer_mismatch_helper.mis.compute_mis_weights_with_cp
                        --custom-config-path "/root/miles/experiments/configs/mis/${MIS_PROFILE}.yaml") ;;

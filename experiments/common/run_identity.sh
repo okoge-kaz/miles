@@ -19,6 +19,7 @@
 : "${TIS_CLIP:?}"
 : "${TIS_CLIP_LOW:?}"
 : "${USE_OPSM:?}"
+: "${M2PO_BUDGET:=0.04}"
 : "${OPSM_DELTA:?}"
 : "${KL_LOSS_COEF:?}"
 : "${LR:?}"
@@ -70,7 +71,8 @@ case "${IS_CORRECTION}" in
     tis)    IS_TAG="tis${BOUNDS}" ;;
     icepop) IS_TAG="icepop${BOUNDS}" ;;
     mis)    : "${MIS_PROFILE:?IS_CORRECTION=mis needs MIS_PROFILE}"; IS_TAG="mis-${MIS_PROFILE}" ;;
-    *)      echo "IS_CORRECTION must be none|tis|icepop|mis, got '${IS_CORRECTION}'" >&2; exit 1 ;;
+    m2po)   IS_TAG="m2po${M2PO_BUDGET}" ;;
+    *)      echo "IS_CORRECTION must be none|tis|icepop|mis|m2po, got '${IS_CORRECTION}'" >&2; exit 1 ;;
 esac
 
 case "${RATIO_DENOMINATOR}" in
@@ -80,7 +82,7 @@ case "${RATIO_DENOMINATOR}" in
     *) echo "RATIO_DENOMINATOR must be actor|rollout-logprobs|old-actor, got '${RATIO_DENOMINATOR}'" >&2; exit 1 ;;
 esac
 # arguments.py:2851 rejects the combination outright.
-[[ "${RATIO_DENOMINATOR}" != rollout-logprobs || "${IS_CORRECTION}" == none ]] ||
+[[ "${RATIO_DENOMINATOR}" != rollout-logprobs || "${IS_CORRECTION}" == none || "${IS_CORRECTION}" == m2po ]] ||
     { echo "RATIO_DENOMINATOR=rollout-logprobs cannot be combined with IS_CORRECTION=${IS_CORRECTION}" >&2; exit 1; }
 
 RL_ALGORITHM="${ADVANTAGE_ESTIMATOR}-clip${EPS_CLIP}-${EPS_CLIP_HIGH}"

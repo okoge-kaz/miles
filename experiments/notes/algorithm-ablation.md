@@ -190,3 +190,169 @@ Fix the bounds against arXiv:2512.02556 section 3.1 before tier 2, and check
 whether `tis_batch_normalize: true` is what the DeepSeek formulation actually
 does -- if it divides out the batch-common component, the bound applies to a
 normalized ratio and the numbers above do not transfer directly.
+
+### What is actually wired, and what has never been executed (2026-08-07)
+
+Static audit of the three corrections tier 2 needs.
+
+| Method | Reachable | Path | Exercised |
+|---|---|---|---|
+| TIS | yes | `--use-tis`, default `vanilla_tis_function` | tier 1, all four arms |
+| ICEPOP | yes | `--use-tis --custom-tis-function-path miles.backends.training_utils.loss_hub.corrections.icepop_function` | unit test only |
+| MIS (sequence mask) | yes | `--custom-tis-function-path examples.…mis.compute_mis_weights_with_cp --custom-config-path .../seq-mask.yaml` | never |
+| OPSM (DeepSeek-V3.2 §3.1) | yes, native | `--use-opsm --opsm-delta` | never |
+
+`load_function` splits on the last `.` and calls `importlib.import_module`, so a
+dotted path is the required form -- the `mis.py:func` spelling in the `--help`
+text is stale. `examples.infra_features` has no `__init__.py` and resolves as a
+namespace package; `find_spec` confirms all four targets resolve.
+
+Two things that will bite when tier 2 runs:
+
+- `icepop_function` returns `loss_masks` unchanged, so a popped token still sits
+  in the `sum_of_sample_mean` denominator. The `[decouple IS and rejection]`
+  path exists precisely to rebuild that denominator from a modified mask and
+  ICEPOP does not use it, so popping shrinks the gradient rather than
+  renormalising it. Check against the ICEPOP formulation before reading a tier-2
+  result as the method's.
+- `icepop_function` emits its metrics under `tis`, `tis_clipfrac`, `tis_abs` --
+  the same keys as vanilla TIS. Runs are separable only by run name, not by
+  series.
+
+### Measured: what the sequence-level bound would actually mask (2026-08-07)
+
+The per-token log-ratio is not a constant offset. From the four running arms'
+`dump/dashboard/metrics.jsonl`:
+
+| quantity | value | source |
+|---|---|---|
+| `E[log w]` per token | -8.5e-06 | `train/tis` - 1 |
+| `E[(log w)^2]` per token | 9.6e-04 | 2 x `train/train_rollout_kl` |
+| RMS per token | **0.0310** | sqrt of the above |
+| response length median / p90 / p99 | 6332 / 10317 / 32768 | `rollout/response_len/*` |
+
+The mean is three orders below the RMS, so the sequence sum is a random walk,
+not a drift: `sd(sum) = 0.0310 * sqrt(L)`. `tis_level: sequence` is
+`masked_sum` (`mis.py:196`), so the sequence weight is `exp` of that sum.
+
+| L | sd(sum) | kept at c=2.0 | kept at c=8.0 | c needed to keep 90% |
+|---|---|---|---|---|
+| 2048 | 1.41 | 37.8% | 86.1% | 10 |
+| 6332 (median) | 2.47 | 22.1% | 60.0% | 58 |
+| 11069 (p90) | 3.27 | 16.8% | 47.5% | 216 |
+| 32768 (p99) | 5.62 | 9.8% | 28.8% | 10300 |
+
+**No fixed bound works.** The threshold that keeps 90% of sequences varies 177x
+across our own length distribution. c = 2.0 masks four sequences in five. This is
+also why VCPO settles on c = 8.0 and why it does not transfer: at their 2048
+tokens c = 8.0 keeps 86%, at our median it keeps 60%.
+
+Tokens within a sequence are positively correlated, so `sqrt(L)` is the
+optimistic end -- the true `sd(sum)` lies between `sqrt(L)*sigma` and `L*sigma`.
+The table is a **lower bound on the damage**.
+
+`tis_batch_normalize` does not rescue this: normalisation happens at `mis.py:274`,
+after `mask()` has already run per sequence at `mis.py:236`. The bound is applied
+to the raw weight.
+
+Going the other way, `tis_level: geometric` (`masked_mean`) needs 1776 sigma at
+the median length to reach c = 2.0 -- it can never fire.
+
+**Conclusion: drop `seq-mask` rather than retune it.** A fixed bound on a
+sequence-level weight is a length filter at 32k, not a mismatch filter. It is not
+in the tier-2 arm list and should not be added. `experiments/configs/mis/` is
+kept only as a worked example.
+
+### Verified on hardware: ICEPOP fires, OPSM does not (2026-08-07)
+
+Two one-node colocated smoke runs on `interactive`, 3 rollouts at 2048 tokens
+(jobs 15309933, 15309937). Both reach a training step without error.
+
+| arm | flags as parsed | first-step metric |
+|---|---|---|
+| ICEPOP | `custom_tis_function_path=...icepop_function`, `tis_clip_low=0.5`, `tis_clip=5.0` | `tis_clipfrac` = 7.83e-06 |
+| OPSM | `use_opsm=True`, `opsm_delta=1e-4` | `opsm_clipfrac` = **0.0** |
+
+ICEPOP works. The pop fires on eight tokens per million, which is what the
+bounds imply on-policy; whether it separates under staleness is the tier-2
+question.
+
+**OPSM's 0.0 is exact, and it is structural.** `compute_opsm_mask`
+(`math_utils.py:279`) forms `seq_kl` from `full_old_log_probs - full_log_probs`,
+and `old_log_probs` is the PPO reference. Under `RATIO_DENOMINATOR=actor` with
+`NUM_STEPS_PER_ROLLOUT=1` the reference is a fresh forward pass of the same
+weights, so `seq_kl` is identically zero and the mask never fires for any
+`opsm_delta`.
+
+DeepSeek-V3.2 masks against the **behaviour** policy. In miles that is
+`--use-rollout-logprobs` (`RATIO_DENOMINATOR=rollout-logprobs`), which puts the
+rollout log-probs in `old_log_probs`. **OPSM is a silent no-op without it**, and
+`convergence_sweep.sh` now sets it whenever `USE_OPSM=1`.
+
+With the reference fixed, `seq_kl` is the per-token mean log-ratio, whose spread
+across sequences is `0.0310 / sqrt(L)` = 3.9e-04 at the median length. The
+`opsm_delta` default of **1e-4 sits at 0.26 sigma**, so roughly 40% of sequences
+exceed it and, gated on `advantage < 0`, about 20% are masked. That is a
+working operating point, and it is what the TBD in the tier-2 table is now set
+to.
+
+### M2PO: the released code is not the algorithm in the paper (2026-08-07)
+
+M2PO is Zheng, Zhao and Chen, *Prosperity before Collapse: How Far Can
+Off-Policy RL Reach with Stale Data on LLMs?*, arXiv:2510.01161 (ICLR 2026).
+It is the closest prior work to this study -- it claims parity with on-policy at
+a staleness of 256 updates -- so it is a tier-3 arm.
+
+The paper (eq. 4/5, Algorithm 1) describes **masking**: drop the tokens with the
+largest `(log r)^2` until the batch mean falls under `tau_M2 = 0.04`, then take
+an unclipped importance-weighted objective over what is left.
+
+`verl/trainer/ppo/core_algos.py` in the authors' repo does something else:
+
+1. it considers only **harmful** tokens -- `(A > 0, r > 1)` and `(A < 0, r < 1)`,
+   the two quadrants PPO's `max()` acts on;
+2. it solves for one scalar `tau` such that capping `|log r|` at `tau` brings
+   their mean `(log r)^2` to the budget;
+3. it turns `tau` into a **PPO clip range**, `eps_low = 1 - exp(-tau)` and
+   `eps_high = exp(tau) - 1`, and clips. Nothing is masked and no token leaves
+   the denominator;
+4. it floors those at `miniclip_low = 0.3` / `miniclip_high = 0.5`.
+
+So the released M2PO is an *adaptive clip range chosen by a second-moment
+budget*. We implement the released version, because it is what the reported
+numbers came from. Two consequences worth carrying into the writeup:
+
+- The floors dominate whenever the batch is near-policy. `[0.7, 1.5]` is already
+  wider than the DAPO clip the rest of this study runs (`[0.8, 1.28]`), so on a
+  quiet batch M2PO *loosens* rather than tightens. `test_m2po_clip_bounds.py`
+  pins this.
+- VCPO's failed reproduction (arXiv:2602.17616, Figure 12) is described as
+  masking with "max = 0.04" and reports the trusted-token fraction collapsing at
+  lag 12. That is the paper's formulation, not the released one. VCPO also
+  attributes the failure to a **mixed-staleness queue** versus M2PO's fixed-lag
+  behaviour policy -- and miles' fully-async rollout is a mixed-staleness queue.
+  We have the per-sample `weight_versions` to settle it.
+
+**M2PO needs `--use-rollout-logprobs`, for the same reason OPSM does.** Its
+`delta` is `log pi_behav - log pi_theta`, which under `RATIO_DENOMINATOR=actor`
+with one step per rollout is identically zero. `arguments.py` now asserts this
+rather than letting it silently no-op, and `run_identity.sh` lets `m2po` pair
+with `rollout-logprobs` where the other corrections may not.
+
+Scope note: the threshold is solved per microbatch, matching the reference,
+which sits inside verl's per-microbatch `compute_policy_loss`. It is not the
+global batch either there or here.
+
+### The loss snapshot test is red before we touch anything
+
+`tests/fast/backends/training_utils/loss/test_loss_snapshot.py` compares against
+`.pt` fixtures shallow-cloned from an external artifacts repo, not from this
+tree. Six cases (`grpo_b3`, `grpo_tis_b3`, `gspo_b1`, `reinforce_pp_baseline_b2`,
+`grpo_kl_loss_b2`, `grpo_bshd_b3`) fail with a metric-key mismatch on committed
+`af90e72e`, verified in a clean worktree (job 15311872). The fixtures predate
+`rollout_ess_ratio`.
+
+Any new key in `policy_loss_function`'s metric dict widens that mismatch. Do not
+read it as a regression from the change under test -- run the same test against
+HEAD in a worktree first. Metrics that only appear behind a flag no snapshot
+config sets (M2PO's, OPSM's) do not affect it.

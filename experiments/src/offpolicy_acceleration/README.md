@@ -32,6 +32,7 @@ within an arm — reported per level by `equivalence.variance_components`.
 |---|---|---|
 | `equivalence.py` | the statistics; no I/O | numpy |
 | `extract_run.py` | one run's dump dir (or job log) → a compact extract | numpy, torch (only for the dumps) |
+| `extract_offline_eval.py` | `src/offline_eval/` checkpoint evaluations → the same extract | numpy |
 | `log_source.py` | recovers the metric stream from a plain Slurm log | stdlib |
 | `analyze.py` | extracts → `results.json` + `summary.csv` | numpy |
 | `figures.py` | `results.json` → five paper figures | numpy, matplotlib |
@@ -66,6 +67,23 @@ uv run --with numpy --with matplotlib python -m experiments.src.offpolicy_accele
   --out $WS/offpolicy-study/figures/aime24 \
   --x-factor MAX_WEIGHT_STALENESS --y-factor MODEL_NAME
 ```
+
+**The offline evaluation is the intended quality source.** The in-training eval is
+one AIME year at `n=8` and exists to show a run is learning;
+`src/offline_eval/run_eval.sbatch` evaluates saved checkpoints on four years at
+`n=16`, and `extract_offline_eval.py` turns those into the same extract shape:
+
+```bash
+uv run --with numpy python -m experiments.src.offpolicy_acceleration.extract_offline_eval \
+  --eval-root /data/offline_eval --match <config-tag> \
+  --base-eval /data/offline_eval/base_<model> \
+  --slurm-log experiments/outputs/training/.../<job>.log \
+  --out $WS/offpolicy-study/extracts --arm on-policy --seed 0
+```
+
+`--base-eval` is the base model's evaluation, placed at step 0: it is `Q0`, which
+anchors the whole `q_p` target ladder. Wall-clock comes from the training log, not
+from the evaluation job — checkpoints are evaluated long after they were written.
 
 `extract_run.py` also accepts `--slurm-log` instead of `--dump-details`, for runs
 whose dump directory is gone. That path loses the per-prompt eval rewards; see
@@ -110,102 +128,59 @@ exactly that triple. `--use-rollout-logprobs` would repoint it at the rollout
 policy but is mutually exclusive with `--use-tis` (`arguments.py:2823`). The ESS
 the off-policy literature means is gap 8 below.
 
-### Eight gaps, and what each one blocks
+### What was missing, and what was changed
 
-**1. Per-prompt eval rewards are not logged.** `log_eval_rollout_data` reduces
-each benchmark to one mean before logging (`ray/rollout/metrics.py:38`). The
-paired-over-prompts bootstrap, and separating prompt variance from rollout
-variance, both need the per-sample rewards — which exist only in the
-`--dump-details` eval dumps (`rollout_data/eval_<rid>.pt`). The `math_async` and
-`math_sync` recipes already pass `--dump-details`, so this costs nothing new; it
-does mean **the dumps must be kept**, not cleaned up with the checkpoints.
+The audit below drove a set of changes to miles and to the recipes. Each row says
+what the measurement gap was and how it now stands.
 
-A power consequence to plan for, not to discover later: with AIME24's 30 prompts
-at `n_samples_per_eval_prompt=16`, one evaluation's bootstrap half-width is
-≈ 0.05 in avg@k. Differencing a single `Q_m(t)` against the many-evaluation mean
-`Q_on*` therefore cannot resolve any margin below ≈ 0.05. `analyze.py` reports
-the **smallest detectable margin** next to `δ` and prints `UNDERPOWERED` when
-`δ` is below it. Three ways out, in order of cost: `--smooth-window` (a trailing
-mean, symmetric with how `Q_on*` is formed — the default, 3); a larger
-`--n-samples-per-eval-prompt`; a bigger held-out set than a 30-problem benchmark.
+| # | gap | status |
+|---|---|---|
+| 1 | per-prompt eval rewards exist only in the `--dump-details` eval dumps; `log_eval_rollout_data` logs the mean (`metrics.py:38`) | **open by design** — keep `--dump-details`, now far cheaper (row 9) |
+| 2 | `avg_staleness` silently absent even with `--max-weight-staleness` set | **fixed** — root cause found: `_CachedWeightVersion.get` returns `None` when the router `/model_info` query fails, which also makes the cap enforce nothing. Now warns loudly, logs `current_weight_version`, and no longer crashes on a malformed payload |
+| 3 | `P(L)` logged as mean/max only | **fixed** — `staleness_p50/p90/p99`, `frac_zero`, `frac_at_bound`, `num_groups` |
+| 4 | `train/entropy_loss` identically 0 (`losses.py:99`) | **fixed** — `--observe-training-entropy` added to all 20 recipes |
+| 5 | factors and seed absent from `meta.json` | **fixed** — study knobs added to `_SNAPSHOT_KEYS` (`dashboard/args.py`) |
+| 6 | wall-clock discontinuous across Slurm allocations; `meta.json` overwritten on resume (`collector.py:153`) | **fixed in this tooling** — `log_source.active_elapsed_hours` never reads `start_ts` |
+| 7 | wasted generation counted in groups, not tokens | **fixed** — `aborted_tokens`, `stale_tokens`, `dynamic_filter_tokens`, `kept_tokens`, `wasted_token_frac` |
+| 8 | no ESS of the rollout-vs-train importance weights | **fixed** — `train/rollout_ess_ratio` |
+| 9 | `policy_loss_debug/` is 76% of the dump and unconditional | **fixed** — `--no-dump-policy-loss-debug`, in all recipes |
 
-**2. Exact realized staleness is conditional on a bound being set.**
-`fully_async_rollout.py:202` only measures staleness when
-`args.max_weight_staleness is not None`, so the "unbounded" arm would be the one
-arm with no staleness measurement. Confirmed empirically: the audited log
-contains **zero** `rollout/fully_async/avg_staleness` records. Run the unbounded
-arm with `MAX_WEIGHT_STALENESS=1000000` rather than unset.
+**`train/ess_ratio` does not measure staleness**, and this is the one that most
+easily misleads. `ppo_kl = old_log_probs − log_probs` with `old_log_probs =
+batch["log_probs"]` (`losses.py:94,158`) — both Megatron logprobs, so it is the
+*PPO inner-loop* ratio across the `NUM_STEPS_PER_ROLLOUT` minibatch updates. At
+one step per rollout the two forwards use identical weights, so `ppo_kl ≡ 0`,
+`pg_clipfrac ≡ 0` and `ess_ratio ≡ 1.0` **by construction, at any staleness** —
+exactly the triple the audited log shows. Use `train/rollout_ess_ratio`.
 
-**3. `P(L)` is never logged as a distribution** — only `avg_staleness` and
-`max_staleness`, per step. The full per-sample distribution is recoverable from
-`weight_versions` in the rollout dumps (`extract_run.realized_lag`), with two
-stated censorings: groups recycled for exceeding the bound never reach the dump,
-so the dumped distribution is truncated at the bound; and the reference "current
-version" is proxied by the newest version in the same batch. If percentiles
-matter enough to want them exactly, it is a five-line addition next to
-`fully_async_rollout.py:251`.
+**Seed replication remains unavailable and is a deliberate limitation.**
+`common/run_identity.sh` builds `CONFIG_TAG` without a seed, so two seeds of one
+configuration would share `CKPT_PATH`; `--seed` (1234) and `--rollout-seed` (42)
+are the same constants in every run. The study is running single-seed, so the
+bootstrap has no seed level and its intervals are **within-run** — they
+understate total uncertainty and must be described that way. Note also that
+fully-async runs are not deterministic at a fixed seed: group arrival order
+follows generation timing, so a fixed seed hides run-to-run variance rather than
+removing it.
 
-**4. Entropy is not actually measured.** `train/entropy_loss` appears in the log
-but is identically `0.0`: `calculate_entropy = args.entropy_coef != 0 or
-args.observe_training_entropy` (`loss_hub/losses.py:99`), and the recipes set
-`--entropy-coef 0.00` without `--observe-training-entropy`. The convergence
-definition names entropy explicitly, so **as configured, that criterion cannot be
-evaluated**. `equivalence._check_guard` reports an all-zero guard as
-`unavailable` rather than `pass`, so this fails loudly instead of certifying a
-check that never ran. Fix: add `--observe-training-entropy` to the recipes.
-(`--use-rollout-entropy` is a different flag — per-token entropy into the train
-dumps — and the recipes only set it when `DUMP_TRAIN_DATA != 0`.)
+### Measured cost of `--dump-details`
 
-**5. Neither the factors nor the seed are recorded with the run.**
-`dashboard/args.py:13` snapshots 16 keys into `meta.json`; none of them are
-`max_weight_staleness`, `num_steps_per_rollout`, `pause_generation_mode`,
-`advantage_estimator`, `lr`, `rollout_max_response_len`, `use_tis` or `seed`. So
-a run cannot be attributed to a cell of the factorial design from its own
-artifacts. `extract_run.py` works around it with `--factor K=V` and
-`--manifest` (joining `experiments/sweep.py`'s manifest, which does record the
-env per job); the durable fix is adding those keys to `_SNAPSHOT_KEYS`.
+From a real 12-rollout-step run (`async-on-1step-rollout-length-24k-lr1e-6`):
 
-**Seed replication is currently not runnable, which matters more.**
-`common/run_identity.sh` builds `CONFIG_TAG` from rollout mode, steps, length and
-LR — no seed — and `CKPT_PATH` is derived from `CONFIG_TAG`. Two seeds of one
-configuration would therefore share a checkpoint directory and resume from each
-other's optimizer state. Since seed variance is one of the three levels the
-protocol requires, this needs fixing before the study starts: add `SEED` to the
-recipe env, pass `--seed`/`--rollout-seed`, and include it in `CONFIG_TAG`.
+| component | measured | per rollout step |
+|---|---|---|
+| `policy_loss_debug/` | 1.17 GB in **2512 files** | 100 MB, 209 files |
+| `rollout_data/` train dumps | 287 MB / 12 | 24 MB |
+| `dashboard_columns/` | 82 MB | 7 MB |
+| `rollout_data/eval_0.pt` | 103 MB | 103 MB per eval |
+| `dashboard/` | 29 MB | — |
+| **total** | **1.7 GB / 12 steps** | **131 MB** |
 
-**6. Wall-clock is not continuous across Slurm allocations.**
-`submit_training.sh` documents the normal mode as "resumable across three 4 h
-jobs", and a converged on-policy math run on this cluster *is* several
-allocations. Two consequences, both of which hit the study's primary metric:
-
-* the dashboard **overwrites** `meta.json` on every resume (`collector.py:153`)
-  while `metrics.jsonl` appends, so `ts - meta.start_ts` is **negative** for
-  every allocation but the last;
-* the queue wait between allocations is unbounded and has nothing to do with the
-  method under test.
-
-`log_source.active_elapsed_hours` is the fix and is now the default time base:
-sum per-record deltas, drop any delta longer than `--max-step-gap-minutes`
-(default 30), and report how much was excluded. It never reads `meta.start_ts`.
-Pass every allocation's log with a repeated `--slurm-log` so replayed steps
-dedupe to the surviving trajectory. The residual bias — per-allocation startup
-is excluded — is identical in shape across arms, so `tau_on/tau_m` is nearly
-unaffected, but the absolute times are lower bounds.
-
-**8. ESS of the rollout-vs-train importance weights is not logged.** `train/tis`
-and `train/tis_abs` give the *mean* of `π_train/π_rollout` and of `|ratio − 1|`,
-but ESS is a sequence-level nonlinear functional: a handful of catastrophic
-tokens can crater it while barely moving a mean. That is precisely why the
-literature reports ESS and not the mean, and precisely why "ESS collapses on long
-sequences" cannot be tested from `tis_abs`. The fix is small —
-`compute_ess_ratio_contribution` already exists and takes a `ppo_kl`-shaped
-tensor, so feeding it `rollout_log_probs − train_log_probs` yields the wanted
-quantity in about three lines next to `corrections.py:23`.
-
-**A ninth, smaller one:** wasted generation is counted, not measured.
-`stale_groups_recycled` / `aborted_groups_recycled` are group counts per drain
-(`fully_async_rollout.py:246`); the tokens thrown away are not recorded, so
-sample- and token-efficiency claims stay coarser than the wall-clock ones.
+Extrapolated to 300 steps and 15 evals that is ≈ 41 GB per run; with
+`--no-dump-policy-loss-debug` it drops to ≈ 11 GB. **The cost is disk and inodes,
+not time**: 131 MB/step against a measured `perf/train_time` of 216 s is well
+under 1% even at conservative Lustre bandwidth. That last figure is an estimate
+from write volume, not a measurement — A/B `perf/actor_train_time` to confirm.
 
 ### What to take from the sglang side
 

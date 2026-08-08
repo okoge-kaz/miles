@@ -9,58 +9,18 @@
 #SBATCH --output=experiments/outputs/offline_eval/%x-%j.log
 
 # Evaluate one checkpoint on every AIME year, offline.
-#
-#   sbatch -A coreai_horizon_dilations \
-#     --export=ALL,CKPT=/ckpt/training/math/dapo-math-p10-90/Qwen3-4B-Instruct-2507/<config>/hf/120 \
-#     experiments/src/offline_eval/run_eval.sbatch
-#
-# This is the path that produces reported numbers. It is deliberately separate
-# from the in-training eval, which is AIME-2025 only at n=8 and exists to show
-# that a run is learning:
-#
-#   * the generation budget is 32768, not the 24576 the training recipe uses.
-#     13.75% of AIME-2024 truncates at 24576 and a truncated sample scores 0
-#     under every rule-based verifier, so the in-training number is depressed by
-#     the budget rather than by the model.
-#   * n is 16 rather than 8, over four years rather than one. 30 problems put the
-#     standard error at ~9 points; 120 problems put it at ~4.5.
-#
-#     All four years carry the same instruction wrapper, asserted at staging time by
-#     prepare_aime.py --template-reference. AIME-2024 was the exception until
-#     2026-08-05 (bare problem text, so the boxed answer the verifier grades was
-#     never asked for); aime-2024.nowrapper.jsonl is that older file, and scores
-#     measured against it do not compare to scores measured now.
-#   * sampling can be set to whatever the comparison needs. Qwen's own card
-#     reports AIME25 = 47.4 at temperature 0.7 / top_p 0.8, and the training
-#     recipe generates at 1.0 / 1.0.
+# Procedure, benchmark choice and failure modes: notes/offline-eval.md
 #
 # Knobs:
-#   CKPT           HF checkpoint dir, in-container (required). Written by
-#                  --save-hf at every --save-interval.
-# AIME 2023 is deliberately NOT in the default set: it is in the training data.
-# Normalized verbatim matching against the prompt files gives
-#   dapo-math-17k   23/30 of AIME-2023   (and 1/30 of AIME-2026)
-#   dapo-math-p10-90 11/30               <- the set actually trained on
-#   deepscaler       26/30
-# so an AIME-2023 score is a memorisation score, not a generalisation one.
-# 2024/2025 are clean against all three. 2026 is clean against the filtered
-# p10-80 set but not against unfiltered dapo-math-17k, so re-check the overlap
-# whenever the difficulty window is widened. Matching is exact-after-normalisation
-# and therefore a LOWER bound: paraphrases and number-swapped variants are missed.
-#
-#   BENCHMARKS     '+'-separated <name>:<path> pairs. Default is the AIME years
-#                  present on disk. '+' because sbatch --export splits on commas.
+#   CKPT           HF checkpoint dir, in-container (required)
+#   BENCHMARKS     '+'-separated <name>:<path> pairs. '+' because sbatch
+#                  --export splits on commas.
 #   N_SAMPLES      samples per problem (16)
 #   MAX_NEW_TOKENS generation cap (32768)
 #   TEMPERATURE / TOP_P  sampling (1.0 / 1.0, matching training)
 #   RM_TYPE        verifier; must match the policy (math for non-thinking)
 #   OUT_DIR        where the per-benchmark jsonl goes
-#   EXTRA_MOUNTS   appended to CONTAINER_MOUNTS. unpad_vocab.py symlinks the
-#                  shards it did not rewrite, so the source tree has to be
-#                  visible inside the container at the same host path.
-#
-# Resumable: measure_pass_rate.py appends per prompt and skips indices already
-# present, so re-submitting after a wall-clock kill continues.
+#   EXTRA_MOUNTS   appended to CONTAINER_MOUNTS; required, see the note
 
 set -euo pipefail
 
@@ -101,9 +61,6 @@ export PYTHONUNBUFFERED=1
 [[ -d ${CKPT} ]] || { echo \"no such checkpoint: ${CKPT}\"; exit 1; }
 mkdir -p ${OUT_DIR}
 
-# dp-size 8, tp-size 1: a 4B model fits on one H100, so eight independent
-# replicas beat one tensor-parallel engine for a pure-inference sweep -- no
-# cross-GPU collectives on the critical path.
 python3 -m sglang.launch_server \
     --model-path ${CKPT} \
     --host 127.0.0.1 --port ${SERVER_PORT} \
@@ -131,10 +88,7 @@ for spec in \$(echo '${BENCHMARKS}' | tr '+' ' '); do
         continue
     fi
     echo \"=== \${name} (\${path}) starting ===\"
-    # Backgrounded, not sequential. A benchmark is 30 prompts, so its last few
-    # long generations leave the eight replicas nearly idle; run sequentially
-    # that tail is paid once per year. Overlapping them keeps the engines fed and
-    # costs nothing, since 90 prompts still fits under --concurrency.
+    # Backgrounded, not sequential -- see the note.
     python3 experiments/src/difficulty_filter/measure_pass_rate.py \
         --prompt-data \${path} \
         --output ${OUT_DIR}/\${name}.jsonl \

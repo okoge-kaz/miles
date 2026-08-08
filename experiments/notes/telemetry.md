@@ -351,3 +351,59 @@ because there the default would be decorative.
 default, and an arm that stops evaluating halfway is no longer comparable with one
 that did not -- the wall-clock being compared would change under it. Do not
 `git pull` into a clone with a running tier. The switch applies from tier 2.
+
+## Open option, not adopted: separating policy lag from engine mismatch
+
+Every off-policyness number we currently log is built on
+
+    delta = log pi_Megatron(theta_t) - log pi_SGLang(theta_{t-k})
+
+which is **two effects added together**: the policy moved between the rollout and
+the update, and the two engines disagree numerically about the same
+distribution. Measured, the second dominates -- `train_rollout_kl` is 4.82e-04
+on the *colocated on-policy* arm, against 5.03e-04 at staleness 4, and the four
+arms are not even ordered by staleness (s1 is the lowest at 4.68e-04). Any
+statistic built on `delta` inherits that.
+
+It splits exactly:
+
+    log pi_M(theta_t) - log pi_M(theta_{t-k})     <- policy lag only
+  + log pi_M(theta_{t-k}) - log pi_S(theta_{t-k}) <- engine mismatch only
+
+The first term evaluates both policies **on the same engine**, so the numerical
+floor cancels rather than being estimated and subtracted.
+
+miles already has the mechanism: `--keep-old-actor`
+(`RATIO_DENOMINATOR=old-actor`) recomputes the denominator with the weights the
+rollout engines used. As a *metric* rather than a loss it does not need the
+whole batch -- 64 of 3072 sequences give the per-token lag KL to within a factor
+of 8 in standard error, for roughly 2% extra compute.
+
+**Not adopted.** Under fully-async the groups in one batch carry different lags,
+so "the old weights" is up to `max_weight_staleness + 1` distinct weight sets,
+and the bookkeeping for that is not designed. Revisit if the lag-stratified
+metric below turns out not to separate the arms.
+
+## What the staleness metrics currently mean (checked 2026-08-07)
+
+`af90e72e` split the two: unprefixed keys became the lag of groups the loss
+actually consumed, and `rollout/fully_async/offered/*` kept the pre-filter lag.
+
+**The running tier-1 arms do not have it.** hiso's checkout contains neither
+`trained_staleness` nor `offered_staleness` in `fully_async_rollout.py`, and no
+`offered` key appears in any arm's `dump/dashboard/metrics.jsonl`. So for every
+number reported off the current runs:
+
+    rollout/fully_async/avg_staleness      <- OFFERED, before the bound check
+    rollout/fully_async/staleness_count_*  <- OFFERED
+    rollout/fully_async/staleness_p50/90/99 <- OFFERED
+
+This is why `staleness_count_3` is non-zero in a `max_weight_staleness=1` run:
+those groups were offered at lag 3 and discarded. The accounting closes exactly
+against `staleness_num_groups`.
+
+It takes effect on the next job launched from a clone that has the commit --
+`miles/**` is read from disk at launch, so a `git pull` is enough; no
+resubmission is needed beyond the normal chain boundary. Runs that straddle the
+boundary will have a discontinuity in the series, which is the reason not to
+pull mid-chain without noting the rollout index where it happened.
