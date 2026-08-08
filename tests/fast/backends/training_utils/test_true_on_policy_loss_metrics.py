@@ -51,10 +51,21 @@ def _patch_single_rank_loss_helpers(monkeypatch):
         "get_local_response_loss_masks",
         lambda total_lengths, response_lengths, loss_masks, qkv_format="thd", max_seq_lens=None: loss_masks,
     )
+    # Both ESS helpers reach for the global ParallelState to size the CP group,
+    # which these tests deliberately run without.
     monkeypatch.setattr(
         loss_utils,
         "compute_ess_ratio_contribution",
         lambda *, ppo_kl, **kwargs: ppo_kl.new_tensor(1.0),
+    )
+    monkeypatch.setattr(
+        loss_utils,
+        "compute_sequence_level_ess_parts",
+        lambda *, log_ratio, loss_masks, **kwargs: (
+            log_ratio.new_tensor(1.0, dtype=torch.float64),
+            log_ratio.new_tensor(1.0, dtype=torch.float64),
+            log_ratio.new_tensor(float(len(loss_masks)), dtype=torch.float64),
+        ),
     )
 
 
@@ -235,3 +246,48 @@ def test_masked_nonfinite_ppo_terms_do_not_poison_policy_loss(monkeypatch):
 
     assert torch.isfinite(loss)
     assert torch.isfinite(metrics["ppo_kl"])
+
+
+def test_m2po_metrics_survive_the_token_normaliser(monkeypatch):
+    """M2PO's clip bounds are per-step scalars, but every reported_loss entry is
+    divided by the token normaliser downstream.
+
+    Emitting `torch.tensor(value)` looks right locally and arrives scaled by
+    1/num_tokens -- observed as a clip epsilon of 5.5e-05 where the floor is 0.3,
+    a factor of 5445. Broadcasting to a per-token constant is what makes the
+    sample mean return the scalar itself.
+    """
+    args = _make_args(use_rollout_logprobs=True)
+    args.use_m2po = True
+    args.m2po_budget = 0.04
+    args.m2po_miniclip_low = 0.3
+    args.m2po_miniclip_high = 0.5
+
+    batch = _make_batch(
+        old_log_probs=torch.tensor([0.10, 0.20], dtype=torch.float32),
+        rollout_log_probs=torch.tensor([0.10, 0.20], dtype=torch.float32),
+    )
+
+    monkeypatch.setattr(
+        loss_utils, "get_parallel_state", lambda: SimpleNamespace(tp=SimpleNamespace(group=None))
+    )
+    _patch_single_rank_loss_helpers(monkeypatch)
+    monkeypatch.setattr(
+        loss_utils,
+        "get_log_probs_and_entropy",
+        lambda *a, **k: {
+            "log_probs": [torch.tensor([0.10, 0.20], dtype=torch.float32)],
+            "entropy": [torch.zeros(2, dtype=torch.float32)],
+        },
+    )
+
+    _, metrics = loss_utils.policy_loss_function(
+        args,
+        batch,
+        logits=torch.zeros((1, 3, 8), dtype=torch.float32),
+        sum_of_sample_mean=lambda tensor: tensor.float().mean(),
+    )
+
+    # This batch is on-policy, so the budget cannot bind and the floors stand.
+    assert float(metrics["m2po_eps_clip"]) == pytest.approx(0.3)
+    assert float(metrics["m2po_eps_clip_high"]) == pytest.approx(0.5)

@@ -1414,6 +1414,33 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="Replay indexer topk from rollout during training.",
             )
             parser.add_argument(
+                "--use-m2po",
+                action="store_true",
+                default=False,
+                help="Second-Moment Trust Policy Optimization (https://arxiv.org/abs/2510.01161): "
+                "replace the static PPO clip range with the widest one whose harmful tokens keep "
+                "mean (log pi_behav - log pi_theta)^2 under --m2po-budget.",
+            )
+            parser.add_argument(
+                "--m2po-budget",
+                type=float,
+                default=0.04,
+                help="The second-moment budget for M2PO. 0.04 is the value used across every "
+                "experiment in the paper.",
+            )
+            parser.add_argument(
+                "--m2po-miniclip-low",
+                type=float,
+                default=0.3,
+                help="Floor on M2PO's derived lower clip epsilon.",
+            )
+            parser.add_argument(
+                "--m2po-miniclip-high",
+                type=float,
+                default=0.5,
+                help="Floor on M2PO's derived upper clip epsilon.",
+            )
+            parser.add_argument(
                 "--use-opsm",
                 action="store_true",
                 default=False,
@@ -2849,6 +2876,13 @@ def miles_validate_args(args):
 
     if args.use_rollout_logprobs:
         assert not args.use_tis, "use_rollout_logprobs and use_tis cannot be set at the same time."
+
+    if args.use_m2po:
+        assert not args.use_tis, "use_m2po replaces the clip range; it cannot be combined with use_tis."
+        # M2PO budgets (log pi_behav - log pi_theta)^2. Without this the
+        # denominator is the current actor, the delta is identically zero at one
+        # step per rollout, and the budget is never binding.
+        assert args.use_rollout_logprobs, "use_m2po requires --use-rollout-logprobs as the ratio denominator."
 
     if args.get_mismatch_metrics:
         assert (

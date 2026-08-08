@@ -14,7 +14,9 @@ from miles.backends.training_utils.loss_hub.logit_processors import get_log_prob
 from miles.backends.training_utils.loss_hub.math_utils import (
     compute_approx_kl,
     compute_ess_ratio_contribution,
+    compute_sequence_level_ess_parts,
     compute_gspo_kl,
+    compute_m2po_clip_bounds,
     compute_opsm_mask,
     compute_policy_loss,
 )
@@ -89,11 +91,17 @@ def policy_loss_function(
         "tis", "ois", "tis_clipfrac" are included when the respective features
         are enabled.
 
-        Two ESS metrics are reported and they answer different questions.
+        Three ESS metrics are reported and they answer different questions.
         "ess_ratio" is built from `ppo_kl` and so covers the PPO inner loop over
-        `--num-steps-per-rollout` minibatch updates; at one step per rollout it is
-        identically 1.0. "rollout_ess_ratio" is built from
-        `pi_train / pi_rollout` and is the one that responds to policy lag.
+        `--num-steps-per-rollout` minibatch updates; at one step per rollout
+        pi_new is pi_old and it is identically 1.0. The other two are built from
+        `pi_train / pi_rollout`: "rollout_token_level_ess" takes Kish's ratio over
+        the tokens *within* a sequence, and "rollout_sequence_level_ess" over the
+        sequences within the batch, which is the population VCPO
+        (arXiv:2602.17616 eq. 4) uses. They are not interchangeable. A uniform
+        per-token mismatch cancels inside a sequence and leaves the token-level
+        number at 1.0 while the sequence-level one falls, because the sequence
+        weight is the *sum* of that mismatch over the sequence.
     """
     parallel_state = get_parallel_state()
     advantages = torch.cat(batch["advantages"], dim=0)
@@ -183,8 +191,26 @@ def policy_loss_function(
         advantages.new_zeros(()),
     )
 
+    eps_clip, eps_clip_high = args.eps_clip, args.eps_clip_high
+    m2po_stats: dict[str, float] = {}
+    if getattr(args, "use_m2po", False):
+        eps_clip, eps_clip_high, m2_before, m2_after = compute_m2po_clip_bounds(
+            ppo_kl,
+            advantages,
+            local_loss_masks,
+            args.m2po_budget,
+            args.m2po_miniclip_low,
+            args.m2po_miniclip_high,
+        )
+        m2po_stats = {
+            "m2po_eps_clip": eps_clip,
+            "m2po_eps_clip_high": eps_clip_high,
+            "m2po_m2_before": m2_before,
+            "m2po_m2_after": m2_after,
+        }
+
     pg_loss, pg_clipfrac = compute_policy_loss(
-        ppo_kl, advantages, args.eps_clip, args.eps_clip_high, getattr(args, "eps_clip_c", None)
+        ppo_kl, advantages, eps_clip, eps_clip_high, getattr(args, "eps_clip_c", None)
     )
 
     if getattr(args, "dump_details", None) is not None:
@@ -318,6 +344,7 @@ def policy_loss_function(
     train_rollout_logprob_abs_diff = None
     train_rollout_kl = None
     rollout_ess_ratio = None
+    rollout_seq_sum_w = rollout_seq_sum_w2 = rollout_seq_n = None
     if "rollout_log_probs" in batch and batch["rollout_log_probs"]:
         rollout_log_probs = torch.cat(batch["rollout_log_probs"], dim=0)
 
@@ -332,6 +359,14 @@ def policy_loss_function(
             active_tokens,
             torch.nan_to_num(rollout_log_probs - train_scored_log_probs, nan=0.0, posinf=0.0, neginf=0.0),
             rollout_log_probs.new_zeros(()),
+        )
+        rollout_seq_sum_w, rollout_seq_sum_w2, rollout_seq_n = compute_sequence_level_ess_parts(
+            log_ratio=-rollout_neg_log_ratio,
+            loss_masks=batch["loss_masks"],
+            total_lengths=total_lengths,
+            response_lengths=response_lengths,
+            qkv_format=args.qkv_format,
+            max_seq_lens=max_seq_lens,
         )
         rollout_ess_ratio = compute_ess_ratio_contribution(
             ppo_kl=rollout_neg_log_ratio,
@@ -374,7 +409,15 @@ def policy_loss_function(
     if train_rollout_kl is not None:
         reported_loss["train_rollout_kl"] = train_rollout_kl.clone().detach()
     if rollout_ess_ratio is not None:
-        reported_loss["rollout_ess_ratio"] = rollout_ess_ratio.clone().detach()
+        reported_loss["rollout_token_level_ess"] = rollout_ess_ratio.clone().detach()
+    if rollout_seq_sum_w is not None:
+        # Three sums, not the ratio: a ratio of sums is not itself additive across
+        # micro-batches or data-parallel ranks. aggregate_train_losses divides all
+        # three by the same normaliser, so it can rebuild the ratio with the
+        # normaliser cancelling. See its "_seq_ess" handling.
+        reported_loss["_seq_ess_sum_w"] = rollout_seq_sum_w.clone().detach().float()
+        reported_loss["_seq_ess_sum_w2"] = rollout_seq_sum_w2.clone().detach().float()
+        reported_loss["_seq_ess_n"] = rollout_seq_n.clone().detach().float()
 
     if args.use_kl_loss:
         reported_loss["kl_loss"] = kl_loss.clone().detach()
@@ -390,6 +433,12 @@ def policy_loss_function(
 
     if args.use_opsm:
         reported_loss["opsm_clipfrac"] = opsm_clipfrac
+
+    # These are per-step scalars, but every entry of reported_loss is divided by
+    # the same token normaliser downstream. Broadcast to a per-token constant so
+    # the sample mean returns the scalar itself.
+    for key, value in m2po_stats.items():
+        reported_loss[key] = sum_of_sample_mean(torch.full_like(ppo_kl, value)).clone().detach()
 
     # Add OPD metrics if available
     if batch.get("opd_reverse_kl") is not None:

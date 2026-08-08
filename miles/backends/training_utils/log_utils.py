@@ -405,6 +405,18 @@ def aggregate_train_losses(
     for key, value in zip(keys, values[1:], strict=False):
         loss_reduced[key] = value * parallel_state.cp.size / num_samples_or_tokens
 
+    # Sequence-level ESS: rho = (sum w)^2 / (B * sum w^2), which is a ratio of
+    # sums and so cannot be averaged the way every other metric here can. The
+    # loss emits the three sums instead; each has just been divided by the same
+    # normaliser N, and rho = a^2 / (b * c) with a=S1/N, b=S2/N, c=B/N leaves N
+    # cancelling exactly. The parts are dropped once consumed -- they are an
+    # implementation detail and mean nothing on their own.
+    a = loss_reduced.pop("_seq_ess_sum_w", None)
+    b = loss_reduced.pop("_seq_ess_sum_w2", None)
+    c = loss_reduced.pop("_seq_ess_n", None)
+    if a is not None and b is not None and c is not None and b > 0.0 and c > 0.0:
+        loss_reduced["rollout_sequence_level_ess"] = (a * a) / (b * c)
+
     return loss_reduced
 
 
