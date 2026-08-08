@@ -143,3 +143,59 @@ The output is a frozen training environment: node split, `SGLANG_MEM_FRACTION`,
 batch shape, and the staleness levels that are worth running. Every algorithm
 arm is then run inside it, unchanged, so that a difference between arms is a
 difference between algorithms. See `notes/algorithm-ablation.md`.
+
+## The bound feeds back on the thing it is supposed to measure (2026-08-08)
+
+The node-ratio sweep ran at `max_weight_staleness=64`, where nothing is ever
+recycled. Re-reading it next to the tier-1/2 arms, which run at bounds 1/2/4:
+
+| run | rollout_time | train | wait | resp_len | avg_staleness |
+|---|---|---|---|---|---|
+| sweep R=1 | 960.0 | 262 | 612.3 | 6395 | 0.43 |
+| sweep R=2 | 462.4 | 262 | 143.9 | 6493 | 0.64 |
+| **sweep R=3** | **110.0** | 262 | **1.6** | 6477 | **1.38** |
+| sweep R=5 | 38.8 | 269 | 1.9 | 6550 | 2.98 |
+| now, bound 4 | 259-381 | 238-306 | 36-89 | 6-8.5k | **0.70** |
+| now, bound 2 | 314-364 | 250-290 | 55-84 | 6-8.5k | 0.69 |
+| now, bound 1 | 343-520 | 222-318 | 136-215 | 6-8.5k | **0.45** |
+
+**`rollout_time` under `--fully-async` is drain time, not generation time.** The
+module docstring says it: "each training step only drains already-completed
+groups from the worker's output queue". A deep queue drains instantly, so
+`rollout_time` falls as staleness *rises* -- the sweep's 960 -> 39 is that
+inverse, not generation getting faster. It is an observable for queue depth.
+
+So the ordering is: production rate > consumption rate -> queue fills -> samples
+wait -> lag. The ceiling is `OUTPUT_QUEUE_MAX_GROUPS / rollout_batch_size` =
+1000/192 ~ 5, which is where R=5's 2.98 sits.
+
+**The bound closes a negative feedback loop around this.** A recycled group is
+regenerated from scratch (`_recycle` -> `reset_for_retry` -> back to the buffer),
+so tightening the bound slows production, which drains the queue, which lowers
+the natural lag -- on top of the truncation the bound applies directly. Bound 1
+recycled 1046-2085 groups and lands at 0.45; bound 4 recycled zero and lands at
+0.70.
+
+`max_weight_staleness` therefore **cannot be a clean independent variable**: it
+moves realized lag and generation throughput together, in the same direction, and
+the arms differ in throughput for a reason that has nothing to do with
+off-policy learning. Bound 2 and bound 4 came out at 0.69 and 0.70 -- the same
+experiment twice, since neither binds.
+
+`--num-steps-per-rollout` has no such feedback. Splitting one rollout into k
+gradient steps makes minibatch j train on data j-1 updates old, with no
+regeneration and no change to production rate. It is also the mechanism
+DeepSeek-V3.2 names as the origin of off-policyness in practice ("split into
+multiple mini-batches for several gradient update steps ... inherently
+introduces off-policy behavior"). We run it at 1, the most on-policy value there
+is.
+
+### Choosing R
+
+R is a throughput decision, not a staleness knob. Pick the smallest R whose
+`train_wait_time` is near zero and report whatever lag results.
+
+At 6.5k responses that was R=3 (wait 1.6 s). **At the 8k responses lr 5e-6
+produces it no longer is** -- wait is 13-39% of step time again, so R=3 is now
+under-provisioned and the trainer is idling. Re-measure the crossover whenever
+response length moves materially; it is not a constant of the recipe.

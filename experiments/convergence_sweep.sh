@@ -7,7 +7,7 @@
 #     experiments/convergence_sweep.sh --tier 1 --submit --force   # ignore a dirty CKPT_PATH
 #     experiments/convergence_sweep.sh --tier 1 --staleness 0      # one arm, to resubmit it alone
 #     experiments/convergence_sweep.sh --tier 3 --lr 1e-6          # half of tier 3, to stage it
-#     experiments/convergence_sweep.sh --tier 6 --is m2po,none     # only the arms that survived 5e-6
+#     experiments/convergence_sweep.sh --tier 3 --is m2po,none     # one algorithm family
 #
 # The split is fixed by notes/node-ratio-procedure.md: 4 nodes everywhere, async
 # arms as 1 train + 3 rollout, the staleness-0 arm colocated across all 4.
@@ -73,30 +73,26 @@ ARMS=$(cat <<'EOF'
 2 1 none   rollout-logprobs -    5e-6 32768
 2 2 none   rollout-logprobs -    5e-6 32768
 2 4 none   rollout-logprobs -    5e-6 32768
-3 0 tis    actor            -    1e-6 32768
-3 1 tis    actor            -    1e-6 32768
-3 2 tis    actor            -    1e-6 32768
-3 4 tis    actor            -    1e-6 32768
 4 0 tis    actor            -    5e-6 4096
 4 1 tis    actor            -    5e-6 4096
 4 2 tis    actor            -    5e-6 4096
 4 4 tis    actor            -    5e-6 4096
-6 0 tis    actor            -    1e-5 32768
-6 1 tis    actor            -    1e-5 32768
-6 2 tis    actor            -    1e-5 32768
-6 4 tis    actor            -    1e-5 32768
-6 1 icepop actor            -    1e-5 32768
-6 2 icepop actor            -    1e-5 32768
-6 4 icepop actor            -    1e-5 32768
-6 1 m2po   rollout-logprobs -    1e-5 32768
-6 2 m2po   rollout-logprobs -    1e-5 32768
-6 4 m2po   rollout-logprobs -    1e-5 32768
-6 1 none   rollout-logprobs 1e-4 1e-5 32768
-6 2 none   rollout-logprobs 1e-4 1e-5 32768
-6 4 none   rollout-logprobs 1e-4 1e-5 32768
-6 1 none   rollout-logprobs -    1e-5 32768
-6 2 none   rollout-logprobs -    1e-5 32768
-6 4 none   rollout-logprobs -    1e-5 32768
+3 0 tis    actor            -    1e-6 32768
+3 1 tis    actor            -    1e-6 32768
+3 2 tis    actor            -    1e-6 32768
+3 4 tis    actor            -    1e-6 32768
+3 1 icepop actor            -    1e-6 32768
+3 2 icepop actor            -    1e-6 32768
+3 4 icepop actor            -    1e-6 32768
+3 1 m2po   rollout-logprobs -    1e-6 32768
+3 2 m2po   rollout-logprobs -    1e-6 32768
+3 4 m2po   rollout-logprobs -    1e-6 32768
+3 1 none   rollout-logprobs 1e-4 1e-6 32768
+3 2 none   rollout-logprobs 1e-4 1e-6 32768
+3 4 none   rollout-logprobs 1e-4 1e-6 32768
+3 1 none   rollout-logprobs -    1e-6 32768
+3 2 none   rollout-logprobs -    1e-6 32768
+3 4 none   rollout-logprobs -    1e-6 32768
 5 0 tis    actor            -    1e-7 32768
 5 1 tis    actor            -    1e-7 32768
 5 2 tis    actor            -    1e-7 32768
@@ -192,13 +188,10 @@ if [[ -z "${TIER}" ]]; then
     echo "pass --tier N. Tiers, in submission order:"
     echo "  1  primary: lr 5e-6, 32k, GRPO + DAPO clip-higher + TIS 2.0, token-level loss"
     echo "  2  algorithm: IcePop, M2PO, DeepSeek-V3.2 OPSM (+ its denominator control)"
-    echo "  3  learning rate: 1e-6 -- the slower reference, not the primary"
+    echo "  3  learning rate: 1e-6 -- the same 16 arms as tiers 1+2, slower"
     echo "  4  response length: 4k"
     echo "  5  RESCUE ONLY: lr 1e-7, for an arm that collapsed above. Not a block;"
     echo "     name the arm with --staleness."
-    echo "  6  learning rate: 1e-5 -- the upper end of the robustness sweep."
-    echo "     tis/icepop collapsed at 5e-6, so expect those four to collapse"
-    echo "     faster here; use --is to submit only the arms you want."
     echo
     awk 'NF{c[$1]++} END{for(t in c) printf "  tier %s: %d arms\n", t, c[t]}' <<<"${ARMS}" | sort
     exit 0
