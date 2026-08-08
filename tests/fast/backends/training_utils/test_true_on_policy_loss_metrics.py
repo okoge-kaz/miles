@@ -281,11 +281,17 @@ def test_m2po_metrics_survive_the_token_normaliser(monkeypatch):
         },
     )
 
+    def strict_reducer(tensor):
+        # The real reducer splits by response length, so a 0-d input is a bug --
+        # and `ppo_kl` is already reduced by the time reported_loss is built.
+        assert tensor.dim() >= 1, "reducer needs a per-token tensor"
+        return tensor.float().mean()
+
     _, metrics = loss_utils.policy_loss_function(
         args,
         batch,
         logits=torch.zeros((1, 3, 8), dtype=torch.float32),
-        sum_of_sample_mean=lambda tensor: tensor.float().mean(),
+        sum_of_sample_mean=strict_reducer,
     )
 
     # This batch is on-policy, so the budget cannot bind and the floors stand.

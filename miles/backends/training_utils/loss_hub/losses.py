@@ -202,11 +202,19 @@ def policy_loss_function(
             args.m2po_miniclip_low,
             args.m2po_miniclip_high,
         )
+        # Reduced here, where ppo_kl is still per-token. These are per-step scalars,
+        # but every entry of reported_loss is divided by the token normaliser
+        # downstream, so a bare scalar arrives scaled by 1/num_tokens -- seen as a
+        # clip epsilon of 5.5e-05 where the floor is 0.3. The reducer needs a
+        # per-token tensor, and by the reporting site ppo_kl is a scalar.
         m2po_stats = {
-            "m2po_eps_clip": eps_clip,
-            "m2po_eps_clip_high": eps_clip_high,
-            "m2po_m2_before": m2_before,
-            "m2po_m2_after": m2_after,
+            f"m2po_{name}": sum_of_sample_mean(torch.full_like(ppo_kl, value)).clone().detach()
+            for name, value in (
+                ("eps_clip", eps_clip),
+                ("eps_clip_high", eps_clip_high),
+                ("m2_before", m2_before),
+                ("m2_after", m2_after),
+            )
         }
 
     pg_loss, pg_clipfrac = compute_policy_loss(
@@ -434,11 +442,7 @@ def policy_loss_function(
     if args.use_opsm:
         reported_loss["opsm_clipfrac"] = opsm_clipfrac
 
-    # These are per-step scalars, but every entry of reported_loss is divided by
-    # the same token normaliser downstream. Broadcast to a per-token constant so
-    # the sample mean returns the scalar itself.
-    for key, value in m2po_stats.items():
-        reported_loss[key] = sum_of_sample_mean(torch.full_like(ppo_kl, value)).clone().detach()
+    reported_loss |= m2po_stats
 
     # Add OPD metrics if available
     if batch.get("opd_reverse_kl") is not None:
