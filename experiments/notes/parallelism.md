@@ -115,3 +115,39 @@ If it ever does OOM, the levers that do not conflict with torch_memory_saver are
 a lower `MAX_TOKENS_PER_GPU` and `--log-probs-chunk-size`, not the allocator --
 and either one has to be applied to every arm, since both cost throughput and
 the study compares arms on wall-clock.
+
+### The colocated arm OOMs, and its SGLang fraction was the wrong way round (2026-08-08)
+
+`conv-s0-tis-lr5e-6-p1` and `p2` both died with
+
+    torch.OutOfMemoryError: Tried to allocate 9.28 GiB.
+    GPU 7 has 79.11 GiB total, 8.55 GiB free.
+    17.75 GiB is reserved by PyTorch but unallocated.
+
+at roughly the same training step, so the chain would have burned all 18 jobs at
+the same place.
+
+`SGLANG_MEM_FRACTION` was **0.80 in the colocated recipe and 0.70 in the async
+one**, which is backwards. Under `--fully-async` the rollout engines own their
+GPUs outright; under `--colocate` the same device also holds the training
+weights, optimizer state and activations. The setting that can afford to be
+generous was the tight one. Colocated is now **0.65**, below async's 0.70.
+
+That frees roughly 12 GiB against a shortfall of 0.73 GiB. The margin is
+deliberately large because the previously measured headroom was **0.113 GiB**
+(prod, above) -- there is nothing to absorb growth -- and because response length
+climbs throughout a run, so the allocation that fits at rollout 10 need not fit
+at rollout 200.
+
+The cost is a smaller KV cache, so fewer concurrent sequences and a slower
+rollout. Colocated is already the slowest arm (604 s/step measured) and carries
+an 18-job chain, so it absorbs this; the alternative levers do not exist.
+`MAX_TOKENS_PER_GPU` is an experimental variable and changing it for one arm
+would confound the comparison, and `expandable_segments` -- which the error
+message itself recommends -- is unavailable here: `--colocate` sets
+`offload_train=True`, which LD_PRELOADs torch_memory_saver, which refuses it.
+
+**This is a robustness fix, not a cure.** The OOM was downstream of a training
+collapse at lr 5e-6 (see notes/algorithm-ablation.md): response length tripled,
+so the activations grew until they did not fit. At a learning rate where the run
+does not diverge, 0.65 should hold; at one where it does, no fraction will.

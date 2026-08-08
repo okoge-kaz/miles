@@ -64,7 +64,7 @@ PROMPT_DATA=/data/dapo-math-p10-90/dapo-math-p10-90.jsonl
 : "${RECOMPUTE_GRANULARITY:=full}"
 : "${OVERLAP_COMM:=0}"
 : "${ROLLOUT_NUM_GPUS_PER_ENGINE:=2}"
-: "${SGLANG_MEM_FRACTION:=0.80}"
+: "${SGLANG_MEM_FRACTION:=0.65}"   # colocated shares the GPU with training
 
 # reward
 : "${RM_TYPE:=math}"
