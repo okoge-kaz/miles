@@ -187,3 +187,38 @@ before anyone looked at `sacct`.
 submission derives. Adding that check is the mechanical fix; the procedural one
 is in `.claude/skills/miles-run-ladder/SKILL.md` under "Handing the command to
 someone else".
+
+## The idle-GPU reaper kills async RL jobs mid-rollout (2026-08-08)
+
+Four arms lost their p2 and p3 jobs to `CANCELLED` at ~35 minutes each, having
+completed **zero** training steps. `DerivedExitCode 0:15` (SIGTERM), and the log
+ends with SGLang still decoding:
+
+    Decode batch, #running-req: 54, #token: 274880, token usage: 0.80
+    KV cache pool is full. Retract requests. #retracted_reqs: 1
+    *** JOB 15319192 ON pool0-00027 CANCELLED AT 2026-08-08T06:03:50 ***
+
+This is the cluster's `OccupiedIdleGPUsJobReaper`, and it is not a false
+positive. Under `--fully-async` with 1 train + 3 rollout nodes, **the training
+node's GPUs are idle for a whole rollout by construction** -- they wait while the
+rollout engines produce the next batch. One batch of 192 x 16 samples at 32k
+response length exceeds the default threshold on its own, and after the lr 5e-6
+collapse tripled response length it took over 35 minutes.
+
+The exemption is documented at
+`https://nvidia.atlassian.net/wiki/spaces/HWINFCSSUP/pages/2441648885` and is
+requested through the job comment. `convergence_sweep.sh` now attaches it:
+
+    --comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"60",
+                "reason":"data_loading","description":"..."}}'
+
+**It must go on the sbatch command line, not in a `#SBATCH` directive.** The
+directive form strips the double quotes -- verified with `scontrol show job`,
+which reported `{OccupiedIdleGPUsJobReaper:{exemptIdleTimeMins:60,...}}` -- and
+the reaper then has invalid JSON to parse. Submitting held (`--hold`) and reading
+the `Comment=` field back is the cheap way to check this; it consumes no nodes.
+
+60 minutes covers container start plus model load (~5 min measured) plus one
+full rollout. The guide notes that exemptions are monitored, so do not raise it
+to mask a run that is actually stuck: a rollout that cannot finish inside an hour
+at these settings is a collapse, not a long batch.

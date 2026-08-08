@@ -7,6 +7,7 @@
 #     experiments/convergence_sweep.sh --tier 1 --submit --force   # ignore a dirty CKPT_PATH
 #     experiments/convergence_sweep.sh --tier 1 --staleness 0      # one arm, to resubmit it alone
 #     experiments/convergence_sweep.sh --tier 3 --lr 1e-6          # half of tier 3, to stage it
+#     experiments/convergence_sweep.sh --tier 6 --is m2po,none     # only the arms that survived 5e-6
 #
 # The split is fixed by notes/node-ratio-procedure.md: 4 nodes everywhere, async
 # arms as 1 train + 3 rollout, the staleness-0 arm colocated across all 4.
@@ -80,6 +81,22 @@ ARMS=$(cat <<'EOF'
 4 1 tis    actor            -    5e-6 4096
 4 2 tis    actor            -    5e-6 4096
 4 4 tis    actor            -    5e-6 4096
+6 0 tis    actor            -    1e-5 32768
+6 1 tis    actor            -    1e-5 32768
+6 2 tis    actor            -    1e-5 32768
+6 4 tis    actor            -    1e-5 32768
+6 1 icepop actor            -    1e-5 32768
+6 2 icepop actor            -    1e-5 32768
+6 4 icepop actor            -    1e-5 32768
+6 1 m2po   rollout-logprobs -    1e-5 32768
+6 2 m2po   rollout-logprobs -    1e-5 32768
+6 4 m2po   rollout-logprobs -    1e-5 32768
+6 1 none   rollout-logprobs 1e-4 1e-5 32768
+6 2 none   rollout-logprobs 1e-4 1e-5 32768
+6 4 none   rollout-logprobs 1e-4 1e-5 32768
+6 1 none   rollout-logprobs -    1e-5 32768
+6 2 none   rollout-logprobs -    1e-5 32768
+6 4 none   rollout-logprobs -    1e-5 32768
 5 0 tis    actor            -    1e-7 32768
 5 1 tis    actor            -    1e-7 32768
 5 2 tis    actor            -    1e-7 32768
@@ -104,6 +121,15 @@ n_jobs_of() {  # staleness -> chained job count
     esac
 }
 
+# The trainer's GPUs are idle for a whole rollout by construction: 1 train node
+# waits while 3 rollout nodes generate its next batch, and at 32k one batch of
+# 192x16 exceeds the reaper's default threshold. Without this, jobs are SIGTERMed
+# mid-rollout having completed zero training steps.
+# https://nvidia.atlassian.net/wiki/spaces/HWINFCSSUP/pages/2441648885
+# Must go on the sbatch line, not in a #SBATCH directive: the directive form
+# strips the double quotes and the reaper then sees invalid JSON.
+IDLE_EXEMPTION='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"60","reason":"data_loading","description":"Async RL: the training node is idle while the rollout engines generate its next batch; one 192x16 batch at 32k response length exceeds the default threshold"}}'
+
 bounds_of() {  # is_correction -> "low high"
     case "$1" in
         icepop) echo "0.5 5.0" ;;
@@ -112,12 +138,13 @@ bounds_of() {  # is_correction -> "low high"
     esac
 }
 
-TIER=""; STALENESS=""; LR_FILTER=""; SUBMIT=0; FORCE=0
+TIER=""; STALENESS=""; LR_FILTER=""; IS_FILTER=""; SUBMIT=0; FORCE=0
 while (( $# )); do
     case "$1" in
         --tier)      TIER="$2"; shift 2 ;;
         --staleness) STALENESS="$2"; shift 2 ;;   # comma-separated, e.g. 0 or 1,2,4
         --lr)        LR_FILTER="$2"; shift 2 ;;   # comma-separated, e.g. 1e-6
+        --is)        IS_FILTER="$2"; shift 2 ;;   # comma-separated, e.g. m2po,none
         --submit)    SUBMIT=1; shift ;;
         --force)     FORCE=1; shift ;;
         *) echo "unknown argument: $1" >&2; exit 1 ;;
@@ -125,12 +152,14 @@ while (( $# )); do
 done
 
 arms_of_tier() {
-    awk -v t="${TIER}" -v s="${STALENESS}" -v l="${LR_FILTER}" '
+    awk -v t="${TIER}" -v s="${STALENESS}" -v l="${LR_FILTER}" -v c="${IS_FILTER}" '
         BEGIN {
             if (s != "") { n = split(s, a, ","); for (i = 1; i <= n; i++) keep[a[i]] = 1 }
             if (l != "") { n = split(l, b, ","); for (i = 1; i <= n; i++) keeplr[b[i]] = 1 }
+            if (c != "") { n = split(c, d, ","); for (i = 1; i <= n; i++) keepis[d[i]] = 1 }
         }
-        NF && ($1 == t || t == "") && (s == "" || $2 in keep) && (l == "" || $6 in keeplr)
+        NF && ($1 == t || t == "") && (s == "" || $2 in keep) \
+           && (l == "" || $6 in keeplr) && (c == "" || $3 in keepis)
     ' <<<"${ARMS}"
 }
 
@@ -167,6 +196,9 @@ if [[ -z "${TIER}" ]]; then
     echo "  4  response length: 4k"
     echo "  5  RESCUE ONLY: lr 1e-7, for an arm that collapsed above. Not a block;"
     echo "     name the arm with --staleness."
+    echo "  6  learning rate: 1e-5 -- the upper end of the robustness sweep."
+    echo "     tis/icepop collapsed at 5e-6, so expect those four to collapse"
+    echo "     faster here; use --is to submit only the arms you want."
     echo
     awk 'NF{c[$1]++} END{for(t in c) printf "  tier %s: %d arms\n", t, c[t]}' <<<"${ARMS}" | sort
     exit 0
@@ -250,6 +282,7 @@ while read -r tier s isc denom prof lr len; do
         # checkpoint, so SAVE_INTERVAL bounds what a boundary costs.
         jid=$(sbatch --parsable ${dep} \
             -A "${SLURM_ACCOUNT_NAME}" \
+            --comment="${IDLE_EXEMPTION}" \
             --partition="${PARTITION}" \
             --job-name="${name}" \
             --nodes="${NODES}" --time="${WALL}" \
