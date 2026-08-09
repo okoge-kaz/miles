@@ -55,6 +55,13 @@ Behind each GPU partition sits a partition QOS with its own caps:
 |---|---|---|---|
 | `batch` | `p_batch` | unlimited | node=768 |
 | `batch_short` | `p_batch_short` | node=20 | **node=4** |
+| `interactive` | `p_interactive` | unlimited | **node=2**, gres/gpu=16 |
+
+`interactive`'s cap is the tightest of the three and it counts *all* of your jobs
+on the partition: a 1-node test job running there blocks a 2-node smoke behind
+`QOSMaxNodePerUserLimit` until it finishes. Verification work on `interactive`
+therefore serialises at two nodes -- plan a batch of smokes as a queue, not as a
+fan-out, or send them to `batch_short` where the cap is 4.
 
 Two reasons the production recipes name only `batch`, the first of which is a
 hard failure rather than a slowdown:
