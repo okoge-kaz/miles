@@ -199,3 +199,131 @@ At 6.5k responses that was R=3 (wait 1.6 s). **At the 8k responses lr 5e-6
 produces it no longer is** -- wait is 13-39% of step time again, so R=3 is now
 under-provisioned and the trainer is idling. Re-measure the crossover whenever
 response length moves materially; it is not a constant of the recipe.
+
+### The queue ceiling, measured (2026-08-08)
+
+The `1000/192 ~ 5` above is not just an arithmetic bound; at R=7 the pipeline
+reaches it and pins there. `noderatio-s64-t1r7-rs42` (job 15254233), bound 64 so
+nothing truncates:
+
+| rollout | `queue_size` | `avg_staleness` | `max_staleness` |
+|---|---|---|---|
+| 0 | 3 | 0.00 | 0 |
+| 2 | 217 | 1.00 | 1 |
+| 4 | 490 | 2.44 | 3 |
+| 6 | 568 | 3.29 | 5 |
+| 8 | 779 | 3.91 | 5 |
+| 9 | **1000** | 4.10 | **6** |
+| 10 | 922 | 4.62 | **6** |
+| 11 | 980 | 5.05 | **6** |
+
+`OUTPUT_QUEUE_MAX_GROUPS` (1000, `fully_async_rollout.py:34`) plus the 192
+in-flight groups, over 192 consumed per step, is 6.2 — and `max_staleness` stops
+at 6 while `queue_size` sits against the cap. R=5 reaches 660-830 and max 5-6;
+R=1..3 never leave `queue_size` 0-1 and are ordered by node ratio instead.
+
+Two consequences:
+
+- **A bound above ~6 is unrealizable at k=1**, whatever is passed to
+  `--max-weight-staleness`. The s=64 arms are s~6 arms; their
+  `stale_groups_recycled` is 0 because the bound never gets the chance to bite.
+  The ceiling scales with `--num-steps-per-rollout` (~6.2k), not with the bound.
+  Reaching further up the staleness axis means editing the constant — it is not
+  a CLI flag — or shrinking `rollout_batch_size`.
+- **A full queue is idle rollout GPUs.** `await self._output.put(...)`
+  (`fully_async_rollout.py:268`) blocks the producer, so past R=5 the extra
+  rollout nodes are throttled by backpressure rather than generating. That is
+  the same ceiling "Choosing R" reaches from the `train_wait_time` side.
+
+### Second pass: the balance per bound, at 8 nodes (2026-08-08)
+
+`experiments/staleness_ratio_sweep.sh`. The first sweep held the bound at 64 and
+swept both node axes to find the *natural* lag; this one fixes the allocation at
+8 nodes and asks a different question — given a bound the study will actually
+run, which split does that bound want?
+
+- 4 splits x 4 bounds: T:R in {1:7, 2:6, 3:5, 4:4}, `max_weight_staleness` in
+  {1, 2, 4, 8}. lr 1e-6, TIS 2.0, actor denominator, production batch shape.
+- **The bound is enforced here, not parked at 64.** Recycling is the mechanism
+  under test, not noise to be excluded: a tight bound slows production, which
+  drains the queue, which lowers the lag — the feedback loop described above. The
+  readout is therefore the pair (realized lag, throughput), never lag alone.
+- 8 nodes, `batch`, 4 h, one job per point. **`NUM_ROLLOUT` is not overridden**:
+  the recipe's 300 stands, the wall stops each job, and the points are compared
+  per step rather than by time-to-completion. Leaving it at the production value
+  is also what keeps a point resumable — `--num-rollout` feeds `train_iters` and
+  so `lr_decay_steps`, which `OptimizerParamScheduler.load_state_dict` asserts
+  against the checkpoint, so a probe budget would freeze the run at that budget
+  forever (`notes/cluster.md`).
+- **Checkpoints are written on the recipe's cadence**, the same one the
+  convergence sweep runs at: `--save-interval 10`, `--save-retain-interval 100`,
+  HF export every 5. A point that turns out to be the right balance is then a
+  run that can be continued rather than repeated.
+- dp is the trainer's alone under `--fully-async`, so 3:5 is legal: 24 train GPUs
+  at tp2 is dp12, and 3072/12 = 256. The script derives this from the recipe,
+  prints `gbs/dp` per point, and drops any split megatron would reject, at
+  submission. Across the four splits dp is 4/8/12/16 and gbs/dp is
+  768/384/256/192 — all four divide.
+- **`--submit` deletes the checkpoint directory of each point it submits**,
+  unconditionally and without a flag — the script is meant to be handed to
+  someone else to run. A point is a fresh measurement; resuming would report a
+  warm queue and an already-moved policy as a cold start. Three guards, because
+  the operator is not necessarily the author: the path comes from
+  `run_identity.sh` rather than from a template, so it is the directory the job
+  will actually write to; the delete refuses anything outside `TRAIN_CKPT_DIR`;
+  and it refuses to touch a point whose job name is already in `squeue`, since
+  deleting under a running job corrupts that run and measures neither. The dry
+  run marks which directories would go.
+- `--check` reports **one log per point**, the highest job id, and says how many
+  it skipped. Re-running a point is now routine, and two runs of one
+  configuration in the table read as two configurations.
+- wandb project `async-rl-dapo-math-node-ratio`, separate from the convergence
+  study's `off-policy-<dataset>`, because these runs are a throughput
+  measurement and do not belong on the same board as the quality curves.
+  `train.sh` honours `WANDB_PROJECT` with the old value as its default, so
+  nothing else moves.
+- The wandb group is `s<S>-t<T>r<R>`: the two swept axes, nothing else.
+  `run_identity.sh`'s derivation is longer, not shorter, so it is overridden
+  rather than inherited. A rejection from `run_identity.sh` is fatal at
+  submission: a command substitution would otherwise swallow it and the job would
+  fail 100 s into an 8-node allocation instead.
+
+Read out `step_s` and `tok/s/gpu` from `--check` (`analyze_throughput.py`)
+against `staleness/mean`, `staleness/frac_at_bound`,
+`stale_groups_recycled` and `wasted_token_frac` from the same table. A split that
+wins on `step_s` while recycling a third of its generation has not won.
+
+**The s=8 row is not a fourth bound level.** The output queue caps realized lag
+at `(1000 + 192)/192 ~ 6.2` at k=1 (see the queue-ceiling section above), so a
+bound of 8 can never bite: that row measures the natural lag of each split and is
+the unbounded reference, not a point on the bound axis. Expect
+`stale_groups_recycled` 0 and `frac_at_bound` 0 there; if either is non-zero,
+the ceiling arithmetic or the batch shape has changed and both notes need
+revisiting.
+
+One rollout seed, by decision rather than by default: 16 jobs, 512 node-hours.
+That orders the bounds. It does **not** separate two adjacent splits — generation
+order is the largest source of run-to-run spread here — so read a 2:6 vs 3:5
+difference as a direction, not a measurement, unless it is large next to the
+spread the first sweep recorded at fixed settings.
+
+The checkpoint cost is small and its bias runs the other way from what
+`notes/checkpoints.md` estimates. Measured from the `save_model` timer on jobs
+15319376 and 15319392, at the recipe's cadence:
+
+| artifact | every | elapsed |
+|---|---|---|
+| HF only | 5 rollouts | 7.8-8.0 s |
+| HF + torch_dist | 10 rollouts | 13.6-19.0 s |
+
+against a 280 s `actor_train`, which is **0.55% and 0.72%** of accounted wall on
+those two runs — not the ~2% the sizing argument assumed.
+
+The save is serial in the trainer loop, but `generate.remote(rollout_id + 1)` is
+dispatched before `train` and `_worker_loop` runs continuously on the rollout
+engines' own GPUs, so **generation does not stop while the trainer saves**. On a
+rollout-bound split the save time comes straight out of the `train_wait` that
+follows it and costs nothing; on a trainer-bound split it is fully on the
+critical path. So it penalises the *trainer-heavy* splits, not the fast ones. At
+0.7% it cannot move a split comparison, and `HF_SAVE_INTERVAL=20` would buy back
+0.4 points at the cost of the `Q(t)` resolution — not worth it.

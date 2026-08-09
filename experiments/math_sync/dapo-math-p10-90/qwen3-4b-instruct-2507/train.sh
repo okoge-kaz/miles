@@ -167,7 +167,7 @@ MISC_ARGS=(
 
 WANDB_ARGS=(
    --use-wandb
-   --wandb-project "off-policy-${DATASET_TAG}"
+   --wandb-project "${WANDB_PROJECT:-off-policy-${DATASET_TAG}}"
    --wandb-group "${RUN_NAME}"
    --wandb-key "${WANDB_API_KEY}"
 )
