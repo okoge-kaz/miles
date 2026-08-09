@@ -301,11 +301,13 @@ class FullyAsyncRolloutFn:
         aborted_groups_recycled = 0
         stale_groups_recycled = 0
         # Two populations, because they answer different questions and only one of
-        # them is the study's variable. ``offered`` is every group the pipeline
-        # handed over, including those the bound then sent back -- that is the
-        # *natural* lag of this node ratio. ``trained`` is what survived into the
-        # batch, and is what the loss actually saw. They diverge exactly where the
-        # bound bites, which is where a reader is most likely to be misled.
+        # them is the study's variable. ``offered`` (logged as
+        # ``staleness/rollout/``) is every group the pipeline handed over,
+        # including those the bound then sent back -- that is the *natural* lag of
+        # this node ratio. ``trained`` (``staleness/train/``) is what survived into
+        # the batch, and is what the loss actually saw. They diverge where the
+        # bound bites and where the dynamic filter drops a group, which is where a
+        # reader is most likely to be misled.
         trained_staleness: list[int] = []
         offered_staleness: list[int] = []
         current_version: int | None = None
@@ -407,17 +409,20 @@ class FullyAsyncRolloutFn:
             metrics["rollout/fully_async/avg_staleness"] = sum(offered_staleness) / len(offered_staleness)
             metrics["rollout/fully_async/max_staleness"] = max(offered_staleness)
 
-        # Everything this study adds lives under `staleness/`. Unprefixed there is
-        # the lag the loss actually trained on; `staleness/offered/` is the
-        # pre-filter distribution the bound was applied to.
+        # Two populations, named for the side they describe. `staleness/rollout/`
+        # is what the pipeline produced, counted before the bound check;
+        # `staleness/train/` is what survived into the batch and is what the loss
+        # saw. Both are subgroups, so neither is the one a reader lands on by
+        # default -- an unprefixed `staleness/mean` used to be the trained lag and
+        # read like a total.
         if trained_staleness:
             metrics |= {
-                f"staleness/{name}": value
+                f"staleness/train/{name}": value
                 for name, value in _staleness_metrics(trained_staleness, args.max_weight_staleness).items()
             }
         if offered_staleness:
             metrics |= {
-                f"staleness/offered/{name}": value
+                f"staleness/rollout/{name}": value
                 for name, value in _staleness_metrics(offered_staleness, args.max_weight_staleness).items()
             }
         # Named for the reason rather than the mechanism: `stale_groups_recycled`

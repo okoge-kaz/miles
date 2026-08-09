@@ -87,7 +87,7 @@ if [[ "${1:-}" == "--check" ]]; then
     echo
     for f in "${logs[@]}"; do
         echo "=== $(basename "${f}") ==="
-        grep -o "'rollout/fully_async/staleness_count_[a-z0-9_]*': [0-9.]*" "${f}" | tail -11
+        grep -o "'staleness/rollout/count_[a-z0-9_]*': [0-9.]*" "${f}" | tail -11
     done
     exit 0
 fi

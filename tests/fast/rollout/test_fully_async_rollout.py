@@ -166,26 +166,26 @@ async def test_stale_group_recycled(monkeypatch):
     # missing staleness metric cannot be told apart from a router that never answered.
     assert output.metrics["rollout/fully_async/current_weight_version"] == 10
 
-    # The unprefixed metrics are the lag the loss saw. The group at 5 exceeded the
+    # `staleness/train/` is the lag the loss saw. The group at 5 exceeded the
     # bound of 2 and was recycled, so only the fresh group at 10 -- lag 0 -- was
     # trained on. A reader plotting "max_staleness" against a bound of 2 must never
     # see a 5 there.
-    assert output.metrics["staleness/max"] == 0
+    assert output.metrics["staleness/train/max"] == 0
     # Upstream's own key keeps upstream's meaning: the offered lag, before the
     # bound check. Two miles runs must not plot different quantities under it.
     assert output.metrics["rollout/fully_async/max_staleness"] == 5
-    assert output.metrics["staleness/num_groups"] == 1
-    assert output.metrics["staleness/frac_zero"] == pytest.approx(1.0)
-    assert output.metrics["staleness/count_0"] == 1
-    assert output.metrics["staleness/count_5"] == 0
+    assert output.metrics["staleness/train/num_groups"] == 1
+    assert output.metrics["staleness/train/frac_zero"] == pytest.approx(1.0)
+    assert output.metrics["staleness/train/count_0"] == 1
+    assert output.metrics["staleness/train/count_5"] == 0
 
-    # The offered distribution keeps both: it is the natural lag of this node
-    # ratio, and the gap between the two is what recycling cost.
-    assert output.metrics["staleness/offered/max"] == 5
-    assert output.metrics["staleness/offered/num_groups"] == 2
-    assert output.metrics["staleness/offered/p50"] == pytest.approx(2.5)
-    assert output.metrics["staleness/offered/frac_zero"] == pytest.approx(0.5)
-    assert output.metrics["staleness/offered/frac_at_bound"] == pytest.approx(0.5)
+    # `staleness/rollout/` keeps both: it is the natural lag of this node ratio,
+    # and the gap between the two is what recycling cost.
+    assert output.metrics["staleness/rollout/max"] == 5
+    assert output.metrics["staleness/rollout/num_groups"] == 2
+    assert output.metrics["staleness/rollout/p50"] == pytest.approx(2.5)
+    assert output.metrics["staleness/rollout/frac_zero"] == pytest.approx(0.5)
+    assert output.metrics["staleness/rollout/frac_at_bound"] == pytest.approx(0.5)
 
     # Tokens counted before reset_for_retry cleared them.
     assert output.metrics["rollout/fully_async/stale_tokens"] == N_SAMPLES_PER_PROMPT
@@ -262,12 +262,12 @@ async def test_trained_staleness_excludes_dynamic_filter_drops(monkeypatch):
     output = await fn(RolloutFnTrainInput(rollout_id=0))
 
     # It was offered at lag 1 and the bound did not stop it...
-    assert output.metrics["staleness/offered/count_1"] == 1
+    assert output.metrics["staleness/rollout/count_1"] == 1
     assert output.metrics["rollout/fully_async/stale_groups_recycled"] == 0
     # ...but the filter dropped it, so the loss only ever saw the lag-0 group.
-    assert output.metrics["staleness/count_1"] == 0
-    assert output.metrics["staleness/count_0"] == 1
-    assert output.metrics["staleness/num_groups"] == 1
+    assert output.metrics["staleness/train/count_1"] == 0
+    assert output.metrics["staleness/train/count_0"] == 1
+    assert output.metrics["staleness/train/num_groups"] == 1
 
 
 async def test_wasted_token_accounting(monkeypatch):

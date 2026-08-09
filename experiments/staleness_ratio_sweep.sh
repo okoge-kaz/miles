@@ -155,10 +155,12 @@ import ast, re, sys, pathlib
 # The last rollout's values: the queue needs several rollouts to reach its depth,
 # so an average over the run mixes the fill-up with the steady state.
 KEYS = [
-    ("staleness/mean", "lag_mean"),
-    ("staleness/max", "lag_max"),
-    ("staleness/frac_at_bound", "at_bound"),
-    ("staleness/offered/mean", "offered_mean"),
+    ("staleness/train/mean", "train_mean"),
+    ("staleness/train/p90", "train_p90"),
+    ("staleness/train/max", "train_max"),
+    ("staleness/train/frac_at_bound", "at_bound"),
+    ("staleness/rollout/mean", "rollout_mean"),
+    ("staleness/rollout/max", "rollout_max"),
     ("rollout/fully_async/queue_size", "queue"),
     ("rollout/fully_async/stale_groups_recycled", "recycled"),
     ("rollout/fully_async/wasted_token_frac", "wasted"),

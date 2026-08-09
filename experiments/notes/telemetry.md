@@ -407,3 +407,37 @@ It takes effect on the next job launched from a clone that has the commit --
 resubmission is needed beyond the normal chain boundary. Runs that straddle the
 boundary will have a discontinuity in the series, which is the reason not to
 pull mid-chain without noting the rollout index where it happened.
+
+## The staleness keys, renamed for the side they describe (2026-08-08)
+
+`staleness/*` and `staleness/offered/*` were not readable as a pair: the trained
+lag sat unprefixed, which reads like a total rather than one of two populations,
+and "offered" describes the transaction rather than the producer. Both are now
+subgroups:
+
+| key | population |
+|---|---|
+| `staleness/rollout/*` | every group the pipeline handed over, counted **before** the bound check — the natural lag of this node ratio |
+| `staleness/train/*` | what survived into the batch — what the loss actually saw |
+
+Sub-keys, identical under both: `mean max p50 p90 p99 frac_zero num_groups
+frac_at_bound count_0 … count_8 count_ge_9`. `frac_at_bound` is a `>=` test, so
+it is "how often the cap was reached", not the rejection rate.
+
+Scalars that belong to neither population stay at the root: `bound_exceeded_{groups,tokens}`,
+`retry_count_{mean,max}`, `retry_frac_nonzero`.
+
+Three things the pair does not say on its own:
+
+- **The gap is not all bound.** A group is dropped between the two populations
+  either by the bound *or* by the dynamic filter, which fires for a reason
+  unrelated to staleness. Attribute the bound's share with
+  `staleness/bound_exceeded_groups`, not by differencing `num_groups`.
+- **Neither population contains aborted groups**, nor groups whose weight
+  version could not be read. Those are recycled before the count.
+- `rollout/fully_async/{avg,max}_staleness` are upstream's keys and still mean
+  the **offered** lag. They were not renamed, because two miles versions must not
+  plot different quantities under one name.
+
+Old runs keep the old keys. A chart or a script that spans the rename has to
+accept both spellings; nothing back-fills.

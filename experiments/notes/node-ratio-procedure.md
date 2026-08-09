@@ -289,7 +289,7 @@ run, which split does that bound want?
   fail 100 s into an 8-node allocation instead.
 
 Read out `step_s` and `tok/s/gpu` from `--check` (`analyze_throughput.py`)
-against `staleness/mean`, `staleness/frac_at_bound`,
+against `staleness/train/mean`, `staleness/train/frac_at_bound`,
 `stale_groups_recycled` and `wasted_token_frac` from the same table. A split that
 wins on `step_s` while recycling a third of its generation has not won.
 
@@ -297,7 +297,7 @@ wins on `step_s` while recycling a third of its generation has not won.
 at `(1000 + 192)/192 ~ 6.2` at k=1 (see the queue-ceiling section above), so a
 bound of 8 can never bite: that row measures the natural lag of each split and is
 the unbounded reference, not a point on the bound axis. Expect
-`stale_groups_recycled` 0 and `frac_at_bound` 0 there; if either is non-zero,
+`stale_groups_recycled` 0 and `staleness/train/frac_at_bound` 0 there; if either is non-zero,
 the ceiling arithmetic or the batch shape has changed and both notes need
 revisiting.
 
