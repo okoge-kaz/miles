@@ -356,3 +356,88 @@ Any new key in `policy_loss_function`'s metric dict widens that mismatch. Do not
 read it as a regression from the change under test -- run the same test against
 HEAD in a worktree first. Metrics that only appear behind a flag no snapshot
 config sets (M2PO's, OPSM's) do not affect it.
+
+## lr 5e-6 does not collapse a learning rate, it collapses a trust region (2026-08-08)
+
+Every tier-1 and tier-2 arm was submitted at lr 5e-6. Sixteen arms, one clean
+split, and the split is **not** along the staleness axis:
+
+| ratio denominator | arms | last step reached | `response_len/mean` | `truncated_ratio` |
+|---|---|---|---|---|
+| `actor` | s0/s1/s2/s4 **tis**, s1/s2/s4 **icepop** | 10-16 | 5.0k -> 18-24k | 0.37-0.67 |
+| `rollout-logprobs` | s1/s2/s4 **m2po**, **none**, **none+opsm** | 60-157 | 5-8k -> 6-10k | 0.01-0.10 |
+
+7 of 7 diverged; 9 of 9 survived. Staleness does not order anything inside
+either group: the colocated s=0 TIS arm drifts the same way as s=4, only slower,
+and the s=4 `none` arm is the healthiest run in the study (145 steps, +34%
+length, 2% truncation).
+
+The divergence is a length runaway, not a loss spike. `conv-s4-tis-lr5e-6-p1`
+(job 15319216), one job, twelve steps:
+
+| step | entropy | grad_norm | tis_clipfrac | tis_abs | resp_len | trunc |
+|---|---|---|---|---|---|---|
+| 0 | 0.289 | 0.048 | 3.7e-06 | 0.010 | 4975 | 0.000 |
+| 4 | 0.234 | 0.055 | 4.0e-04 | 0.020 | 7542 | 0.063 |
+| 6 | 0.205 | 0.203 | 3.0e-04 | 0.017 | 9013 | 0.118 |
+| 8 | 0.197 | 0.615 | 1.2e-03 | 0.042 | 11908 | 0.214 |
+| 10 | 0.309 | 1.346 | 5.5e-03 | 0.127 | 16386 | 0.381 |
+| 11 | 0.508 | 2.705 | 6.4e-03 | 0.210 | 18583 | 0.458 |
+
+`grad_norm` departs from its 0.04 baseline at step 5-6, ahead of the entropy
+turn at step 9. The same arm at lr 1e-6 (job 15288366) holds `grad_norm`
+0.039-0.051 and `tis_clipfrac` 3-7e-06 flat across 34 steps. So `tis_clipfrac`
+rising three orders is a **symptom** of the policy leaving the rollout policy,
+not the cause, and it is not evidence that TIS is at fault.
+
+### Why the denominator, and not the learning rate, is the variable
+
+At `--num-steps-per-rollout 1` the actor-denominator arms have **no trust region
+at all**. The PPO ratio is `pi_train / pi_old` with `pi_old` recomputed by the
+trainer from the same weights, so it is identically 1 and the clip is a no-op —
+measured, not inferred:
+
+| arm | `pg_clipfrac` | `ppo_kl` | `ess_ratio` |
+|---|---|---|---|
+| s4 tis (actor) | **0.0000** | **0.00000** | 1.0000 |
+| s1 icepop (actor) | **0.0000** | **0.00000** | 1.0000 |
+| s1 none (rollout-logprobs) | 0.0008 | 0.00056 | 0.9989 |
+| s1 m2po (rollout-logprobs) | 0.0002 | 0.00055 | 0.9987 |
+
+exact zeros, every step. `grpo-clip0.2-0.28` in those run names is decorative:
+at k=1 the only thing between the update and vanilla REINFORCE is TIS's
+one-sided c=2.0, and that fires on 4e-06 of tokens at the start. With
+`rollout-logprobs` the ratio is the real off-policy `pi_train / pi_rollout`, so
+the clip has something to bite on — 0.02-0.08% of tokens, which is small but is
+exactly the tail that drives length growth.
+
+**This is a hypothesis with one cell missing.** `actor` and the correction
+family are confounded: every arm that collapsed also used TIS or ICEPOP, and
+every survivor also used M2PO/none/OPSM. One control run separates them —
+`none` + `actor` at 5e-6, or `tis` + `rollout-logprobs` — and it is worth the
+four node-hours before any conclusion about the corrections is written down.
+Note that k=1 makes the identity `ratio == 1` unavoidable for any
+actor-denominator arm; it is a property of the schedule, not a miles defect.
+
+### What this means for the learning-rate axis
+
+- **There is no single ceiling.** `rollout-logprobs` arms ran 100+ steps at 5e-6
+  with no sign of instability, so for them 5e-6 is a measured-good setting and
+  tier 6 (1e-5) is a real question. Actor-denominator arms diverge by step 8-11.
+- **1e-6 stays the common LR for the cross-arm comparison**, because a shared
+  setting has to be one every arm survives. Reporting arms at different learning
+  rates would confound the algorithm axis with the LR axis, which is the one
+  thing tier 2 exists to avoid.
+- **The gap 1e-6 -> 5e-6 is a factor of 5 with nothing in it.** If the
+  actor-denominator ceiling matters, probe 2e-6 and 3e-6 on one arm (s=2 tis, 14
+  steps is enough — divergence is visible by step 6) rather than inferring it.
+- **`--clip-grad 1.0` never binds at 1e-6** (`grad_norm` ~0.04, 25x below it),
+  and at 5e-6 it only binds after the runaway is already underway. It is not a
+  safety net at these settings; do not treat it as one.
+- Submitting tier 6 for `tis`/`icepop` is guaranteed waste. `convergence_sweep.sh
+  --tier 6 --is m2po,none` is the only form of that submission worth GPU-hours.
+
+Evidence: jobs 15319173/91/15319206/16 (tis s0/s1/s2/s4), 15319226/44/55
+(icepop), 15319267/88/99 (m2po), 15319358/75/89 (none), 15319312/34/48
+(none+opsm), all lr 5e-6; 15288366 (s4 tis lr 1e-6) as the control. Logs under
+`hiso/kzk/miles/experiments/outputs/training/math/dapo-math-p10-90/qwen3-4b-instruct-2507/`.

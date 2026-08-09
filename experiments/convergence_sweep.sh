@@ -93,6 +93,7 @@ ARMS=$(cat <<'EOF'
 3 1 none   rollout-logprobs -    1e-6 32768
 3 2 none   rollout-logprobs -    1e-6 32768
 3 4 none   rollout-logprobs -    1e-6 32768
+7 2 tis    actor            -    2e-6 32768
 5 0 tis    actor            -    1e-7 32768
 5 1 tis    actor            -    1e-7 32768
 5 2 tis    actor            -    1e-7 32768
@@ -192,6 +193,8 @@ if [[ -z "${TIER}" ]]; then
     echo "  4  response length: 4k"
     echo "  5  RESCUE ONLY: lr 1e-7, for an arm that collapsed above. Not a block;"
     echo "     name the arm with --staleness."
+    echo "  6  robustness: lr 1e-5. Only for the arms that survived 5e-6 -- --is m2po,none"
+    echo "  7  probe: lr 2e-6, one arm, to locate the actor-denominator ceiling"
     echo
     awk 'NF{c[$1]++} END{for(t in c) printf "  tier %s: %d arms\n", t, c[t]}' <<<"${ARMS}" | sort
     exit 0
