@@ -297,3 +297,61 @@ def test_m2po_metrics_survive_the_token_normaliser(monkeypatch):
     # This batch is on-policy, so the budget cannot bind and the floors stand.
     assert float(metrics["m2po_eps_clip"]) == pytest.approx(0.3)
     assert float(metrics["m2po_eps_clip_high"]) == pytest.approx(0.5)
+
+
+def test_policy_rollout_metrics_survive_use_rollout_logprobs(monkeypatch):
+    """`train_rollout_*` compares a tensor with itself under --use-rollout-logprobs.
+
+    `old_log_probs` becomes `batch["rollout_log_probs"]`, and the mismatch metrics
+    are referenced to it, so the difference is identically zero: abs_diff and kl
+    pin at 0.0 and both ESS ratios at 1.0. That is indistinguishable from a
+    healthy run, which is the dangerous part -- 1.0 is also what "no mismatch"
+    looks like.
+
+    The `policy_rollout_*` family references the forward pass instead, so it
+    still measures something. This is the whole point of that family; if it ever
+    reads 0.0/1.0 here again, it has been re-pointed at the denominator.
+    """
+    args = _make_args(use_rollout_logprobs=True)
+    batch = _make_batch(
+        old_log_probs=torch.tensor([0.10, 0.20], dtype=torch.float32),
+        rollout_log_probs=torch.tensor([0.10, 0.20], dtype=torch.float32),
+    )
+    # The trainer's forward disagrees with the rollout engine -- the thing to measure.
+    train_log_probs = torch.tensor([0.40, 0.80], dtype=torch.float32)
+
+    monkeypatch.setattr(
+        loss_utils, "get_parallel_state", lambda: SimpleNamespace(tp=SimpleNamespace(group=None))
+    )
+    _patch_single_rank_loss_helpers(monkeypatch)
+    monkeypatch.setattr(
+        loss_utils,
+        "get_log_probs_and_entropy",
+        lambda *a, **k: {"log_probs": [train_log_probs.clone()], "entropy": [torch.zeros(2)]},
+    )
+    monkeypatch.setattr(
+        loss_utils,
+        "compute_policy_loss",
+        lambda ppo_kl, advantages, eps_clip, eps_clip_high, eps_clip_c=None: (
+            torch.zeros_like(ppo_kl),
+            torch.zeros_like(ppo_kl),
+        ),
+    )
+
+    _, metrics = loss_utils.policy_loss_function(
+        args,
+        batch,
+        logits=torch.zeros((1, 3, 8), dtype=torch.float32),
+        sum_of_sample_mean=lambda tensor: tensor.float().mean(),
+    )
+
+    # The existing family is degenerate here, and stays that way: it is upstream's
+    # true-on-policy check and other users read it.
+    assert float(metrics["train_rollout_logprob_abs_diff"]) == 0.0
+    assert float(metrics["train_rollout_kl"]) == 0.0
+
+    # The new family sees the real gap: |0.10-0.40| and |0.20-0.80| average to 0.45.
+    assert float(metrics["policy_rollout_abs_diff"]) == pytest.approx(0.45)
+    assert float(metrics["policy_rollout_kl"]) > 0.0
+    # Sequence-level parts are emitted for aggregate_train_losses to combine.
+    assert "_policy_seq_ess_sum_w" in metrics

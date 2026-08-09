@@ -411,11 +411,12 @@ def aggregate_train_losses(
     # normaliser N, and rho = a^2 / (b * c) with a=S1/N, b=S2/N, c=B/N leaves N
     # cancelling exactly. The parts are dropped once consumed -- they are an
     # implementation detail and mean nothing on their own.
-    a = loss_reduced.pop("_seq_ess_sum_w", None)
-    b = loss_reduced.pop("_seq_ess_sum_w2", None)
-    c = loss_reduced.pop("_seq_ess_n", None)
-    if a is not None and b is not None and c is not None and b > 0.0 and c > 0.0:
-        loss_reduced["rollout_sequence_level_ess"] = (a * a) / (b * c)
+    for src, dst in (("_seq_ess", "rollout_sequence_level_ess"), ("_policy_seq_ess", "policy_rollout_sequence_ess")):
+        a = loss_reduced.pop(f"{src}_sum_w", None)
+        b = loss_reduced.pop(f"{src}_sum_w2", None)
+        c = loss_reduced.pop(f"{src}_n", None)
+        if a is not None and b is not None and c is not None and b > 0.0 and c > 0.0:
+            loss_reduced[dst] = (a * a) / (b * c)
 
     return loss_reduced
 

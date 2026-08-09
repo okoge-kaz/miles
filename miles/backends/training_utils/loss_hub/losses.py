@@ -353,6 +353,8 @@ def policy_loss_function(
     train_rollout_kl = None
     rollout_ess_ratio = None
     rollout_seq_sum_w = rollout_seq_sum_w2 = rollout_seq_n = None
+    policy_rollout_abs_diff = policy_rollout_kl = policy_rollout_token_ess = None
+    policy_seq_sum_w = policy_seq_sum_w2 = policy_seq_n = None
     if "rollout_log_probs" in batch and batch["rollout_log_probs"]:
         rollout_log_probs = torch.cat(batch["rollout_log_probs"], dim=0)
 
@@ -403,6 +405,54 @@ def policy_loss_function(
         )
         train_rollout_kl = sum_of_sample_mean(rollout_train_kl)
 
+        # The same four quantities, but referenced to the policy the forward pass
+        # just evaluated rather than to whatever the PPO ratio uses as its
+        # denominator. Under --use-rollout-logprobs that denominator *is*
+        # `rollout_log_probs`, so the metrics above compare a tensor with itself
+        # and are pinned at 0.0 / 1.0 -- silently, since 1.0 is also what a
+        # healthy run looks like. These do not depend on the denominator, so the
+        # two families agree on the `actor` arms and only these say anything on
+        # the rollout-logprobs ones.
+        #
+        # It measures engine mismatch *and* policy lag together; the on-policy
+        # colocated arm puts the first at ~5e-04 per token, so do not read it as
+        # lag alone.
+        policy_neg_log_ratio = torch.where(
+            active_tokens,
+            torch.nan_to_num(rollout_log_probs - log_probs.detach(), nan=0.0, posinf=0.0, neginf=0.0),
+            rollout_log_probs.new_zeros(()),
+        )
+        policy_seq_sum_w, policy_seq_sum_w2, policy_seq_n = compute_sequence_level_ess_parts(
+            log_ratio=-policy_neg_log_ratio,
+            loss_masks=batch["loss_masks"],
+            total_lengths=total_lengths,
+            response_lengths=response_lengths,
+            qkv_format=args.qkv_format,
+            max_seq_lens=max_seq_lens,
+        )
+        policy_rollout_token_ess = compute_ess_ratio_contribution(
+            ppo_kl=policy_neg_log_ratio,
+            loss_masks=batch["loss_masks"],
+            total_lengths=total_lengths,
+            response_lengths=response_lengths,
+            qkv_format=args.qkv_format,
+            max_seq_lens=max_seq_lens,
+            calculate_per_token_loss=args.calculate_per_token_loss,
+        ).squeeze()
+        policy_rollout_abs_diff = sum_of_sample_mean(policy_neg_log_ratio.abs())
+        policy_rollout_kl = sum_of_sample_mean(
+            torch.where(
+                active_tokens,
+                torch.nan_to_num(
+                    compute_approx_kl(rollout_log_probs, log_probs.detach(), kl_loss_type="low_var_kl"),
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                ),
+                rollout_log_probs.new_zeros(()),
+            )
+        )
+
     reported_loss = {
         "loss": loss.clone().detach(),
         "pg_loss": pg_loss.clone().detach(),
@@ -418,6 +468,13 @@ def policy_loss_function(
         reported_loss["train_rollout_kl"] = train_rollout_kl.clone().detach()
     if rollout_ess_ratio is not None:
         reported_loss["rollout_token_level_ess"] = rollout_ess_ratio.clone().detach()
+    if policy_rollout_abs_diff is not None:
+        reported_loss["policy_rollout_abs_diff"] = policy_rollout_abs_diff.clone().detach()
+        reported_loss["policy_rollout_kl"] = policy_rollout_kl.clone().detach()
+        reported_loss["policy_rollout_token_ess"] = policy_rollout_token_ess.clone().detach()
+        reported_loss["_policy_seq_ess_sum_w"] = policy_seq_sum_w.clone().detach().float()
+        reported_loss["_policy_seq_ess_sum_w2"] = policy_seq_sum_w2.clone().detach().float()
+        reported_loss["_policy_seq_ess_n"] = policy_seq_n.clone().detach().float()
     if rollout_seq_sum_w is not None:
         # Three sums, not the ratio: a ratio of sums is not itself additive across
         # micro-batches or data-parallel ranks. aggregate_train_losses divides all
