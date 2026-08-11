@@ -9,7 +9,6 @@ from dataclasses import replace
 
 import httpx
 import pytest
-from types import SimpleNamespace
 
 import miles.rollout.fully_async_rollout as fully_async
 from miles.rollout.base_types import RolloutFnConstructorInput, RolloutFnEvalInput, RolloutFnTrainInput
@@ -158,6 +157,7 @@ async def test_stale_group_recycled(monkeypatch):
             return 10
 
     fn._weight_version = FakeWeightVersion()
+    fn.commit_applied_weight_version(10)
 
     output = await fn(RolloutFnTrainInput(rollout_id=0))
 
@@ -251,6 +251,7 @@ async def test_trained_staleness_excludes_dynamic_filter_drops(monkeypatch):
             return 10
 
     fn._weight_version = FakeWeightVersion()
+    fn.commit_applied_weight_version(10)
 
     # Drop the scripted group -- lag 1, comfortably inside the bound of 4 -- and
     # keep the fresh one that replaces it.
@@ -363,13 +364,8 @@ async def test_remembered_endpoint_is_dropped_when_it_stops_answering(monkeypatc
     assert cache._endpoint == "/model_info"
 
 
-async def test_unreachable_router_disables_the_cap_loudly(monkeypatch, caplog):
-    """A router that never answers must not fail silently.
-
-    ``_CachedWeightVersion.get`` returning None skips the staleness branch entirely,
-    so ``--max-weight-staleness`` enforces nothing and no staleness metric is emitted.
-    A run then looks like a staleness arm while training fully on-policy.
-    """
+async def test_unreachable_router_only_disables_submission_diagnostics(monkeypatch, caplog):
+    """The HTTP cache is diagnostic-only; tracker-based drain control remains live."""
 
     async def unreachable(url, *args, **kwargs):
         raise httpx.ConnectError("no router")
@@ -380,9 +376,9 @@ async def test_unreachable_router_disables_the_cap_loudly(monkeypatch, caplog):
     with caplog.at_level("WARNING"):
         output = await fn(RolloutFnTrainInput(rollout_id=0))
 
-    assert "No staleness metric will be emitted" in caplog.text
+    assert "submission_weight_version diagnostics will be absent" in caplog.text
     assert "rollout/fully_async/avg_staleness" not in output.metrics
-    assert "rollout/fully_async/current_weight_version" not in output.metrics
+    assert output.metrics["rollout/fully_async/current_weight_version"] == 0
 
 
 async def test_malformed_model_info_does_not_kill_the_drain(monkeypatch):
@@ -581,6 +577,7 @@ async def test_pre_queue_staleness_records_updates_crossed_during_generation(mon
     async def generate_crossing_an_update(state, group, sampling_params, evaluation=False):
         await asyncio.sleep(0)
         version.value = 6
+        fn.commit_applied_weight_version(6)
         for sample in group:
             sample.weight_versions = ["6"]
         return group
@@ -592,6 +589,7 @@ async def test_pre_queue_staleness_records_updates_crossed_during_generation(mon
         generate=generate_crossing_an_update,
     )
     fn._weight_version = version
+    fn.commit_applied_weight_version(4)
 
     output = await fn(RolloutFnTrainInput(rollout_id=0))
 
@@ -619,6 +617,7 @@ async def test_straggler_is_charged_to_pre_queue_not_in_queue(monkeypatch):
         # First sample lands under v1; the update arrives; the straggler lands under v2.
         group[0].weight_versions = ["1"]
         version.value = 2
+        fn.commit_applied_weight_version(2)
         for sample in group[1:]:
             sample.weight_versions = ["2"]
         return group
@@ -630,6 +629,7 @@ async def test_straggler_is_charged_to_pre_queue_not_in_queue(monkeypatch):
         generate=generate_with_a_straggler,
     )
     fn._weight_version = version
+    fn.commit_applied_weight_version(1)
 
     output = await fn(RolloutFnTrainInput(rollout_id=0))
 
@@ -652,9 +652,9 @@ async def test_components_sum_to_the_total(monkeypatch):
         # max(), because the worker keeps submitting: a later group must not walk
         # the version backwards and make the assertion depend on task scheduling.
         version.value = max(version.value, 4)  # two updates during generation
+        fn.commit_applied_weight_version(4)
         for sample in group:
             sample.weight_versions = ["4"]
-        version.value = max(version.value, 7)  # three more before the drain reads it
         return group
 
     fn = make_fn(
@@ -664,6 +664,16 @@ async def test_components_sum_to_the_total(monkeypatch):
         generate=generate_then_let_the_queue_age,
     )
     fn._weight_version = version
+    fn.commit_applied_weight_version(2)
+    original_next_group = fn._next_group
+
+    async def next_group_after_queue_ages():
+        item = await original_next_group()
+        version.value = max(version.value, 7)
+        fn.commit_applied_weight_version(7)
+        return item
+
+    fn._next_group = next_group_after_queue_ages
 
     output = await fn(RolloutFnTrainInput(rollout_id=0))
 
@@ -707,6 +717,7 @@ async def test_submission_stamp_is_refreshed_when_a_group_is_recycled(monkeypatc
 
     fn = make_fn(monkeypatch, make_args(rollout_batch_size=1, max_weight_staleness=2), data_source)
     fn._weight_version = version
+    fn.commit_applied_weight_version(10)
 
     await fn(RolloutFnTrainInput(rollout_id=0))
 
@@ -747,6 +758,7 @@ async def _run_with_reference(monkeypatch, reference: str, bound: int):
     async def generate_crossing_an_update(state, group, sampling_params, evaluation=False):
         await asyncio.sleep(0)
         version.value = max(version.value, 2)
+        fn.commit_applied_weight_version(2)
         for sample in group:
             sample.weight_versions = ["2"]
         return group
@@ -759,6 +771,7 @@ async def _run_with_reference(monkeypatch, reference: str, bound: int):
         generate=generate_crossing_an_update,
     )
     fn._weight_version = version
+    fn.commit_applied_weight_version(1)
     return await fn(RolloutFnTrainInput(rollout_id=0)), data_source
 
 
@@ -789,6 +802,147 @@ async def test_submission_reference_bounds_the_whole_off_policy_distance(monkeyp
     # completion reference the same group passes (see the test above).
     assert output.metrics["staleness/bound/rollout/max"] == 1
     assert output.metrics["staleness/total/max"] == 0
+
+
+def _stamp_prefill_provenance(
+    group: list[Sample],
+    *,
+    first: int,
+    minimum: int | None = None,
+    maximum: int | None = None,
+    last: int | None = None,
+) -> None:
+    minimum = first if minimum is None else minimum
+    maximum = first if maximum is None else maximum
+    last = maximum if last is None else last
+    for sample in group:
+        sample.first_prefill_weight_versions = [first]
+        sample.min_forward_weight_versions = [minimum]
+        sample.max_forward_weight_versions = [maximum]
+        sample.last_forward_weight_versions = [last]
+        sample.response_weight_versions = [str(last)]
+        sample.weight_versions = [str(last)]
+
+
+async def test_prefill_reference_ignores_update_while_waiting_for_prefill(monkeypatch):
+    """submission=10, prefill=11, drain=11 has zero realized staleness."""
+
+    class SubmissionVersion:
+        async def get(self, args):
+            return 10
+
+    async def generate_after_queue_update(state, group, sampling_params, evaluation=False):
+        fn.commit_applied_weight_version(11)
+        _stamp_prefill_provenance(group, first=11)
+        return group
+
+    fn = make_fn(
+        monkeypatch,
+        make_args(
+            rollout_batch_size=1,
+            max_weight_staleness=0,
+            staleness_reference="prefill",
+        ),
+        FakeDataSource(),
+        generate=generate_after_queue_update,
+    )
+    fn._weight_version = SubmissionVersion()
+    fn.commit_applied_weight_version(10)
+
+    output = await fn(RolloutFnTrainInput(rollout_id=0))
+
+    assert output.metrics["staleness/bound/train/max"] == 0
+    assert output.metrics["rollout/fully_async/stale_groups_recycled"] == 0
+    sample = output.samples[0][0]
+    assert sample.metadata[fully_async.SUBMISSION_VERSION_KEY] == 10
+    assert sample.metadata[fully_async.GROUP_READY_VERSION_KEY] == 11
+    assert sample.metadata[fully_async.QUEUE_PUT_VERSION_KEY] == 11
+    assert sample.metadata[fully_async.DRAIN_VERSION_KEY] == 11
+
+
+async def test_prefill_reference_detects_mixed_generation_and_enforces_bound(monkeypatch):
+    """prefill=10, mixed decode=11, drain=11 is stale by one and is recycled at max=0."""
+    scripted = make_group(1)
+    data_source = FakeDataSource(scripted=[scripted])
+
+    async def generate_mixed_then_fresh(state, group, sampling_params, evaluation=False):
+        if group[0].group_index == 1:
+            _stamp_prefill_provenance(group, first=10, minimum=10, maximum=11, last=11)
+            fn.commit_applied_weight_version(11)
+        else:
+            _stamp_prefill_provenance(group, first=11)
+        return group
+
+    fn = make_fn(
+        monkeypatch,
+        make_args(
+            rollout_batch_size=1,
+            max_weight_staleness=0,
+            staleness_reference="prefill",
+        ),
+        data_source,
+        generate=generate_mixed_then_fresh,
+    )
+    fn._weight_version = StubWeightVersion(10)
+    fn.commit_applied_weight_version(10)
+
+    output = await fn(RolloutFnTrainInput(rollout_id=0))
+
+    assert data_source.recycled == [scripted]
+    assert output.metrics["rollout/fully_async/stale_groups_recycled"] == 1
+    assert output.metrics["staleness/bound/rollout/count_1"] == 1
+    assert output.metrics["staleness/mixed_version_frac/rollout"] == pytest.approx(0.5)
+    assert output.metrics["staleness/mixed_version_frac/train"] == 0.0
+
+
+async def test_prefill_reference_accepts_one_step_mixed_generation_at_max_one(monkeypatch):
+    async def generate_mixed(state, group, sampling_params, evaluation=False):
+        _stamp_prefill_provenance(group, first=10, minimum=10, maximum=11, last=11)
+        fn.commit_applied_weight_version(11)
+        return group
+
+    fn = make_fn(
+        monkeypatch,
+        make_args(
+            rollout_batch_size=1,
+            max_weight_staleness=1,
+            staleness_reference="prefill",
+        ),
+        FakeDataSource(),
+        generate=generate_mixed,
+    )
+    fn._weight_version = StubWeightVersion(10)
+    fn.commit_applied_weight_version(10)
+
+    output = await fn(RolloutFnTrainInput(rollout_id=0))
+
+    assert output.metrics["staleness/bound/train/max"] == 1
+    assert output.metrics["rollout/fully_async/stale_groups_recycled"] == 0
+    assert output.metrics["staleness/mixed_version_frac/train"] == 1.0
+
+
+async def test_prefill_reference_fails_fast_without_scheduler_metadata(monkeypatch):
+    fn = make_fn(
+        monkeypatch,
+        make_args(
+            rollout_batch_size=1,
+            max_weight_staleness=0,
+            staleness_reference="prefill",
+        ),
+        FakeDataSource(),
+    )
+    fn._weight_version = StubWeightVersion(0)
+
+    with pytest.raises(RuntimeError, match="patched SGLang image"):
+        await fn(RolloutFnTrainInput(rollout_id=0))
+
+
+def test_applied_weight_version_tracker_rejects_rollback():
+    tracker = fully_async.AppliedWeightVersionTracker(initial_version=10)
+    tracker.commit(11)
+    assert tracker.current() == 11
+    with pytest.raises(ValueError, match="cannot move backwards"):
+        tracker.commit(10)
 
 
 async def test_submission_reference_leaves_the_decomposition_alone(monkeypatch):

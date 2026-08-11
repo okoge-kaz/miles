@@ -109,6 +109,12 @@ class RolloutManager:
     def get_router_address(self) -> tuple[str, int]:
         return self.args.sglang_router_ip, self.args.sglang_router_port
 
+    def set_applied_weight_version(self, version: int) -> None:
+        """Commit after every rollout engine finalized the same weight update."""
+        commit = getattr(self.generate_rollout, "commit_applied_weight_version", None)
+        if commit is not None:
+            commit(version)
+
     def dispose(self):
         if (close := getattr(self.data_source, "close", None)) is not None:
             close()

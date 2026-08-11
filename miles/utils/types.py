@@ -40,6 +40,11 @@ class Sample:
     reward: float | dict[str, Any] | None = None
     loss_mask: list[int] | None = None
     weight_versions: list[str] = field(default_factory=list)
+    first_prefill_weight_versions: list[int] = field(default_factory=list)
+    min_forward_weight_versions: list[int] = field(default_factory=list)
+    max_forward_weight_versions: list[int] = field(default_factory=list)
+    last_forward_weight_versions: list[int] = field(default_factory=list)
+    response_weight_versions: list[str] = field(default_factory=list)
     rollout_log_probs: list[float] | None = None  # Log probabilities from rollout engine
     rollout_routed_experts: numpy.ndarray | None = (
         None  # Routed experts from rollout engine. shape: (num_tokens-1, num_layers, moe_router_topk), dtype=int32
@@ -254,6 +259,11 @@ class Sample:
         self.reward = None
         self.loss_mask = None
         self.weight_versions = []
+        self.first_prefill_weight_versions = []
+        self.min_forward_weight_versions = []
+        self.max_forward_weight_versions = []
+        self.last_forward_weight_versions = []
+        self.response_weight_versions = []
         self.rollout_log_probs = None
         self.rollout_routed_experts = None
         self.rollout_indexer_topk = None
@@ -294,8 +304,7 @@ class Sample:
         # Collect prefix cache statistics
         self.prefix_cache_info.add(meta_info=meta_info)
 
-        if "weight_version" in meta_info:
-            self.weight_versions.append(meta_info["weight_version"])
+        self.update_policy_version_from_meta_info(meta_info)
 
         match meta_info["finish_reason"]["type"]:
             case "length":
@@ -304,6 +313,23 @@ class Sample:
                 self.status = Sample.Status.ABORTED
             case "stop":
                 self.status = Sample.Status.COMPLETED
+
+    def update_policy_version_from_meta_info(self, meta_info: dict) -> None:
+        """Append per-generation policy provenance returned by SGLang."""
+        if "weight_version" in meta_info:
+            self.weight_versions.append(meta_info["weight_version"])
+
+        for key, field_name in (
+            ("first_prefill_weight_version", "first_prefill_weight_versions"),
+            ("min_forward_weight_version", "min_forward_weight_versions"),
+            ("max_forward_weight_version", "max_forward_weight_versions"),
+            ("last_forward_weight_version", "last_forward_weight_versions"),
+        ):
+            if key in meta_info:
+                getattr(self, field_name).append(int(meta_info[key]))
+
+        if "response_weight_version" in meta_info:
+            self.response_weight_versions.append(str(meta_info["response_weight_version"]))
 
 
 @dataclass(frozen=True)

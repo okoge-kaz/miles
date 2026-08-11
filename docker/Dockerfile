@@ -15,8 +15,9 @@ FROM lmsysorg/sglang:${SGLANG_IMAGE_TAG} AS sglang
 
 # ======================================== Arguments =============================================
 
-ARG SGLANG_BRANCH=sglang-miles
-ARG SGLANG_COMMIT=""
+ARG SGLANG_REPO=okoge-kaz/sglang
+ARG SGLANG_BRANCH=miles-prefill-weight-version
+ARG SGLANG_COMMIT=23aaf6597dbbe47f9ceb6090e10372c844fed960
 
 ARG MEGATRON_REPO=radixark/Megatron-LM
 ARG MEGATRON_BRANCH=miles-main
@@ -197,7 +198,7 @@ RUN rm -rf /root/.cache/pip /root/flash-attention
 # the cu13 markers, and sglang's editable install makes them visible to every later pip
 # resolve, which would drag cu13 packages onto a cu12 image.
 RUN cd /sgl-workspace/sglang && \
-    git fetch origin ${SGLANG_BRANCH} && \
+    git fetch https://github.com/${SGLANG_REPO}.git ${SGLANG_BRANCH} && \
     if [ -n "${SGLANG_COMMIT}" ]; then \
       git checkout -f ${SGLANG_COMMIT}; \
     else \

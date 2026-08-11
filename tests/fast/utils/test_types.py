@@ -105,3 +105,33 @@ class TestStripLastOutputTokens:
         original_tokens = list(s.tokens)
         s.strip_last_output_tokens(-1, tokenizer)
         assert s.tokens == original_tokens
+
+
+def test_policy_version_metadata_is_typed_and_reset_for_retry():
+    sample = Sample()
+    sample.update_policy_version_from_meta_info(
+        {
+            "weight_version": "11",
+            "first_prefill_weight_version": 10,
+            "min_forward_weight_version": 10,
+            "max_forward_weight_version": 11,
+            "last_forward_weight_version": 11,
+            "response_weight_version": "11",
+        }
+    )
+
+    assert sample.weight_versions == ["11"]
+    assert sample.first_prefill_weight_versions == [10]
+    assert sample.min_forward_weight_versions == [10]
+    assert sample.max_forward_weight_versions == [11]
+    assert sample.last_forward_weight_versions == [11]
+    assert sample.response_weight_versions == ["11"]
+
+    sample.reset_for_retry()
+
+    assert sample.weight_versions == []
+    assert sample.first_prefill_weight_versions == []
+    assert sample.min_forward_weight_versions == []
+    assert sample.max_forward_weight_versions == []
+    assert sample.last_forward_weight_versions == []
+    assert sample.response_weight_versions == []

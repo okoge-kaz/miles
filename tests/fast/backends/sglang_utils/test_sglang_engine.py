@@ -1,7 +1,24 @@
 import time
+from unittest.mock import MagicMock
 
 import pytest
 import requests
+
+
+def test_begin_weight_update_sends_authoritative_version():
+    pytest.importorskip("sglang")
+    from miles.backends.sglang_utils.sglang_engine import SGLangEngine
+
+    engine = SGLangEngine.__new__(SGLangEngine)
+    engine._make_request = MagicMock(return_value=[True, "Success"])
+
+    result = engine.begin_weight_update(selector="all", weight_version="11")
+
+    assert result == [True, "Success"]
+    engine._make_request.assert_called_once_with(
+        "begin_weight_update",
+        {"selector": "all", "weight_version": "11"},
+    )
 
 
 def test_flush_cache_sleeps_between_pending_request_retries(monkeypatch):

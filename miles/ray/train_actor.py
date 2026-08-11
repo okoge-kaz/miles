@@ -176,5 +176,7 @@ class TrainRayActor(RayActor):
 
     def set_rollout_manager(self, rollout_manager):
         self.rollout_manager = rollout_manager
+        if hasattr(self, "weight_updater"):
+            self.weight_updater.rollout_manager = rollout_manager
         if self.args.rank == 0:
             ray.get(self.rollout_manager.set_train_parallel_config.remote(self.train_parallel_config))

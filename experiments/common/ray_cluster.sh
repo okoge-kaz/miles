@@ -11,6 +11,13 @@ RAY_JOIN_TIMEOUT=600
 NNODES="${SLURM_JOB_NUM_NODES}"
 NODEID="${SLURM_NODEID:-0}"
 
+RAY_TEMP_ARGS=()
+if [[ -n "${RAY_TEMP_DIR:-}" ]]; then
+    NODE_RAY_TEMP_DIR="${RAY_TEMP_DIR}/node-${NODEID}"
+    mkdir -p "${NODE_RAY_TEMP_DIR}"
+    RAY_TEMP_ARGS=(--temp-dir "${NODE_RAY_TEMP_DIR}")
+fi
+
 ray stop --force || true
 
 if [[ "${NODEID}" -ne 0 ]]; then
@@ -25,7 +32,8 @@ if [[ "${NODEID}" -ne 0 ]]; then
         _waited=$(( _waited + 5 ))
     done
     set -x
-    ray start --address="${RAY_HEAD_IP}:${RAY_PORT}" --num-gpus "${GPUS_PER_NODE}" --disable-usage-stats
+    ray start --address="${RAY_HEAD_IP}:${RAY_PORT}" --num-gpus "${GPUS_PER_NODE}" \
+        --disable-usage-stats "${RAY_TEMP_ARGS[@]}"
     set +x
     echo "worker ${NODEID}: joined, idling until the driver signals completion"
     while [[ ! -f "${RAY_DONE_FLAG}" ]]; do sleep 15; done
@@ -39,7 +47,7 @@ trap 'touch "${RAY_DONE_FLAG}" 2>/dev/null || true' EXIT
 
 ray start --head --node-ip-address "${RAY_HEAD_IP}" --port "${RAY_PORT}" \
     --num-gpus "${GPUS_PER_NODE}" --disable-usage-stats \
-    --dashboard-host=0.0.0.0 --dashboard-port=8265
+    --dashboard-host=0.0.0.0 --dashboard-port=8265 "${RAY_TEMP_ARGS[@]}"
 
 python3 /root/miles/experiments/common/wait_for_ray_nodes.py \
     "${RAY_HEAD_IP}:${RAY_PORT}" "${NNODES}" "${RAY_JOIN_TIMEOUT}"

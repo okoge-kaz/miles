@@ -31,6 +31,11 @@ ROLLOUT_DATA_VALUE_SPEC: dict[str, ValueSpec] = {
     "prompt": ValueSpec(codec="msgpack_ragged"),
     "metadata": ValueSpec(codec="msgpack_ragged"),
     "weight_versions": ValueSpec(codec="msgpack_ragged"),
+    "first_prefill_weight_versions": ValueSpec(codec="msgpack_ragged"),
+    "min_forward_weight_versions": ValueSpec(codec="msgpack_ragged"),
+    "max_forward_weight_versions": ValueSpec(codec="msgpack_ragged"),
+    "last_forward_weight_versions": ValueSpec(codec="msgpack_ragged"),
+    "response_weight_versions": ValueSpec(codec="msgpack_ragged"),
     "raw_reward": ValueSpec(codec="auto"),
     "total_lengths": ValueSpec(codec="auto"),
     "dynamic_global_batch_size": ValueSpec(codec="auto"),
@@ -113,6 +118,15 @@ def convert_samples_to_train_data(
 
     if any(sample.weight_versions for sample in samples):
         train_data["weight_versions"] = [sample.weight_versions for sample in samples]
+    for field in (
+        "first_prefill_weight_versions",
+        "min_forward_weight_versions",
+        "max_forward_weight_versions",
+        "last_forward_weight_versions",
+        "response_weight_versions",
+    ):
+        if any(getattr(sample, field) for sample in samples):
+            train_data[field] = [getattr(sample, field) for sample in samples]
 
     if samples[0].teacher_log_probs is not None:
         train_data["teacher_log_probs"] = [sample.teacher_log_probs for sample in samples]
@@ -239,6 +253,11 @@ def split_train_data_by_dp_raw(args, data: dict[str, Any], *, dp_size: int) -> l
             "opd_reverse_kl",
             "seq_witness_ids",
             "weight_versions",
+            "first_prefill_weight_versions",
+            "min_forward_weight_versions",
+            "max_forward_weight_versions",
+            "last_forward_weight_versions",
+            "response_weight_versions",
             "adapter_slots",
         ]:
             if key not in data:

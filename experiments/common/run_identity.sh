@@ -44,8 +44,9 @@ case "${PLACEMENT}" in
     async)
         : "${MAX_WEIGHT_STALENESS:?}"
         : "${STALENESS_REFERENCE:=completion}"
-        [[ "${STALENESS_REFERENCE}" == completion || "${STALENESS_REFERENCE}" == submission ]] ||
-            { echo "STALENESS_REFERENCE must be completion or submission, got '${STALENESS_REFERENCE}'" >&2; exit 1; }
+        [[ "${STALENESS_REFERENCE}" == completion || "${STALENESS_REFERENCE}" == submission \
+           || "${STALENESS_REFERENCE}" == prefill ]] ||
+            { echo "STALENESS_REFERENCE must be completion, submission, or prefill, got '${STALENESS_REFERENCE}'" >&2; exit 1; }
         ;;
     *)
         echo "PLACEMENT must be colocated or async, got '${PLACEMENT}'" >&2

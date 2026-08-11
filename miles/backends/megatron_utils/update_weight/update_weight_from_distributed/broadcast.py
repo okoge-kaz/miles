@@ -109,17 +109,19 @@ class UpdateWeightFromDistributed(DistBucketedWeightUpdateMixin):
         # lock the rollout engines to prevent dead lock on broadcast.
         while not ray.get(self.rollout_engine_lock.acquire.remote()):
             time.sleep(0.1)
-        refs = update_weights_from_distributed(
-            self._group_name,
-            self._model_update_groups,
-            self.weight_version,
-            self.rollout_engines,
-            converted_named_tensors,
-            selector=self._weight_update_selector,
-        )
-        ray.get(refs)
-        converted_named_tensors.clear()
-        ray.get(self.rollout_engine_lock.release.remote())
+        try:
+            refs = update_weights_from_distributed(
+                self._group_name,
+                self._model_update_groups,
+                self.weight_version,
+                self.rollout_engines,
+                converted_named_tensors,
+                selector=self._weight_update_selector,
+            )
+            _check_weight_sync_results(ray.get(refs), is_lora=False)
+            converted_named_tensors.clear()
+        finally:
+            ray.get(self.rollout_engine_lock.release.remote())
         if pbar:
             pbar.update(1)
 

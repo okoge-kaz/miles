@@ -54,7 +54,7 @@ PROMPT_DATA=/data/dapo-math-p10-90/dapo-math-p10-90.jsonl
 # off-policy degree: how stale a sample may be, and what happens to in-flight
 # generation at a weight update
 : "${MAX_WEIGHT_STALENESS:=2}"
-: "${STALENESS_REFERENCE:=completion}"   # completion | submission
+: "${STALENESS_REFERENCE:=prefill}"   # completion | submission | prefill
 : "${PAUSE_GENERATION_MODE:=in_place}"
 : "${ASYNC_MAX_CONCURRENT_SAMPLES:=}"
 

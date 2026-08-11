@@ -19,6 +19,9 @@ import typer
 
 CACHE_DIR = "/tmp/miles-docker-cache"
 REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_SGLANG_REPO = "okoge-kaz/sglang"
+DEFAULT_SGLANG_BRANCH = "miles-prefill-weight-version"
+DEFAULT_SGLANG_COMMIT = "23aaf6597dbbe47f9ceb6090e10372c844fed960"
 
 VARIANTS = {
     "cu13": {
@@ -96,7 +99,15 @@ def run(cmd: list[str], dry_run: bool) -> None:
 
 
 def build_and_push(
-    variant: str, image_tag: str, dry_run: bool, dockerfile: str, push: bool = False, custom_tag: str = ""
+    variant: str,
+    image_tag: str,
+    dry_run: bool,
+    dockerfile: str,
+    push: bool = False,
+    custom_tag: str = "",
+    sglang_repo: str = "",
+    sglang_branch: str = "",
+    sglang_commit: str = "",
 ) -> None:
     config = VARIANTS[variant]
     # A variant may pin its own Dockerfile (e.g. ROCm); otherwise use the CLI default.
@@ -144,6 +155,13 @@ def build_and_push(
     for key, value in config.get("build_args", {}).items():
         cmd += ["--build-arg", f"{key}={value}"]
 
+    for key, value in (
+        ("SGLANG_REPO", sglang_repo),
+        ("SGLANG_BRANCH", sglang_branch),
+        ("SGLANG_COMMIT", sglang_commit),
+    ):
+        if value:
+            cmd += ["--build-arg", f"{key}={value}"]
     for tag in tags:
         cmd += ["-t", tag]
 
@@ -177,8 +195,30 @@ def main(
     dry_run: bool = typer.Option(False, help="Print commands without executing them."),  # noqa: B008
     push: bool = typer.Option(False, help="Push images to registry after building."),  # noqa: B008
     custom_tag: str = typer.Option("", help="Custom tag name (required when --image-tag is custom)."),  # noqa: B008
+    sglang_repo: str = typer.Option(  # noqa: B008
+        DEFAULT_SGLANG_REPO,
+        help="GitHub owner/repo for the SGLang fork.",
+    ),
+    sglang_branch: str = typer.Option(  # noqa: B008
+        DEFAULT_SGLANG_BRANCH,
+        help="SGLang branch to fetch.",
+    ),
+    sglang_commit: str = typer.Option(  # noqa: B008
+        DEFAULT_SGLANG_COMMIT,
+        help="Exact SGLang commit to install.",
+    ),
 ) -> None:
-    build_and_push(variant.value, image_tag.value, dry_run, dockerfile, push=push, custom_tag=custom_tag)
+    build_and_push(
+        variant.value,
+        image_tag.value,
+        dry_run,
+        dockerfile,
+        push=push,
+        custom_tag=custom_tag,
+        sglang_repo=sglang_repo,
+        sglang_branch=sglang_branch,
+        sglang_commit=sglang_commit,
+    )
 
 
 if __name__ == "__main__":

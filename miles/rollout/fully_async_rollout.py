@@ -80,6 +80,74 @@ def group_queue_entry_weight_version(group: Group) -> int | None:
 
 
 SUBMISSION_VERSION_KEY = "submission_weight_version"
+GROUP_READY_VERSION_KEY = "group_ready_weight_version"
+QUEUE_PUT_VERSION_KEY = "queue_put_weight_version"
+DRAIN_VERSION_KEY = "drain_weight_version"
+
+
+class AppliedWeightVersionTracker:
+    """The version committed after every rollout engine acknowledges finalization."""
+
+    def __init__(self, initial_version: int = 0):
+        self._version = initial_version
+
+    def commit(self, version: int) -> None:
+        if version < self._version:
+            raise ValueError(f"Applied weight version cannot move backwards: current={self._version}, new={version}")
+        self._version = version
+
+    def current(self) -> int:
+        return self._version
+
+
+def stamp_group_weight_version(group: Group, key: str, version: int) -> None:
+    for sample in _iter_samples(group):
+        sample.metadata[key] = version
+
+
+def group_lifecycle_weight_version(group: Group, key: str) -> int | None:
+    versions = [sample.metadata.get(key) for sample in _iter_samples(group)]
+    numeric_versions = [version for version in versions if isinstance(version, int)]
+    if not numeric_versions:
+        return None
+    if len(numeric_versions) != len(versions) or len(set(numeric_versions)) != 1:
+        raise RuntimeError(f"Inconsistent {key} across rollout group: {versions}")
+    return numeric_versions[0]
+
+
+def group_first_prefill_weight_version(group: Group) -> int | None:
+    versions = [version for sample in _iter_samples(group) for version in sample.first_prefill_weight_versions]
+    return min(versions) if versions else None
+
+
+def group_has_mixed_forward_versions(group: Group) -> bool:
+    minimums = [version for sample in _iter_samples(group) for version in sample.min_forward_weight_versions]
+    maximums = [version for sample in _iter_samples(group) for version in sample.max_forward_weight_versions]
+    return bool(minimums and maximums and min(minimums) != max(maximums))
+
+
+def validate_prefill_policy_provenance(group: Group) -> None:
+    fields = (
+        "first_prefill_weight_versions",
+        "min_forward_weight_versions",
+        "max_forward_weight_versions",
+        "last_forward_weight_versions",
+    )
+    for sample in _iter_samples(group):
+        values_by_field = {field: getattr(sample, field) for field in fields}
+        lengths = {len(values) for values in values_by_field.values()}
+        if lengths == {0} or len(lengths) != 1:
+            raise RuntimeError(
+                "SGLang response is missing aligned prefill policy provenance for "
+                f"sample {sample.index}: {values_by_field}. Use the patched SGLang image."
+            )
+        invalid = {
+            field: values for field, values in values_by_field.items() if any(version < 0 for version in values)
+        }
+        if invalid:
+            raise RuntimeError(
+                f"SGLang returned invalid prefill policy provenance for sample {sample.index}: {invalid}"
+            )
 
 
 def stamp_submission_weight_version(group: Group, version: int | None) -> None:
@@ -164,9 +232,7 @@ class _CachedWeightVersion:
         try:
             for endpoint in candidates:
                 try:
-                    data = await asyncio.wait_for(
-                        get(f"{base}{endpoint}"), timeout=WEIGHT_VERSION_QUERY_TIMEOUT_SECS
-                    )
+                    data = await asyncio.wait_for(get(f"{base}{endpoint}"), timeout=WEIGHT_VERSION_QUERY_TIMEOUT_SECS)
                     self._value = int(data["weight_version"])
                     self._endpoint = endpoint
                     self._failures = 0
@@ -190,20 +256,12 @@ class _CachedWeightVersion:
         return self._value
 
     def _warn_on_failure(self, url: str, error: Exception) -> None:
-        """Loud while no version has ever been read, quiet once one has.
-
-        Until the first success there is no reference version, so
-        ``--max-weight-staleness`` silently enforces nothing and no staleness metric
-        is emitted -- a run can look like a staleness arm while training fully
-        on-policy. That is worth a warning every time. After a success the cached
-        value keeps the filter working across a blip, so back off to avoid a warning
-        per group.
-        """
+        """Report missing submission diagnostics without affecting control."""
         if self._value is None:
             logger.warning(
                 f"Cannot read the engine weight version from {url} ({error!r}). "
-                "No staleness metric will be emitted, and --max-weight-staleness (when set) "
-                "cannot be enforced, until this succeeds."
+                "submission_weight_version diagnostics will be absent; drain-side "
+                "staleness control still uses the committed applied-version tracker."
             )
         elif self._failures & (self._failures - 1) == 0:  # 1, 2, 4, 8, ... consecutive
             logger.warning(f"Weight version query failed {self._failures}x, using cached value: {error!r}")
@@ -252,9 +310,7 @@ def _staleness_metrics(values: list[int], bound: int | None) -> dict[str, float]
     # did the pipeline produce a sample this stale".
     for level in range(STALENESS_HISTOGRAM_MAX + 1):
         metrics[f"count_{level}"] = float((array == level).sum())
-    metrics[f"count_ge_{STALENESS_HISTOGRAM_MAX + 1}"] = float(
-        (array > STALENESS_HISTOGRAM_MAX).sum()
-    )
+    metrics[f"count_ge_{STALENESS_HISTOGRAM_MAX + 1}"] = float((array > STALENESS_HISTOGRAM_MAX).sum())
     return metrics
 
 
@@ -274,8 +330,13 @@ class FullyAsyncRolloutFn:
         self._dynamic_filter = load_function(input.args.dynamic_sampling_filter_path)
         self._sample_filter = load_function(input.args.rollout_sample_filter_path)
         self._weight_version = _CachedWeightVersion()
+        self._applied_weight_version = AppliedWeightVersionTracker()
         self._worker: asyncio.Task | None = None
         self._output: asyncio.Queue[tuple[list[Sample], Group]] | None = None
+        self._output_slots: asyncio.Semaphore | None = None
+
+    def commit_applied_weight_version(self, version: int) -> None:
+        self._applied_weight_version.commit(version)
 
     async def __call__(self, input: RolloutFnInput) -> RolloutFnOutput:
         if input.evaluation:
@@ -284,7 +345,8 @@ class FullyAsyncRolloutFn:
                 "miles.rollout.inference_rollout.inference_rollout_common.InferenceRolloutFn"
             )
         if self._worker is None:
-            self._output = asyncio.Queue(maxsize=OUTPUT_QUEUE_MAX_GROUPS)
+            self._output = asyncio.Queue()
+            self._output_slots = asyncio.Semaphore(OUTPUT_QUEUE_MAX_GROUPS)
             self._worker = asyncio.create_task(self._worker_loop())
             logger.info("Started fully-async rollout worker")
         return await self._drain(input.rollout_id)
@@ -292,7 +354,7 @@ class FullyAsyncRolloutFn:
     # -------------------------- producer --------------------------
 
     async def _current_weight_version(self) -> int | None:
-        """The engine weight version, or None if it cannot be read right now.
+        """A cached submission-side diagnostic snapshot from the router.
 
         Guarded because this is now on the submission path as well as the drain,
         and reading it is instrumentation plus bound enforcement -- neither is
@@ -335,6 +397,11 @@ class FullyAsyncRolloutFn:
         # Stamped again on the result: a generate function may return new Sample
         # objects rather than the ones it was handed.
         stamp_submission_weight_version(result, submission_version)
+        stamp_group_weight_version(
+            result,
+            GROUP_READY_VERSION_KEY,
+            self._applied_weight_version.current(),
+        )
         return prompt_group, result
 
     async def _worker_loop(self):
@@ -346,7 +413,14 @@ class FullyAsyncRolloutFn:
             for task in done:
                 # Blocks when the queue is full: training lagging behind rollout
                 # production pauses submission instead of growing the queue unboundedly.
-                await self._output.put(task.result())
+                item = task.result()
+                await self._output_slots.acquire()
+                stamp_group_weight_version(
+                    item[1],
+                    QUEUE_PUT_VERSION_KEY,
+                    self._applied_weight_version.current(),
+                )
+                self._output.put_nowait(item)
 
     # -------------------------- consumer --------------------------
 
@@ -365,7 +439,9 @@ class FullyAsyncRolloutFn:
                     self._worker.result()
                     raise RuntimeError("fully-async rollout worker exited without an exception")
                 if queue_get in done:
-                    return queue_get.result()
+                    result = queue_get.result()
+                    self._output_slots.release()
+                    return result
                 logger.warning(
                     f"No completed rollout groups for {NO_PROGRESS_WARN_SECS}s (queued: {self._output.qsize()})"
                 )
@@ -403,7 +479,9 @@ class FullyAsyncRolloutFn:
         trained_pre_queue: list[int] = []
         trained_in_queue: list[int] = []
         trained_total: list[int] = []
-        current_version: int | None = None
+        current_version = self._applied_weight_version.current()
+        offered_mixed_versions: list[bool] = []
+        trained_mixed_versions: list[bool] = []
         # Generation that was produced and then thrown away. Counted in tokens, not
         # groups, because that is the unit a sample-efficiency claim is made in, and
         # because the three ways to waste generation cost wildly different amounts.
@@ -425,22 +503,41 @@ class FullyAsyncRolloutFn:
                 continue
 
             oldest = group_oldest_weight_version(group)
-            queue_entry = group_queue_entry_weight_version(group)
             submitted = group_submission_weight_version(group)
-            current = await self._current_weight_version()
-            if current is not None:
-                current_version = current
+            ready = group_lifecycle_weight_version(group, GROUP_READY_VERSION_KEY)
+            current = self._applied_weight_version.current()
+            current_version = current
+            stamp_group_weight_version(group, DRAIN_VERSION_KEY, current)
+
+            first_prefill = group_first_prefill_weight_version(group)
+            if args.staleness_reference == "prefill":
+                validate_prefill_policy_provenance(group)
+                first_prefill = group_first_prefill_weight_version(group)
+                assert first_prefill is not None
+
+            mixed_version = group_has_mixed_forward_versions(group)
+            offered_mixed_versions.append(mixed_version)
 
             # Which end of generation the bound is measured from. `completion` keeps
             # the historical behaviour -- the gap covers queue residency but not the
             # updates a generation crossed. `submission` bounds the whole off-policy
             # distance, the quantity logged as `staleness/total`.
-            reference = oldest if args.staleness_reference == "completion" else submitted
+            if args.staleness_reference == "completion":
+                reference = oldest
+            elif args.staleness_reference == "submission":
+                reference = submitted
+            else:
+                reference = first_prefill
 
             group_bound_staleness: int | None = None
             if args.max_weight_staleness is not None:
-                if reference is not None and current is not None:
+                if reference is not None:
                     staleness = current - reference
+                    if staleness < 0:
+                        raise RuntimeError(
+                            f"Negative weight staleness: current={current}, reference={reference}, "
+                            f"mode={args.staleness_reference}"
+                        )
                     group_bound_staleness = staleness
                     offered_bound_staleness.append(staleness)
                     if staleness > args.max_weight_staleness:
@@ -455,10 +552,21 @@ class FullyAsyncRolloutFn:
 
             # Not gated on the bound: the bound tests one derived quantity, and every
             # arm -- including an unbounded one -- needs the decomposition.
-            have_span = queue_entry is not None and submitted is not None
-            group_pre_queue = queue_entry - submitted if have_span else None
-            group_in_queue = current - queue_entry if current is not None and queue_entry is not None else None
-            group_total = current - submitted if current is not None and submitted is not None else None
+            span_start = first_prefill if args.staleness_reference == "prefill" else submitted
+            have_span = ready is not None and span_start is not None
+            group_pre_queue = ready - span_start if have_span else None
+            group_in_queue = current - ready if have_span else None
+            group_total = current - span_start if have_span else None
+            for name, value in (
+                ("pre_queue", group_pre_queue),
+                ("in_queue", group_in_queue),
+                ("total", group_total),
+            ):
+                if value is not None and value < 0:
+                    raise RuntimeError(
+                        f"Negative {name} weight staleness for group: start={span_start}, "
+                        f"ready={ready}, drain={current}"
+                    )
 
             filter_output = call_dynamic_filter(self._dynamic_filter, args, group)
             if not filter_output.keep:
@@ -483,6 +591,7 @@ class FullyAsyncRolloutFn:
                 trained_in_queue.append(group_in_queue)
             if group_total is not None:
                 trained_total.append(group_total)
+            trained_mixed_versions.append(mixed_version)
             data.append(group)
 
         sample = _first_sample(data[-1])
@@ -516,14 +625,16 @@ class FullyAsyncRolloutFn:
             # this version, and without it a missing staleness metric is impossible to
             # tell apart from a router that never answered.
             metrics["rollout/fully_async/current_weight_version"] = current_version
+        if offered_mixed_versions:
+            metrics["staleness/mixed_version_frac/rollout"] = sum(offered_mixed_versions) / len(offered_mixed_versions)
+        if trained_mixed_versions:
+            metrics["staleness/mixed_version_frac/train"] = sum(trained_mixed_versions) / len(trained_mixed_versions)
         # `rollout/fully_async/{avg,max}_staleness` are upstream's and keep
         # upstream's meaning: the lag as *offered*, counted before the bound check.
         # Redefining them to the trained lag would leave two miles runs plotting
         # the same key against different quantities.
         if offered_bound_staleness:
-            metrics["rollout/fully_async/avg_staleness"] = sum(offered_bound_staleness) / len(
-                offered_bound_staleness
-            )
+            metrics["rollout/fully_async/avg_staleness"] = sum(offered_bound_staleness) / len(offered_bound_staleness)
             metrics["rollout/fully_async/max_staleness"] = max(offered_bound_staleness)
 
         # The decomposition, over the trained batch. `total` is the quantity a
@@ -539,8 +650,7 @@ class FullyAsyncRolloutFn:
         ):
             if values:
                 metrics |= {
-                    f"staleness/{name}/{key}": value
-                    for key, value in _staleness_metrics(values, None).items()
+                    f"staleness/{name}/{key}": value for key, value in _staleness_metrics(values, None).items()
                 }
 
         # What the bound actually tests, which depends on `--staleness-reference`:
@@ -560,9 +670,7 @@ class FullyAsyncRolloutFn:
         if offered_bound_staleness:
             metrics |= {
                 f"staleness/bound/rollout/{name}": value
-                for name, value in _staleness_metrics(
-                    offered_bound_staleness, args.max_weight_staleness
-                ).items()
+                for name, value in _staleness_metrics(offered_bound_staleness, args.max_weight_staleness).items()
             }
 
         # Named for the reason rather than the mechanism: `stale_groups_recycled`
@@ -574,6 +682,7 @@ class FullyAsyncRolloutFn:
         # `staleness/bound/*` means a different quantity under each reference, so the
         # choice is logged next to it rather than left to the run config.
         metrics["staleness/bound_reference_is_submission"] = float(args.staleness_reference == "submission")
+        metrics["staleness/bound_reference_is_prefill"] = float(args.staleness_reference == "prefill")
 
         # Rejecting more groups than were kept means the bound is not being met by
         # regenerating, which `--staleness-reference submission` makes reachable:

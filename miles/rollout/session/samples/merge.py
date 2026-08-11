@@ -126,8 +126,7 @@ def _compute_sample_from_openai_record(
     if args.sglang_speculative_algorithm:
         sample.spec_info.add(choice.get("meta_info", {}))
     sample.prefix_cache_info.add(choice.get("meta_info", {}))
-    if "weight_version" in choice["meta_info"]:
-        sample.weight_versions.append(choice["meta_info"]["weight_version"])
+    sample.update_policy_version_from_meta_info(choice["meta_info"])
 
     return sample
 

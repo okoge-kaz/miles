@@ -631,7 +631,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 "--staleness-reference",
                 type=str,
                 default="completion",
-                choices=["completion", "submission"],
+                choices=["completion", "submission", "prefill"],
                 help=(
                     "Which end of generation --max-weight-staleness is measured from. "
                     "'completion' (default) uses the group's oldest completed weight version, so "
@@ -639,7 +639,9 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "generation, and 0 does not imply on-policy. 'submission' uses the version the "
                     "group was submitted under, so a bound of N allows N older policy versions end "
                     "to end (the quantity logged as staleness/total) and 0 is genuinely on-policy. "
-                    "Both are logged either way; this only selects what is enforced."
+                    "'prefill' uses the scheduler-authoritative version at the first "
+                    "prefill forward and requires the patched SGLang provenance metadata. "
+                    "All references remain available for historical reproduction."
                 ),
             )
             parser.add_argument(

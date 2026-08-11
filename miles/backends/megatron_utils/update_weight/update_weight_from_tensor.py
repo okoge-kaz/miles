@@ -189,6 +189,12 @@ class UpdateWeightFromTensor:
         out = self.__dict__.pop("update_weight_metrics", {})
         return out
 
+    def _all_rollout_engines(self) -> list[ActorHandle]:
+        engines = list(self.rollout_engines)
+        if self.use_distribute:
+            engines.extend(self.distributed_rollout_engines)
+        return engines
+
     @torch.no_grad()
     def update_weights(self) -> None:
         """
@@ -211,11 +217,16 @@ class UpdateWeightFromTensor:
         )
 
         if rank == 0:
+            all_rollout_engines = self._all_rollout_engines()
             mode = self.args.pause_generation_mode
-            ray.get([engine.pause_generation.remote(mode=mode) for engine in self.rollout_engines])
-            ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
+            ray.get([engine.pause_generation.remote(mode=mode) for engine in all_rollout_engines])
+            ray.get([engine.flush_cache.remote() for engine in all_rollout_engines])
             if not skip_base_sync:
-                begin_weight_update(self.rollout_engines, weight_update_selector(self.args))
+                begin_weight_update(
+                    all_rollout_engines,
+                    weight_update_selector(self.args),
+                    self.weight_version,
+                )
         dist.barrier(group=get_gloo_group())
 
         megatron_local_weights = self.weights_getter()
@@ -257,10 +268,12 @@ class UpdateWeightFromTensor:
         dist.barrier(group=get_gloo_group())
 
         if rank == 0:
+            all_rollout_engines = self._all_rollout_engines()
             # Skip when no fresh base bytes landed (skip_base_sync).
             if not skip_base_sync:
-                end_weight_update(self.rollout_engines)
-            ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
+                end_weight_update(all_rollout_engines)
+                ray.get(self.rollout_manager.set_applied_weight_version.remote(self.weight_version))
+            ray.get([engine.continue_generation.remote() for engine in all_rollout_engines])
         dist.barrier(group=get_gloo_group())
 
     def _send_base_params(self, hf_named_tensors) -> tuple[list[ObjectRef], Any]:
