@@ -179,8 +179,10 @@ Before submitting:
 
 While running, the questions worth asking are about learning, not speed:
 `dump/zero_std_group_frac` climbing means the batch is losing gradient signal;
-`dump/mixed_version_frac` is the staleness that matters in async runs; a gap
-opening between AIME-2024 and AIME-2025 means memorisation rather than learning.
+`staleness/total/*` is the staleness that matters in async runs
+(**not** `dump/mixed_version_frac`, which is structurally 0 for single-turn
+fully-async — see `notes/telemetry.md`); a gap opening between AIME-2024 and
+AIME-2025 means memorisation rather than learning.
 
 ## Handing the command to someone else
 

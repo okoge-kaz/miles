@@ -9,7 +9,7 @@
 #     experiments/staleness_ratio_sweep.sh --ratio 1:7,2:6  # one pair of columns
 #     experiments/staleness_ratio_sweep.sh --check
 #
-# Unlike node_ratio_sweep.sh, the bound here is *enforced*, not parked at 64: the
+# Unlike realized_staleness_sweep.sh, the bound here is *enforced*, not parked at 64: the
 # question is what balance each bound wants, so the recycling it causes is part
 # of the measurement rather than something to keep out of it.
 #
@@ -28,6 +28,10 @@ LOG_DIR="${OUTPUT_DIR}/training/math/dapo-math-p10-90/qwen3-4b-instruct-2507"
 : "${TOTAL_NODES:=8}"
 : "${RATIOS:=1:7 2:6 3:5 4:4}"      # train:rollout, in nodes
 : "${STALENESS_LEVELS:=1 2 4 8}"
+# The bound is enforced here, so the reference decides what it is enforced *on*:
+# `submission` bounds the whole off-policy distance (staleness/total), which
+# includes the updates a generation crossed. See notes/telemetry.md.
+: "${STALENESS_REFERENCE:=submission}"
 : "${ROLLOUT_SEED:=42}"
 : "${LR:=1e-6}"
 : "${IS_CORRECTION:=tis}"
@@ -104,6 +108,7 @@ ckpt_path_of() {  # staleness config_tag
         ROLLOUT_BATCH_SIZE=192 N_SAMPLES_PER_PROMPT=16 GLOBAL_BATCH_SIZE="${GBS}"
         NUM_STEPS_PER_ROLLOUT=1 MAX_RESPONSE_LEN=32768 LR="${LR}"
         MAX_WEIGHT_STALENESS=$1 PAUSE_GENERATION_MODE=in_place
+        STALENESS_REFERENCE="${STALENESS_REFERENCE}"
         TRAIN_SEED=1234 ROLLOUT_SEED="${ROLLOUT_SEED}" RUN_NAME=$2 CONFIG_TAG=$2
         source "${REPO_ROOT}/experiments/common/run_identity.sh" >/dev/null
         printf '%s\n' "${CKPT_PATH}"
@@ -155,12 +160,12 @@ import ast, re, sys, pathlib
 # The last rollout's values: the queue needs several rollouts to reach its depth,
 # so an average over the run mixes the fill-up with the steady state.
 KEYS = [
-    ("staleness/train/mean", "train_mean"),
-    ("staleness/train/p90", "train_p90"),
-    ("staleness/train/max", "train_max"),
-    ("staleness/train/frac_at_bound", "at_bound"),
-    ("staleness/rollout/mean", "rollout_mean"),
-    ("staleness/rollout/max", "rollout_max"),
+    ("staleness/total/mean", "total_mean"),
+    ("staleness/pre_queue/mean", "pre_queue_mean"),
+    ("staleness/in_queue/mean", "in_queue_mean"),
+    ("staleness/bound/train/frac_at_bound", "at_bound"),
+    ("staleness/bound/rollout/mean", "bound_offered_mean"),
+    ("staleness/bound/rollout/max", "bound_offered_max"),
     ("rollout/fully_async/queue_size", "queue"),
     ("rollout/fully_async/stale_groups_recycled", "recycled"),
     ("rollout/fully_async/wasted_token_frac", "wasted"),
@@ -192,9 +197,21 @@ printf 'lr %s, %s, %d nodes per job, %s wall, rseed %s\n' \
     "${LR}" "${IS_CORRECTION}" "${TOTAL_NODES}" "${WALL}" "${ROLLOUT_SEED}"
 printf 'wandb project %s\n' "${WANDB_PROJECT}"
 printf 'NUM_ROLLOUT unset: the recipe default stands, so the wall stops each job and\n'
-printf 'the run stays resumable. gbs %s, tp %s, cp %s; the bound is enforced, so\n' \
+printf 'the run stays resumable. gbs %s, tp %s, cp %s; the bound is enforced on\n' \
     "${GBS}" "${TP}" "${CP}"
-printf 'recycling is part of the result.\n\n'
+printf '%s, so recycling is part of the result.\n' "${STALENESS_REFERENCE}"
+if [[ "${STALENESS_REFERENCE}" == submission ]]; then
+    printf '\ns=N allows N older policy versions end to end (NeMo-RL max_trajectory_age_steps),\n'
+    printf 'and s=0 is genuinely on-policy -- neither holds under completion.\n'
+    printf '\nThe same N is STRICTLY TIGHTER than it was: C-oldest <= C-S always, so this\n'
+    printf 'rejects a superset of what completion rejected at the same threshold. Under\n'
+    printf 'the looser definition s=1 already discarded ~25%% of the tokens it generated\n'
+    printf 'and stayed rollout-bound (jobs 15288337/15288347, notes/off-policy-variables.md).\n'
+    printf 'Expect at least that here; watch wasted_token_frac and staleness/pre_queue.\n'
+    printf 'It does not hang -- a stalled drain freezes the weight version -- it just\n'
+    printf 'spends the allocation regenerating.\n'
+fi
+printf '\n'
 
 printf '  %-3s %-3s %-3s %-5s %-5s %-9s %s\n' s T R dp gbs/dp place "checkpoint state"
 while read -r s t r dp; do
@@ -253,7 +270,7 @@ while read -r s t r dp; do
         --job-name="${name}" \
         --nodes="${TOTAL_NODES}" --time="${WALL}" \
         --output="${LOG_DIR}/${name}-%j.log" \
-        --export="ALL,WANDB_PROJECT=${WANDB_PROJECT},RUN_NAME=${name},CONFIG_TAG=${name},LR=${LR},MAX_WEIGHT_STALENESS=${s},PAUSE_GENERATION_MODE=in_place,ACTOR_NUM_NODES=${t},ROLLOUT_NUM_GPUS=$(( r * GPN )),ROLLOUT_SEED=${ROLLOUT_SEED},IS_CORRECTION=${IS_CORRECTION},TIS_CLIP=${TIS_CLIP},TIS_CLIP_LOW=${TIS_CLIP_LOW},RATIO_DENOMINATOR=${RATIO_DENOMINATOR}" \
+        --export="ALL,WANDB_PROJECT=${WANDB_PROJECT},RUN_NAME=${name},CONFIG_TAG=${name},LR=${LR},MAX_WEIGHT_STALENESS=${s},STALENESS_REFERENCE=${STALENESS_REFERENCE},PAUSE_GENERATION_MODE=in_place,ACTOR_NUM_NODES=${t},ROLLOUT_NUM_GPUS=$(( r * GPN )),ROLLOUT_SEED=${ROLLOUT_SEED},IS_CORRECTION=${IS_CORRECTION},TIS_CLIP=${TIS_CLIP},TIS_CLIP_LOW=${TIS_CLIP_LOW},RATIO_DENOMINATOR=${RATIO_DENOMINATOR}" \
         "${REPO_ROOT}/${RECIPE}")
     printf '%s  s=%-2s T=%s R=%s  dp%-3s\n' "${jid}" "${s}" "${t}" "${r}" "${dp}"
 done < <(points)

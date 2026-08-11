@@ -33,10 +33,29 @@ changes buffer depth, which changes everyone else's lag. The steady state under 
 cap is a different dynamical system, not a censored view of the same one.
 Whatever an s=2 run reports as its lag distribution, it is not the natural one.
 
-Pass `MAX_WEIGHT_STALENESS=64`, not nothing. `fully_async_rollout.py:306` guards
-the whole block on `max_weight_staleness is not None`, so leaving it unset skips
-the measurement along with the enforcement. 64 is far above anything observed and
-never binds, so it measures without acting.
+Pass `MAX_WEIGHT_STALENESS=64`, not nothing. `fully_async_rollout.py:407` guards
+`staleness/bound/{rollout,train}/*` on `max_weight_staleness is not None`, so
+leaving it unset means no record of what the cap would have seen. 64 is far above
+anything observed and never binds, so it measures without acting.
+(`staleness/{total,pre_queue,in_queue}/*` are not gated this way -- see
+`notes/telemetry.md`, "Staleness is measured from the completion version".)
+
+`experiments/realized_staleness_sweep.sh` runs this pass (renamed from
+`node_ratio_sweep.sh`, whose name described the axis rather than the readout). It
+has two modes:
+
+| mode | shape | answers |
+|---|---|---|
+| `--mode verify` (default) | one 4 h job per ratio, 12 rollouts, 2 seeds, no checkpoints | the steady-state lag at a fixed response length |
+| `--mode convergence` | chained 4 h jobs to 300 rollouts, 1 seed, plus one colocated on-policy arm | what the lag *settles* at once training has lengthened responses |
+
+The reference stays at `completion` here: with the cap parked at 64 it never
+binds, so it only picks which quantity `staleness/bound/*` mirrors. The
+readout is `staleness/{total,pre_queue,in_queue}`, which is not gated on it.
+`staleness_ratio_sweep.sh` is where the reference changes behaviour.
+
+`verify` is the one to run first. `convergence` costs four figures in node-hours
+and only earns them once `verify` has shown the ratios differ.
 
 Run it at every candidate split, because the answer is per-split: more rollout
 capacity means a deeper buffer means more lag. That relationship is itself a
@@ -231,7 +250,7 @@ Two consequences:
   Reaching further up the staleness axis means editing the constant — it is not
   a CLI flag — or shrinking `rollout_batch_size`.
 - **A full queue is idle rollout GPUs.** `await self._output.put(...)`
-  (`fully_async_rollout.py:268`) blocks the producer, so past R=5 the extra
+  (`fully_async_rollout.py:329`) blocks the producer, so past R=5 the extra
   rollout nodes are throttled by backpressure rather than generating. That is
   the same ceiling "Choosing R" reaches from the `train_wait_time` side.
 
@@ -289,7 +308,7 @@ run, which split does that bound want?
   fail 100 s into an 8-node allocation instead.
 
 Read out `step_s` and `tok/s/gpu` from `--check` (`analyze_throughput.py`)
-against `staleness/train/mean`, `staleness/train/frac_at_bound`,
+against `staleness/bound/train/mean`, `staleness/bound/train/frac_at_bound`,
 `stale_groups_recycled` and `wasted_token_frac` from the same table. A split that
 wins on `step_s` while recycling a third of its generation has not won.
 
@@ -297,7 +316,7 @@ wins on `step_s` while recycling a third of its generation has not won.
 at `(1000 + 192)/192 ~ 6.2` at k=1 (see the queue-ceiling section above), so a
 bound of 8 can never bite: that row measures the natural lag of each split and is
 the unbounded reference, not a point on the bound axis. Expect
-`stale_groups_recycled` 0 and `staleness/train/frac_at_bound` 0 there; if either is non-zero,
+`stale_groups_recycled` 0 and `staleness/bound/train/frac_at_bound` 0 there; if either is non-zero,
 the ceiling arithmetic or the batch shape has changed and both notes need
 revisiting.
 

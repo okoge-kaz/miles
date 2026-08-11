@@ -33,14 +33,19 @@
 
 case "${PLACEMENT}" in
     colocated)
-        # Neither flag exists on this path; a non-default value would be silently dropped.
-        [[ "${MAX_WEIGHT_STALENESS:-0}" == 0 && "${PAUSE_GENERATION_MODE:-none}" == none ]] ||
-            { echo "PLACEMENT=colocated cannot carry MAX_WEIGHT_STALENESS/PAUSE_GENERATION_MODE" >&2; exit 1; }
+        # None of these flags exist on this path; a non-default value would be silently dropped.
+        [[ "${MAX_WEIGHT_STALENESS:-0}" == 0 && "${PAUSE_GENERATION_MODE:-none}" == none \
+           && "${STALENESS_REFERENCE:-completion}" == completion ]] ||
+            { echo "PLACEMENT=colocated cannot carry MAX_WEIGHT_STALENESS/PAUSE_GENERATION_MODE/STALENESS_REFERENCE" >&2; exit 1; }
         MAX_WEIGHT_STALENESS=0
         PAUSE_GENERATION_MODE=none
+        STALENESS_REFERENCE=completion
         ;;
     async)
         : "${MAX_WEIGHT_STALENESS:?}"
+        : "${STALENESS_REFERENCE:=completion}"
+        [[ "${STALENESS_REFERENCE}" == completion || "${STALENESS_REFERENCE}" == submission ]] ||
+            { echo "STALENESS_REFERENCE must be completion or submission, got '${STALENESS_REFERENCE}'" >&2; exit 1; }
         ;;
     *)
         echo "PLACEMENT must be colocated or async, got '${PLACEMENT}'" >&2
@@ -94,7 +99,11 @@ if awk "BEGIN{exit !(${KL_LOSS_COEF} != 0)}"; then
 fi
 
 CONFIG_TAG="${CONFIG_TAG:-rollout-length-$(( MAX_RESPONSE_LEN / 1024 ))k-lr${LR}-rbs${ROLLOUT_BATCH_SIZE}-gbs${GLOBAL_BATCH_SIZE}-n${N_SAMPLES_PER_PROMPT}-tseed${TRAIN_SEED}-rseed${ROLLOUT_SEED}}"
+# Suffixed only away from the default, so paths written before the option existed
+# keep their spelling. The reference decides which groups are recycled, so two runs
+# that differ only here are different runs and must not share a directory.
 STALENESS_TAG="max-weight-staleness-${MAX_WEIGHT_STALENESS}"
+[[ "${STALENESS_REFERENCE:-completion}" == completion ]] || STALENESS_TAG="${STALENESS_TAG}-from-${STALENESS_REFERENCE}"
 
 # RUN_NAME is the wandb group and the log directory, not a path. It shows the
 # axes this study varies and closes over the rest with a hash; the full identity

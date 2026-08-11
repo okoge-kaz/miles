@@ -220,9 +220,15 @@ def lag_from_weight_versions(records: list[dict[str, Any]]) -> list[dict[str, fl
     cannot produce percentiles, and it silently reads zero whenever the batch
     happens to contain no fresh sample. The exact per-batch mean is
     ``rollout/fully_async/avg_staleness``, which miles only computes when
-    ``--max-weight-staleness`` is set (``fully_async_rollout.py:202``) -- run the
+    ``--max-weight-staleness`` is set (``fully_async_rollout.py:407``) -- run the
     unbounded arm with a bound so large it never binds rather than unset, or this
     is all there is.
+
+    All of the above is *queue residency*: it is a difference against the version
+    a sample finished generating under, so it contains no part of a weight update
+    crossed mid-generation. ``staleness/total/*`` is the whole distance
+    and is not gated on the bound; see ``notes/telemetry.md``, "Staleness is
+    measured from the completion version".
     """
     rows = []
     running_max = None

@@ -48,6 +48,7 @@ ROLLOUT_ARGS=(
    --num-steps-per-rollout "${NUM_STEPS_PER_ROLLOUT}"
    --balance-data
    --max-weight-staleness "${MAX_WEIGHT_STALENESS}"
+   --staleness-reference "${STALENESS_REFERENCE}"
    --pause-generation-mode "${PAUSE_GENERATION_MODE}"
 )
 if [[ -n "${ASYNC_MAX_CONCURRENT_SAMPLES:-}" ]]; then

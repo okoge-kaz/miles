@@ -36,7 +36,12 @@ NO_PROGRESS_WARN_SECS = 30.0
 WEIGHT_VERSION_QUERY_TIMEOUT_SECS = 2.0
 # Realized lag is a small integer; anything past this goes in one overflow bucket
 # so the metric count stays bounded no matter how far behind a run drifts.
-STALENESS_HISTOGRAM_MAX = 8
+#
+# 16, not 8: `staleness/total` is unbounded whenever the bound is not enforced on
+# it -- `--staleness-reference completion`, or the parked bound the node-ratio
+# sweep uses -- and that is exactly the run whose tail decides how staleness maps
+# to downstream score. At 8 the tail collapsed into one overflow bucket.
+STALENESS_HISTOGRAM_MAX = 16
 
 # A finished group is list[Sample], or list[list[Sample]] when a generate function
 # returns multiple samples per trajectory (e.g. multi-agent).
@@ -58,6 +63,50 @@ def _first_sample(group: Group) -> Sample:
 def group_oldest_weight_version(group: Group) -> int | None:
     """Return the minimum weight version across all trajectories and turns in a group."""
     versions = [v for s in _iter_samples(group) if (v := s.oldest_weight_version) is not None]
+    return min(versions) if versions else None
+
+
+def group_queue_entry_weight_version(group: Group) -> int | None:
+    """Return the version the group became available to the trainer under.
+
+    The **maximum**, not the minimum. A group is one concurrent request per
+    sample joined by ``asyncio.gather`` (``inference_rollout_common.py:137-146``),
+    so it enters the output queue when its *slowest* sample lands. Taking the
+    minimum would charge a straggler that crossed a weight update to in-queue
+    staleness, when it is the defining case of pre-queue staleness.
+    """
+    versions = [v for s in _iter_samples(group) if (v := s.newest_weight_version) is not None]
+    return max(versions) if versions else None
+
+
+SUBMISSION_VERSION_KEY = "submission_weight_version"
+
+
+def stamp_submission_weight_version(group: Group, version: int | None) -> None:
+    """Record the version the engines were serving when generation started.
+
+    SGLang builds ``meta_info["weight_version"]`` from ``server_args.weight_version``
+    while handling a batch-output message (``tokenizer_manager.py:1982`` in
+    0.5.17.dev32+g3fe50ed, the build in the image), and ``Req`` carries no version
+    of its own, so there is nothing to snapshot at arrival: ``Sample.weight_versions``
+    only ever holds the version a turn *finished* under. Under
+    ``--pause-generation-mode in_place`` a request is frozen across a weight
+    update and resumed on the same KV cache: one response, no retraction, so
+    ``num_retractions`` is zero too and nothing in the reply records that the
+    sample spans versions. This stamp is the other end of that interval.
+
+    Survives ``reset_for_retry`` (``types.py:240-249`` keeps ``metadata``), which
+    is harmless because every submission re-stamps.
+    """
+    if version is None:
+        return
+    for sample in _iter_samples(group):
+        sample.metadata[SUBMISSION_VERSION_KEY] = version
+
+
+def group_submission_weight_version(group: Group) -> int | None:
+    """Return the weight version stamped on the group when it was submitted."""
+    versions = [v for s in _iter_samples(group) if isinstance(v := s.metadata.get(SUBMISSION_VERSION_KEY), int)]
     return min(versions) if versions else None
 
 
@@ -87,12 +136,23 @@ class _CachedWeightVersion:
         self._last_query = float("-inf")
         self._failures = 0
         self._endpoint: str | None = None
+        self._lock = asyncio.Lock()
 
     async def get(self, args) -> int | None:
         # Throttles failures too: the drain queries once per group, and an unreachable
         # router would otherwise cost every one of them the full timeout.
         if (time.monotonic() - self._last_query) < self._ttl:
             return self._value
+        async with self._lock:
+            # Re-checked after the wait, because the submission side calls this from
+            # every in-flight group concurrently: the first fill starts
+            # `_max_in_flight_groups` tasks in one batch, and without single-flight
+            # each would put its own /model_info request on the router.
+            if (time.monotonic() - self._last_query) < self._ttl:
+                return self._value
+            return await self._query(args)
+
+    async def _query(self, args) -> int | None:
         base = f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
         # Remembered name first, then the rest: preferring it costs nothing, and
         # keeping the others behind it means a router replaced under a resumed run
@@ -142,8 +202,8 @@ class _CachedWeightVersion:
         if self._value is None:
             logger.warning(
                 f"Cannot read the engine weight version from {url} ({error!r}). "
-                "--max-weight-staleness cannot be enforced and no staleness metric will be "
-                "emitted until this succeeds."
+                "No staleness metric will be emitted, and --max-weight-staleness (when set) "
+                "cannot be enforced, until this succeeds."
             )
         elif self._failures & (self._failures - 1) == 0:  # 1, 2, 4, 8, ... consecutive
             logger.warning(f"Weight version query failed {self._failures}x, using cached value: {error!r}")
@@ -231,6 +291,22 @@ class FullyAsyncRolloutFn:
 
     # -------------------------- producer --------------------------
 
+    async def _current_weight_version(self) -> int | None:
+        """The engine weight version, or None if it cannot be read right now.
+
+        Guarded because this is now on the submission path as well as the drain,
+        and reading it is instrumentation plus bound enforcement -- neither is
+        worth killing generation over. An uncaught error here would reach
+        ``_worker_loop``'s ``task.result()`` and take the whole rollout down.
+        ``_CachedWeightVersion`` stamps its query time in a ``finally``, so a
+        persistent failure costs one log line per TTL, not one per group.
+        """
+        try:
+            return await self._weight_version.get(self.args)
+        except Exception as e:  # noqa: BLE001 - degrade, never stop generating
+            logger.warning(f"Weight version unreadable, staleness not measured for this group: {e!r}")
+            return None
+
     def _max_in_flight_groups(self) -> int:
         if (x := self.args.async_max_concurrent_samples) is not None:
             # Whole groups are submitted, so the sample budget floors to a group count.
@@ -248,12 +324,17 @@ class FullyAsyncRolloutFn:
         trajectory into several samples, and ``generate_and_rm_group`` does not accept
         that shape back.
         """
+        submission_version = await self._current_weight_version()
+        stamp_submission_weight_version(prompt_group, submission_version)
         result = await generate_and_rm_group(
             self.state,
             prompt_group,
             sampling_params=self.state.sampling_params.copy(),
             evaluation=False,
         )
+        # Stamped again on the result: a generate function may return new Sample
+        # objects rather than the ones it was handed.
+        stamp_submission_weight_version(result, submission_version)
         return prompt_group, result
 
     async def _worker_loop(self):
@@ -302,14 +383,26 @@ class FullyAsyncRolloutFn:
         stale_groups_recycled = 0
         # Two populations, because they answer different questions and only one of
         # them is the study's variable. ``offered`` (logged as
-        # ``staleness/rollout/``) is every group the pipeline handed over,
+        # ``staleness/bound/rollout/``) is every group the pipeline handed over,
         # including those the bound then sent back -- that is the *natural* lag of
-        # this node ratio. ``trained`` (``staleness/train/``) is what survived into
+        # this node ratio. ``trained`` (``staleness/bound/train/``) is what survived into
         # the batch, and is what the loss actually saw. They diverge where the
         # bound bites and where the dynamic filter drops a group, which is where a
         # reader is most likely to be misled.
-        trained_staleness: list[int] = []
-        offered_staleness: list[int] = []
+        # What `--max-weight-staleness` is tested against, in its two populations.
+        # This is `current - oldest`, which is neither of the two components below:
+        # it is in-queue staleness plus however far the group's samples spread
+        # across versions among themselves.
+        trained_bound_staleness: list[int] = []
+        offered_bound_staleness: list[int] = []
+        # The decomposition. Per group, with S the version at submission, Q the
+        # version the group entered the queue under, and C the version at drain:
+        #   pre-queue = Q - S   updates crossed while generating
+        #   in-queue  = C - Q   updates crossed while waiting to be trained on
+        #   total     = C - S   = pre-queue + in-queue
+        trained_pre_queue: list[int] = []
+        trained_in_queue: list[int] = []
+        trained_total: list[int] = []
         current_version: int | None = None
         # Generation that was produced and then thrown away. Counted in tokens, not
         # groups, because that is the unit a sample-efficiency claim is made in, and
@@ -331,25 +424,41 @@ class FullyAsyncRolloutFn:
                 aborted_groups_recycled += 1
                 continue
 
-            group_staleness: int | None = None
+            oldest = group_oldest_weight_version(group)
+            queue_entry = group_queue_entry_weight_version(group)
+            submitted = group_submission_weight_version(group)
+            current = await self._current_weight_version()
+            if current is not None:
+                current_version = current
+
+            # Which end of generation the bound is measured from. `completion` keeps
+            # the historical behaviour -- the gap covers queue residency but not the
+            # updates a generation crossed. `submission` bounds the whole off-policy
+            # distance, the quantity logged as `staleness/total`.
+            reference = oldest if args.staleness_reference == "completion" else submitted
+
+            group_bound_staleness: int | None = None
             if args.max_weight_staleness is not None:
-                oldest = group_oldest_weight_version(group)
-                current = await self._weight_version.get(args)
-                if current is not None:
-                    current_version = current
-                if oldest is not None and current is not None:
-                    staleness = current - oldest
-                    group_staleness = staleness
-                    offered_staleness.append(staleness)
+                if reference is not None and current is not None:
+                    staleness = current - reference
+                    group_bound_staleness = staleness
+                    offered_bound_staleness.append(staleness)
                     if staleness > args.max_weight_staleness:
                         stale_tokens += group_response_tokens(group)
                         self._recycle(prompt_group)
                         stale_groups_recycled += 1
                         logger.info(
-                            f"Recycled stale group (oldest_version={oldest}, current={current}, "
-                            f"staleness={staleness} > max={args.max_weight_staleness})"
+                            f"Recycled stale group ({args.staleness_reference}_version={reference}, "
+                            f"current={current}, staleness={staleness} > max={args.max_weight_staleness})"
                         )
                         continue
+
+            # Not gated on the bound: the bound tests one derived quantity, and every
+            # arm -- including an unbounded one -- needs the decomposition.
+            have_span = queue_entry is not None and submitted is not None
+            group_pre_queue = queue_entry - submitted if have_span else None
+            group_in_queue = current - queue_entry if current is not None and queue_entry is not None else None
+            group_total = current - submitted if current is not None and submitted is not None else None
 
             filter_output = call_dynamic_filter(self._dynamic_filter, args, group)
             if not filter_output.keep:
@@ -366,8 +475,14 @@ class FullyAsyncRolloutFn:
                 )
                 do_print = False
 
-            if group_staleness is not None:
-                trained_staleness.append(group_staleness)
+            if group_bound_staleness is not None:
+                trained_bound_staleness.append(group_bound_staleness)
+            if group_pre_queue is not None:
+                trained_pre_queue.append(group_pre_queue)
+            if group_in_queue is not None:
+                trained_in_queue.append(group_in_queue)
+            if group_total is not None:
+                trained_total.append(group_total)
             data.append(group)
 
         sample = _first_sample(data[-1])
@@ -405,32 +520,81 @@ class FullyAsyncRolloutFn:
         # upstream's meaning: the lag as *offered*, counted before the bound check.
         # Redefining them to the trained lag would leave two miles runs plotting
         # the same key against different quantities.
-        if offered_staleness:
-            metrics["rollout/fully_async/avg_staleness"] = sum(offered_staleness) / len(offered_staleness)
-            metrics["rollout/fully_async/max_staleness"] = max(offered_staleness)
+        if offered_bound_staleness:
+            metrics["rollout/fully_async/avg_staleness"] = sum(offered_bound_staleness) / len(
+                offered_bound_staleness
+            )
+            metrics["rollout/fully_async/max_staleness"] = max(offered_bound_staleness)
 
-        # Two populations, named for the side they describe. `staleness/rollout/`
-        # is what the pipeline produced, counted before the bound check;
-        # `staleness/train/` is what survived into the batch and is what the loss
-        # saw. Both are subgroups, so neither is the one a reader lands on by
-        # default -- an unprefixed `staleness/mean` used to be the trained lag and
-        # read like a total.
-        if trained_staleness:
+        # The decomposition, over the trained batch. `total` is the quantity a
+        # staleness claim is about -- policy versions between the first token and
+        # the update that trains on it -- and the two components say where it came
+        # from: `pre_queue` is generation (straggler-driven), `in_queue` is waiting.
+        # `frac_at_bound` is absent from all three: `--max-weight-staleness` is not
+        # applied to any of them, see `staleness/bound/` below.
+        for name, values in (
+            ("total", trained_total),
+            ("pre_queue", trained_pre_queue),
+            ("in_queue", trained_in_queue),
+        ):
+            if values:
+                metrics |= {
+                    f"staleness/{name}/{key}": value
+                    for key, value in _staleness_metrics(values, None).items()
+                }
+
+        # What the bound actually tests, which depends on `--staleness-reference`:
+        #
+        #   completion (default)  current - oldest  = in_queue + the group's internal
+        #                         version spread. Not `in_queue`, and not `total`.
+        #   submission            current - S       = `total` exactly.
+        #
+        # Kept under its own name because it is the only quantity that explains which
+        # groups were recycled, in the two populations the bound separates: `rollout`
+        # is every group offered, counted before the check; `train` is what survived.
+        if trained_bound_staleness:
             metrics |= {
-                f"staleness/train/{name}": value
-                for name, value in _staleness_metrics(trained_staleness, args.max_weight_staleness).items()
+                f"staleness/bound/train/{name}": value
+                for name, value in _staleness_metrics(trained_bound_staleness, args.max_weight_staleness).items()
             }
-        if offered_staleness:
+        if offered_bound_staleness:
             metrics |= {
-                f"staleness/rollout/{name}": value
-                for name, value in _staleness_metrics(offered_staleness, args.max_weight_staleness).items()
+                f"staleness/bound/rollout/{name}": value
+                for name, value in _staleness_metrics(
+                    offered_bound_staleness, args.max_weight_staleness
+                ).items()
             }
+
         # Named for the reason rather than the mechanism: `stale_groups_recycled`
         # is what happened, `bound_exceeded` is why. Split from the dynamic-filter
         # drops, which land in the same recycled/dropped bucket if only totals are
         # compared.
         metrics["staleness/bound_exceeded_groups"] = stale_groups_recycled
         metrics["staleness/bound_exceeded_tokens"] = stale_tokens
+        # `staleness/bound/*` means a different quantity under each reference, so the
+        # choice is logged next to it rather than left to the run config.
+        metrics["staleness/bound_reference_is_submission"] = float(args.staleness_reference == "submission")
+
+        # Rejecting more groups than were kept means the bound is not being met by
+        # regenerating, which `--staleness-reference submission` makes reachable:
+        # the pre-queue part of the lag is the generation itself, so a retry pays
+        # it again rather than shrinking it.
+        #
+        # This does not deadlock. The drain blocks the training step and the
+        # training step is what publishes the weight update, so a stalled drain
+        # freezes the version; groups submitted after the freeze cross no update
+        # and pass. The equilibrium is the *synchronous* one -- everything in
+        # flight at each boundary discarded, the batch refilled from cold -- which
+        # is a throughput collapse rather than a hang, and is what this warning is
+        # for. `retry_count_max` above says how deep it has gone.
+        if stale_groups_recycled > target_data_size:
+            logger.warning(
+                f"Recycled {stale_groups_recycled} groups to keep {target_data_size} at "
+                f"--max-weight-staleness {args.max_weight_staleness} "
+                f"(--staleness-reference {args.staleness_reference}). If this persists the pipeline "
+                "has degenerated to synchronous: the batch is being refilled from cold after every "
+                "weight update instead of overlapping with training."
+            )
 
         # How many times a group that reached training had to be regenerated. The
         # per-sample counter survives `reset_for_retry`, so this is cumulative over

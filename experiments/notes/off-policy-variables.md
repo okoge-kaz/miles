@@ -7,8 +7,10 @@ the analysis scripts are a separate exercise.
 
 Primary axis: **`MAX_WEIGHT_STALENESS`** — how many weight versions a group may
 lag the engine before it is recycled instead of trained on
-(`fully_async_rollout.py:202-213`). miles' own default is `None`, meaning no
-bound at all.
+(`fully_async_rollout.py:407-419`). miles' own default is `None`, meaning no
+bound at all. The lag it bounds is measured from the version a group *finished*
+generating under, not the one it started under; see "The bound measures queue
+residency" below.
 
 `NUM_STEPS_PER_ROLLOUT` is a *second, different* off-policy quantity: minibatch
 reuse inside one rollout batch, where the lag is deterministic (`0..N-1`
@@ -22,16 +24,16 @@ bounded on two sides in `fully_async_rollout.py`:
 
 ```python
 OUTPUT_QUEUE_MAX_GROUPS = 1000                                  # :34
-self._output = asyncio.Queue(maxsize=OUTPUT_QUEUE_MAX_GROUPS)   # :224
+self._output = asyncio.Queue(maxsize=OUTPUT_QUEUE_MAX_GROUPS)   # :267
 
-def _max_in_flight_groups(self):                                # :230
+def _max_in_flight_groups(self):                                # :290
     if (x := self.args.async_max_concurrent_samples) is not None:
         return max(1, x // self.args.n_samples_per_prompt)
     return self.args.rollout_batch_size
 
-async def _worker_loop(self):                                   # :256
+async def _worker_loop(self):                                   # :320
     ...
-    await self._output.put(task.result())                       # :265  blocks when full
+    await self._output.put(task.result())                       # :329  blocks when full
 ```
 
 `await put` is backpressure: with the queue full the worker stops submitting, so
@@ -75,6 +77,98 @@ target lag *is* imposing staleness artificially, which is the practice this stud
 exists to distinguish itself from. `ASYNC_MAX_CONCURRENT_SAMPLES` bounds the
 other side and is already a swept variable; `OUTPUT_QUEUE_MAX_GROUPS` is not an
 argument and would need a code change.
+
+## The bound measures queue residency, not the whole off-policy distance (2026-08-09)
+
+`staleness = current - oldest` (`fully_async_rollout.py:409`) is a difference
+against the version a group *finished* generating under. It is not the version
+generation started under, and under this study's pause mode those are not the
+same number.
+
+`Sample.weight_versions` gets one entry per generate **call**
+(`types.py:285-286`, appended from `sglang_rollout.py:301` and
+`generate_endpoint_utils.py:112`), and single-turn generation is exactly one HTTP
+call (`generate_hub/single_turn.py:44`). The value of that entry is whatever
+SGLang reads at the moment it builds the reply:
+
+```python
+# sglang 0.5.17.dev32+g3fe50ed (the build in the image), tokenizer_manager.py:1977-1984
+# in the batch-output handler -- i.e. built when the reply is assembled.
+meta_info = {
+    "id": rid,
+    "finish_reason": recv_obj.finished_reasons[i],
+    "prompt_tokens": recv_obj.prompt_tokens[i],
+    "weight_version": self.server_args.weight_version,   # server-level current value
+    "num_retractions": recv_obj.retraction_counts[i],
+}
+```
+
+`Req` carries no weight version of its own (nothing matches `weight_version` in
+`schedule_batch.py` or `scheduler.py`), so there is no arrival-time snapshot to
+report. `/model_info` reads the *same* `server_args.weight_version`
+(`http_server.py:716`), which is what miles polls for `current` -- so the two ends
+of the subtraction are one variable read at two times, and the difference is
+exactly the interval between reply and drain.
+
+**`PAUSE_GENERATION_MODE=in_place` is the recipe default** (`run.sbatch:57`, and
+every sweep passes it explicitly), and it is the mode that hides the most.
+`pause_generation` returns immediately without touching scheduler state
+(`sglang/srt/managers/scheduler.py:4465-4475`), so the request is frozen and
+resumed on the KV cache the *old* weights built. One reply, and
+`retraction_count` is only incremented by `Req.reset_for_retract`
+(`schedule_batch.py:1603-1606`), which that path never reaches — so
+`num_retractions` is 0 too. A sample that spanned v3→v5 is recorded as v5, with
+nothing anywhere in the reply saying otherwise.
+
+Consequences:
+
+- `--max-weight-staleness` bounds **only** the queue residency. Weight updates
+  crossed mid-generation are counted as zero and the bound never sees them.
+- `weight_version/mixed_version_ratio` and `dump/mixed_version_frac` are
+  `len(set(weight_versions)) > 1` (`ray/rollout/metrics.py:101`,
+  `dashboard/dump_reader.py:456`). With one call per sample the list has length 1,
+  so **both are structurally 0 for every run in this study**. They measure
+  multi-turn and partial-rollout resume, neither of which fully-async does
+  (`arguments.py:54` rejects partial rollout).
+- `in_place` also means the continuation attends to a KV cache built by the
+  previous weights — the mismatch VCPO and PipelineRL are about — and that is
+  filed under staleness 0.
+
+Since 2026-08-09 the missing interval is measured, and the logged staleness is a
+decomposition rather than one number. `_generate_group` reads the current version
+before generating and stamps it on the group (`fully_async_rollout.py:64-90`, the
+same idea as multi-LoRA's `metadata["slot_version"]`,
+`multi_lora/async_rollout.py:141-146`). With **S** at submission, **Q** at queue
+entry and **C** at drain, over the trained batch:
+
+| key | quantity |
+|---|---|
+| `staleness/pre_queue/*` | `Q - S` — updates crossed while generating |
+| `staleness/in_queue/*` | `C - Q` — updates crossed while waiting to be trained on |
+| `staleness/total/*` | `C - S` = `pre_queue + in_queue` |
+
+The names are Applied Compute's PQS/IQS
+([staleness in fully-async RL](https://www.appliedcompute.com/research/staleness-in-fully-async-rl)).
+Q is the group's *newest* sample, because a group enters the queue when its
+slowest sample lands — see `notes/telemetry.md` for why keying on the oldest
+inverts the split. None of the three is gated on `MAX_WEIGHT_STALENESS`, and all
+three are absent when the router never answers, deliberately: a zero there would
+read as "nothing crossed" exactly when the instrument is broken.
+
+`staleness/bound/{rollout,train}/*` is a fourth quantity: what
+`--max-weight-staleness` was tested against. **`--staleness-reference` selects
+which:** `completion` (default) tests `C - oldest`, i.e. `in_queue` plus the
+group's internal version spread — it does not cover the generation; `submission`
+tests `C - S`, i.e. `total` exactly. The flag changes only what is enforced, never
+what is measured, and it is in the checkpoint path
+(`max-weight-staleness-<s>-from-submission`) because it changes which groups are
+recycled. A tight bound under `submission` collapses throughput to the
+synchronous condition rather than hanging -- see `notes/telemetry.md`.
+
+**`total` is the number a staleness claim is about, and `pre_queue` is the one to
+read first.** If `pre_queue` is materially non-zero the arms are separated by less
+off-policy distance than their `MAX_WEIGHT_STALENESS` labels claim, because the
+bound never sees it.
 
 ## What miles actually implements
 
@@ -213,6 +307,7 @@ part of the configuration rather than a variable.
 | variable | flag / env | values | affects |
 |---|---|---|---|
 | weight staleness | `MAX_WEIGHT_STALENESS` | 1, 2, 4, 1000000 (= effectively unbounded, see below) | both |
+| what the bound measures from | `STALENESS_REFERENCE` | `completion` (default), `submission` | both |
 | minibatch reuse | `NUM_STEPS_PER_ROLLOUT` | 1, 2, 4 | both |
 | generation concurrency | `ASYNC_MAX_CONCURRENT_SAMPLES` | 1×, 2×, 4× `rollout_batch × n` | both |
 | in-flight fate at weight update | `PAUSE_GENERATION_MODE` | `retract`, `in_place`, `abort` | both |
@@ -267,7 +362,7 @@ the fact**, or sample-efficiency claims cannot be made later without rerunning:
 | optimizer steps | `rollout_id × num_steps_per_rollout` |
 | samples consumed | `rollout_batch × n_samples` per rollout. With dynamic sampling off there is nothing else to add on the colocated side; on the fully-async side, generation is still discarded by the staleness bound and by weight-update aborts, counted in tokens by `rollout/fully_async/{stale,aborted,dynamic_filter}_tokens` and `wasted_token_frac` |
 | tokens generated | `dump/response_length_mean × samples`, and `perf/*` from `ray/rollout/metrics.py` |
-| realised staleness | `dump/mixed_version_frac`, `rollout/fully_async/avg_staleness`, `max_staleness` |
+| realised staleness | `staleness/total/*` (the whole distance), split into `staleness/pre_queue/*` and `staleness/in_queue/*`. `staleness/bound/{rollout,train}/*` is what the cap tested; `rollout/fully_async/{avg,max}_staleness` is the offered form of that. **Not** `dump/mixed_version_frac` — structurally 0 here, see "The bound measures queue residency" |
 | realised drift | `dump/mean_abs_lp_diff`, per-sample `mean_imp_ratio` |
 | wasted generation | `rollout/fully_async/aborted_groups_recycled`, `stale_groups_recycled` |
 
@@ -275,11 +370,13 @@ The staleness bound is a *cap*, not the realised value — always report
 `avg_staleness` next to the setting, or a plateau in the results will be
 misread as insensitivity when it was actually the bound never binding.
 
-**The realised-staleness metrics are gated on the bound being set.**
-`fully_async_rollout.py:202` only measures staleness when
-`args.max_weight_staleness is not None`, so the "unbounded" arm would be the one
-run with no staleness measurement at all. Run that arm with a bound so large it
-never binds (`MAX_WEIGHT_STALENESS=1000000`) rather than unsetting it.
+**The bound's own metric is gated on the bound being set.**
+`fully_async_rollout.py:407` only measures `staleness/bound/{rollout,train}/*`
+when `args.max_weight_staleness is not None`, so an arm run with the bound unset
+would have no record of what the cap would have seen. Run that arm with a bound
+so large it never binds (`MAX_WEIGHT_STALENESS=1000000`) rather than unsetting it.
+`staleness/{total,pre_queue,in_queue}/*` are not gated this way and appear either
+way.
 
 ## Future work, deliberately out of scope
 
@@ -303,11 +400,16 @@ first.** Any swept knob missing from the path is a silent data corruption.
 
 ```
 /ckpt/training/math/<DATASET_TAG>/<MODEL_NAME>/<RL_ALGORITHM>/<PLACEMENT>/
-    <POLICY_REGIME>/max-weight-staleness-<S>/<CONFIG_TAG>
+    <POLICY_REGIME>/max-weight-staleness-<S>[-from-submission]/<CONFIG_TAG>
 
 CONFIG_TAG = rollout-length-<N>k-lr<LR>-rbs<RBS>-gbs<GBS>
              -tseed<TRAIN_SEED>-rseed<ROLLOUT_SEED>
 ```
+
+The `-from-submission` suffix appears only when `STALENESS_REFERENCE` is not
+`completion`, so paths written before the option existed keep their spelling.
+It has to be in the path: the reference decides which groups are recycled, so two
+runs differing only there train on different data.
 
 Every axis of the main grid appears exactly once. Three are absent on purpose:
 

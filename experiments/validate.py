@@ -141,7 +141,7 @@ def check_recipe(recipe_dir: Path) -> None:
     # colocated arm's role as the on-policy reference. See notes/telemetry.md.
     if "--partial-rollout" in train_text:
         fail(rel, "--partial-rollout: rejected by --fully-async, and off-policy by construction under --colocate")
-    for flag in ("--max-weight-staleness", "--pause-generation-mode"):
+    for flag in ("--max-weight-staleness", "--staleness-reference", "--pause-generation-mode"):
         if is_async and flag not in train_text:
             fail(rel, f"async recipe is missing {flag}")
         if not is_async and flag in train_text:

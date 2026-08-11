@@ -270,6 +270,18 @@ class Sample:
         numeric = [int(v) for v in self.weight_versions if str(v).isdigit()]
         return min(numeric) if numeric else None
 
+    @property
+    def newest_weight_version(self) -> int | None:
+        """Maximum weight version across all turns (generation calls) for this trajectory.
+
+        The version this trajectory was *finished* under. Each entry is stamped by
+        the engine when it builds a reply, so for a group this is the version at
+        which the last sample landed -- which is when the group becomes available
+        to the trainer.
+        """
+        numeric = [int(v) for v in self.weight_versions if str(v).isdigit()]
+        return max(numeric) if numeric else None
+
     def update_from_meta_info(self, args, meta_info: dict):
         """
         Update the sample with new information from meta_info returned by the rollout engine.
