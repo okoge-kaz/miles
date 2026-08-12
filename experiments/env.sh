@@ -83,11 +83,10 @@ export OUTPUT_DIR="${MILES_REPO}/experiments/outputs"
 
 # --- Container --------------------------------------------------------------
 export DOCKER_IMAGE="${DOCKER_IMAGE:-radixark/miles:latest}"
-# Every import writes a dated file (miles-latest-YYYYMMDD.sqsh) and repoints the
-# `miles-latest.sqsh` symlink at it. Runs follow the symlink by default; pin a
-# dated file explicitly (SQSH_IMAGE=.../miles-latest-20260803.sqsh) when a
-# result has to stay reproducible against one image.
-export SQSH_IMAGE="${SQSH_IMAGE:-${CONTAINER_DIR}/miles-latest.sqsh}"
+# The prefill-staleness runs require SGLang's scheduler-authoritative policy
+# provenance fields, which are present in this derived image. An explicitly set
+# SQSH_IMAGE still takes precedence for historical reproduction.
+export SQSH_IMAGE="${SQSH_IMAGE:-${CONTAINER_DIR}/miles-prefill-weight-version-23aaf6597.sqsh}"
 
 # In-container paths. Keep these stable: every train.sh references them.
 #   /root/miles       miles checkout (over the image's copy)
