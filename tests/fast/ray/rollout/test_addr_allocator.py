@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 from tests.fast.ray.rollout.conftest import fake_engine, make_args
 
 from miles.ray.rollout.addr_allocator import (
+    ROLLOUT_ENGINE_BASE_PORT,
     PortCursors,
     allocate_rollout_engine_addr_and_ports_external,
     allocate_rollout_engine_addr_and_ports_normal,
@@ -17,7 +18,7 @@ class TestPortCursors:
         assert c._values == {}
 
     def test_next_base_port_default_when_empty(self):
-        assert PortCursors.empty().next_base_port() == 15000
+        assert PortCursors.empty().next_base_port() == ROLLOUT_ENGINE_BASE_PORT
 
     def test_next_base_port_returns_max_value(self):
         c = PortCursors(_values={0: 17000, 1: 16500, 2: 18000})
@@ -54,6 +55,20 @@ def _all_ports(addr_and_ports: dict) -> list[int]:
 
 
 class TestAllocateNormal:
+    def test_default_base_avoids_ray_and_trainer_port_ranges(self, patch_ray_get):
+        args = make_args(num_gpus_per_node=8, sglang_dp_size=1)
+        engines = [(0, fake_engine(port_seed=0))]
+
+        addr_and_ports, _ = allocate_rollout_engine_addr_and_ports_normal(
+            args=args,
+            rollout_engines=engines,
+            num_gpus_per_engine=1,
+        )
+
+        assert min(_all_ports(addr_and_ports)) >= ROLLOUT_ENGINE_BASE_PORT
+        assert ROLLOUT_ENGINE_BASE_PORT > 21000
+        assert max(_all_ports(addr_and_ports)) < 32768
+
     def test_single_node_8_cards_tp1(self, patch_ray_get):
         args = make_args(num_gpus_per_node=8, sglang_dp_size=1)
         engines = [(rank, fake_engine(host="10.0.0.1", port_seed=30000)) for rank in range(8)]

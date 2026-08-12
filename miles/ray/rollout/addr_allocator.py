@@ -5,6 +5,8 @@ import ray
 
 logger = logging.getLogger(__name__)
 
+ROLLOUT_ENGINE_BASE_PORT = 22000
+
 
 @dataclass
 class PortCursors:
@@ -18,7 +20,7 @@ class PortCursors:
         self._values = other._values.copy()
 
     def next_base_port(self) -> int:
-        return max(self._values.values()) if self._values else 15000
+        return max(self._values.values()) if self._values else ROLLOUT_ENGINE_BASE_PORT
 
 
 # NOTE: May re-implement this in a potentially easier way if needed
@@ -29,7 +31,7 @@ def allocate_rollout_engine_addr_and_ports_normal(
     worker_type="regular",
     num_gpus_per_engine=None,
     rank_offset=0,
-    base_port=15000,
+    base_port=ROLLOUT_ENGINE_BASE_PORT,
 ):
     # get ports
     # there are 4 ports we need to allocate
@@ -57,8 +59,8 @@ def allocate_rollout_engine_addr_and_ports_normal(
         num_engines_on_this_node = num_engines_per_node - (local_rank % num_engines_per_node)
 
         def get_addr_and_ports(engine, node_idx):
-            # use small ports to prevent ephemeral port between 32768 and 65536.
-            # also, ray uses port 10002-19999, thus we avoid near-10002 to avoid racing condition
+            # Stay above Ray's worker ports (10002-19999) and the trainer's
+            # rendezvous range (20000-21000), but below ephemeral ports (32768+).
             start_port = node_port_cursor.get(node_idx, base_port)
 
             def port(consecutive=1):
