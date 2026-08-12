@@ -390,18 +390,18 @@ prepare_shared_output_permissions
 # running job corrupts that run and produces a measurement of neither.
 while read -r s t r dp; do
     name=$(name_of "${s}" "${t}" "${r}")
-    if [[ -n "$(squeue -h -u "${USER}" -n "${name}" -o '%i' 2>/dev/null)" ]]; then
+    if [[ -n "$(squeue -h -n "${name}" -o '%i' 2>/dev/null)" ]]; then
         echo "refusing: ${name} is already queued or running as" \
-             "$(squeue -h -u "${USER}" -n "${name}" -o '%i' | tr '\n' ' ')" >&2
+             "$(squeue -h -n "${name}" -o '%i' | tr '\n' ' ')" >&2
         echo "cancel it first, or narrow this submission with --staleness/--ratio" >&2
         exit 1
     fi
 done < <(points)
 if (( INCLUDE_COLOCATED == 1 )); then
     name=$(colo_name_of)
-    if [[ -n "$(squeue -h -u "${USER}" -n "${name}" -o '%i' 2>/dev/null)" ]]; then
+    if [[ -n "$(squeue -h -n "${name}" -o '%i' 2>/dev/null)" ]]; then
         echo "refusing: ${name} is already queued or running as" \
-             "$(squeue -h -u "${USER}" -n "${name}" -o '%i' | tr '\n' ' ')" >&2
+             "$(squeue -h -n "${name}" -o '%i' | tr '\n' ' ')" >&2
         echo "cancel it first, or omit --include-colocated" >&2
         exit 1
     fi
