@@ -188,10 +188,10 @@ class ServerGroup:
                 logger.info(f"Shutting down and killing engine at index {i}")
                 try:
                     ray.get(engine.actor_handle.shutdown.remote())
-                    ray.kill(engine.actor_handle)
-                    logger.info(f"Successfully killed engine at index {i}")
                 except Exception as e:
-                    logger.warning(f"Fail to kill engine at index {i} (e: {e})")
+                    logger.warning(f"Engine shutdown failed at index {i}; forcing actor termination (e: {e})")
+                ray.kill(engine.actor_handle)
+                logger.info(f"Successfully killed engine at index {i}")
             else:
                 logger.info(f"Engine at index {i} is already None")
             self.all_engines[i].mark_stopped()
