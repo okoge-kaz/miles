@@ -10,6 +10,7 @@
 #     experiments/staleness_ratio_sweep.sh --staleness 2    # one row of the grid
 #     experiments/staleness_ratio_sweep.sh --ratio 1:7,2:6  # one pair of columns
 #     experiments/staleness_ratio_sweep.sh --include-colocated  # add one s=0 on-policy arm
+#     experiments/staleness_ratio_sweep.sh --colocated-only     # select only that s=0 arm
 #     experiments/staleness_ratio_sweep.sh --check
 #
 # Unlike realized_staleness_sweep.sh, the bound here is *enforced*, not parked at 64: the
@@ -41,6 +42,8 @@ STALENESS_REFERENCE=prefill
 : "${LR:=1e-6}"
 : "${IS_CORRECTION:=tis}"
 : "${FUSE_ONE_STEP_ACTOR_LOGPROBS:=1}"
+: "${LOG_PROBS_CHUNK_SIZE:=-1}"
+: "${OBSERVE_TRAINING_ENTROPY:=0}"
 : "${WANDB_PROJECT:=async-rl-dapo-math-node-ratio}"
 : "${PARTITION:=batch}"             # 8 nodes: batch_short caps at 4
 : "${WALL:=04:00:00}"
@@ -68,7 +71,7 @@ CP=$(read_default CONTEXT_PARALLEL_SIZE)
 GPN=$(read_default ACTOR_GPUS_PER_NODE)
 NUM_ROLLOUT="${NUM_ROLLOUT:-$(read_default NUM_ROLLOUT)}"
 
-STALENESS_FILTER=""; RATIO_FILTER=""; INCLUDE_COLOCATED=0
+STALENESS_FILTER=""; RATIO_FILTER=""; INCLUDE_COLOCATED=0; COLOCATED_ONLY=0
 SUBMIT=0; RESUME=0; CLEAN_CHECKPOINTS=0; CHECK=0
 while (( $# )); do
     case "$1" in
@@ -78,6 +81,7 @@ while (( $# )); do
         --resume)    RESUME=1; shift ;;
         --clean-checkpoints) CLEAN_CHECKPOINTS=1; shift ;;
         --include-colocated) INCLUDE_COLOCATED=1; shift ;;
+        --colocated-only) INCLUDE_COLOCATED=1; COLOCATED_ONLY=1; shift ;;
         --check)     CHECK=1; shift ;;
         *) echo "unknown argument: $1" >&2; exit 1 ;;
     esac
@@ -109,6 +113,7 @@ in_list() {  # value comma-separated-list -> 0 when the list is empty or contain
 # A shape megatron would reject is dropped here, at submission, with the reason.
 points() {  # staleness T R dp
     local s t r dp
+    (( COLOCATED_ONLY == 0 )) || return 0
     for s in ${STALENESS_LEVELS}; do
         in_list "${s}" "${STALENESS_FILTER}" || continue
         for pair in ${RATIOS}; do
@@ -520,7 +525,7 @@ submit_colocated_chain() {
             --job-name="${name}" \
             --nodes="${TOTAL_NODES}" --time="${WALL}" \
             --output="${LOG_DIR}/${name}-%j.log" \
-            --export="ALL,WANDB_PROJECT=${WANDB_PROJECT},RUN_NAME=${name},CONFIG_TAG=${name},NUM_ROLLOUT=${NUM_ROLLOUT},SAVE_INTERVAL=${SAVE_INTERVAL},SAVE_RETAIN_INTERVAL=${SAVE_RETAIN_INTERVAL},SAVE_HF=0,EVAL_INTERVAL=0,SKIP_EVAL_BEFORE_TRAIN=1,LR=${LR},MAX_WEIGHT_STALENESS=0,STALENESS_REFERENCE=completion,PAUSE_GENERATION_MODE=none,ACTOR_NUM_NODES=${TOTAL_NODES},ROLLOUT_NUM_GPUS=0,ROLLOUT_SEED=${ROLLOUT_SEED},IS_CORRECTION=${IS_CORRECTION},TIS_CLIP=${TIS_CLIP},TIS_CLIP_LOW=${TIS_CLIP_LOW},RATIO_DENOMINATOR=${RATIO_DENOMINATOR}" \
+            --export="ALL,WANDB_PROJECT=${WANDB_PROJECT},RUN_NAME=${name},CONFIG_TAG=${name},NUM_ROLLOUT=${NUM_ROLLOUT},SAVE_INTERVAL=${SAVE_INTERVAL},SAVE_RETAIN_INTERVAL=${SAVE_RETAIN_INTERVAL},SAVE_HF=0,EVAL_INTERVAL=0,SKIP_EVAL_BEFORE_TRAIN=1,LR=${LR},MAX_WEIGHT_STALENESS=0,STALENESS_REFERENCE=completion,PAUSE_GENERATION_MODE=none,ACTOR_NUM_NODES=${TOTAL_NODES},ROLLOUT_NUM_GPUS=0,ROLLOUT_SEED=${ROLLOUT_SEED},IS_CORRECTION=${IS_CORRECTION},TIS_CLIP=${TIS_CLIP},TIS_CLIP_LOW=${TIS_CLIP_LOW},RATIO_DENOMINATOR=${RATIO_DENOMINATOR},LOG_PROBS_CHUNK_SIZE=${LOG_PROBS_CHUNK_SIZE},OBSERVE_TRAINING_ENTROPY=${OBSERVE_TRAINING_ENTROPY}" \
             "${REPO_ROOT}/${COLO_RECIPE}")
         jid=${raw_jid%%;*}
         dependency_label=""

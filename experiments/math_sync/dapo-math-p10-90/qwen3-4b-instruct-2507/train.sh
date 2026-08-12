@@ -50,9 +50,11 @@ ROLLOUT_ARGS=(
 TELEMETRY_ARGS=(
    --dump-details "${CKPT_PATH}/dump"
    --use-miles-dashboard
-   --observe-training-entropy
    --no-dump-policy-loss-debug
 )
+if [[ "${OBSERVE_TRAINING_ENTROPY}" != "0" ]]; then
+   TELEMETRY_ARGS+=(--observe-training-entropy)
+fi
 if [[ "${DUMP_TRAIN_DATA}" == "0" ]]; then
    TELEMETRY_ARGS+=(--no-dump-train-data)
 else
@@ -89,6 +91,7 @@ PERF_ARGS=(
 
    --use-dynamic-batch-size
    --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
+   --log-probs-chunk-size "${LOG_PROBS_CHUNK_SIZE}"
 )
 if [[ "${RECOMPUTE_GRANULARITY}" == "full" ]]; then
    PERF_ARGS+=(--recompute-method uniform --recompute-num-layers 1)

@@ -116,6 +116,41 @@ a lower `MAX_TOKENS_PER_GPU` and `--log-probs-chunk-size`, not the allocator --
 and either one has to be applied to every arm, since both cost throughput and
 the study compares arms on wall-clock.
 
+### Colocated training entropy is opt-in (2026-08-12)
+
+Job 15627089 failed in `_VocabParallelEntropy.forward` while allocating
+9,965,666,304 bytes (9.28125 GiB): 32,768 response tokens times the local
+TP2 vocabulary of 76,032 logits times fp32. `ENTROPY_COEF=0`, so
+`--observe-training-entropy` was performing a detached diagnostic calculation;
+it was not part of the loss or backward pass.
+
+An exact dumped rollout batch from that run was replayed for one deterministic
+optimizer step on 8 H100s with the same 32k token cap. The table reports the
+largest `nvidia-smi memory.used` sample across the eight trainers. This replay
+does not instantiate SGLang, so use the absolute values only to compare the
+trainer-side alternatives, not as a production colocated capacity estimate.
+
+| training entropy | log-prob chunk | max used | change from baseline |
+|---|---:|---:|---:|
+| yes | disabled | 67,666 MiB | -- |
+| yes | 8,192 | 62,052 MiB | -5,614 MiB |
+| no | disabled | 58,098 MiB | -9,568 MiB |
+| no | 8,192 | 60,188 MiB | -7,478 MiB |
+
+Disabling diagnostic entropy gave the largest observed reduction. Combining it
+with chunking did not lower the total replay peak further, although chunking
+still reduces the largest individual full-vocabulary allocation and can help
+fragmentation. The sync colocated default is therefore entropy observation off
+and chunking off. To run an entropy diagnostic safely, set
+`OBSERVE_TRAINING_ENTROPY=1 LOG_PROBS_CHUNK_SIZE=8192`.
+
+All four replays produced identical displayed loss, policy-gradient loss, TIS,
+KL, ESS, and gradient norm. Their saved gradient-norm artifacts were also
+byte-identical. A standalone tensor test found chunked versus unchunked maximum
+log-prob error `9.54e-7`, relative gradient L2 error `2.39e-7`, and identical
+entropy. With entropy disabled, the current metric reducer emits the placeholder
+`train/entropy_loss=0`; that value means "not observed", not zero policy entropy.
+
 ### The colocated arm OOMs, and its SGLang fraction was the wrong way round (2026-08-08)
 
 `conv-s0-tis-lr5e-6-p1` and `p2` both died with

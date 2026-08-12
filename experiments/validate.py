@@ -45,7 +45,7 @@ def sh(script: str) -> subprocess.CompletedProcess:
 
 
 def knob(text: str, name: str) -> int | None:
-    m = re.search(rf'{name}:=(\d+)', text)
+    m = re.search(rf'{name}:=(-?\d+)', text)
     return int(m.group(1)) if m else None
 
 
@@ -157,6 +157,19 @@ def check_recipe(recipe_dir: Path) -> None:
     # notes/parallelism.md.
     if not is_async and "expandable_segments" in train_text:
         fail(rel, "colocated recipe cannot set expandable_segments: torch_memory_saver rejects it")
+    if "qwen3-4b-instruct-2507" in rel:
+        has_logprob_chunk_flag = "--log-probs-chunk-size" in train_text
+        if is_async and has_logprob_chunk_flag:
+            fail(rel, "async Qwen3-4B recipe must not enable colocated-only log-prob chunking")
+        if not is_async:
+            if knob(run_text, "LOG_PROBS_CHUNK_SIZE") != -1:
+                fail(rel, "colocated Qwen3-4B recipe must leave log-prob chunking opt-in")
+            if not has_logprob_chunk_flag:
+                fail(rel, "colocated Qwen3-4B recipe is missing --log-probs-chunk-size")
+            if knob(run_text, "OBSERVE_TRAINING_ENTROPY") != 0:
+                fail(rel, "colocated Qwen3-4B recipe must leave diagnostic training entropy opt-in")
+            if 'OBSERVE_TRAINING_ENTROPY}" != "0"' not in train_text:
+                fail(rel, "colocated Qwen3-4B recipe does not conditionally enable training entropy")
     if "30b-a3b" in rel and "--use-rollout-routing-replay" not in train_text:
         fail(rel, "MoE recipe is missing R3")
     if "instruct-2507" in rel and "RM_TYPE:=math" not in run_text:
