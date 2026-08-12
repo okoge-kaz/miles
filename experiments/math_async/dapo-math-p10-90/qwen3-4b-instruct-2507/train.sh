@@ -121,6 +121,16 @@ GRPO_ARGS=(
    --eps-clip-high "${EPS_CLIP_HIGH}"
    --calculate-per-token-loss
 )
+if [[ "${FUSE_ONE_STEP_ACTOR_LOGPROBS}" != "0" ]]; then
+   GRPO_ARGS+=(--fuse-one-step-actor-logprobs)
+fi
+if [[ "${VERIFY_FUSED_ONE_STEP_ACTOR_LOGPROBS}" != "0" ]]; then
+   if [[ "${FUSE_ONE_STEP_ACTOR_LOGPROBS}" == "0" ]]; then
+      echo "VERIFY_FUSED_ONE_STEP_ACTOR_LOGPROBS requires FUSE_ONE_STEP_ACTOR_LOGPROBS=1" >&2
+      exit 1
+   fi
+   GRPO_ARGS+=(--verify-fused-one-step-actor-logprobs)
+fi
 TIS_BOUNDS=(--tis-clip "${TIS_CLIP}" --tis-clip-low "${TIS_CLIP_LOW}")
 case "${IS_CORRECTION}" in
    none)   ;;

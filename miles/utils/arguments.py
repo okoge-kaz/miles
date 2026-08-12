@@ -2,6 +2,7 @@ import argparse
 import json
 import logging
 import os
+from collections.abc import Sequence
 from typing import Any
 
 import yaml
@@ -1374,6 +1375,26 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "If not set, we will use the logprobs from the actor model."
                 ),
             )
+            parser.add_argument(
+                "--fuse-one-step-actor-logprobs",
+                action="store_true",
+                default=False,
+                help=(
+                    "For a one-optimizer-step GRPO rollout batch, skip the standalone actor "
+                    "log-probability forward and anchor PPO plus behavior correction to the "
+                    "gradient-enabled current log-probabilities via current_logprobs.detach()."
+                ),
+            )
+            parser.add_argument(
+                "--verify-fused-one-step-actor-logprobs",
+                action="store_true",
+                default=False,
+                help=(
+                    "Debug-only shadow validation for --fuse-one-step-actor-logprobs. Execute "
+                    "the legacy no-grad actor forward for comparison while keeping the fused "
+                    "detached anchor as the loss denominator. Do not use for performance runs."
+                ),
+            )
             # Off-Policy Correction using Importance Sampling: https://fengyao.notion.site/off-policy-rl
             parser.add_argument(
                 "--use-tis",
@@ -2639,6 +2660,89 @@ def _resolve_ft_components(args: argparse.Namespace) -> list[str]:
     return list(args.ft_components)
 
 
+_FUSED_ONE_STEP_REPLAY_FLAGS = (
+    "use_routing_replay",
+    "use_rollout_routing_replay",
+    "use_indexer_replay",
+    "use_rollout_indexer_replay",
+)
+
+
+def validate_fused_one_step_actor_logprobs(args: argparse.Namespace) -> None:
+    """Validate configuration invariants known before training data is consumed."""
+    enabled = getattr(args, "fuse_one_step_actor_logprobs", False)
+    verify = getattr(args, "verify_fused_one_step_actor_logprobs", False)
+    if verify and not enabled:
+        raise ValueError(
+            "--verify-fused-one-step-actor-logprobs requires --fuse-one-step-actor-logprobs"
+        )
+    if not enabled:
+        return
+
+    configured_steps = getattr(args, "num_steps_per_rollout", None)
+    rollout_batch_size = getattr(args, "rollout_batch_size", None)
+    n_samples_per_prompt = getattr(args, "n_samples_per_prompt", None)
+    global_batch_size = getattr(args, "global_batch_size", None)
+    if configured_steps is None:
+        configured_one_step = (
+            rollout_batch_size is not None
+            and n_samples_per_prompt is not None
+            and global_batch_size is not None
+            and rollout_batch_size * n_samples_per_prompt == global_batch_size
+        )
+        step_requirement = (
+            "a one-step batch shape: rollout_batch_size * n_samples_per_prompt "
+            "must equal global_batch_size"
+        )
+    else:
+        configured_one_step = configured_steps == 1
+        step_requirement = "--num-steps-per-rollout 1"
+    checks = (
+        (getattr(args, "train_backend", None) == "megatron", "the Megatron training backend"),
+        (configured_one_step, step_requirement),
+        (getattr(args, "advantage_estimator", None) == "grpo", "--advantage-estimator grpo"),
+        (getattr(args, "kl_coef", None) == 0, "--kl-coef 0"),
+        (not getattr(args, "use_rollout_logprobs", False), "--use-rollout-logprobs disabled"),
+        (not getattr(args, "keep_old_actor", False), "--keep-old-actor disabled"),
+        (not getattr(args, "use_opd", False), "--use-opd disabled"),
+        (getattr(args, "attention_dropout", None) == 0, "--attention-dropout 0"),
+        (getattr(args, "hidden_dropout", None) == 0, "--hidden-dropout 0"),
+    )
+    for valid, requirement in checks:
+        if not valid:
+            raise ValueError(f"--fuse-one-step-actor-logprobs requires {requirement}")
+
+    enabled_replays = [flag for flag in _FUSED_ONE_STEP_REPLAY_FLAGS if getattr(args, flag, False)]
+    if enabled_replays:
+        flags = ", ".join(f"--{flag.replace('_', '-')}" for flag in enabled_replays)
+        raise ValueError(
+            "--fuse-one-step-actor-logprobs does not yet support routing/indexer replay; "
+            f"disable {flags}"
+        )
+
+
+def validate_fused_one_step_actor_logprobs_runtime(
+    args: argparse.Namespace,
+    num_microbatches: Sequence[int],
+) -> None:
+    """Validate the effective optimizer-step count after dynamic batch sizing."""
+    if not getattr(args, "fuse_one_step_actor_logprobs", False):
+        return
+    if len(num_microbatches) != 1:
+        raise RuntimeError(
+            "--fuse-one-step-actor-logprobs requires exactly one optimizer step for the "
+            f"consumed rollout batch, but get_data_iterator produced {len(num_microbatches)} "
+            f"steps with num_microbatches={list(num_microbatches)}"
+        )
+
+
+def should_run_actor_logprob_forward(args: argparse.Namespace) -> bool:
+    """Whether the standalone actor scoring forward is required for this batch."""
+    if getattr(args, "fuse_one_step_actor_logprobs", False):
+        return getattr(args, "verify_fused_one_step_actor_logprobs", False)
+    return not args.use_rollout_logprobs or args.get_mismatch_metrics
+
+
 def miles_validate_args(args):
     validate_dashboard_args(args)
 
@@ -3204,6 +3308,8 @@ def miles_validate_args(args):
     if args.use_rollout_indexer_replay:
         args.use_indexer_replay = True
         assert args.context_parallel_size == 1, "indexer replay does not support context parallelism yet"
+
+    validate_fused_one_step_actor_logprobs(args)
 
     if args.eval_max_context_len is None:
         logger.info(

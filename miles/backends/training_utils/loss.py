@@ -34,11 +34,26 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
         args: Configuration specifying estimator type, KL coefficient,
             normalization settings, and other hyperparameters.
         rollout_data: Dict containing input lists ("log_probs", "ref_log_probs",
-            "rewards", "values", "response_lengths", "loss_masks",
-            "total_lengths"). Modified in-place to add "advantages" and
-            "returns" keys, each mapping to lists of tensors per sample.
+            "rollout_log_probs", "rewards", "values", "response_lengths",
+            "loss_masks", "total_lengths"). Modified in-place to add
+            "advantages" and "returns" keys, each mapping to lists of tensors
+            per sample.
     """
-    log_probs: list[torch.Tensor] = rollout_data.get("rollout_log_probs" if args.use_rollout_logprobs else "log_probs")
+    fused_logprobs = getattr(args, "fuse_one_step_actor_logprobs", False)
+    if fused_logprobs:
+        # GRPO with reward-level KL disabled needs only a response-aligned tensor
+        # template for zero KL. The actor anchor is created later from the
+        # gradient-enabled forward, so do not give rollout probabilities policy
+        # semantics here.
+        if not get_parallel_state().is_pp_last_stage:
+            return
+        log_probs = None
+        kl_template: list[torch.Tensor] | None = rollout_data.get("rollout_log_probs")
+    else:
+        log_probs: list[torch.Tensor] | None = rollout_data.get(
+            "rollout_log_probs" if args.use_rollout_logprobs else "log_probs"
+        )
+        kl_template = log_probs
     ref_log_probs: list[torch.Tensor] = rollout_data.get("ref_log_probs")
     rewards: list[float] = rollout_data.get("rewards")
     values: None | list[torch.Tensor] = rollout_data.get("values")
@@ -48,12 +63,13 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
     max_seq_lens: list[int] | None = rollout_data.get("max_seq_lens", None)
 
     # return when not the last pp stage.
-    if log_probs is None and values is None:
+    if kl_template is None and values is None:
         return
 
     if args.kl_coef == 0 or not log_probs:
         # when kl_coef is 0, we won't compute ref_log_prob
-        xs = log_probs if log_probs is not None else values
+        xs = kl_template if kl_template is not None else values
+        assert xs is not None
         kl = [torch.zeros_like(x, dtype=torch.float32, device=x.device) for x in xs]
     else:
         kl = [

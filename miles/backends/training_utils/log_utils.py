@@ -143,6 +143,10 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
                 "step_adapter_names",
                 "step_adapter_batch_sizes",
                 "prompt_group_sizes",
+                # Debug-only fused shadow input. It is compared against the
+                # gradient-enabled anchor under train/verify_* metrics; logging it
+                # here would imply a production rollout-phase actor forward.
+                "legacy_actor_log_probs",
             ]:
                 continue
             # Upload per sample mean for each rollout value
@@ -222,7 +226,12 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
             if "rollout/entropy" in reduced_log_dict:
                 assert 0 < reduced_log_dict["rollout/entropy"] < 0.7
 
-        if args.ci_test and args.true_on_policy_mode and not args.ci_disable_logprobs_checker:
+        if (
+            args.ci_test
+            and args.true_on_policy_mode
+            and not args.ci_disable_logprobs_checker
+            and not getattr(args, "fuse_one_step_actor_logprobs", False)
+        ):
             assert log_dict["log_probs"] == log_dict["rollout_log_probs"], (
                 f"CI check failed: true_on_policy_mode is enabled, but log_probs "
                 f"({log_dict['log_probs']}) != rollout_log_probs "
@@ -268,12 +277,14 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
             correct_total_lengths = []
             correct_loss_masks = []
             correct_entropy = []
+            actor_log_probs = rollout_data.get("log_probs")
             for i, raw_reward in enumerate(raw_rewards):
                 if raw_reward == 1:
                     correct_response_lengths.append(response_lengths[i])
                     correct_total_lengths.append(total_lengths[i])
                     correct_loss_masks.append(loss_masks[i])
-                    correct_entropy.append(-rollout_data["log_probs"][i])
+                    if actor_log_probs is not None:
+                        correct_entropy.append(-actor_log_probs[i])
             num_correct_responses = len(correct_total_lengths)
             rollout_data["correct_response_lengths"] = correct_response_lengths
             correct_response_length_percentile = quantile(
@@ -281,14 +292,15 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
             )
             for p, val in correct_response_length_percentile.items():
                 rollout_data[f"correct_length/{p}"] = [val] * num_correct_responses
-            if len(correct_entropy) > 0:
-                sum_of_sample_mean = get_sum_of_sample_mean(
-                    correct_total_lengths, correct_response_lengths, correct_loss_masks
-                )
-                correct_entropy = sum_of_sample_mean(torch.cat(correct_entropy, dim=0))
-                rollout_data["correct_entropy"] = [correct_entropy.item()] * num_correct_responses
-            else:
-                rollout_data["correct_entropy"] = [0] * num_correct_responses
+            if actor_log_probs is not None:
+                if len(correct_entropy) > 0:
+                    sum_of_sample_mean = get_sum_of_sample_mean(
+                        correct_total_lengths, correct_response_lengths, correct_loss_masks
+                    )
+                    correct_entropy = sum_of_sample_mean(torch.cat(correct_entropy, dim=0))
+                    rollout_data["correct_entropy"] = [correct_entropy.item()] * num_correct_responses
+                else:
+                    rollout_data["correct_entropy"] = [0] * num_correct_responses
 
 
 def log_multi_turn_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatch) -> None:

@@ -61,6 +61,89 @@ class LossFunction(Protocol):
         ...
 
 
+def _scalar_as_token_metric(
+    value: torch.Tensor,
+    template: torch.Tensor,
+    reducer: Callable[[torch.Tensor], torch.Tensor],
+) -> torch.Tensor:
+    """Broadcast a batch scalar so the train metric normalizer preserves it."""
+    return reducer(torch.ones_like(template) * value)
+
+
+def _absolute_difference_metrics(
+    prefix: str,
+    difference: torch.Tensor,
+    active_tokens: torch.Tensor,
+    reducer: Callable[[torch.Tensor], torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Summarize a same-batch absolute difference for fused shadow validation."""
+    absolute = torch.where(
+        active_tokens,
+        difference.abs().float(),
+        difference.new_zeros((), dtype=torch.float32),
+    )
+    valid = absolute[active_tokens]
+    if valid.numel() == 0:
+        valid = absolute.new_zeros(1)
+
+    metrics = {f"{prefix}_mean": reducer(absolute)}
+    for name, quantile in (("p50", 0.50), ("p95", 0.95), ("p99", 0.99)):
+        value = torch.quantile(valid, quantile)
+        metrics[f"{prefix}_{name}"] = _scalar_as_token_metric(value, absolute, reducer)
+    metrics[f"{prefix}_max"] = _scalar_as_token_metric(valid.max(), absolute, reducer)
+    return metrics
+
+
+def _fused_shadow_validation_metrics(
+    args: Namespace,
+    batch: RolloutBatch,
+    actor_anchor_logprobs: list[torch.Tensor],
+    active_tokens: torch.Tensor,
+    reducer: Callable[[torch.Tensor], torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Compare the debug legacy forward with the anchor used by fused loss."""
+    legacy_list = batch.get("legacy_actor_log_probs")
+    if not legacy_list:
+        raise RuntimeError(
+            "--verify-fused-one-step-actor-logprobs requires legacy_actor_log_probs "
+            "from the shadow actor forward"
+        )
+
+    legacy = torch.cat(legacy_list, dim=0).detach()
+    anchor = torch.cat(actor_anchor_logprobs, dim=0).detach()
+    rollout = torch.cat(batch["rollout_log_probs"], dim=0).detach()
+    if legacy.shape != anchor.shape or anchor.shape != rollout.shape:
+        raise RuntimeError(
+            "Fused shadow-validation log-probability shapes differ: "
+            f"legacy={tuple(legacy.shape)}, anchor={tuple(anchor.shape)}, "
+            f"rollout={tuple(rollout.shape)}"
+        )
+
+    metrics = _absolute_difference_metrics(
+        "verify_anchor_logprob_abs", legacy - anchor, active_tokens, reducer
+    )
+    legacy_tis = torch.exp(legacy - rollout)
+    fused_tis = torch.exp(anchor - rollout)
+    metrics |= _absolute_difference_metrics(
+        "verify_tis_weight_abs", legacy_tis - fused_tis, active_tokens, reducer
+    )
+
+    legacy_clipped = torch.clamp(legacy_tis, min=args.tis_clip_low, max=args.tis_clip)
+    fused_clipped = torch.clamp(fused_tis, min=args.tis_clip_low, max=args.tis_clip)
+    metrics |= _absolute_difference_metrics(
+        "verify_tis_clipped_weight_abs", legacy_clipped - fused_clipped, active_tokens, reducer
+    )
+    legacy_clip_decision = legacy_clipped != legacy_tis
+    fused_clip_decision = fused_clipped != fused_tis
+    disagreement = torch.where(
+        active_tokens,
+        (legacy_clip_decision != fused_clip_decision).float(),
+        fused_tis.new_zeros(()),
+    )
+    metrics["verify_tis_clip_decision_disagreement"] = reducer(disagreement)
+    return metrics
+
+
 def policy_loss_function(
     args: Namespace,
     batch: RolloutBatch,
@@ -105,7 +188,7 @@ def policy_loss_function(
     """
     parallel_state = get_parallel_state()
     advantages = torch.cat(batch["advantages"], dim=0)
-    old_log_probs = batch["rollout_log_probs"] if args.use_rollout_logprobs else batch["log_probs"]
+    fused_logprobs = getattr(args, "fuse_one_step_actor_logprobs", False)
 
     response_lengths = batch["response_lengths"]
     total_lengths = batch["total_lengths"]
@@ -124,6 +207,12 @@ def policy_loss_function(
     )
 
     log_probs = log_probs_and_entropy["log_probs"]
+    if fused_logprobs:
+        actor_anchor_logprobs = [value.detach() for value in log_probs]
+        old_log_probs = actor_anchor_logprobs
+    else:
+        actor_anchor_logprobs = []
+        old_log_probs = batch["rollout_log_probs"] if args.use_rollout_logprobs else batch["log_probs"]
     train_log_probs_list = log_probs
     old_log_probs_list = old_log_probs
 
@@ -190,6 +279,31 @@ def policy_loss_function(
         torch.nan_to_num(advantages, nan=0.0, posinf=0.0, neginf=0.0),
         advantages.new_zeros(()),
     )
+    # Preserve the per-token gap before `ppo_kl` is rebound to its reduction;
+    # fused invariant metrics are constructed from the unreduced ratio.
+    ppo_kl_tokens = ppo_kl
+    fused_metrics: dict[str, torch.Tensor] = {}
+    if fused_logprobs:
+        fused_prox_ratio = torch.exp(-ppo_kl_tokens.detach())
+        valid_prox_deviation = (fused_prox_ratio - 1).abs()[active_tokens]
+        max_prox_deviation = (
+            valid_prox_deviation.max() if valid_prox_deviation.numel() else fused_prox_ratio.new_zeros(())
+        )
+        fused_metrics = {
+            "fused_one_step_logprobs_enabled": sum_of_sample_mean(torch.ones_like(ppo_kl_tokens)),
+            "fused_prox_ratio_max_abs_from_one": _scalar_as_token_metric(
+                max_prox_deviation, ppo_kl_tokens, sum_of_sample_mean
+            ),
+            "fused_anchor_logprob_mean": sum_of_sample_mean(torch.cat(actor_anchor_logprobs, dim=0)),
+        }
+        if getattr(args, "verify_fused_one_step_actor_logprobs", False):
+            fused_metrics |= _fused_shadow_validation_metrics(
+                args,
+                batch,
+                actor_anchor_logprobs,
+                active_tokens,
+                sum_of_sample_mean,
+            )
 
     eps_clip, eps_clip_high = args.eps_clip, args.eps_clip_high
     m2po_stats: dict[str, float] = {}
@@ -257,7 +371,7 @@ def policy_loss_function(
         tis_kwargs = {
             "args": args,
             "pg_loss": pg_loss,
-            "train_log_probs": batch["log_probs"],
+            "train_log_probs": actor_anchor_logprobs if fused_logprobs else batch["log_probs"],
             "rollout_log_probs": batch["rollout_log_probs"],
             "loss_masks": batch["loss_masks"],
             "total_lengths": total_lengths,
@@ -461,6 +575,7 @@ def policy_loss_function(
         "ppo_kl": ppo_kl.clone().detach(),
         "ess_ratio": ess_ratio_sum.squeeze(),
     }
+    reported_loss |= {name: value.clone().detach() for name, value in fused_metrics.items()}
 
     if train_rollout_logprob_abs_diff is not None:
         reported_loss["train_rollout_logprob_abs_diff"] = train_rollout_logprob_abs_diff.clone().detach()

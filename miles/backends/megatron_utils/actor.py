@@ -15,6 +15,10 @@ from torch_memory_saver import torch_memory_saver
 from miles.dashboard import hooks as dashboard_hooks
 from miles.ray.train_actor import TrainRayActor
 from miles.utils import train_dump_utils
+from miles.utils.arguments import (
+    should_run_actor_logprob_forward,
+    validate_fused_one_step_actor_logprobs_runtime,
+)
 from miles.utils.argparse_utils import inplace_modify_args
 from miles.utils.audit_utils.event_logger.logger import event_logger_context
 from miles.utils.audit_utils.witness.allocator import WitnessInfo
@@ -447,6 +451,7 @@ class MegatronTrainRayActor(TrainRayActor):
     ) -> TrainStepOutcome:
         # Create data iterator for log_probs and train.
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+        validate_fused_one_step_actor_logprobs_runtime(self.args, num_microbatches)
 
         for m in all_replay_managers:
             if self._use_rollout_replay(m):
@@ -489,7 +494,8 @@ class MegatronTrainRayActor(TrainRayActor):
                         )
                     )
                 self._switch_model("old_actor" if self.args.keep_old_actor else "actor")
-                if not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics:
+                fused_logprobs = getattr(self.args, "fuse_one_step_actor_logprobs", False)
+                if should_run_actor_logprob_forward(self.args):
                     for m in all_replay_managers:
                         if m.enabled:
                             if self._use_rollout_replay(m):
@@ -501,7 +507,7 @@ class MegatronTrainRayActor(TrainRayActor):
                             data_iterator,
                             num_microbatches,
                             rollout_id=rollout_id,
-                            store_prefix="",
+                            store_prefix="legacy_actor_" if fused_logprobs else "",
                         )
                     )
                     for m in all_replay_managers:
