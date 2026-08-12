@@ -56,12 +56,13 @@ esac
 
 TASK_FAMILY=math
 
-# The two ways a sample can be off-policy: generated under older weights, or
-# reused across more than one optimizer step. Completion metadata cannot detect
-# an update crossed during generation, so a zero completion bound is not enough
-# to claim on-policy sampling.
-if [[ "${MAX_WEIGHT_STALENESS}" -eq 0 && "${NUM_STEPS_PER_ROLLOUT}" -eq 1 \
-      && "${STALENESS_REFERENCE}" != completion ]]; then
+# Colocated generation pauses training, so one optimizer step per rollout is
+# on-policy without an async staleness reference. On the async path, completion
+# metadata cannot detect an update crossed during generation; a zero completion
+# bound is therefore not enough to claim on-policy sampling.
+if [[ "${NUM_STEPS_PER_ROLLOUT}" -eq 1 \
+      && ( "${PLACEMENT}" == colocated \
+           || ( "${MAX_WEIGHT_STALENESS}" -eq 0 && "${STALENESS_REFERENCE}" != completion ) ) ]]; then
     POLICY_REGIME=on-policy
 else
     POLICY_REGIME=off-policy
