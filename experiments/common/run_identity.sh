@@ -57,8 +57,11 @@ esac
 TASK_FAMILY=math
 
 # The two ways a sample can be off-policy: generated under older weights, or
-# reused across more than one optimizer step.
-if [[ "${MAX_WEIGHT_STALENESS}" -eq 0 && "${NUM_STEPS_PER_ROLLOUT}" -eq 1 ]]; then
+# reused across more than one optimizer step. Completion metadata cannot detect
+# an update crossed during generation, so a zero completion bound is not enough
+# to claim on-policy sampling.
+if [[ "${MAX_WEIGHT_STALENESS}" -eq 0 && "${NUM_STEPS_PER_ROLLOUT}" -eq 1 \
+      && "${STALENESS_REFERENCE}" != completion ]]; then
     POLICY_REGIME=on-policy
 else
     POLICY_REGIME=off-policy

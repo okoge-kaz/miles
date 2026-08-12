@@ -638,9 +638,10 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "the bound covers queue residency but not weight updates crossed during "
                     "generation, and 0 does not imply on-policy. 'submission' uses the version the "
                     "group was submitted under, so a bound of N allows N older policy versions end "
-                    "to end (the quantity logged as staleness/total) and 0 is genuinely on-policy. "
+                    "to end and 0 is genuinely on-policy. "
                     "'prefill' uses the scheduler-authoritative version at the first "
                     "prefill forward and requires the patched SGLang provenance metadata. "
+                    "staleness/total uses the same reference as the selected bound in every mode. "
                     "All references remain available for historical reproduction."
                 ),
             )

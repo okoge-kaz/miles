@@ -37,10 +37,9 @@ WEIGHT_VERSION_QUERY_TIMEOUT_SECS = 2.0
 # Realized lag is a small integer; anything past this goes in one overflow bucket
 # so the metric count stays bounded no matter how far behind a run drifts.
 #
-# 16, not 8: `staleness/total` is unbounded whenever the bound is not enforced on
-# it -- `--staleness-reference completion`, or the parked bound the node-ratio
-# sweep uses -- and that is exactly the run whose tail decides how staleness maps
-# to downstream score. At 8 the tail collapsed into one overflow bucket.
+# 16, not 8: unbounded runs and runs with a parked bound need enough resolution
+# in the tail to show how realized staleness maps to downstream score. At 8 the
+# tail collapsed into one overflow bucket.
 STALENESS_HISTOGRAM_MAX = 16
 
 # A finished group is list[Sample], or list[list[Sample]] when a generate function
@@ -471,11 +470,11 @@ class FullyAsyncRolloutFn:
         # across versions among themselves.
         trained_bound_staleness: list[int] = []
         offered_bound_staleness: list[int] = []
-        # The decomposition. Per group, with S the version at submission, Q the
-        # version the group entered the queue under, and C the version at drain:
-        #   pre-queue = Q - S   updates crossed while generating
+        # The decomposition. Per group, with R the selected bound reference, Q
+        # the version the group became trainable under, and C the version at drain:
+        #   pre-queue = Q - R   updates crossed before the group became trainable
         #   in-queue  = C - Q   updates crossed while waiting to be trained on
-        #   total     = C - S   = pre-queue + in-queue
+        #   total     = C - R   = pre-queue + in-queue = the bound quantity
         trained_pre_queue: list[int] = []
         trained_in_queue: list[int] = []
         trained_total: list[int] = []
@@ -520,8 +519,8 @@ class FullyAsyncRolloutFn:
 
             # Which end of generation the bound is measured from. `completion` keeps
             # the historical behaviour -- the gap covers queue residency but not the
-            # updates a generation crossed. `submission` bounds the whole off-policy
-            # distance, the quantity logged as `staleness/total`.
+            # updates a generation crossed. `submission` bounds the whole request
+            # lifetime. `prefill` starts at the first scheduler-authoritative forward.
             if args.staleness_reference == "completion":
                 reference = oldest
             elif args.staleness_reference == "submission":
@@ -552,7 +551,9 @@ class FullyAsyncRolloutFn:
 
             # Not gated on the bound: the bound tests one derived quantity, and every
             # arm -- including an unbounded one -- needs the decomposition.
-            span_start = first_prefill if args.staleness_reference == "prefill" else submitted
+            # The decomposition uses the exact same start as the bound. This keeps
+            # `staleness/total` equal to the enforced quantity in every reference mode.
+            span_start = reference
             have_span = ready is not None and span_start is not None
             group_pre_queue = ready - span_start if have_span else None
             group_in_queue = current - ready if have_span else None
@@ -637,10 +638,9 @@ class FullyAsyncRolloutFn:
             metrics["rollout/fully_async/avg_staleness"] = sum(offered_bound_staleness) / len(offered_bound_staleness)
             metrics["rollout/fully_async/max_staleness"] = max(offered_bound_staleness)
 
-        # The decomposition, over the trained batch. `total` is the quantity a
-        # staleness claim is about -- policy versions between the first token and
-        # the update that trains on it -- and the two components say where it came
-        # from: `pre_queue` is generation (straggler-driven), `in_queue` is waiting.
+        # The decomposition, over the trained batch. `total` is the selected bound
+        # quantity. The two components say where it came from: `pre_queue` is the
+        # selected reference to group-ready span, and `in_queue` is queue waiting.
         # `frac_at_bound` is absent from all three: `--max-weight-staleness` is not
         # applied to any of them, see `staleness/bound/` below.
         for name, values in (
@@ -656,8 +656,9 @@ class FullyAsyncRolloutFn:
         # What the bound actually tests, which depends on `--staleness-reference`:
         #
         #   completion (default)  current - oldest  = in_queue + the group's internal
-        #                         version spread. Not `in_queue`, and not `total`.
+        #                         completion-version spread = `total` exactly.
         #   submission            current - S       = `total` exactly.
+        #   prefill               current - first prefill = `total` exactly.
         #
         # Kept under its own name because it is the only quantity that explains which
         # groups were recycled, in the two populations the bound separates: `rollout`

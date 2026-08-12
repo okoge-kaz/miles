@@ -562,29 +562,20 @@ class StubWeightVersion:
         return self.value
 
 
-async def test_pre_queue_staleness_records_updates_crossed_during_generation(monkeypatch):
-    """The quantity `--pause-generation-mode in_place` hides.
-
-    SGLang stamps `meta_info["weight_version"]` when it builds the response, so a
-    request frozen across a weight update and resumed on the same KV cache reports
-    only the version it *finished* under -- one response, no retraction, nothing
-    else in the reply saying it spanned two policies. The bound is a difference
-    against that completion version and so reads zero; pre-queue staleness is the
-    difference against the version the group was submitted under.
-    """
+async def test_prefill_pre_queue_staleness_records_updates_crossed_during_generation(monkeypatch):
+    """Prefill provenance exposes the span hidden by completion metadata."""
     version = StubWeightVersion(4)
 
     async def generate_crossing_an_update(state, group, sampling_params, evaluation=False):
         await asyncio.sleep(0)
         version.value = 6
         fn.commit_applied_weight_version(6)
-        for sample in group:
-            sample.weight_versions = ["6"]
+        _stamp_prefill_provenance(group, first=4, minimum=4, maximum=6, last=6)
         return group
 
     fn = make_fn(
         monkeypatch,
-        make_args(rollout_batch_size=1, max_weight_staleness=2),
+        make_args(rollout_batch_size=1, max_weight_staleness=2, staleness_reference="prefill"),
         FakeDataSource(),
         generate=generate_crossing_an_update,
     )
@@ -593,9 +584,7 @@ async def test_pre_queue_staleness_records_updates_crossed_during_generation(mon
 
     output = await fn(RolloutFnTrainInput(rollout_id=0))
 
-    # Completion version 6 against current 6: what the bound tests is zero, so the
-    # bound of 2 never sees the two updates the group actually crossed.
-    assert output.metrics["staleness/bound/train/max"] == 0
+    assert output.metrics["staleness/bound/train/max"] == 2
     assert output.metrics["rollout/fully_async/stale_groups_recycled"] == 0
 
     assert output.metrics["staleness/pre_queue/max"] == 2
@@ -659,7 +648,7 @@ async def test_components_sum_to_the_total(monkeypatch):
 
     fn = make_fn(
         monkeypatch,
-        make_args(rollout_batch_size=1, max_weight_staleness=None),
+        make_args(rollout_batch_size=1, max_weight_staleness=None, staleness_reference="submission"),
         FakeDataSource(),
         generate=generate_then_let_the_queue_age,
     )
@@ -780,8 +769,9 @@ async def test_completion_reference_does_not_see_the_generation_span(monkeypatch
     of 0, because the gap is measured from the version it finished under."""
     output, data_source = await _run_with_reference(monkeypatch, "completion", bound=0)
 
-    assert output.metrics["staleness/total/max"] == 1
+    assert output.metrics["staleness/total/max"] == 0
     assert output.metrics["staleness/bound/train/max"] == 0
+    assert output.metrics["staleness/total/max"] == output.metrics["staleness/bound/train/max"]
     assert output.metrics["rollout/fully_async/stale_groups_recycled"] == 0
     assert data_source.recycled == []
     assert output.metrics["staleness/bound_reference_is_submission"] == 0.0
@@ -852,6 +842,9 @@ async def test_prefill_reference_ignores_update_while_waiting_for_prefill(monkey
     output = await fn(RolloutFnTrainInput(rollout_id=0))
 
     assert output.metrics["staleness/bound/train/max"] == 0
+    assert output.metrics["staleness/pre_queue/max"] == 0
+    assert output.metrics["staleness/in_queue/max"] == 0
+    assert output.metrics["staleness/total/max"] == 0
     assert output.metrics["rollout/fully_async/stale_groups_recycled"] == 0
     sample = output.samples[0][0]
     assert sample.metadata[fully_async.SUBMISSION_VERSION_KEY] == 10
@@ -917,6 +910,9 @@ async def test_prefill_reference_accepts_one_step_mixed_generation_at_max_one(mo
     output = await fn(RolloutFnTrainInput(rollout_id=0))
 
     assert output.metrics["staleness/bound/train/max"] == 1
+    assert output.metrics["staleness/pre_queue/max"] == 1
+    assert output.metrics["staleness/in_queue/max"] == 0
+    assert output.metrics["staleness/total/max"] == 1
     assert output.metrics["rollout/fully_async/stale_groups_recycled"] == 0
     assert output.metrics["staleness/mixed_version_frac/train"] == 1.0
 
@@ -945,11 +941,17 @@ def test_applied_weight_version_tracker_rejects_rollback():
         tracker.commit(10)
 
 
-async def test_submission_reference_leaves_the_decomposition_alone(monkeypatch):
-    """Switching the reference changes what is enforced, not what is measured: the
-    three components are computed from the same endpoints either way."""
+async def test_decomposition_uses_the_selected_bound_reference(monkeypatch):
+    """Every mode reports `total` from the same endpoints its bound enforces."""
     completion, _ = await _run_with_reference(monkeypatch, "completion", bound=4)
     submission, _ = await _run_with_reference(monkeypatch, "submission", bound=4)
 
-    for key in ("staleness/pre_queue/max", "staleness/in_queue/max", "staleness/total/max"):
-        assert completion.metrics[key] == submission.metrics[key], key
+    assert completion.metrics["staleness/pre_queue/max"] == 0
+    assert completion.metrics["staleness/in_queue/max"] == 0
+    assert completion.metrics["staleness/total/max"] == 0
+    assert completion.metrics["staleness/total/max"] == completion.metrics["staleness/bound/train/max"]
+
+    assert submission.metrics["staleness/pre_queue/max"] == 1
+    assert submission.metrics["staleness/in_queue/max"] == 0
+    assert submission.metrics["staleness/total/max"] == 1
+    assert submission.metrics["staleness/total/max"] == submission.metrics["staleness/bound/train/max"]
