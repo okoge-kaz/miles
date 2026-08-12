@@ -162,6 +162,14 @@ Before submitting:
 - **`SAVE_INTERVAL` small enough that a 4 h wall loses little.** The run is
   expected to span several jobs; resubmitting the same command resumes from
   `--load`.
+- **Retain HF checkpoints for every dependency chain.** Resolve the values on
+  the actual `sbatch` command and require `SAVE_HF=1` plus a positive
+  `HF_SAVE_INTERVAL`; do not rely on recipe defaults. A sweep wrapper can
+  override a recipe's `SAVE_HF=1` with `SAVE_HF=0`, leaving only resumable
+  `torch_dist` checkpoints and making the requested evaluation curve
+  unavailable. Confirm that `train.sh` receives both `--save-hf` and
+  `--hf-save-interval`, and make the sweep's dry-run output state the retained
+  HF cadence before submitting any link.
 - **Scale the batch, not just the node count.** More nodes raise data parallelism
   and shrink the per-rank batch; they do not by themselves make each step more
   informative. Raise `ROLLOUT_BATCH_SIZE` with the allocation, and keep the
@@ -220,7 +228,11 @@ The smoke run has to get past three points, in order:
 **Do not chain jobs with `--dependency=afterany` until one link is known to
 work.** `afterany` releases the next job on failure too, so a command that dies
 during startup walks the whole chain in minutes and reports it as scheduling
-activity rather than as a failure.
+activity rather than as a failure. Before creating the chain, also inspect the
+resolved `sbatch --export` for every arm and refuse submission unless
+`SAVE_HF=1` and `HF_SAVE_INTERVAL` is a positive integer. Verify the first link
+actually writes the expected `hf/<rollout_id>` directory before allowing the
+rest of the chain to proceed.
 
 ## Rules
 
@@ -232,5 +244,8 @@ activity rather than as a failure.
   Never tune on `batch` — it is slower to schedule and the result is not the
   point of that lane.
 - Every tuning submission gets its own `CONFIG_TAG`.
+- Never submit a dependency chain with HF retention disabled: require
+  `SAVE_HF=1`, validate `HF_SAVE_INTERVAL`, and verify one HF export on the first
+  link.
 - Report measured step times and dump sizes, not estimates, once a stage 2 run
   exists to measure.
