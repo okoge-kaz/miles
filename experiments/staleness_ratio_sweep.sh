@@ -49,7 +49,7 @@ STALENESS_REFERENCE=prefill
 : "${WALL:=04:00:00}"
 : "${CHAIN_JOBS:=10}"               # 300 rollouts need ~7 measured 4 h segments
 : "${SAVE_INTERVAL:=10}"
-: "${SAVE_RETAIN_INTERVAL:=100}"
+: "${SAVE_RETAIN_INTERVAL:=10}"     # retain every distributed checkpoint
 : "${SAVE_HF:=1}"                   # retain policy snapshots for offline eval
 : "${HF_SAVE_INTERVAL:=10}"         # rollout cadence of the retained HF series
 
@@ -357,6 +357,7 @@ printf 'lr %s, %s, %d nodes per job, %s wall, rseed %s\n' \
 printf 'wandb project %s\n' "${WANDB_PROJECT}"
 printf '%s rollouts, %s dependent %s jobs per arm; gbs %s, tp %s, cp %s.\n' \
     "${NUM_ROLLOUT}" "${CHAIN_JOBS}" "${WALL}" "${GBS}" "${TP}" "${CP}"
+printf 'Megatron checkpoints are retained every %s rollouts.\n' "${SAVE_RETAIN_INTERVAL}"
 if (( SAVE_HF == 1 )); then
     printf 'HF checkpoints are retained every %s rollouts for offline eval.\n' "${HF_SAVE_INTERVAL}"
 else
