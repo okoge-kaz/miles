@@ -50,6 +50,8 @@ STALENESS_REFERENCE=prefill
 : "${CHAIN_JOBS:=10}"               # 300 rollouts need ~7 measured 4 h segments
 : "${SAVE_INTERVAL:=10}"
 : "${SAVE_RETAIN_INTERVAL:=100}"
+: "${SAVE_HF:=1}"                   # retain policy snapshots for offline eval
+: "${HF_SAVE_INTERVAL:=10}"         # rollout cadence of the retained HF series
 
 # Both are pinned rather than inherited: this sweep names them as its fixed
 # conditions, and a recipe default that moves later must not move the sweep.
@@ -100,6 +102,9 @@ fi
 [[ "${SAVE_INTERVAL}" =~ ^[1-9][0-9]*$ ]] || { echo "SAVE_INTERVAL must be a positive integer" >&2; exit 1; }
 [[ "${SAVE_RETAIN_INTERVAL}" =~ ^[1-9][0-9]*$ ]] ||
     { echo "SAVE_RETAIN_INTERVAL must be a positive integer" >&2; exit 1; }
+[[ "${SAVE_HF}" =~ ^[01]$ ]] || { echo "SAVE_HF must be 0 or 1" >&2; exit 1; }
+[[ "${HF_SAVE_INTERVAL}" =~ ^[1-9][0-9]*$ ]] ||
+    { echo "HF_SAVE_INTERVAL must be a positive integer" >&2; exit 1; }
 (( SAVE_RETAIN_INTERVAL % SAVE_INTERVAL == 0 )) ||
     { echo "SAVE_RETAIN_INTERVAL must be divisible by SAVE_INTERVAL" >&2; exit 1; }
 
@@ -352,6 +357,11 @@ printf 'lr %s, %s, %d nodes per job, %s wall, rseed %s\n' \
 printf 'wandb project %s\n' "${WANDB_PROJECT}"
 printf '%s rollouts, %s dependent %s jobs per arm; gbs %s, tp %s, cp %s.\n' \
     "${NUM_ROLLOUT}" "${CHAIN_JOBS}" "${WALL}" "${GBS}" "${TP}" "${CP}"
+if (( SAVE_HF == 1 )); then
+    printf 'HF checkpoints are retained every %s rollouts for offline eval.\n' "${HF_SAVE_INTERVAL}"
+else
+    printf 'HF checkpoint retention is disabled.\n'
+fi
 printf 'The bound is enforced from first prefill to training drain (%s).\n' "${STALENESS_REFERENCE}"
 printf 's=N admits realized prefill staleness 0..N; s=0 is on-policy when each\n'
 printf 'optimizer step is synced once and NUM_STEPS_PER_ROLLOUT=1. Recycling is\n'
@@ -493,7 +503,7 @@ submit_async_chain() {  # staleness train_nodes rollout_nodes dp
             --job-name="${name}" \
             --nodes="${TOTAL_NODES}" --time="${WALL}" \
             --output="${LOG_DIR}/${name}-%j.log" \
-            --export="ALL,WANDB_PROJECT=${WANDB_PROJECT},RUN_NAME=${name},CONFIG_TAG=${name},NUM_ROLLOUT=${NUM_ROLLOUT},SAVE_INTERVAL=${SAVE_INTERVAL},SAVE_RETAIN_INTERVAL=${SAVE_RETAIN_INTERVAL},SAVE_HF=0,EVAL_INTERVAL=0,SKIP_EVAL_BEFORE_TRAIN=1,LR=${LR},MAX_WEIGHT_STALENESS=${s},STALENESS_REFERENCE=prefill,PAUSE_GENERATION_MODE=in_place,ACTOR_NUM_NODES=${t},ROLLOUT_NUM_GPUS=$(( r * GPN )),ROLLOUT_SEED=${ROLLOUT_SEED},IS_CORRECTION=${IS_CORRECTION},TIS_CLIP=${TIS_CLIP},TIS_CLIP_LOW=${TIS_CLIP_LOW},RATIO_DENOMINATOR=${RATIO_DENOMINATOR},FUSE_ONE_STEP_ACTOR_LOGPROBS=${FUSE_ONE_STEP_ACTOR_LOGPROBS},VERIFY_FUSED_ONE_STEP_ACTOR_LOGPROBS=0" \
+            --export="ALL,WANDB_PROJECT=${WANDB_PROJECT},RUN_NAME=${name},CONFIG_TAG=${name},NUM_ROLLOUT=${NUM_ROLLOUT},SAVE_INTERVAL=${SAVE_INTERVAL},SAVE_RETAIN_INTERVAL=${SAVE_RETAIN_INTERVAL},SAVE_HF=${SAVE_HF},HF_SAVE_INTERVAL=${HF_SAVE_INTERVAL},EVAL_INTERVAL=0,SKIP_EVAL_BEFORE_TRAIN=1,LR=${LR},MAX_WEIGHT_STALENESS=${s},STALENESS_REFERENCE=prefill,PAUSE_GENERATION_MODE=in_place,ACTOR_NUM_NODES=${t},ROLLOUT_NUM_GPUS=$(( r * GPN )),ROLLOUT_SEED=${ROLLOUT_SEED},IS_CORRECTION=${IS_CORRECTION},TIS_CLIP=${TIS_CLIP},TIS_CLIP_LOW=${TIS_CLIP_LOW},RATIO_DENOMINATOR=${RATIO_DENOMINATOR},FUSE_ONE_STEP_ACTOR_LOGPROBS=${FUSE_ONE_STEP_ACTOR_LOGPROBS},VERIFY_FUSED_ONE_STEP_ACTOR_LOGPROBS=0" \
             "${REPO_ROOT}/${ASYNC_RECIPE}")
         jid=${raw_jid%%;*}
         dependency_label=""
@@ -525,7 +535,7 @@ submit_colocated_chain() {
             --job-name="${name}" \
             --nodes="${TOTAL_NODES}" --time="${WALL}" \
             --output="${LOG_DIR}/${name}-%j.log" \
-            --export="ALL,WANDB_PROJECT=${WANDB_PROJECT},RUN_NAME=${name},CONFIG_TAG=${name},NUM_ROLLOUT=${NUM_ROLLOUT},SAVE_INTERVAL=${SAVE_INTERVAL},SAVE_RETAIN_INTERVAL=${SAVE_RETAIN_INTERVAL},SAVE_HF=0,EVAL_INTERVAL=0,SKIP_EVAL_BEFORE_TRAIN=1,LR=${LR},MAX_WEIGHT_STALENESS=0,STALENESS_REFERENCE=completion,PAUSE_GENERATION_MODE=none,ACTOR_NUM_NODES=${TOTAL_NODES},ROLLOUT_NUM_GPUS=0,ROLLOUT_SEED=${ROLLOUT_SEED},IS_CORRECTION=${IS_CORRECTION},TIS_CLIP=${TIS_CLIP},TIS_CLIP_LOW=${TIS_CLIP_LOW},RATIO_DENOMINATOR=${RATIO_DENOMINATOR},LOG_PROBS_CHUNK_SIZE=${LOG_PROBS_CHUNK_SIZE},OBSERVE_TRAINING_ENTROPY=${OBSERVE_TRAINING_ENTROPY}" \
+            --export="ALL,WANDB_PROJECT=${WANDB_PROJECT},RUN_NAME=${name},CONFIG_TAG=${name},NUM_ROLLOUT=${NUM_ROLLOUT},SAVE_INTERVAL=${SAVE_INTERVAL},SAVE_RETAIN_INTERVAL=${SAVE_RETAIN_INTERVAL},SAVE_HF=${SAVE_HF},HF_SAVE_INTERVAL=${HF_SAVE_INTERVAL},EVAL_INTERVAL=0,SKIP_EVAL_BEFORE_TRAIN=1,LR=${LR},MAX_WEIGHT_STALENESS=0,STALENESS_REFERENCE=completion,PAUSE_GENERATION_MODE=none,ACTOR_NUM_NODES=${TOTAL_NODES},ROLLOUT_NUM_GPUS=0,ROLLOUT_SEED=${ROLLOUT_SEED},IS_CORRECTION=${IS_CORRECTION},TIS_CLIP=${TIS_CLIP},TIS_CLIP_LOW=${TIS_CLIP_LOW},RATIO_DENOMINATOR=${RATIO_DENOMINATOR},LOG_PROBS_CHUNK_SIZE=${LOG_PROBS_CHUNK_SIZE},OBSERVE_TRAINING_ENTROPY=${OBSERVE_TRAINING_ENTROPY}" \
             "${REPO_ROOT}/${COLO_RECIPE}")
         jid=${raw_jid%%;*}
         dependency_label=""
