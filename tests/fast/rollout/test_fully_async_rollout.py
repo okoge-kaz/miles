@@ -135,6 +135,8 @@ async def test_aborted_group_recycled(monkeypatch):
 
 async def test_stale_group_recycled(monkeypatch):
     stale = make_group(1, weight_versions=["5"])
+    stale[0].response_length = 1
+    stale[1].response_length = 3
     data_source = FakeDataSource(scripted=[stale])
     data_source_fresh_versions = ["10"]
 
@@ -167,6 +169,15 @@ async def test_stale_group_recycled(monkeypatch):
     # missing staleness metric cannot be told apart from a router that never answered.
     assert output.metrics["rollout/fully_async/current_weight_version"] == 10
 
+    # Queue selection is group-valued. The stale group's slowest sample had
+    # length 3, while the replacement group has two length-1 samples.
+    assert output.metrics["queue/selection/stale_recycled/sample_length/mean"] == pytest.approx(2.0)
+    assert output.metrics["queue/selection/stale_recycled/group_max_length/max"] == 3
+    assert output.metrics["queue/selection/trained/sample_length/mean"] == pytest.approx(1.0)
+    assert output.metrics["queue/selection/completed/sample_length/count"] == 4
+    assert output.metrics["queue/selection/completed/sample_length/sum"] == 6
+    assert output.metrics["queue/selection/aborted_recycled/group_max_length/count"] == 0
+
     # `staleness/bound/train/` is what the bound saw for the batch. The group at 5 exceeded the
     # bound of 2 and was recycled, so only the fresh group at 10 -- lag 0 -- was
     # trained on. A reader plotting "max_staleness" against a bound of 2 must never
@@ -189,13 +200,13 @@ async def test_stale_group_recycled(monkeypatch):
     assert output.metrics["staleness/bound/rollout/frac_at_bound"] == pytest.approx(0.5)
 
     # Tokens counted before reset_for_retry cleared them.
-    assert output.metrics["rollout/fully_async/stale_tokens"] == N_SAMPLES_PER_PROMPT
+    assert output.metrics["rollout/fully_async/stale_tokens"] == 4
 
     # Named for the cause, under the section that owns it, so the bound's cost does
     # not have to be reconstructed by differencing group counts -- which would fold
     # in the dynamic-filter drops.
     assert output.metrics["staleness/bound_exceeded_groups"] == 1
-    assert output.metrics["staleness/bound_exceeded_tokens"] == N_SAMPLES_PER_PROMPT
+    assert output.metrics["staleness/bound_exceeded_tokens"] == 4
 
     # The recycled group was regenerated, so its retry counter advanced. The group
     # that trained this step was never recycled.

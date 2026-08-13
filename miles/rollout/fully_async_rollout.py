@@ -275,6 +275,65 @@ def group_response_tokens(group: Group) -> int:
     return sum(sample.response_length for sample in _iter_samples(group))
 
 
+def _distribution_metrics(values: list[int]) -> dict[str, float]:
+    """Reduce an in-memory integer population to fixed-cardinality scalars."""
+    if not values:
+        return {"count": 0.0, "sum": 0.0}
+    array = np.asarray(values, dtype=float)
+    return {
+        "count": float(array.size),
+        "sum": float(array.sum()),
+        "mean": float(array.mean()),
+        "std": float(array.std()),
+        "p50": float(np.percentile(array, 50)),
+        "p90": float(np.percentile(array, 90)),
+        "p99": float(np.percentile(array, 99)),
+        "max": float(array.max()),
+    }
+
+
+class _ResponseLengthMetrics:
+    """Small integer-only view of queue admission outcomes.
+
+    Queue admission is group-valued, while the loss and token cost are
+    sample-valued. Keep both views: the slowest response is the natural proxy for
+    group completion latency, and the flattened sample lengths describe the data
+    distribution seen (or rejected) by training.
+    """
+
+    _POPULATIONS = (
+        "completed",
+        "trained",
+        "stale_recycled",
+        "dynamic_filter_dropped",
+        "aborted_recycled",
+    )
+
+    def __init__(self) -> None:
+        self._sample_lengths = {population: [] for population in self._POPULATIONS}
+        self._group_max_lengths = {population: [] for population in self._POPULATIONS}
+
+    def record(self, population: str, group: Group) -> None:
+        lengths = [sample.response_length for sample in _iter_samples(group)]
+        if not lengths:
+            return
+        self._sample_lengths[population].extend(lengths)
+        self._group_max_lengths[population].append(max(lengths))
+
+    def collect(self) -> dict[str, float]:
+        metrics: dict[str, float] = {}
+        for population, sample_lengths in self._sample_lengths.items():
+            for view, values in (
+                ("sample_length", sample_lengths),
+                ("group_max_length", self._group_max_lengths[population]),
+            ):
+                metrics |= {
+                    f"queue/selection/{population}/{view}/{name}": value
+                    for name, value in _distribution_metrics(values).items()
+                }
+        return metrics
+
+
 def _staleness_metrics(values: list[int], bound: int | None) -> dict[str, float]:
     """P(L) reduced to bounded scalars: the logger takes scalars, not histograms.
 
@@ -453,6 +512,8 @@ class FullyAsyncRolloutFn:
         assert args.rollout_global_dataset
 
         target_data_size = args.rollout_batch_size
+        queue_size_start = self._output.qsize()
+        queue_sizes_after_dequeue: list[int] = []
         data: list[Group] = []
         aborted_groups_recycled = 0
         stale_groups_recycled = 0
@@ -487,19 +548,24 @@ class FullyAsyncRolloutFn:
         aborted_tokens = 0
         stale_tokens = 0
         filtered_tokens = 0
+        response_length_metrics = _ResponseLengthMetrics()
         metric_gatherer = MetricGatherer()
         do_print = True
 
         while len(data) < target_data_size:
             prompt_group, group = await self._next_group()
+            queue_sizes_after_dequeue.append(self._output.qsize())
             assert len(group) == args.n_samples_per_prompt
 
             # A weight update paused generation mid-group: return it for re-sampling.
             if any(s.status == Sample.Status.ABORTED for s in _iter_samples(group)):
+                response_length_metrics.record("aborted_recycled", group)
                 aborted_tokens += group_response_tokens(group)
                 self._recycle(prompt_group)
                 aborted_groups_recycled += 1
                 continue
+
+            response_length_metrics.record("completed", group)
 
             oldest = group_oldest_weight_version(group)
             submitted = group_submission_weight_version(group)
@@ -540,6 +606,7 @@ class FullyAsyncRolloutFn:
                     group_bound_staleness = staleness
                     offered_bound_staleness.append(staleness)
                     if staleness > args.max_weight_staleness:
+                        response_length_metrics.record("stale_recycled", group)
                         stale_tokens += group_response_tokens(group)
                         self._recycle(prompt_group)
                         stale_groups_recycled += 1
@@ -572,6 +639,7 @@ class FullyAsyncRolloutFn:
             filter_output = call_dynamic_filter(self._dynamic_filter, args, group)
             if not filter_output.keep:
                 # Dropped, not recycled: no usable gradient signal.
+                response_length_metrics.record("dynamic_filter_dropped", group)
                 filtered_tokens += group_response_tokens(group)
                 metric_gatherer.on_dynamic_filter_drop(reason=filter_output.reason)
                 continue
@@ -593,6 +661,7 @@ class FullyAsyncRolloutFn:
             if group_total is not None:
                 trained_total.append(group_total)
             trained_mixed_versions.append(mixed_version)
+            response_length_metrics.record("trained", group)
             data.append(group)
 
         sample = _first_sample(data[-1])
@@ -610,6 +679,10 @@ class FullyAsyncRolloutFn:
         wasted_tokens = aborted_tokens + stale_tokens + filtered_tokens
         metrics = {
             "rollout/fully_async/queue_size": self._output.qsize(),
+            "queue/occupancy/start_groups": queue_size_start,
+            "queue/occupancy/end_groups": self._output.qsize(),
+            "queue/occupancy/capacity_groups": OUTPUT_QUEUE_MAX_GROUPS,
+            "queue/occupancy/max_in_flight_groups": self._max_in_flight_groups(),
             "rollout/fully_async/aborted_groups_recycled": aborted_groups_recycled,
             "rollout/fully_async/stale_groups_recycled": stale_groups_recycled,
             "rollout/fully_async/aborted_tokens": aborted_tokens,
@@ -619,6 +692,11 @@ class FullyAsyncRolloutFn:
             "rollout/fully_async/wasted_token_frac": (
                 wasted_tokens / (wasted_tokens + kept_tokens) if wasted_tokens + kept_tokens else 0.0
             ),
+            **{
+                f"queue/occupancy/after_dequeue/{name}": value
+                for name, value in _distribution_metrics(queue_sizes_after_dequeue).items()
+            },
+            **response_length_metrics.collect(),
             **metric_gatherer.collect(),
         }
         if current_version is not None:

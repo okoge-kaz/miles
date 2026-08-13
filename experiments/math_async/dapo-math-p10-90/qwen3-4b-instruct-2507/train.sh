@@ -55,6 +55,9 @@ if [[ -n "${ASYNC_MAX_CONCURRENT_SAMPLES:-}" ]]; then
 
    ROLLOUT_ARGS+=(--async-max-concurrent-samples "${ASYNC_MAX_CONCURRENT_SAMPLES}")
 fi
+if [[ -n "${DEBUG_EXIT_AFTER_ROLLOUT:-}" ]]; then
+   ROLLOUT_ARGS+=(--debug-exit-after-rollout "${DEBUG_EXIT_AFTER_ROLLOUT}")
+fi
 
 TELEMETRY_ARGS=(
    --dump-details "${CKPT_PATH}/dump"
