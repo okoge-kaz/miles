@@ -132,6 +132,7 @@ async def test_queue_lifecycle_dump_is_primitive_and_opt_in(monkeypatch):
     assert record["disposition"] == "trained"
     assert record["rollout_id"] == 7
     assert record["response_lengths"] == [2, 4]
+    assert record["reward_values"] == [1.0, 1.0]
     assert record["completion_version_min"] == 3
     assert record["ready_version"] == 3
     assert record["queue_depth_before_enqueue"] == 0

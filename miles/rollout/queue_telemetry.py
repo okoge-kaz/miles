@@ -50,6 +50,26 @@ def group_response_tokens(group: Group) -> int:
     return sum(sample.response_length for sample in _iter_samples(group))
 
 
+def group_reward_values(group: Group, reward_key: str | None) -> list[float | None]:
+    """Return scalar rewards aligned with the group's flattened samples.
+
+    Queue diagnostics must never trigger reward computation. The values here are
+    copied only after generation and reward evaluation have completed. A custom
+    non-scalar reward remains missing rather than making optional telemetry fail
+    an otherwise usable rollout.
+    """
+    values = []
+    for sample in _iter_samples(group):
+        reward = sample.reward
+        if reward is not None and reward_key:
+            reward = reward.get(reward_key) if isinstance(reward, dict) else None
+        if isinstance(reward, (int, float, np.integer, np.floating)):
+            values.append(float(reward))
+        else:
+            values.append(None)
+    return values
+
+
 def _distribution_metrics(values: list[int]) -> dict[str, float]:
     """Reduce an in-memory integer population to fixed-cardinality scalars."""
     if not values:
@@ -204,10 +224,19 @@ class _QueueLifecycleRecorder:
         if record is not None:
             record.clear()
 
-    def group_ready(self, record: dict | None, group: Group, ready_version: int) -> None:
+    def group_ready(
+        self,
+        record: dict | None,
+        group: Group,
+        ready_version: int,
+        *,
+        reward_values: list[float | None] | None = None,
+    ) -> None:
         if record is None:
             return
         samples = list(_iter_samples(group))
+        if reward_values is not None and len(reward_values) != len(samples):
+            raise ValueError(f"Reward telemetry has {len(reward_values)} values for {len(samples)} flattened samples")
         record.update(
             response_lengths=[sample.response_length for sample in samples],
             statuses=[sample.status.value for sample in samples],
@@ -217,6 +246,8 @@ class _QueueLifecycleRecorder:
             ready_version=ready_version,
             ready_time_ns=self._now_ns(),
         )
+        if reward_values is not None:
+            record["reward_values"] = list(reward_values)
         key = self._group_key(group)
         if key in self._records_by_group_key:
             raise RuntimeError(f"Duplicate live queue lifecycle identity: {key}")

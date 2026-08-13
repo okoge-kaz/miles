@@ -55,6 +55,7 @@ from miles.rollout.queue_telemetry import (
     group_oldest_weight_version,
     group_queue_entry_weight_version,
     group_response_tokens,
+    group_reward_values,
 )
 from miles.utils.http_utils import get
 from miles.utils.misc import load_function
@@ -894,7 +895,15 @@ class FullyAsyncRolloutFn:
             GROUP_READY_VERSION_KEY,
             ready_version,
         )
-        self._queue_lifecycle.group_ready(lifecycle_record, result, ready_version)
+        reward_values = None
+        if lifecycle_record is not None:
+            reward_values = group_reward_values(result, getattr(self.args, "reward_key", None))
+        self._queue_lifecycle.group_ready(
+            lifecycle_record,
+            result,
+            ready_version,
+            reward_values=reward_values,
+        )
         if not any(sample.status == Sample.Status.ABORTED for sample in _iter_samples(result)):
             self._producer_response_lengths.record("generated", result)
         if self._checkpoint_packed_fields is not None:

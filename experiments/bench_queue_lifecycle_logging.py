@@ -9,7 +9,7 @@ import time
 
 import torch
 
-from miles.rollout.queue_telemetry import _QueueLifecycleRecorder
+from miles.rollout.queue_telemetry import _QueueLifecycleRecorder, group_reward_values
 from miles.utils.types import Sample
 
 
@@ -24,6 +24,7 @@ def make_groups(num_groups: int, samples_per_group: int) -> list[list[Sample]]:
                     group_index=group_index,
                     index=group_index * samples_per_group + sample_offset,
                     response_length=response_length,
+                    reward=float((group_index + sample_offset) % 2),
                     status=Sample.Status.COMPLETED,
                     weight_versions=["3"],
                     first_prefill_weight_versions=[2],
@@ -40,7 +41,8 @@ def record_batch(groups: list[list[Sample]], *, enabled: bool) -> dict | None:
     recorder = _QueueLifecycleRecorder(enabled=enabled)
     for sequence, group in enumerate(groups):
         record = recorder.begin_attempt(group, submission_version=2)
-        recorder.group_ready(record, group, ready_version=3)
+        rewards = group_reward_values(group, reward_key=None) if record is not None else None
+        recorder.group_ready(record, group, ready_version=3, reward_values=rewards)
         recorder.enqueued(
             group,
             queue_put_version=3,

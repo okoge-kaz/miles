@@ -102,6 +102,86 @@ def _length_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _pearson(pairs: list[tuple[float, float]]) -> float | None:
+    if len(pairs) < 2:
+        return None
+    left = [pair[0] for pair in pairs]
+    right = [pair[1] for pair in pairs]
+    left_mean = statistics.fmean(left)
+    right_mean = statistics.fmean(right)
+    left_ss = sum((value - left_mean) ** 2 for value in left)
+    right_ss = sum((value - right_mean) ** 2 for value in right)
+    if left_ss == 0 or right_ss == 0:
+        return None
+    covariance = sum((x - left_mean) * (y - right_mean) for x, y in pairs)
+    return covariance / math.sqrt(left_ss * right_ss)
+
+
+def _reward_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
+    sample_rewards = []
+    group_mean_rewards = []
+    sample_length_reward_pairs = []
+    group_length_reward_pairs = []
+    records_with_values = 0
+    samples_missing_reward = 0
+    group_categories: Counter[str] = Counter()
+
+    for record in records:
+        lengths = record.get("response_lengths", [])
+        raw_rewards = record.get("reward_values")
+        if raw_rewards is None:
+            samples_missing_reward += len(lengths)
+            continue
+        if len(raw_rewards) != len(lengths):
+            raise ValueError(
+                f"attempt {record.get('attempt_id')}: {len(raw_rewards)} rewards "
+                f"do not align with {len(lengths)} response lengths"
+            )
+        records_with_values += 1
+        rewards = []
+        for length, raw_reward in zip(lengths, raw_rewards, strict=True):
+            if raw_reward is None:
+                samples_missing_reward += 1
+                continue
+            reward = float(raw_reward)
+            rewards.append(reward)
+            sample_rewards.append(reward)
+            sample_length_reward_pairs.append((float(length), reward))
+
+        if len(rewards) != len(lengths) or not rewards:
+            continue
+        group_mean = statistics.fmean(rewards)
+        group_mean_rewards.append(group_mean)
+        group_length_reward_pairs.append((float(max(lengths)), group_mean))
+        if all(reward == 0 for reward in rewards):
+            group_categories["all_zero"] += 1
+        elif all(reward == 1 for reward in rewards):
+            group_categories["all_one"] += 1
+        elif len(set(rewards)) > 1:
+            group_categories["mixed"] += 1
+        else:
+            group_categories["uniform_other"] += 1
+
+    complete_groups = len(group_mean_rewards)
+    return {
+        "records_with_reward_values": records_with_values,
+        "groups_with_complete_rewards": complete_groups,
+        "samples_missing_reward": samples_missing_reward,
+        "sample_reward": distribution(sample_rewards),
+        "group_mean_reward": distribution(group_mean_rewards),
+        "all_zero_group_frac": group_categories["all_zero"] / complete_groups if complete_groups else None,
+        "all_one_group_frac": group_categories["all_one"] / complete_groups if complete_groups else None,
+        "mixed_reward_group_frac": group_categories["mixed"] / complete_groups if complete_groups else None,
+        "uniform_other_group_frac": group_categories["uniform_other"] / complete_groups if complete_groups else None,
+        "sample_length_reward_pearson": _pearson(sample_length_reward_pairs),
+        "group_max_length_mean_reward_pearson": _pearson(group_length_reward_pairs),
+    }
+
+
+def _record_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
+    return {**_length_summary(records), "reward": _reward_summary(records)}
+
+
 def _version_gap(records: list[dict[str, Any]], end: str, start: str) -> dict[str, float | int]:
     gaps = []
     for record in records:
@@ -176,12 +256,14 @@ def summarize(
 
     completed = [record for record in records if record["disposition"] in COMPLETED_DISPOSITIONS]
     trained = by_disposition["trained"]
-    completed_summary = _length_summary(completed)
-    trained_summary = _length_summary(trained)
+    completed_summary = _record_summary(completed)
+    trained_summary = _record_summary(trained)
     sampled_mean = completed_summary["sample_length"].get("mean")
     trained_mean = trained_summary["sample_length"].get("mean")
     group_max_mean = completed_summary["group_max_length"].get("mean")
     tailness = group_max_mean / sampled_mean if sampled_mean else None
+    completed_reward_mean = completed_summary["reward"]["sample_reward"].get("mean")
+    trained_reward_mean = trained_summary["reward"]["sample_reward"].get("mean")
 
     groups_per_batch, samples_per_group = _infer_batch_shape(trained)
     batch_samples = groups_per_batch * samples_per_group if groups_per_batch and samples_per_group else None
@@ -201,7 +283,7 @@ def summarize(
             "queue_factor": queue_factor,
         },
         "dispositions": {
-            disposition: _length_summary(disposition_records)
+            disposition: _record_summary(disposition_records)
             for disposition, disposition_records in sorted(by_disposition.items())
         },
         "terminal_completed": completed_summary,
@@ -215,6 +297,18 @@ def summarize(
             ),
             "group_tailness_multiplier": tailness,
         },
+        "reward_selection": {
+            "trained_minus_terminal_completed_sample_mean": (
+                trained_reward_mean - completed_reward_mean
+                if trained_reward_mean is not None and completed_reward_mean is not None
+                else None
+            ),
+            "trained_to_terminal_completed_sample_mean_ratio": (
+                trained_reward_mean / completed_reward_mean
+                if trained_reward_mean is not None and completed_reward_mean
+                else None
+            ),
+        },
         "trained_selection_staleness": {
             "pre_queue_ready_minus_first_prefill": _version_gap(trained, "ready_version", "first_prefill_version"),
             "in_queue_selection_minus_ready": _version_gap(trained, "decision_version", "ready_version"),
@@ -225,6 +319,7 @@ def summarize(
             "finite runs censor groups still in flight or queued at the final dump; discard warmup/final windows for inference",
             "trained means queue-admitted; exclude a debug-exit prefetch dump whose rollout_id was never consumed",
             "decision_version is queue-selection time; join queue/consumption/selection_to_train_gap for legacy prefetch slack",
+            "reward summaries are absent for lifecycle dumps written before reward_values was added",
         ],
     }
 

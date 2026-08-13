@@ -525,6 +525,15 @@ under `submission` or `prefill`, it is. Dumps carry the submission stamp, all
 four forward-provenance arrays, completion versions, and the queue lifecycle's
 ready/enqueue/dequeue/decision fields for offline reconstruction.
 
+Each new lifecycle record also carries scalar `reward_values` aligned with its
+`sample_indices` and `response_lengths`. Reward evaluation has already completed
+before the group becomes ready, so recording the values does not call the RM or
+send anything through the trainer object store. The offline analyzer reports
+sample and group reward distributions, all-zero/all-one/mixed group fractions,
+and sample-length/reward and group-max-length/group-mean-reward correlations for
+every terminal disposition. Older dumps remain readable and report missing
+reward coverage rather than inventing zero rewards.
+
 ### Queue policies and the formula boundary
 
 - `queue-recycle` is the compatibility default: completion FIFO, immediate

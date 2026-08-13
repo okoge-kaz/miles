@@ -1,6 +1,12 @@
 import copy
 
-from miles.rollout.queue_telemetry import _QueueLifecycleRecorder, _ResponseLengthMetrics
+import pytest
+
+from miles.rollout.queue_telemetry import (
+    _QueueLifecycleRecorder,
+    _ResponseLengthMetrics,
+    group_reward_values,
+)
 from miles.utils.types import Sample
 
 
@@ -31,11 +37,22 @@ def test_response_length_metrics_checkpoint_roundtrip_preserves_accumulators():
     assert metrics["queue/selection/queue_evicted/sample_length/sum"] == 10
 
 
+def test_group_reward_values_normalizes_scalars_without_computing_rewards():
+    group = _group(3, (2, 4))
+    group[0].reward = 0
+    group[1].reward = {"score": 1, "detail": "already computed"}
+
+    assert group_reward_values(group, reward_key="score") == [None, 1.0]
+
+    group[1].reward = 0.25
+    assert group_reward_values(group, reward_key=None) == [0.0, 0.25]
+
+
 def test_queue_lifecycle_checkpoint_roundtrip_uses_stable_group_identity():
     group = _group(7, (3, 4))
     original = _QueueLifecycleRecorder(enabled=True)
     attempt = original.begin_attempt(group, submission_version=1)
-    original.group_ready(attempt, group, ready_version=2)
+    original.group_ready(attempt, group, ready_version=2, reward_values=[0.0, 1.0])
     original.enqueued(group, queue_put_version=2, depth_before=0, depth_after=1)
 
     restored = _QueueLifecycleRecorder(enabled=True)
@@ -58,6 +75,7 @@ def test_queue_lifecycle_checkpoint_roundtrip_uses_stable_group_identity():
     assert record["enqueue_seq"] == 0
     assert record["dequeue_seq"] == 0
     assert record["sample_indices"] == [70, 71]
+    assert record["reward_values"] == [0.0, 1.0]
     assert record["disposition"] == "trained"
     assert record["bound_staleness"] == 2
 
@@ -92,3 +110,12 @@ def test_queue_lifecycle_restore_records_checkpoint_promoted_admission():
     assert record["queue_put_version"] == 2
     assert record["queue_depth_before_enqueue"] == 4
     assert record["queue_depth_after_enqueue"] == 5
+
+
+def test_queue_lifecycle_rejects_misaligned_reward_values():
+    group = _group(10, (2, 3))
+    recorder = _QueueLifecycleRecorder(enabled=True)
+    attempt = recorder.begin_attempt(group, submission_version=1)
+
+    with pytest.raises(ValueError, match="1 values for 2 flattened samples"):
+        recorder.group_ready(attempt, group, ready_version=2, reward_values=[1.0])
