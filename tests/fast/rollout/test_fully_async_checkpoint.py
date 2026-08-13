@@ -4,6 +4,7 @@ register_cpu_ci(est_time=30, suite="stage-a-cpu", labels=[])
 
 import asyncio
 import copy
+import gc
 import hashlib
 import json
 import struct
@@ -16,6 +17,7 @@ import pytest
 import torch
 
 import miles.rollout.fully_async_checkpoint as checkpoint_module
+import miles.rollout.fully_async_checkpoint_codec as codec_module
 import miles.rollout.fully_async_rollout as fully_async
 from miles.rollout.base_types import RolloutFnConstructorInput, RolloutFnTrainInput
 from miles.rollout.fully_async_checkpoint import (
@@ -29,6 +31,7 @@ from miles.rollout.fully_async_checkpoint import (
 )
 from miles.rollout.fully_async_checkpoint_codec import (
     SAMPLE_CODEC_STATE_KEY,
+    CheckpointPackedFieldCache,
     CheckpointSampleEncoder,
     materialize_checkpoint_state,
 )
@@ -428,6 +431,86 @@ def test_packed_sample_codec_applies_queue_overlay_without_mutating_or_aliasing_
     assert prompt is not result
 
 
+def test_prepacked_sample_cache_is_lossless_and_reassigned_fields_fall_back():
+    sample = Sample(
+        tokens=[1, 2, 3],
+        response="first line\n雪🙂",
+        loss_mask=[1, 0, 1],
+        rollout_log_probs=[-0.0, -1.25, float("nan")],
+    )
+    cache = CheckpointPackedFieldCache()
+    cache.cache_group([sample])
+    assert cache.stats()["live_packed_bytes"] == 3 * (4 + 1 + 8) + len(sample.response.encode("utf-8"))
+
+    sample.tokens = [4, 5, 6, 7]
+    sample.loss_mask = []
+    sample.teacher_log_probs = (-2.0, -3.0)
+    encoder = CheckpointSampleEncoder(cache)
+    group_state = encoder.encode_group([sample], use_packed_cache=True)
+    materialized = materialize_checkpoint_state(_codec_state(group_state, encoder.finish()))
+    [sample_state] = materialized["pending_prompts"][0]
+
+    assert sample_state["tokens"] == sample.tokens
+    assert sample_state["response"] == sample.response
+    assert sample_state["loss_mask"] == sample.loss_mask
+    assert sample_state["teacher_log_probs"] == sample.teacher_log_probs
+    assert np.asarray(sample_state["rollout_log_probs"], dtype=np.float64).tobytes() == np.asarray(
+        sample.rollout_log_probs, dtype=np.float64
+    ).tobytes()
+
+
+def test_prepacked_group_uses_one_tensor_and_current_lifecycle_metadata():
+    samples = [
+        Sample(tokens=[1, 2], rollout_log_probs=[-1.0, -2.0], metadata={"version": 1}),
+        Sample(tokens=[3, 4, 5], rollout_log_probs=[-3.0, -4.0, -5.0], metadata={"version": 1}),
+    ]
+    cache = CheckpointPackedFieldCache()
+    cache.cache_group(samples)
+    samples[0].metadata["version"] = 2
+
+    encoder = CheckpointSampleEncoder(cache)
+    group_state = encoder.encode_group(samples, use_packed_cache=True)
+    codec = encoder.finish()
+
+    assert len(codec["arrays"]["tokens"]) == 1
+    assert codec["arrays"]["tokens"][0].tolist() == [1, 2, 3, 4, 5]
+    materialized = materialize_checkpoint_state(_codec_state(group_state, codec))
+    first, second = materialized["pending_prompts"][0]
+    assert first["tokens"] == samples[0].tokens
+    assert second["tokens"] == samples[1].tokens
+    assert first["metadata"] == {"version": 2}
+    assert second["metadata"] == {"version": 1}
+
+
+async def test_checkpoint_capture_restores_gc_after_failure(monkeypatch):
+    fn = _make_fn(monkeypatch, _args(), _DataSource(), lambda *args, **kwargs: None)
+
+    def fail(_rollout_id):
+        assert not gc.isenabled()
+        raise RuntimeError("capture failed")
+
+    monkeypatch.setattr(fn, "_capture_checkpoint_state", fail)
+    was_enabled = gc.isenabled()
+    with pytest.raises(RuntimeError, match="capture failed"):
+        await fn.checkpoint_state(1)
+    assert gc.isenabled() == was_enabled
+
+
+def test_packed_sample_codec_spans_multiple_tensor_shards(monkeypatch):
+    monkeypatch.setattr(codec_module, "ARRAY_SHARD_BYTES", 16)
+    sample = Sample(tokens=list(range(11)), rollout_log_probs=[-float(index) for index in range(11)])
+    encoder = CheckpointSampleEncoder()
+    group_state = encoder.encode_group([sample])
+    codec = encoder.finish()
+
+    assert [tensor.numel() for tensor in codec["arrays"]["tokens"]] == [4, 4, 3]
+    assert [tensor.numel() for tensor in codec["arrays"]["rollout_log_probs"]] == [2, 2, 2, 2, 2, 1]
+    materialized = materialize_checkpoint_state(_codec_state(group_state, codec))
+    [sample_state] = materialized["pending_prompts"][0]
+    assert sample_state["tokens"] == sample.tokens
+    assert sample_state["rollout_log_probs"] == sample.rollout_log_probs
+
+
 def _codec_state(group_state, codec):
     return {
         "dataset_fingerprint": "dataset-a",
@@ -484,6 +567,96 @@ def test_checkpoint_checksum_fingerprint_and_retention(tmp_path: Path):
     assert (tmp_path / "rollout" / "fully_async_state_8.pt").is_file()
 
 
+def test_checkpoint_external_tensor_shards_are_verified_and_pruned(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(codec_module, "ARRAY_SHARD_BYTES", 16)
+    monkeypatch.setattr(checkpoint_module, "TENSOR_PART_BYTES", 16)
+    sample = Sample(
+        tokens=list(range(20)),
+        response="external response 雪🙂" * 20,
+        rollout_log_probs=[-float(index) for index in range(20)],
+    )
+    encoder = CheckpointSampleEncoder()
+    group_state = encoder.encode_group([sample])
+    state = _codec_state(group_state, encoder.finish())
+
+    path, size = save_checkpoint(tmp_path, 12, state)
+    checksum_path = Path(f"{path}.sha256.json")
+    manifest = json.loads(checksum_path.read_text(encoding="utf-8"))
+    parts_path = path.parent / manifest["parts_directory"]
+    assert parts_path.stat().st_mode & 0o777 == 0o755
+    assert len(manifest["parts"]) > 1
+    assert size == path.stat().st_size + sum(part["size"] for part in manifest["parts"])
+    for part in manifest["parts"]:
+        part_path = parts_path / part["file"]
+        assert part_path.stat().st_mode & 0o777 == 0o644
+
+    loaded = load_checkpoint(tmp_path, 12, expected_fingerprint="dataset-a")
+    [sample_state] = loaded["pending_prompts"][0]
+    assert sample_state["tokens"] == sample.tokens
+    assert sample_state["response"] == sample.response
+    assert sample_state["rollout_log_probs"] == sample.rollout_log_probs
+
+    first_part = parts_path / manifest["parts"][0]["file"]
+    first_part.write_bytes(first_part.read_bytes() + b"corruption")
+    with pytest.raises(RuntimeError, match="checksum mismatch"):
+        load_checkpoint(tmp_path, 12, expected_fingerprint="dataset-a")
+
+    prune_checkpoints(tmp_path, current_rollout_id=12, keep_last=1, archive_interval=None)
+    save_checkpoint(tmp_path, 13, state)
+    prune_checkpoints(tmp_path, current_rollout_id=13, keep_last=1, archive_interval=None)
+    assert not path.exists()
+    assert not checksum_path.exists()
+    assert not parts_path.exists()
+
+
+def test_checkpoint_preserves_empty_packable_lists(tmp_path: Path):
+    sample = Sample(tokens=[], loss_mask=[], rollout_log_probs=[])
+    encoder = CheckpointSampleEncoder()
+    group_state = encoder.encode_group([sample])
+    state = _codec_state(group_state, encoder.finish())
+
+    save_checkpoint(tmp_path, 13, state)
+    loaded = load_checkpoint(tmp_path, 13, expected_fingerprint="dataset-a")
+    [sample_state] = loaded["pending_prompts"][0]
+
+    assert sample_state["tokens"] == []
+    assert sample_state["loss_mask"] == []
+    assert sample_state["rollout_log_probs"] == []
+
+
+def test_checkpoint_tensor_write_failure_publishes_nothing(tmp_path: Path, monkeypatch):
+    sample = Sample(tokens=[1, 2, 3], rollout_log_probs=[-1.0, -2.0, -3.0])
+    encoder = CheckpointSampleEncoder()
+    group_state = encoder.encode_group([sample])
+    state = _codec_state(group_state, encoder.finish())
+
+    def fail(*_args, **_kwargs):
+        raise OSError("injected part failure")
+
+    monkeypatch.setattr(checkpoint_module, "_write_tensor_parts", fail)
+    with pytest.raises(OSError, match="injected part failure"):
+        save_checkpoint(tmp_path, 14, state)
+
+    rollout_dir = tmp_path / "rollout"
+    assert list(rollout_dir.iterdir()) == []
+
+
+def test_checkpoint_manifest_write_failure_removes_published_tensor_parts(tmp_path: Path, monkeypatch):
+    sample = Sample(tokens=[1, 2, 3], response="answer", rollout_log_probs=[-1.0, -2.0, -3.0])
+    encoder = CheckpointSampleEncoder()
+    group_state = encoder.encode_group([sample])
+    state = _codec_state(group_state, encoder.finish())
+
+    def fail(*_args, **_kwargs):
+        raise OSError("injected manifest failure")
+
+    monkeypatch.setattr(checkpoint_module, "_write_torch_file", fail)
+    with pytest.raises(OSError, match="injected manifest failure"):
+        save_checkpoint(tmp_path, 15, state)
+
+    assert list((tmp_path / "rollout").iterdir()) == []
+
+
 def test_save_checkpoint_does_not_reread_payload_for_checksum(tmp_path: Path, monkeypatch):
     state = _codec_state([], CheckpointSampleEncoder().finish())
 
@@ -514,6 +687,38 @@ def test_load_checkpoint_accepts_legacy_schema_one(tmp_path: Path):
 
     loaded = load_checkpoint(tmp_path, 7, expected_fingerprint="dataset-a")
     assert loaded["value"] == "legacy"
+
+
+def test_load_checkpoint_accepts_legacy_schema_two_with_monolithic_arrays(tmp_path: Path):
+    sample = Sample(tokens=[1, 2, 3], rollout_log_probs=[-1.0, -2.0, -3.0])
+    encoder = CheckpointSampleEncoder()
+    group_state = encoder.encode_group([sample])
+    codec = encoder.finish()
+    codec["version"] = 1
+    codec["arrays"] = {
+        field: torch.cat(codec["arrays"][field])
+        if codec["arrays"][field]
+        else torch.empty(0, dtype=spec.torch_dtype)
+        for field, spec in codec_module._PACKED_FIELDS.items()
+    }
+    state = {
+        **_codec_state(group_state, codec),
+        "schema_version": 2,
+        "checkpoint_rollout_id": 8,
+    }
+    path = checkpoint_path(tmp_path, 8)
+    path.parent.mkdir(parents=True)
+    torch.save(state, path)
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    Path(f"{path}.sha256.json").write_text(
+        json.dumps({"schema_version": 2, "sha256": digest, "size": path.stat().st_size}) + "\n",
+        encoding="utf-8",
+    )
+
+    loaded = load_checkpoint(tmp_path, 8, expected_fingerprint="dataset-a")
+    [sample_state] = loaded["pending_prompts"][0]
+    assert sample_state["tokens"] == sample.tokens
+    assert sample_state["rollout_log_probs"] == sample.rollout_log_probs
 
 
 def test_dataset_fingerprint_includes_model_tokenizer_and_chat_template(tmp_path: Path):

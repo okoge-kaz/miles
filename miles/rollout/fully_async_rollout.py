@@ -16,9 +16,11 @@ explicitly.
 
 import asyncio
 import copy
+import gc
 import logging
 import time
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -35,6 +37,7 @@ from miles.rollout.fully_async_checkpoint import (
 )
 from miles.rollout.fully_async_checkpoint_codec import (
     SAMPLE_CODEC_STATE_KEY,
+    CheckpointPackedFieldCache,
     CheckpointSampleEncoder,
     materialize_checkpoint_state,
 )
@@ -109,6 +112,19 @@ def _flat_prompt_group(group: Group) -> list[Sample]:
     return list(group)
 
 
+@contextmanager
+def _defer_cyclic_gc():
+    """Avoid a full-heap cyclic-GC scan in the short, acyclic snapshot path."""
+    was_enabled = gc.isenabled()
+    if was_enabled:
+        gc.disable()
+    try:
+        yield
+    finally:
+        if was_enabled:
+            gc.enable()
+
+
 def _encode_ready_item(
     item: tuple[list[Sample], Group],
     queue_put_version: int,
@@ -123,8 +139,12 @@ def _encode_ready_item(
         # live result: failure-free execution may enqueue it under a later version.
         metadata_updates = {QUEUE_PUT_VERSION_KEY: queue_put_version}
     return {
-        "prompt_group": sample_encoder.encode_group(prompt_group),
-        "result": sample_encoder.encode_group(result, metadata_updates=metadata_updates),
+        "prompt_group": sample_encoder.encode_group(prompt_group, use_packed_cache=True),
+        "result": sample_encoder.encode_group(
+            result,
+            metadata_updates=metadata_updates,
+            use_packed_cache=True,
+        ),
     }
 
 
@@ -463,6 +483,7 @@ class FullyAsyncRolloutFn:
         self._queue_gets: set[asyncio.Task] = set()
 
         self._checkpoint_enabled = getattr(input.args, "fully_async_rollout_checkpoint", False)
+        self._checkpoint_packed_fields = CheckpointPackedFieldCache() if self._checkpoint_enabled else None
         self._dataset_fingerprint = (
             dataset_fingerprint(input.args, input.data_source) if self._checkpoint_enabled else None
         )
@@ -505,6 +526,10 @@ class FullyAsyncRolloutFn:
         """Capture one coherent lifecycle snapshot on the rollout event loop."""
         if not self._checkpoint_enabled:
             raise RuntimeError("Fully-async rollout checkpointing is disabled")
+        with _defer_cyclic_gc():
+            return self._capture_checkpoint_state(rollout_id)
+
+    def _capture_checkpoint_state(self, rollout_id: int) -> dict[str, Any]:
         claimed_items = [task.result() for task in self._queue_gets if task.done() and not task.cancelled()]
         finished_active_items = [task.result() for task in self._active if task.done() and not task.cancelled()]
         ready_items = list(claimed_items)
@@ -516,7 +541,7 @@ class FullyAsyncRolloutFn:
         if missing:
             raise RuntimeError(f"Materialized groups are absent from the pending prompt ledger: {sorted(missing)}")
         regeneration_group_ids = self._regeneration_group_ids(materialized)
-        sample_encoder = CheckpointSampleEncoder()
+        sample_encoder = CheckpointSampleEncoder(self._checkpoint_packed_fields)
         state = {
             "dataset_fingerprint": self._dataset_fingerprint,
             "data_source": self.data_source.checkpoint_state(),
@@ -548,9 +573,10 @@ class FullyAsyncRolloutFn:
         }
         state[SAMPLE_CODEC_STATE_KEY] = sample_encoder.finish()
         logger.info(
-            "Captured fully-async rollout state %d: %s",
+            "Captured fully-async rollout state %d: counts=%s, pack_cache=%s",
             rollout_id,
             state["snapshot_counts"],
+            self._checkpoint_packed_fields.stats(),
         )
         return state
 
@@ -576,6 +602,12 @@ class FullyAsyncRolloutFn:
             self._pending_prompts[group_id] = prompt_group
 
         ready_items = [_decode_ready_item(item) for item in state["ready_items"]]
+        for prompt_group, result in ready_items:
+            # Decode intentionally recreates prompt/result occurrences as
+            # independent Samples. Cache both so a second checkpoint after
+            # resume does not move list/string conversion back onto its boundary.
+            self._checkpoint_packed_fields.cache_group(prompt_group)
+            self._checkpoint_packed_fields.cache_group(result)
         self._output = asyncio.Queue()
         for item in ready_items:
             self._output.put_nowait(item)
@@ -586,6 +618,8 @@ class FullyAsyncRolloutFn:
             if progress.rollout_id in self._drain_progress:
                 raise RuntimeError(f"Duplicate partial drain for rollout {progress.rollout_id}")
             self._drain_progress[progress.rollout_id] = progress
+            for group in progress.data:
+                self._checkpoint_packed_fields.cache_group(group)
 
         self._prepared_batches = {}
         for prepared_state in state["prepared_batches"]:
@@ -593,6 +627,8 @@ class FullyAsyncRolloutFn:
             if batch_rollout_id in self._prepared_batches:
                 raise RuntimeError(f"Duplicate prepared batch for rollout {batch_rollout_id}")
             self._prepared_batches[batch_rollout_id] = prepared
+            for group in prepared.output.samples:
+                self._checkpoint_packed_fields.cache_group(group)
         acked_batch_tokens = {
             int(rollout_id): token for rollout_id, token in state.get("acked_batch_tokens", {}).items()
         }
@@ -675,7 +711,9 @@ class FullyAsyncRolloutFn:
         sample_encoder: CheckpointSampleEncoder,
     ) -> dict[str, Any]:
         state = {key: copy.deepcopy(value) for key, value in progress.__dict__.items() if key != "data"}
-        state["data"] = [sample_encoder.encode_group(group) for group in progress.data]
+        state["data"] = [
+            sample_encoder.encode_group(group, use_packed_cache=True) for group in progress.data
+        ]
         return state
 
     @staticmethod
@@ -692,7 +730,10 @@ class FullyAsyncRolloutFn:
     ) -> dict[str, Any]:
         return {
             "rollout_id": rollout_id,
-            "samples": [sample_encoder.encode_group(group) for group in prepared.output.samples],
+            "samples": [
+                sample_encoder.encode_group(group, use_packed_cache=True)
+                for group in prepared.output.samples
+            ],
             "metrics": copy.deepcopy(prepared.output.metrics),
             "group_ids": list(prepared.group_ids),
             "token": prepared.token,
@@ -808,6 +849,8 @@ class FullyAsyncRolloutFn:
             GROUP_READY_VERSION_KEY,
             self._applied_weight_version.current(),
         )
+        if self._checkpoint_packed_fields is not None:
+            self._checkpoint_packed_fields.cache_group(result)
         return prompt_group, result
 
     async def _worker_loop(self):

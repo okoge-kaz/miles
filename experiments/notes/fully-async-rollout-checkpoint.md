@@ -73,12 +73,22 @@ prepared batch. These are fail-fast guards, not silent fallbacks.
 Full `Sample` trajectories are saved for the prepared batch, partial drain, and
 the entire ready queue. This can make a sidecar large when the queue is deep or
 responses are long. Schema 2 stores per-token lists in contiguous CPU tensors
-and records repeated references to the same live `Sample` only once. Loading
-still creates an independent `Sample` at every occurrence, matching schema 1's
-mutation semantics, and schema 1 sidecars remain readable. The checksum is
-computed while writing instead of rereading the just-written file. Checkpoint
-write time and bytes are logged. The newest two sidecars are retained by
-default, in addition to IDs selected by `--save-retain-interval`.
+and records repeated references to the same live `Sample` only once. Schema 3
+pre-packs each completed prompt group while generation is running and writes
+the immutable per-token tensors and UTF-8 response bytes as checksum-verified,
+256-MiB-bounded binary parts in parallel. The small lifecycle/queue manifest
+remains atomically published as the main `.pt` file. This moves list conversion
+and hashing away from the checkpoint boundary and avoids serializing the entire
+queue through one tensor/file stream. It costs additional rollout-manager RAM
+approximately equal to the packed payload (tokens, masks, rollout log-probs,
+and response bytes); the cache entries are released with their `Sample` objects.
+
+Loading still creates an independent `Sample` at every occurrence, matching
+schema 1's mutation semantics, and schema 1/2 sidecars remain readable. Every
+binary slice, the main manifest, byte size, dtype, offset, and length are
+validated before restore. Capture time and write time are logged separately.
+The newest two sidecars are retained by default, in addition to IDs selected by
+`--save-retain-interval`.
 
 Resume metrics are emitted on the first restored rollout:
 

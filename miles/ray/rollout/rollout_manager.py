@@ -268,16 +268,22 @@ class RolloutManager:
         if getattr(self.args, "fully_async_rollout_checkpoint", False):
             checkpoint_start = time.monotonic()
             state = await asyncio.to_thread(run, self.generate_rollout.checkpoint_state(rollout_id))
+            capture_seconds = time.monotonic() - checkpoint_start
+            write_start = time.monotonic()
             path, size = await asyncio.to_thread(
                 save_fully_async_checkpoint,
                 self.args.save,
                 rollout_id,
                 state,
             )
+            write_seconds = time.monotonic() - write_start
             logger.info(
-                "Published fully-async rollout checkpoint %s (%d bytes, %.3f seconds)",
+                "Published fully-async rollout checkpoint %s "
+                "(%d bytes, capture %.3f seconds, write %.3f seconds, total %.3f seconds)",
                 path,
                 size,
+                capture_seconds,
+                write_seconds,
                 time.monotonic() - checkpoint_start,
             )
         elif self.args.rollout_global_dataset:
