@@ -1,6 +1,6 @@
 ---
 name: miles-run-ladder
-description: Take a miles RL recipe under experiments/ from first submission to a production run on cw-dfw in three stages — interactive for bring-up, batch_short for parallelism and rollout tuning, batch for the real 4-hour job. Use when asked to run, scale, tune, or debug a training recipe on this cluster, when a run needs more nodes, or when deciding whether a configuration is ready for a production allocation. Enforces that only one class of setting changes per stage, so a regression is attributable.
+description: Take a miles RL recipe under experiments/ from first submission to a production run on cw-dfw in three stages — interactive for bring-up, batch_short for parallelism and rollout tuning, batch for the real 4-hour job. Use when asked to prepare, review, share, or execute a Slurm submission command; to run, scale, tune, or debug a training recipe on this cluster; when a run needs more nodes; or when deciding whether a configuration is ready for a production allocation. Enforces that only one class of setting changes per stage, so a regression is attributable.
 ---
 
 # Miles Run Ladder
@@ -18,6 +18,29 @@ whole point is that when something regresses, only one class of thing moved.
 Partition is the only scheduling lever on cw-dfw — it selects the QoS, so never
 pass `--qos`. `interactive` caps at 2 nodes and schedules ahead of everything
 else; `batch_short` caps at 2 h and 4 nodes; `batch` is the 4 h production lane.
+
+## Checkpoint gate for non-validation jobs
+
+Before sharing a command that another person will run, or submitting a job
+yourself, determine whether it is explicitly a disposable validation/smoke job.
+For every other job, inspect the values resolved through the actual wrapper,
+recipe, and `train.sh`; do not infer them from defaults in only one layer.
+
+Require all of the following before sharing or executing the command:
+
+1. A unique, writable checkpoint path and resumable Megatron/`torch_dist`
+   saving with a positive `SAVE_INTERVAL`. Confirm the retention policy (for
+   example, `SAVE_RETAIN_INTERVAL`) preserves the cadence the user intends.
+2. Explicit HF export with `SAVE_HF=1` and a positive `HF_SAVE_INTERVAL`.
+   Confirm that `train.sh` receives both `--save-hf` and
+   `--hf-save-interval`; a Megatron checkpoint is not a substitute for the HF
+   series used by offline evaluation.
+3. The command makes the resolved checkpoint and HF cadences clear to the
+   operator. If either save mode is absent or ambiguous, stop before sharing or
+   submitting and ask the user whether to enable it.
+
+A validation-only job may omit HF export only when its output is intentionally
+disposable; state that exception explicitly when presenting or running it.
 
 Recipes live at `experiments/<task>/<dataset>/<model>/`, submitted as
 `experiments/<task>/<dataset>/<model>/run.sbatch` with `-N <nodes>`. Every knob is a
