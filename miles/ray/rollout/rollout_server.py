@@ -1,11 +1,12 @@
 import asyncio
 import dataclasses
 import logging
+import os
 
 import ray
 
 from miles.backends.sglang_utils.sglang_config import ModelConfig, ServerGroupConfig, SglangConfig
-from miles.ray.rollout.addr_allocator import PortCursors
+from miles.ray.rollout.addr_allocator import PortCursors, choose_rollout_engine_base_port
 from miles.ray.rollout.router_manager import start_router
 from miles.ray.rollout.server_engine import ServerEngine
 from miles.ray.rollout.server_group import ServerGroup
@@ -77,7 +78,9 @@ def start_rollout_servers(args, pg) -> dict[str, "RolloutServer"]:
         server_groups: list[ServerGroup] = []
         all_init_handles: list = []
         new_engine_indices_per_group: list[list[int]] = []
-        port_cursors = PortCursors.empty()
+        base_port = choose_rollout_engine_base_port(os.environ.get("SLURM_JOB_ID"))
+        logger.info("Using rollout engine port slot starting at %d", base_port)
+        port_cursors = PortCursors.empty(base_port=base_port)
 
         for group_cfg in model_cfg.server_groups:
             gpus_per_engine = group_cfg.num_gpus_per_engine

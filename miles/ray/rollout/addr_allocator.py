@@ -1,4 +1,5 @@
 import logging
+import zlib
 from dataclasses import dataclass
 
 import ray
@@ -6,21 +7,41 @@ import ray
 logger = logging.getLogger(__name__)
 
 ROLLOUT_ENGINE_BASE_PORT = 22000
+ROLLOUT_ENGINE_PORT_UPPER_BOUND = 32768
+ROLLOUT_ENGINE_PORT_SLOT_SIZE = 1024
+ROLLOUT_ENGINE_PORT_SLOT_COUNT = (
+    ROLLOUT_ENGINE_PORT_UPPER_BOUND - ROLLOUT_ENGINE_BASE_PORT
+) // ROLLOUT_ENGINE_PORT_SLOT_SIZE
+
+
+def choose_rollout_engine_base_port(job_id: str | None) -> int:
+    """Choose a stable per-job port slot below the ephemeral port range."""
+    if not job_id:
+        return ROLLOUT_ENGINE_BASE_PORT
+
+    try:
+        job_hash = int(job_id)
+    except ValueError:
+        job_hash = zlib.crc32(job_id.encode())
+
+    slot = job_hash % ROLLOUT_ENGINE_PORT_SLOT_COUNT
+    return ROLLOUT_ENGINE_BASE_PORT + slot * ROLLOUT_ENGINE_PORT_SLOT_SIZE
 
 
 @dataclass
 class PortCursors:
     _values: dict[int, int]
+    _base_port: int = ROLLOUT_ENGINE_BASE_PORT
 
     @staticmethod
-    def empty() -> "PortCursors":
-        return PortCursors(_values={})
+    def empty(base_port: int = ROLLOUT_ENGINE_BASE_PORT) -> "PortCursors":
+        return PortCursors(_values={}, _base_port=base_port)
 
     def assign(self, other: "PortCursors"):
         self._values = other._values.copy()
 
     def next_base_port(self) -> int:
-        return max(self._values.values()) if self._values else ROLLOUT_ENGINE_BASE_PORT
+        return max(self._values.values()) if self._values else self._base_port
 
 
 # NOTE: May re-implement this in a potentially easier way if needed
