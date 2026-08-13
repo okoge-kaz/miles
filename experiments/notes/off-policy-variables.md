@@ -5,8 +5,15 @@ off-policy degree is varied. This is the catalogue of variables, not the
 measurement design — the definition of "time to reach on-policy performance" and
 the analysis scripts are a separate exercise.
 
-Primary axis: **`MAX_WEIGHT_STALENESS`** — how many weight versions a group may
-lag the engine before it is recycled instead of trained on
+> **2026-08-13 compatibility note:** the measurements below describe the original
+> completion-FIFO implementation, now named `queue-recycle`. The current code also
+> supports scheduler-authoritative `--staleness-reference prefill`, `queue-max`,
+> and bounded `queue-drop`. See the current "Staleness reference and queue policy"
+> section in `notes/telemetry.md`; do not apply the historical completion-only or
+> blocking-queue conclusions below to those two new policies.
+
+Historical primary axis: **`MAX_WEIGHT_STALENESS`** — how many weight versions a
+group may lag the engine before it is recycled instead of trained on
 (`fully_async_rollout.py:407-419`). miles' own default is `None`, meaning no
 bound at all. The lag it bounds is measured from the version a group *finished*
 generating under, not the one it started under; see "The bound measures queue

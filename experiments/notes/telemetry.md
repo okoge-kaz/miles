@@ -450,151 +450,101 @@ Three things the pair does not say on its own:
 Old runs keep the old keys. A chart or a script that spans the rename has to
 accept both spellings; nothing back-fills.
 
-## Staleness is measured from the completion version (2026-08-09)
+## Staleness reference and queue policy (2026-08-09; updated 2026-08-13)
 
-Both families above are `current - oldest_weight_version`, and
-`oldest_weight_version` is **not** the version generation started under. It is
-the minimum over generate *calls* (`types.py:268-271`), each stamped by SGLang
-when it builds the reply (`tokenizer_manager.py:1982` in 0.5.17.dev32+g3fe50ed, the
-build in the image, reading the server-level `server_args.weight_version`; `Req`
-carries no version of its own, so there is no arrival-time snapshot). Single-turn generation is one call
-(`generate_hub/single_turn.py:44`), so the list has one entry: the version the
-sample **finished** under.
+`Sample.weight_versions` alone cannot identify the policy at the start of a
+request. SGLang stamps it when it builds a reply, so single-turn generation
+usually has one completion version. With `PAUSE_GENERATION_MODE=in_place`, a
+request can span an update and still finish with one version and zero
+retractions. The old `weight_version/mixed_version_ratio` therefore remains
+structurally blind to that crossing.
 
-`PAUSE_GENERATION_MODE=in_place` — the recipe default (`run.sbatch:57`) — freezes
-a request across a weight update and resumes it on the same KV cache
-(`sglang/srt/managers/scheduler.py:4465-4475` returns before touching scheduler
-state). One reply, and no retraction either, so `num_retractions` is 0 as well.
-A sample that generated under v3 and finished under v5 is recorded as v5 with
-lag 0.
-
-Two things follow, and both change how the existing keys read:
-
-- **`weight_version/mixed_version_ratio` and `dump/mixed_version_frac` are
-  structurally 0 here.** Both are `len(set(weight_versions)) > 1`
-  (`ray/rollout/metrics.py:101`, `dashboard/dump_reader.py:456`), and the set has
-  one element unless a sample took more than one generate call. That needs
-  multi-turn or partial-rollout resume, and fully-async rejects partial rollout
-  (`arguments.py:54`). Do not read a flat zero there as "no mixed-version
-  samples" — it is "this metric cannot see them".
-- **What `--max-weight-staleness` tests sees no update crossed mid-generation.**
-  It is `current - oldest`, and `oldest` is a completion version.
+The patched SGLang image also returns scheduler-authoritative
+`first_prefill_weight_versions`, `min_forward_weight_versions`,
+`max_forward_weight_versions`, and `last_forward_weight_versions`. The
+`prefill` reference uses the minimum first-prefill version over every sample and
+turn in the group. Unlike the submission-side HTTP snapshot, it does not charge
+router or scheduler waiting before the first actual forward.
 
 ### The decomposition
 
-Three families over the trained batch, named after Applied Compute's PQS/IQS
-split ([staleness in fully-async RL](https://www.appliedcompute.com/research/staleness-in-fully-async-rl)).
-With **S** the version at submission, **Q** the version the group entered the
-output queue under, and **C** the version at drain:
+The scalar families follow Applied Compute's PQS/IQS split
+([staleness in fully-async RL](https://www.appliedcompute.com/research/staleness-in-fully-async-rl)).
+Let **R** be the configured reference, **Q** the applied version when the whole
+group became ready, and **C** the applied version at queue selection:
 
 | key | quantity | gated on the bound? |
 |---|---|---|
-| `staleness/pre_queue/*` | `Q - S` — updates crossed while generating | no |
-| `staleness/in_queue/*` | `C - Q` — updates crossed while waiting to be trained on | no |
-| `staleness/total/*` | `C - S` = `pre_queue + in_queue` | no |
+| `staleness/pre_queue/*` | `Q - R` — updates crossed before the whole group became ready | no |
+| `staleness/in_queue/*` | `C - Q` — updates crossed while waiting for selection | no |
+| `staleness/total/*` | `C - R` = `pre_queue + in_queue` | no |
 
-Sub-keys are the usual family minus `frac_at_bound`, which is omitted because the
-bound is not applied to any of the three.
+Q is stamped only after the group's slowest sample lands. A group is one
+concurrent request per sample joined by `asyncio.gather`; using an earlier sample
+completion would incorrectly charge the straggler interval to `in_queue`.
 
-**Q is the group's *newest* sample version.** A group is one concurrent request
-per sample joined by `asyncio.gather` (`inference_rollout_common.py:137-146`), so
-it becomes available to the trainer when its *slowest* sample lands. Keying on the
-oldest would charge a straggler's crossing to `in_queue` — inverting the split in
-the straggler-driven case it exists for, which is the case the blog identifies as
-the dominant source of PQS.
+The `submission` reference is a TTL-cached HTTP snapshot written immediately
+before generation and carried in `Sample.metadata` under
+`submission_weight_version`. The `prefill` reference comes from the engine
+provenance above. Missing provenance stays missing rather than becoming zero;
+`prefill` enforcement fails fast if those fields are absent or misaligned.
 
-**S** comes from a stamp written before generation starts
-(`fully_async_rollout.py:64-90`), carried in `Sample.metadata` under
-`submission_weight_version` — the same mechanism multi-LoRA uses for
-`slot_version` (`multi_lora/async_rollout.py:141-146`). All three families are
-absent when the router never answers rather than defaulting to zero, because a
-zero reads as "nothing crossed" exactly when the instrument is broken.
+### What the bound tests
 
-### What the bound tests, and `--staleness-reference`
-
-`staleness/bound/{rollout,train}/*` is what `--max-weight-staleness` was tested
-against, kept under its own name because it is the only quantity that explains
-which groups were recycled. **Which quantity that is depends on
-`--staleness-reference`:**
+`staleness/bound/{rollout,train}/*` records the exact quantity tested by
+`--max-weight-staleness`:
 
 | `--staleness-reference` | bound tests | relation to the components |
 |---|---|---|
-| `completion` (default) | `C - oldest` | `in_queue + (Q - oldest)` — in-queue plus the group's internal version spread. Neither `in_queue` nor `total` |
+| `completion` (library default) | `C - oldest completion` | includes in-queue lag plus the group's internal completion spread; not `total` |
 | `submission` | `C - S` | exactly `total` |
+| `prefill` (math-async recipe default) | `C - F` | exactly `total` |
 
-So the default bound does **not** cover updates crossed during generation, and
-`submission` does. Both are logged either way — the flag only selects what is
-enforced — and the choice is recorded per step as
-`staleness/bound_reference_is_submission` (0 or 1) so a chart spanning both cannot
-silently mix them. It is also in the checkpoint path
-(`max-weight-staleness-<s>-from-submission`), because it changes which groups are
-recycled and therefore what the run trains on.
+The choice is also logged as `staleness/bound_reference_is_submission` and
+`staleness/bound_reference_is_prefill` and included in the run path. `rollout`
+means every group offered before the check; `train` means the groups that
+survived selection.
 
-The `rollout`/`train` split under it is the bound's own: `rollout` is every group
-offered, counted before the check; `train` is what survived into the batch.
+Under `submission` or `prefill`, `s=N` permits N intervening applied policy
+versions from the selected start event to queue selection. For the legacy
+prefetched driver path, inspect `queue/consumption/selection_to_train_gap` as
+well: actual trainer consumption can follow selection by one additional update.
 
-**Under `submission`, `s=N` allows N older policy versions.** `total <= N` means
-at most N weight updates between the version a group started generating under and
-the one that trains on it -- the same meaning as NeMo-RL's
-`max_trajectory_age_steps`. `s=0` is then genuinely on-policy, which it is not
-under `completion`: there a group can span an update during generation and still
-read 0.
+A bound tighter than the pipeline can meet collapses overlap rather than
+deadlocking. While drain waits, training cannot publish a new version, so fresh
+groups eventually pass under the frozen version. The signatures are a high
+`wasted_token_frac`, many bound-exceeded groups, and rising retry counts.
 
-**A `submission` bound tighter than the pipeline can meet collapses throughput;
-it does not hang.** The
-pre-queue part of the lag *is* the generation, and a recycled group regenerates
-from scratch, so a retry does not shrink it the way it shrinks queue residency.
-What stops it running away is that the weight version cannot advance while the
-drain is stuck: `_drain` blocks the training step, the training step is what
-publishes the update, so a stalled drain freezes `current`. Groups submitted
-after the freeze cross no update, so `total = 0` and they pass.
+The staleness histograms resolve `count_0` through `count_16` plus
+`count_ge_17`. Under `completion`, an arm label is not an upper bound on `total`;
+under `submission` or `prefill`, it is. Dumps carry the submission stamp, all
+four forward-provenance arrays, completion versions, and the queue lifecycle's
+ready/enqueue/dequeue/decision fields for offline reconstruction.
 
-The equilibrium is therefore the *synchronous* one. Everything in flight at each
-update boundary is discarded, the drain refills from a cold start inside one
-frozen-version window, and the pipelining the async layout exists for is gone.
-The signature is `wasted_token_frac` near 1 and `rollout/step` creeping, not a
-hung job. The drain logs a warning when it recycled more groups than it kept, and
-`staleness/retry_count_max` says how deep it has gone.
+### Queue policies and the formula boundary
 
-Read `staleness/pre_queue/*` at production response length before choosing a
-bound for a `submission` run.
+- `queue-recycle` is the compatibility default: completion FIFO, immediate
+  next-batch prefetch by the driver, safety backpressure at 1000 completed
+  groups, and over-age groups returned to the prompt buffer. With
+  `--staleness-reference prefill`, this is the former
+  FIFO-prefill-age-cutoff configuration.
+- `queue-max` waits until the trainer requests a complete batch, takes the oldest
+  completed groups, and permanently drops groups whose first-prefill age exceeds
+  the required `--max-weight-staleness`. It does not reserve the next training
+  batch before the preceding weight update.
+- `queue-drop` keeps at most `q * rollout_batch_size` completed groups and evicts
+  the oldest completed group on overflow. It has no age cutoff and likewise
+  selects only when the trainer is ready after the preceding weight update.
 
-### Why the tail resolution matters, and where it stops (2026-08-09)
+The Applied Compute IQS closed form applies only to `queue-drop`. The offline
+analyzer implements `IQS = rho` for `rho < 1` and
+`(2q + rho - 1) / (2rho)` for `rho > 1`, adds the measured group-tailness PQS
+term, and intentionally rejects the exact `rho = 1` boundary. Do not apply the
+formula to `queue-recycle` or `queue-max`.
 
-The histogram runs `count_0 … count_16` with `count_ge_17` as the overflow
-(`STALENESS_HISTOGRAM_MAX`, `fully_async_rollout.py:39`), raised from 8 on
-2026-08-09.
-
-`staleness/total` is **unbounded whenever the bound is not enforced on it** —
-under `--staleness-reference completion`, and in any run with the bound parked.
-That is precisely the run whose tail decides how staleness maps to downstream
-score, and at a cap of 8 the tail collapsed into a single bucket.
-
-It is also the reason the reference matters for the *analysis* and not only for
-the run. Under `completion`, arms labelled s=1/2/4/8 do not have separated `total`
-distributions — the bound constrains `C - oldest`, so a group with a large
-pre-queue interval enters the batch of any arm. Regressing a downstream score on
-the arm label then regresses it on something that is not the staleness of the
-data. Under `submission` the label *is* the upper bound of `total`, and the
-histogram resolves the whole range as long as the bound is below 17.
-
-Per-sample reconstruction does not depend on either choice: the dump carries
-`metadata["submission_weight_version"]` and `weight_versions` on every sample, and
-`rollout/fully_async/current_weight_version` is logged per step, so
-`total = current - submission` can be rebuilt offline and joined against reward.
-The stamp is per group, so that is group granularity, not per trajectory.
-
-### Two endpoints that do not line up with the blog
-
-- **S is submission to the engine, not the first token.** A request that waits in
-  SGLang's queue across an update is charged to `pre_queue` though it generated
-  nothing. Over-counts; a token-accurate start would need an engine change.
-- **The blog's IQS formulas assume a queue-drop algorithm.** miles blocks instead
-  (`await self._output.put`, `fully_async_rollout.py:329`), so `IQS = ρ` and
-  `(2q + ρ - 1)/(2ρ)` do not transfer. The decomposition does; the closed forms do
-  not.
-
-Also, the version read is TTL-cached at 1 s (`_CachedWeightVersion`), so S is
-quantised at that resolution.
+The submission-side version is TTL-cached at 1 s; engine-reported prefill
+provenance is not. Full rollout checkpointing currently supports only
+`queue-recycle`; argument validation rejects the two policy-deque layouts rather
+than silently writing an incomplete snapshot.
 
 Runs before 2026-08-09 have none of these keys, and nothing back-fills.
