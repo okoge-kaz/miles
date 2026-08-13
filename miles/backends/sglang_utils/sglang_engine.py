@@ -4,8 +4,10 @@ import logging
 import multiprocessing
 import os
 import time
+from collections.abc import Callable
 from urllib.parse import quote
 
+import psutil
 import requests
 import sglang_router
 from packaging.version import parse
@@ -70,6 +72,8 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     server_args.host = server_args.host.strip("[]")
     p = multiprocessing.Process(target=launch_server, args=(server_args,))
     p.start()
+    process_pid = p.pid
+    assert process_pid is not None
 
     if server_args.node_rank != 0:
         return
@@ -78,12 +82,40 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
         base_url=server_args.url(),
         api_key=server_args.api_key,
         is_process_alive=lambda: p.is_alive(),
+        is_server_owner=lambda: _process_tree_listens_on_port(root_pid=process_pid, port=server_args.port),
     )
 
     return p
 
 
-def _wait_server_healthy(base_url, api_key, is_process_alive):
+def _process_tree_listens_on_port(*, root_pid: int, port: int) -> bool:
+    """Return whether ``root_pid`` or one of its descendants owns the listener."""
+    try:
+        root = psutil.Process(root_pid)
+        processes = [root, *root.children(recursive=True)]
+    except (psutil.Error, OSError):
+        return False
+
+    for process in processes:
+        try:
+            connections = process.net_connections(kind="inet")
+        except (psutil.Error, OSError):
+            continue
+        owns_listener = any(
+            connection.status == psutil.CONN_LISTEN and connection.laddr.port == port
+            for connection in connections
+        )
+        if owns_listener:
+            return True
+    return False
+
+
+def _wait_server_healthy(
+    base_url: str,
+    api_key: str | None,
+    is_process_alive: Callable[[], bool],
+    is_server_owner: Callable[[], bool] | None = None,
+) -> None:
     headers = {
         "Content-Type": "application/json; charset=utf-8",
         "Authorization": f"Bearer {api_key}",
@@ -93,7 +125,7 @@ def _wait_server_healthy(base_url, api_key, is_process_alive):
         while True:
             try:
                 response = session.get(f"{base_url}/health_generate", headers=headers)
-                if response.status_code == 200:
+                if response.status_code == 200 and (is_server_owner is None or is_server_owner()):
                     break
             except requests.RequestException:
                 pass

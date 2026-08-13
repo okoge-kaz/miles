@@ -6,9 +6,13 @@ from tests.fast.ray.rollout.conftest import fake_engine, make_args
 
 from miles.ray.rollout.addr_allocator import (
     ROLLOUT_ENGINE_BASE_PORT,
+    ROLLOUT_ENGINE_PORT_SLOT_COUNT,
+    ROLLOUT_ENGINE_PORT_SLOT_SIZE,
+    ROLLOUT_ENGINE_PORT_UPPER_BOUND,
     PortCursors,
     allocate_rollout_engine_addr_and_ports_external,
     allocate_rollout_engine_addr_and_ports_normal,
+    choose_rollout_engine_base_port,
 )
 
 
@@ -19,6 +23,10 @@ class TestPortCursors:
 
     def test_next_base_port_default_when_empty(self):
         assert PortCursors.empty().next_base_port() == ROLLOUT_ENGINE_BASE_PORT
+
+    def test_next_base_port_uses_explicit_job_slot_when_empty(self):
+        base_port = ROLLOUT_ENGINE_BASE_PORT + ROLLOUT_ENGINE_PORT_SLOT_SIZE
+        assert PortCursors.empty(base_port=base_port).next_base_port() == base_port
 
     def test_next_base_port_returns_max_value(self):
         c = PortCursors(_values={0: 17000, 1: 16500, 2: 18000})
@@ -37,6 +45,30 @@ class TestPortCursors:
         a.assign(b)
         b._values[0] = 99999
         assert a._values == {0: 19000}, "assign must deep-copy the inner dict"
+
+
+class TestChooseRolloutEngineBasePort:
+    def test_no_job_id_preserves_default(self):
+        assert choose_rollout_engine_base_port(None) == ROLLOUT_ENGINE_BASE_PORT
+
+    def test_numeric_job_ids_select_stable_slots(self):
+        assert (
+            choose_rollout_engine_base_port("1")
+            == ROLLOUT_ENGINE_BASE_PORT + ROLLOUT_ENGINE_PORT_SLOT_SIZE
+        )
+        assert choose_rollout_engine_base_port("1") == choose_rollout_engine_base_port("1")
+        assert choose_rollout_engine_base_port("2") != choose_rollout_engine_base_port("1")
+
+    def test_slots_stay_below_ephemeral_port_range(self):
+        highest_slot_job_id = str(ROLLOUT_ENGINE_PORT_SLOT_COUNT - 1)
+        base_port = choose_rollout_engine_base_port(highest_slot_job_id)
+
+        assert base_port + ROLLOUT_ENGINE_PORT_SLOT_SIZE <= ROLLOUT_ENGINE_PORT_UPPER_BOUND
+
+    def test_non_numeric_job_id_is_supported(self):
+        base_port = choose_rollout_engine_base_port("12345_6")
+
+        assert ROLLOUT_ENGINE_BASE_PORT <= base_port < ROLLOUT_ENGINE_PORT_UPPER_BOUND
 
 
 def _all_ports(addr_and_ports: dict) -> list[int]:
