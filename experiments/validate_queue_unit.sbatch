@@ -27,15 +27,21 @@ srun \
             miles/ray/rollout/metrics.py
             miles/ray/rollout/rollout_manager.py
             miles/rollout/base_types.py
+            miles/rollout/fully_async_checkpoint.py
+            miles/rollout/fully_async_checkpoint_codec.py
             miles/rollout/fully_async_rollout.py
             miles/rollout/queue_policy.py
             miles/rollout/queue_telemetry.py
             miles/utils/arguments.py
             tests/fast/ray/rollout/real_ray/test_rollout_manager.py
             tests/fast/ray/rollout/test_metrics.py
+            tests/fast/rollout/test_fully_async_checkpoint.py
             tests/fast/rollout/test_fully_async_rollout.py
             tests/fast/rollout/test_queue_lifecycle_analysis.py
             tests/fast/rollout/test_queue_policy.py
+            tests/fast/rollout/test_queue_telemetry.py
+            tests/fast/test_train_async_checkpoint.py
+            tests/fast/utils/test_arguments.py
             train_async.py
         )
         if [[ "${QUEUE_VALIDATION_MODE}" == format ]]; then
@@ -46,10 +52,15 @@ srun \
         python -m isort --check-only "${python_files[@]}"
         python -m black --check "${python_files[@]}"
         pytest -q \
+            tests/fast/backends/training_utils/test_batching_metrics.py \
+            tests/fast/rollout/test_fully_async_checkpoint.py \
             tests/fast/rollout/test_fully_async_rollout.py \
             tests/fast/rollout/test_queue_lifecycle_analysis.py \
             tests/fast/rollout/test_queue_policy.py \
+            tests/fast/rollout/test_queue_telemetry.py \
             tests/fast/ray/rollout/test_debug_data.py \
-            tests/fast/ray/rollout/test_metrics.py
+            tests/fast/ray/rollout/test_metrics.py \
+            tests/fast/test_train_async_checkpoint.py \
+            tests/fast/utils/test_arguments.py
         python experiments/bench_queue_lifecycle_logging.py
     '

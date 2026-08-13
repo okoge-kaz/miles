@@ -9,7 +9,7 @@ FULLY_ASYNC_QUEUE_POLICIES = (LEGACY_QUEUE_POLICY, QUEUE_MAX_POLICY, QUEUE_DROP_
 def should_prefetch_rollout_batches(args) -> bool:
     """Whether the driver may reserve the next batch during the current train step."""
     policy = getattr(args, "fully_async_queue_policy", LEGACY_QUEUE_POLICY)
-    return not (args.fully_async and policy in (QUEUE_MAX_POLICY, QUEUE_DROP_POLICY))
+    return not (getattr(args, "fully_async", False) and policy in (QUEUE_MAX_POLICY, QUEUE_DROP_POLICY))
 
 
 def validate_fully_async_queue_args(args) -> None:

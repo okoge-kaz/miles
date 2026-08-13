@@ -526,7 +526,10 @@ class TestGenerate:
                 debug_metadata={"schema_version": 1, "records": [{"attempt_id": 9}]},
             )
 
-        fake_rollout_fn.current_applied_weight_version = lambda: 4
+        async def current_applied_weight_version():
+            return 4
+
+        fake_rollout_fn.current_applied_weight_version = current_applied_weight_version
         manager.generate_rollout = fake_rollout_fn
 
         result = await manager.generate(rollout_id=42)
@@ -536,7 +539,7 @@ class TestGenerate:
         assert isinstance(captured[0], RolloutFnTrainInput)
         assert captured[0].rollout_id == 42
         assert captured_dump_metadata == [{"rollout_fn_debug": {"schema_version": 1, "records": [{"attempt_id": 9}]}}]
-        assert manager.record_batch_consumption(42) == {
+        assert await manager.record_batch_consumption(42) == {
             "selection_weight_version": 3,
             "train_start_weight_version": 4,
         }

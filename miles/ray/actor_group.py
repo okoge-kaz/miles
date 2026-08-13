@@ -119,6 +119,10 @@ class RayTrainGroup:
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
 
+        if getattr(self.args, "fully_async_rollout_checkpoint", False):
+            current_version = await self.rollout_manager.get_current_applied_weight_version.remote()
+            await self.restore_weight_version(current_version)
+
         if self.args.use_fault_tolerance:
             await self.rollout_manager.recover_updatable_engines.remote()
 
@@ -126,6 +130,10 @@ class RayTrainGroup:
         await self.rollout_manager.health_monitoring_pause.remote()
 
         await self._broadcast("update_weights", info=info)
+
+    async def restore_weight_version(self, version: int) -> None:
+        """Align every trainer rank before the next versioned weight push."""
+        await self._broadcast("restore_weight_version", version)
 
     async def reconcile_adapters(self) -> None:
         """Multi-LoRA: reconcile loaded adapters with the controller's active set

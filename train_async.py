@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 # The framework supports other asynchronous approaches such as fully async (see miles/rollout/fully_async_rollout.py).
 async def train(args):
     assert not args.colocate, "Colocation is not supported for async training."
+    fully_async_checkpoint = getattr(args, "fully_async_rollout_checkpoint", False)
     validate_async_off_policy_correction(args)
     configure_logger(args, source=MainProcessIdentity())
     maybe_start_periodic_pyspy_dump()
@@ -81,7 +82,7 @@ async def train(args):
         elif not prefetch_rollout_batches:
             rollout_data_next_future = None
 
-        if args.fully_async:
+        if getattr(args, "fully_async", False):
             # Preserve the legacy policy's immediate prefetch above, then sample
             # the authoritative applied version before the trainer consumes this
             # batch. No weight update can occur between these two operations.
@@ -97,6 +98,11 @@ async def train(args):
                     await actor_model.offload()
         else:
             await actor_model.train(rollout_id, rollout_data_curr_ref)
+        if fully_async_checkpoint:
+            await rollout_manager.acknowledge_trained_batch.remote(
+                rollout_id,
+                rollout_data_curr_ref.get("fully_async_batch_token"),
+            )
         remove_rollout_data_refs(args, rollout_data_curr_ref)
 
         external_save = args.save_trigger_sentinel is not None and os.path.exists(args.save_trigger_sentinel)
@@ -109,15 +115,35 @@ async def train(args):
             external_save=external_save,
         )
         if write_dist or write_hf:
-            force_sync = external_save or rollout_id == args.num_rollout - 1
+            if write_dist and fully_async_checkpoint and rollout_data_next_future is not None:
+                # Failure-free execution finishes this prefetched batch before
+                # the weight push below. Finish it before the snapshot as well,
+                # so resume restores one complete, already-admitted batch rather
+                # than completing a partial drain under the next weight version.
+                await rollout_data_next_future
+            force_sync = (
+                external_save
+                or rollout_id == args.num_rollout - 1
+                # The model tracker is the full-replay commit record. Megatron's
+                # async save can return before publishing it; pruning sidecars at
+                # that point could remove the state named by the old tracker.
+                or (write_dist and fully_async_checkpoint)
+            )
+            # The model tracker is the commit record. Publish the matching rollout
+            # sidecar first so a visible model checkpoint can never lack replay state.
+            if write_dist and fully_async_checkpoint:
+                await rollout_manager.save.remote(rollout_id)
             await save_training_model(actor_model, rollout_id, force_sync, write_dist=write_dist, write_hf=write_hf)
             if args.use_critic:
                 await save_training_model(
                     critic_model, rollout_id, force_sync, write_dist=write_dist, write_hf=write_hf
                 )
-            # Buffer state is only meaningful next to a resumable checkpoint.
             if write_dist:
-                await rollout_manager.save.remote(rollout_id)
+                if fully_async_checkpoint:
+                    await rollout_manager.mark_checkpoint_published.remote(rollout_id)
+                else:
+                    # Preserve the legacy cursor-only checkpoint order.
+                    await rollout_manager.save.remote(rollout_id)
             if external_save:
                 os.remove(args.save_trigger_sentinel)
 

@@ -56,6 +56,9 @@ if [[ "${QUEUE_POLICY}" == queue-drop ]]; then
 else
    ROLLOUT_ARGS+=(--max-weight-staleness "${MAX_WEIGHT_STALENESS}")
 fi
+if [[ "${FULLY_ASYNC_ROLLOUT_CHECKPOINT:-0}" != "0" ]]; then
+   ROLLOUT_ARGS+=(--fully-async-rollout-checkpoint)
+fi
 if [[ -n "${ASYNC_MAX_CONCURRENT_SAMPLES:-}" ]]; then
 
    ROLLOUT_ARGS+=(--async-max-concurrent-samples "${ASYNC_MAX_CONCURRENT_SAMPLES}")

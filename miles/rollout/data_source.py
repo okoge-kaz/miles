@@ -43,6 +43,10 @@ class DataSource(abc.ABC):
         """Pending-sample backlog, or None for sources without a buffer."""
         return None
 
+    def checkpoint_retry_buffer_groups(self) -> list[list[Sample]]:
+        """Return retry groups in scheduling order for lifecycle checkpoints."""
+        return []
+
 
 # TODO may further refactor data-loading part later
 class RolloutDataSource(DataSource):
@@ -124,16 +128,31 @@ class RolloutDataSource(DataSource):
         if not self.args.rollout_global_dataset:
             return
 
-        state_dict = {
+        state_dict = self.checkpoint_state()
+        path = os.path.join(self.args.save, f"rollout/global_dataset_state_dict_{rollout_id}.pt")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        torch.save(state_dict, path)
+
+    def checkpoint_state(self) -> dict:
+        """Return allocation state without transient retry buffers."""
+        return {
             "sample_offset": self.sample_offset,
             "epoch_id": self.epoch_id,
             "sample_group_index": self.sample_group_index,
             "sample_index": self.sample_index,
-            "metadata": self.metadata,
+            "metadata": copy.deepcopy(self.metadata),
         }
-        path = os.path.join(self.args.save, f"rollout/global_dataset_state_dict_{rollout_id}.pt")
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        torch.save(state_dict, path)
+
+    def restore_checkpoint_state(self, state_dict: dict) -> None:
+        """Restore the cursor; pending prompts are restored by their lifecycle owner."""
+        self.sample_offset = state_dict.get("sample_offset", 0)
+        self.epoch_id = state_dict.get("epoch_id", 0)
+        self.sample_group_index = state_dict.get("sample_group_index", 0)
+        self.sample_index = state_dict.get("sample_index", 0)
+        self.metadata = copy.deepcopy(state_dict.get("metadata", {}))
+
+        if self.args.rollout_global_dataset and self.args.rollout_shuffle:
+            self.dataset.shuffle(self.epoch_id)
 
     def load(self, rollout_id=None):
         if not self.args.rollout_global_dataset:
@@ -150,14 +169,7 @@ class RolloutDataSource(DataSource):
         logger.info(f"load metadata from {path}")
         logger.info(f"load metadata: {self.metadata}")
         state_dict = torch.load(path)
-        self.sample_offset = state_dict.get("sample_offset", 0)
-        self.epoch_id = state_dict.get("epoch_id", 0)
-        self.sample_group_index = state_dict.get("sample_group_index", 0)
-        self.sample_index = state_dict.get("sample_index", 0)
-        self.metadata = state_dict.get("metadata", {})
-
-        if self.args.rollout_global_dataset and self.args.rollout_shuffle:
-            self.dataset.shuffle(self.epoch_id)
+        self.restore_checkpoint_state(state_dict)
 
 
 class RolloutDataSourceWithBuffer(RolloutDataSource):
@@ -204,6 +216,13 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
             ), f"the length of the elements of samples must be equal to n_samples_per_prompt, got {len(samples[i])} != {self.args.n_samples_per_prompt}"
             group = samples[i]  # type: ignore
             self.buffer.append(group)
+
+    def restore_checkpoint_state(self, state_dict: dict) -> None:
+        super().restore_checkpoint_state(state_dict)
+        self.buffer.clear()
+
+    def checkpoint_retry_buffer_groups(self) -> list[list[Sample]]:
+        return copy.deepcopy(self.buffer)
 
     # TODO remove
     def update_metadata(self, metadata: dict):

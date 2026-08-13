@@ -15,18 +15,36 @@ explicitly.
 """
 
 import asyncio
+import copy
+import gc
 import logging
 import time
 from collections import deque
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from typing import Any
 
 import httpx
 import numpy as np
 
 from miles.rollout.base_types import RolloutFnConstructorInput, RolloutFnInput, RolloutFnOutput, RolloutFnTrainOutput
-from miles.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter
+from miles.rollout.filter_hub.base_types import call_dynamic_filter
+from miles.rollout.fully_async_checkpoint import (
+    dataset_fingerprint,
+    decode_group,
+    prompt_group_id,
+    rollout_batch_token,
+)
+from miles.rollout.fully_async_checkpoint_codec import (
+    SAMPLE_CODEC_STATE_KEY,
+    CheckpointPackedFieldCache,
+    CheckpointSampleEncoder,
+    materialize_checkpoint_state,
+)
 from miles.rollout.inference_rollout.inference_rollout_common import GenerateState, generate_and_rm_group
 from miles.rollout.queue_policy import LEGACY_QUEUE_POLICY, QUEUE_DROP_POLICY, QUEUE_MAX_POLICY
 from miles.rollout.queue_telemetry import (
+    DEFAULT_RESPONSE_LENGTH_POPULATIONS,
     Group,
     _distribution_metrics,
     _first_sample,
@@ -45,6 +63,7 @@ from miles.utils.types import Sample
 logger = logging.getLogger(__name__)
 
 OUTPUT_QUEUE_MAX_GROUPS = 1000
+ACKED_BATCH_HISTORY_SIZE = 16
 NO_PROGRESS_WARN_SECS = 30.0
 WEIGHT_VERSION_QUERY_TIMEOUT_SECS = 2.0
 # Realized lag is a small integer; anything past this goes in one overflow bucket
@@ -56,6 +75,143 @@ WEIGHT_VERSION_QUERY_TIMEOUT_SECS = 2.0
 STALENESS_HISTOGRAM_MAX = 16
 
 QueueItem = tuple[list[Sample], Group]
+
+
+@dataclass
+class _DrainProgress:
+    rollout_id: int
+    data: list[Group] = field(default_factory=list)
+    group_ids: list[int] = field(default_factory=list)
+    queue_size_start: int | None = None
+    queue_sizes_after_dequeue: list[int] = field(default_factory=list)
+    aborted_groups_recycled: int = 0
+    stale_groups_recycled: int = 0
+    stale_groups_dropped: int = 0
+    trained_bound_staleness: list[int] = field(default_factory=list)
+    offered_bound_staleness: list[int] = field(default_factory=list)
+    trained_pre_queue: list[int] = field(default_factory=list)
+    trained_in_queue: list[int] = field(default_factory=list)
+    trained_total: list[int] = field(default_factory=list)
+    current_version: int = 0
+    offered_mixed_versions: list[bool] = field(default_factory=list)
+    trained_mixed_versions: list[bool] = field(default_factory=list)
+    aborted_tokens: int = 0
+    stale_tokens: int = 0
+    age_cutoff_tokens: int = 0
+    filtered_tokens: int = 0
+    response_sample_lengths: dict[str, list[int]] = field(
+        default_factory=lambda: {population: [] for population in DEFAULT_RESPONSE_LENGTH_POPULATIONS}
+    )
+    response_group_max_lengths: dict[str, list[int]] = field(
+        default_factory=lambda: {population: [] for population in DEFAULT_RESPONSE_LENGTH_POPULATIONS}
+    )
+    dynamic_filter_drop_counts: dict[str, int] = field(default_factory=dict)
+    do_print: bool = True
+
+
+@dataclass(frozen=True)
+class _PreparedBatch:
+    output: RolloutFnTrainOutput
+    group_ids: tuple[int, ...]
+    token: str
+
+
+def _flat_prompt_group(group: Group) -> list[Sample]:
+    if any(isinstance(item, list) for item in group):
+        raise RuntimeError("A pending prompt lease must be a flat list of Sample objects")
+    return list(group)
+
+
+@contextmanager
+def _defer_cyclic_gc():
+    """Avoid a full-heap cyclic-GC scan in the short, acyclic snapshot path."""
+    was_enabled = gc.isenabled()
+    if was_enabled:
+        gc.disable()
+    try:
+        yield
+    finally:
+        if was_enabled:
+            gc.enable()
+
+
+def _encode_ready_item(
+    item: tuple[list[Sample], Group],
+    queue_put_version: int,
+    sample_encoder: CheckpointSampleEncoder,
+) -> dict[str, Any]:
+    prompt_group, result = item
+    metadata_updates = None
+    if group_lifecycle_weight_version(result, QUEUE_PUT_VERSION_KEY) is None:
+        # A completed task may be blocked on queue capacity when the snapshot is
+        # taken. Restore promotes it into the reconstructed ready queue, so the
+        # durable snapshot boundary is its queue-put version. Do not mutate the
+        # live result: failure-free execution may enqueue it under a later version.
+        metadata_updates = {QUEUE_PUT_VERSION_KEY: queue_put_version}
+    return {
+        "prompt_group": sample_encoder.encode_group(prompt_group, use_packed_cache=True),
+        "result": sample_encoder.encode_group(
+            result,
+            metadata_updates=metadata_updates,
+            use_packed_cache=True,
+        ),
+    }
+
+
+def _decode_ready_item(state: dict[str, Any]) -> tuple[list[Sample], Group]:
+    prompt_group = _flat_prompt_group(decode_group(state["prompt_group"]))
+    return prompt_group, decode_group(state["result"])
+
+
+def _materialized_group_ids(
+    ready_items: list[tuple[list[Sample], Group]],
+    drains: dict[int, _DrainProgress],
+    prepared_batches: dict[int, _PreparedBatch],
+) -> set[int]:
+    ready_ids = []
+    for prompt_group, result in ready_items:
+        prompt_id = prompt_group_id(prompt_group)
+        result_ids = {sample.group_index for sample in _iter_samples(result)}
+        if result_ids != {prompt_id}:
+            raise RuntimeError(f"Ready result identity {result_ids} does not match prompt group {prompt_id}")
+        ready_ids.append(prompt_id)
+
+    drained_ids = []
+    for progress in drains.values():
+        if len(progress.data) != len(progress.group_ids):
+            raise RuntimeError(
+                f"Partial drain {progress.rollout_id} has {len(progress.data)} groups but "
+                f"{len(progress.group_ids)} group ids"
+            )
+        for group, group_id in zip(progress.data, progress.group_ids, strict=True):
+            result_ids = {sample.group_index for sample in _iter_samples(group)}
+            if result_ids != {group_id}:
+                raise RuntimeError(
+                    f"Partial drain {progress.rollout_id} result identity {result_ids} "
+                    f"does not match stored group {group_id}"
+                )
+            drained_ids.append(group_id)
+
+    prepared_ids = []
+    for rollout_id, prepared in prepared_batches.items():
+        if len(prepared.output.samples) != len(prepared.group_ids):
+            raise RuntimeError(
+                f"Prepared batch {rollout_id} has {len(prepared.output.samples)} groups but "
+                f"{len(prepared.group_ids)} group ids"
+            )
+        for group, group_id in zip(prepared.output.samples, prepared.group_ids, strict=True):
+            result_ids = {sample.group_index for sample in _iter_samples(group)}
+            if result_ids != {group_id}:
+                raise RuntimeError(
+                    f"Prepared batch {rollout_id} result identity {result_ids} "
+                    f"does not match stored group {group_id}"
+                )
+            prepared_ids.append(group_id)
+
+    all_ids = ready_ids + drained_ids + prepared_ids
+    if len(all_ids) != len(set(all_ids)):
+        raise RuntimeError("A fully-async prompt group appears in more than one materialized lifecycle state")
+    return set(all_ids)
 
 
 SUBMISSION_VERSION_KEY = "submission_weight_version"
@@ -312,13 +468,301 @@ class FullyAsyncRolloutFn:
         self._output_slots: asyncio.Semaphore | None = None
         self._policy_output: deque[QueueItem] | None = None
         self._policy_output_ready: asyncio.Event | None = None
+        self._active: set[asyncio.Task] = set()
+        self._completed_waiting: dict[int, tuple[list[Sample], Group]] = {}
+        self._queue_gets: set[asyncio.Task] = set()
+
+        self._checkpoint_enabled = getattr(input.args, "fully_async_rollout_checkpoint", False)
+        self._checkpoint_packed_fields = CheckpointPackedFieldCache() if self._checkpoint_enabled else None
+        self._dataset_fingerprint = (
+            dataset_fingerprint(input.args, input.data_source) if self._checkpoint_enabled else None
+        )
+        self._pending_prompts: dict[int, list[Sample]] = {}
+        self._drain_progress: dict[int, _DrainProgress] = {}
+        self._prepared_batches: dict[int, _PreparedBatch] = {}
+        self._acked_batch_tokens: dict[int, str] = {}
+        self._resume_metrics: dict[str, float] = {}
 
     def commit_applied_weight_version(self, version: int) -> None:
         self._applied_weight_version.commit(version)
 
-    def current_applied_weight_version(self) -> int:
+    async def commit_applied_weight_version_on_loop(self, version: int) -> None:
+        self.commit_applied_weight_version(version)
+
+    async def current_applied_weight_version(self) -> int:
         """Return the last weight version finalized on every rollout engine."""
         return self._applied_weight_version.current()
+
+    async def acknowledge_trained_batch(self, rollout_id: int, token: str) -> None:
+        """Commit consumption only after the trainer reports a successful update."""
+        prepared = self._prepared_batches.get(rollout_id)
+        if prepared is None:
+            if self._acked_batch_tokens.get(rollout_id) == token:
+                return
+            raise RuntimeError(f"Cannot acknowledge unknown fully-async rollout batch {rollout_id}")
+        if prepared.token != token:
+            raise RuntimeError(
+                f"Fully-async rollout batch token mismatch for {rollout_id}: "
+                f"expected={prepared.token}, received={token}"
+            )
+        for group_id in prepared.group_ids:
+            if self._pending_prompts.pop(group_id, None) is None:
+                raise RuntimeError(f"Prepared group {group_id} is absent from the pending prompt ledger")
+        del self._prepared_batches[rollout_id]
+        self._acked_batch_tokens[rollout_id] = token
+        for old_rollout_id in sorted(self._acked_batch_tokens)[:-ACKED_BATCH_HISTORY_SIZE]:
+            del self._acked_batch_tokens[old_rollout_id]
+
+    async def checkpoint_state(self, rollout_id: int) -> dict[str, Any]:
+        """Capture one coherent lifecycle snapshot on the rollout event loop."""
+        if not self._checkpoint_enabled:
+            raise RuntimeError("Fully-async rollout checkpointing is disabled")
+        with _defer_cyclic_gc():
+            return self._capture_checkpoint_state(rollout_id)
+
+    def _capture_checkpoint_state(self, rollout_id: int) -> dict[str, Any]:
+        claimed_items = [task.result() for task in self._queue_gets if task.done() and not task.cancelled()]
+        finished_active_items = [task.result() for task in self._active if task.done() and not task.cancelled()]
+        ready_items = list(claimed_items)
+        ready_items.extend(list(self._output._queue) if self._output is not None else [])
+        ready_items.extend(self._completed_waiting.values())
+        ready_items.extend(finished_active_items)
+        materialized = _materialized_group_ids(ready_items, self._drain_progress, self._prepared_batches)
+        missing = materialized - self._pending_prompts.keys()
+        if missing:
+            raise RuntimeError(f"Materialized groups are absent from the pending prompt ledger: {sorted(missing)}")
+        regeneration_group_ids = self._regeneration_group_ids(materialized)
+        sample_encoder = CheckpointSampleEncoder(self._checkpoint_packed_fields)
+        state = {
+            "dataset_fingerprint": self._dataset_fingerprint,
+            "data_source": self.data_source.checkpoint_state(),
+            "applied_weight_version": self._applied_weight_version.current(),
+            "pending_prompts": [sample_encoder.encode_group(group) for group in self._pending_prompts.values()],
+            "ready_items": [
+                _encode_ready_item(item, self._applied_weight_version.current(), sample_encoder)
+                for item in ready_items
+            ],
+            "drain_progress": [
+                self._encode_drain_progress(progress, sample_encoder) for progress in self._drain_progress.values()
+            ],
+            "prepared_batches": [
+                self._encode_prepared_batch(batch_rollout_id, prepared, sample_encoder)
+                for batch_rollout_id, prepared in self._prepared_batches.items()
+            ],
+            "regeneration_group_ids": regeneration_group_ids,
+            "acked_batch_tokens": dict(self._acked_batch_tokens),
+            "queue_telemetry": {
+                "lifecycle": self._queue_lifecycle.checkpoint_state(),
+                "producer_response_lengths": self._producer_response_lengths.checkpoint_state(),
+            },
+            "snapshot_counts": {
+                "pending_groups": len(self._pending_prompts),
+                "ready_groups": len(ready_items),
+                "active_groups": len(self._active) - len(finished_active_items),
+                "finished_active_groups": len(finished_active_items),
+                "completed_waiting_groups": len(self._completed_waiting),
+                "claimed_groups": len(claimed_items),
+                "partial_drains": len(self._drain_progress),
+                "prepared_batches": len(self._prepared_batches),
+            },
+        }
+        state[SAMPLE_CODEC_STATE_KEY] = sample_encoder.finish()
+        logger.info(
+            "Captured fully-async rollout state %d: counts=%s, pack_cache=%s",
+            rollout_id,
+            state["snapshot_counts"],
+            self._checkpoint_packed_fields.stats(),
+        )
+        return state
+
+    async def restore_checkpoint_state(self, state: dict[str, Any]) -> None:
+        """Restore materialized trajectories and regenerate only active prompt leases."""
+        if not self._checkpoint_enabled:
+            raise RuntimeError("Fully-async rollout checkpointing is disabled")
+        if self._worker is not None:
+            raise RuntimeError("Fully-async rollout state must be restored before the worker starts")
+        state = materialize_checkpoint_state(state)
+
+        self.data_source.restore_checkpoint_state(state["data_source"])
+        telemetry_state = state.get("queue_telemetry", {})
+        self._queue_lifecycle.restore_checkpoint_state(telemetry_state.get("lifecycle"))
+        self._producer_response_lengths.restore_checkpoint_state(telemetry_state.get("producer_response_lengths"))
+        applied_version = int(state["applied_weight_version"])
+        self._applied_weight_version = AppliedWeightVersionTracker(applied_version)
+
+        pending_groups = [decode_group(group) for group in state["pending_prompts"]]
+        self._pending_prompts = {}
+        for group in pending_groups:
+            prompt_group = _flat_prompt_group(group)
+            group_id = prompt_group_id(prompt_group)
+            if group_id in self._pending_prompts:
+                raise RuntimeError(f"Duplicate pending prompt group {group_id} in rollout checkpoint")
+            self._pending_prompts[group_id] = prompt_group
+
+        ready_items = [_decode_ready_item(item) for item in state["ready_items"]]
+        for prompt_group, result in ready_items:
+            # Decode intentionally recreates prompt/result occurrences as
+            # independent Samples. Cache both so a second checkpoint after
+            # resume does not move list/string conversion back onto its boundary.
+            self._checkpoint_packed_fields.cache_group(prompt_group)
+            self._checkpoint_packed_fields.cache_group(result)
+        self._output = asyncio.Queue()
+        for depth_before, item in enumerate(ready_items):
+            self._output.put_nowait(item)
+            queue_put_version = group_lifecycle_weight_version(item[1], QUEUE_PUT_VERSION_KEY)
+            if queue_put_version is None:
+                raise RuntimeError("Restored ready group has no queue-put weight version")
+            self._queue_lifecycle.restore_queue_admission(
+                item[1],
+                queue_put_version=queue_put_version,
+                depth_before=depth_before,
+                depth_after=depth_before + 1,
+            )
+
+        self._drain_progress = {}
+        for progress_state in state["drain_progress"]:
+            progress = self._decode_drain_progress(progress_state)
+            if progress.rollout_id in self._drain_progress:
+                raise RuntimeError(f"Duplicate partial drain for rollout {progress.rollout_id}")
+            self._drain_progress[progress.rollout_id] = progress
+            for group in progress.data:
+                self._checkpoint_packed_fields.cache_group(group)
+
+        self._prepared_batches = {}
+        for prepared_state in state["prepared_batches"]:
+            batch_rollout_id, prepared = self._decode_prepared_batch(prepared_state)
+            if batch_rollout_id in self._prepared_batches:
+                raise RuntimeError(f"Duplicate prepared batch for rollout {batch_rollout_id}")
+            self._prepared_batches[batch_rollout_id] = prepared
+            for group in prepared.output.samples:
+                self._checkpoint_packed_fields.cache_group(group)
+        acked_batch_tokens = {
+            int(rollout_id): token for rollout_id, token in state.get("acked_batch_tokens", {}).items()
+        }
+        self._acked_batch_tokens = dict(sorted(acked_batch_tokens.items())[-ACKED_BATCH_HISTORY_SIZE:])
+
+        materialized = _materialized_group_ids(ready_items, self._drain_progress, self._prepared_batches)
+        missing = materialized - self._pending_prompts.keys()
+        if missing:
+            raise RuntimeError(f"Materialized groups are absent from the pending prompt ledger: {sorted(missing)}")
+        regeneration_group_ids = [int(group_id) for group_id in state["regeneration_group_ids"]]
+        expected_regeneration_ids = self._pending_prompts.keys() - materialized
+        if len(regeneration_group_ids) != len(set(regeneration_group_ids)) or set(regeneration_group_ids) != set(
+            expected_regeneration_ids
+        ):
+            raise RuntimeError(
+                "Fully-async regeneration order does not match pending non-materialized groups: "
+                f"stored={regeneration_group_ids}, expected={sorted(expected_regeneration_ids)}"
+            )
+        regeneration_groups = [self._pending_prompts[group_id] for group_id in regeneration_group_ids]
+        # Keep the canonical prompt leases detached from objects handed to the
+        # generator. Generation mutates Sample instances in place; sharing these
+        # objects would turn a partially generated response into the next
+        # checkpoint's supposed original prompt.
+        self.data_source.add_samples(copy.deepcopy(regeneration_groups))
+        self._output_slots = asyncio.Semaphore(max(0, OUTPUT_QUEUE_MAX_GROUPS - len(ready_items)))
+
+        self._resume_metrics = {
+            "resume/fully_async/pending_groups_restored": float(len(pending_groups)),
+            "resume/fully_async/ready_groups_restored": float(len(ready_items)),
+            "resume/fully_async/regenerated_active_groups": float(len(regeneration_groups)),
+            "resume/fully_async/partial_drains_restored": float(len(self._drain_progress)),
+            "resume/fully_async/prepared_batches_restored": float(len(self._prepared_batches)),
+            "resume/fully_async/applied_weight_version_restored": float(applied_version),
+        }
+        logger.info("Restored fully-async rollout state: %s", self._resume_metrics)
+
+    def _regeneration_group_ids(self, materialized: set[int]) -> list[int]:
+        pending_regeneration_ids = self._pending_prompts.keys() - materialized
+        retry_group_ids = [prompt_group_id(group) for group in self.data_source.checkpoint_retry_buffer_groups()]
+        if len(retry_group_ids) != len(set(retry_group_ids)) or not set(retry_group_ids) <= set(
+            pending_regeneration_ids
+        ):
+            raise RuntimeError(
+                "Retry-buffer groups do not match pending prompt leases: "
+                f"retry={retry_group_ids}, pending={sorted(pending_regeneration_ids)}"
+            )
+        active_group_ids = [
+            group_id
+            for group_id in self._pending_prompts
+            if group_id in pending_regeneration_ids and group_id not in retry_group_ids
+        ]
+        # Requests that were already running at the snapshot regain the in-flight
+        # slots they lost with the process. Retry-buffer groups remain FIFO behind
+        # them, matching the failure-free state where those retries were waiting
+        # while the active requests continued generation.
+        return active_group_ids + retry_group_ids
+
+    def restored_applied_weight_version(self) -> int:
+        return self._applied_weight_version.current()
+
+    def checkpoint_dataset_fingerprint(self) -> str:
+        if self._dataset_fingerprint is None:
+            raise RuntimeError("Fully-async rollout checkpointing is disabled")
+        return self._dataset_fingerprint
+
+    async def shutdown(self) -> None:
+        tasks = [task for task in [self._worker, *self._active] if task is not None]
+        tasks.extend(self._queue_gets)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._worker = None
+        self._active.clear()
+        self._queue_gets.clear()
+
+    @staticmethod
+    def _encode_drain_progress(
+        progress: _DrainProgress,
+        sample_encoder: CheckpointSampleEncoder,
+    ) -> dict[str, Any]:
+        state = {key: copy.deepcopy(value) for key, value in progress.__dict__.items() if key != "data"}
+        state["data"] = [sample_encoder.encode_group(group, use_packed_cache=True) for group in progress.data]
+        return state
+
+    @staticmethod
+    def _decode_drain_progress(state: dict[str, Any]) -> _DrainProgress:
+        state = copy.deepcopy(state)
+        state["data"] = [decode_group(group) for group in state["data"]]
+        return _DrainProgress(**state)
+
+    @staticmethod
+    def _encode_prepared_batch(
+        rollout_id: int,
+        prepared: _PreparedBatch,
+        sample_encoder: CheckpointSampleEncoder,
+    ) -> dict[str, Any]:
+        return {
+            "rollout_id": rollout_id,
+            "samples": [
+                sample_encoder.encode_group(group, use_packed_cache=True) for group in prepared.output.samples
+            ],
+            "metrics": copy.deepcopy(prepared.output.metrics),
+            "debug_metadata": copy.deepcopy(prepared.output.debug_metadata),
+            "group_ids": list(prepared.group_ids),
+            "token": prepared.token,
+        }
+
+    @staticmethod
+    def _decode_prepared_batch(state: dict[str, Any]) -> tuple[int, _PreparedBatch]:
+        samples = [decode_group(group) for group in state["samples"]]
+        prepared = _PreparedBatch(
+            output=RolloutFnTrainOutput(
+                samples=samples,
+                metrics=copy.deepcopy(state["metrics"]),
+                debug_metadata=copy.deepcopy(state.get("debug_metadata")),
+            ),
+            group_ids=tuple(int(group_id) for group_id in state["group_ids"]),
+            token=state["token"],
+        )
+        if rollout_batch_token(samples) != prepared.token:
+            raise RuntimeError(f"Prepared rollout batch {state['rollout_id']} token does not match its samples")
+        return int(state["rollout_id"]), prepared
+
+    def _take_resume_metrics(self) -> dict[str, float]:
+        metrics, self._resume_metrics = self._resume_metrics, {}
+        return metrics
 
     async def __call__(self, input: RolloutFnInput) -> RolloutFnOutput:
         if input.evaluation:
@@ -326,22 +770,51 @@ class FullyAsyncRolloutFn:
                 "FullyAsyncRolloutFn does not serve eval; set --eval-function-path to "
                 "miles.rollout.inference_rollout.inference_rollout_common.InferenceRolloutFn"
             )
-        if self._worker is None:
-            if self._queue_policy() == LEGACY_QUEUE_POLICY:
-                self._output = asyncio.Queue()
-                self._output_slots = asyncio.Semaphore(OUTPUT_QUEUE_MAX_GROUPS)
-            else:
-                self._policy_output = deque()
-                self._policy_output_ready = asyncio.Event()
-                if self._queue_policy() == QUEUE_MAX_POLICY:
-                    self._output_slots = asyncio.Semaphore(self._queue_capacity_groups())
-            self._worker = asyncio.create_task(self._worker_loop())
-            logger.info(
-                "Started fully-async rollout worker (queue_policy=%s, capacity_groups=%d)",
-                self._queue_policy(),
-                self._queue_capacity_groups(),
+        if prepared := self._prepared_batches.get(input.rollout_id):
+            prepared.output.metrics = {
+                **(prepared.output.metrics or {}),
+                "resume/fully_async/warm_prepared_batch_hit": 1.0,
+                "resume/fully_async/current_applied_weight_version": float(self._applied_weight_version.current()),
+                **self._take_resume_metrics(),
+            }
+            logger.info("Reusing prepared fully-async rollout batch %d", input.rollout_id)
+            return prepared.output
+
+        self._ensure_worker()
+        output = await self._drain(input.rollout_id)
+        if self._checkpoint_enabled:
+            group_ids = tuple(prompt_group_id([_first_sample(group)]) for group in output.samples)
+            prepared = _PreparedBatch(
+                output=output,
+                group_ids=group_ids,
+                token=rollout_batch_token(output.samples),
             )
-        return await self._drain(input.rollout_id)
+            self._prepared_batches[input.rollout_id] = prepared
+        return output
+
+    def _ensure_worker(self) -> None:
+        if self._worker is not None:
+            return
+        if self._queue_policy() == LEGACY_QUEUE_POLICY:
+            if self._output is None:
+                self._output = asyncio.Queue()
+            if self._output_slots is None:
+                available_slots = max(0, self._queue_capacity_groups() - self._output.qsize())
+                self._output_slots = asyncio.Semaphore(available_slots)
+        else:
+            if self._policy_output is None:
+                self._policy_output = deque()
+            if self._policy_output_ready is None:
+                self._policy_output_ready = asyncio.Event()
+            if self._queue_policy() == QUEUE_MAX_POLICY and self._output_slots is None:
+                available_slots = max(0, self._queue_capacity_groups() - len(self._policy_output))
+                self._output_slots = asyncio.Semaphore(available_slots)
+        self._worker = asyncio.create_task(self._worker_loop())
+        logger.info(
+            "Started fully-async rollout worker (queue_policy=%s, capacity_groups=%d)",
+            self._queue_policy(),
+            self._queue_capacity_groups(),
+        )
 
     def _queue_policy(self) -> str:
         return getattr(self.args, "fully_async_queue_policy", LEGACY_QUEUE_POLICY)
@@ -386,6 +859,10 @@ class FullyAsyncRolloutFn:
 
     def _submit_one_group(self) -> asyncio.Task:
         [prompt_group] = self.data_source.get_samples(1)
+        if self._checkpoint_enabled:
+            group_id = prompt_group_id(prompt_group)
+            if group_id not in self._pending_prompts:
+                self._pending_prompts[group_id] = copy.deepcopy(prompt_group)
         return asyncio.create_task(self._generate_group(prompt_group))
 
     async def _generate_group(self, prompt_group: list[Sample]) -> tuple[list[Sample], Group]:
@@ -420,16 +897,22 @@ class FullyAsyncRolloutFn:
         self._queue_lifecycle.group_ready(lifecycle_record, result, ready_version)
         if not any(sample.status == Sample.Status.ABORTED for sample in _iter_samples(result)):
             self._producer_response_lengths.record("generated", result)
+        if self._checkpoint_packed_fields is not None:
+            self._checkpoint_packed_fields.cache_group(result)
         return prompt_group, result
 
     async def _worker_loop(self):
-        active: set[asyncio.Task] = set()
         while True:
-            while len(active) < self._max_in_flight_groups():
-                active.add(self._submit_one_group())
-            done, active = await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
-            for task in done:
-                await self._enqueue_completed_group(task.result())
+            while len(self._active) < self._max_in_flight_groups():
+                self._active.add(self._submit_one_group())
+            done, self._active = await asyncio.wait(self._active, return_when=asyncio.FIRST_COMPLETED)
+            completed = [(id(task), task.result()) for task in done]
+            if self._checkpoint_enabled:
+                self._completed_waiting.update(completed)
+            for task_id, item in completed:
+                await self._enqueue_completed_group(item)
+                if self._checkpoint_enabled:
+                    del self._completed_waiting[task_id]
 
     async def _enqueue_completed_group(self, item: QueueItem) -> None:
         policy = self._queue_policy()
@@ -474,7 +957,17 @@ class FullyAsyncRolloutFn:
     # -------------------------- consumer --------------------------
 
     async def _next_group(self) -> tuple[list[Sample], Group]:
+        if self._worker.done():
+            self._worker.result()
+            raise RuntimeError("fully-async rollout worker exited without an exception")
+        if not self._output.empty():
+            result = self._output.get_nowait()
+            self._release_output_slot()
+            self._queue_lifecycle.dequeued(result[1], depth_after_observed=self._output.qsize())
+            return result
         queue_get = asyncio.create_task(self._output.get())
+        if self._checkpoint_enabled:
+            self._queue_gets.add(queue_get)
         try:
             while True:
                 done, _ = await asyncio.wait(
@@ -489,13 +982,15 @@ class FullyAsyncRolloutFn:
                     raise RuntimeError("fully-async rollout worker exited without an exception")
                 if queue_get in done:
                     result = queue_get.result()
-                    self._output_slots.release()
+                    self._release_output_slot()
                     self._queue_lifecycle.dequeued(result[1], depth_after_observed=self._output.qsize())
                     return result
                 logger.warning(
                     f"No completed rollout groups for {NO_PROGRESS_WARN_SECS}s (queued: {self._output.qsize()})"
                 )
         finally:
+            if self._checkpoint_enabled:
+                self._queue_gets.discard(queue_get)
             if not queue_get.done():
                 queue_get.cancel()
 
@@ -542,18 +1037,38 @@ class FullyAsyncRolloutFn:
             selected.append((item, depth_after))
         return selected
 
+    def _release_output_slot(self) -> None:
+        """Release capacity only after a restored overfull queue reaches its cap."""
+        if self._output.qsize() < self._queue_capacity_groups():
+            self._output_slots.release()
+
     async def _drain(self, rollout_id: int) -> RolloutFnTrainOutput:
         args = self.args
         assert args.rollout_global_dataset
 
         target_data_size = args.rollout_batch_size
-        queue_size_start = self._queue_size()
-        queue_sizes_after_dequeue: list[int] = []
+        if self._checkpoint_enabled:
+            other_drains = set(self._drain_progress) - {rollout_id}
+            if other_drains:
+                raise RuntimeError(f"Cannot start rollout {rollout_id} with partial drains {sorted(other_drains)}")
+            progress = self._drain_progress.setdefault(
+                rollout_id,
+                _DrainProgress(
+                    rollout_id=rollout_id,
+                    current_version=self._applied_weight_version.current(),
+                ),
+            )
+        else:
+            progress = _DrainProgress(
+                rollout_id=rollout_id,
+                current_version=self._applied_weight_version.current(),
+            )
+        data = progress.data
+        if progress.queue_size_start is None:
+            progress.queue_size_start = self._queue_size()
+        queue_size_start = progress.queue_size_start
+        queue_sizes_after_dequeue = progress.queue_sizes_after_dequeue
         candidates: deque[tuple[QueueItem, int]] = deque()
-        data: list[Group] = []
-        aborted_groups_recycled = 0
-        stale_groups_recycled = 0
-        stale_groups_dropped = 0
         # Two populations, because they answer different questions and only one of
         # them is the study's variable. ``offered`` (logged as
         # ``staleness/bound/rollout/``) is every group the pipeline handed over,
@@ -565,30 +1080,25 @@ class FullyAsyncRolloutFn:
         # What `--max-weight-staleness` is tested against, in its two populations.
         # This is `current - reference`; the reference is completion, submission,
         # or first prefill according to the configured semantics.
-        trained_bound_staleness: list[int] = []
-        offered_bound_staleness: list[int] = []
+        trained_bound_staleness = progress.trained_bound_staleness
+        offered_bound_staleness = progress.offered_bound_staleness
         # The decomposition. Per group, with R the selected bound reference, Q
         # the version the group became trainable under, and C the version at drain:
         #   pre-queue = Q - R   updates crossed before the group became trainable
         #   in-queue  = C - Q   updates crossed while waiting to be trained on
         #   total     = C - R   = pre-queue + in-queue = the bound quantity
-        trained_pre_queue: list[int] = []
-        trained_in_queue: list[int] = []
-        trained_total: list[int] = []
-        current_version = self._applied_weight_version.current()
-        offered_mixed_versions: list[bool] = []
-        trained_mixed_versions: list[bool] = []
+        trained_pre_queue = progress.trained_pre_queue
+        trained_in_queue = progress.trained_in_queue
+        trained_total = progress.trained_total
+        offered_mixed_versions = progress.offered_mixed_versions
+        trained_mixed_versions = progress.trained_mixed_versions
         # Generation that was produced and then thrown away. Counted in tokens, not
         # groups, because that is the unit a sample-efficiency claim is made in, and
         # because the three ways to waste generation cost wildly different amounts.
-        aborted_tokens = 0
-        stale_tokens = 0
-        age_cutoff_tokens = 0
-        filtered_tokens = 0
-        response_length_metrics = _ResponseLengthMetrics()
-        metric_gatherer = MetricGatherer()
-        do_print = True
-
+        response_length_metrics = _ResponseLengthMetrics(
+            sample_lengths=progress.response_sample_lengths,
+            group_max_lengths=progress.response_group_max_lengths,
+        )
         while len(data) < target_data_size:
             if not candidates:
                 if self._queue_policy() == LEGACY_QUEUE_POLICY:
@@ -604,7 +1114,7 @@ class FullyAsyncRolloutFn:
             # A weight update paused generation mid-group: return it for re-sampling.
             if any(s.status == Sample.Status.ABORTED for s in _iter_samples(group)):
                 response_length_metrics.record("aborted_recycled", group)
-                aborted_tokens += group_response_tokens(group)
+                progress.aborted_tokens += group_response_tokens(group)
                 self._queue_lifecycle.finish(
                     group,
                     disposition="aborted_recycled",
@@ -612,7 +1122,7 @@ class FullyAsyncRolloutFn:
                     rollout_id=rollout_id,
                 )
                 self._recycle(prompt_group)
-                aborted_groups_recycled += 1
+                progress.aborted_groups_recycled += 1
                 continue
 
             response_length_metrics.record("offered", group)
@@ -621,7 +1131,7 @@ class FullyAsyncRolloutFn:
             submitted = group_submission_weight_version(group)
             ready = group_lifecycle_weight_version(group, GROUP_READY_VERSION_KEY)
             current = self._applied_weight_version.current()
-            current_version = current
+            progress.current_version = current
             stamp_group_weight_version(group, DRAIN_VERSION_KEY, current)
 
             first_prefill = group_first_prefill_weight_version(group)
@@ -661,12 +1171,14 @@ class FullyAsyncRolloutFn:
                         if self._queue_policy() == QUEUE_MAX_POLICY:
                             disposition = "age_cutoff_dropped"
                             response_length_metrics.record(disposition, group)
-                            age_cutoff_tokens += rejected_tokens
-                            stale_groups_dropped += 1
+                            progress.age_cutoff_tokens += rejected_tokens
+                            progress.stale_groups_dropped += 1
+                            self._finish_prompt(prompt_group)
                         else:
                             response_length_metrics.record(disposition, group)
-                            stale_tokens += rejected_tokens
-                            stale_groups_recycled += 1
+                            progress.stale_tokens += rejected_tokens
+                            progress.stale_groups_recycled += 1
+                            self._recycle(prompt_group)
                         self._queue_lifecycle.finish(
                             group,
                             disposition=disposition,
@@ -675,8 +1187,6 @@ class FullyAsyncRolloutFn:
                             reference_version=reference,
                             bound_staleness=staleness,
                         )
-                        if self._queue_policy() == LEGACY_QUEUE_POLICY:
-                            self._recycle(prompt_group)
                         logger.info(
                             f"Rejected stale group ({args.staleness_reference}_version={reference}, "
                             f"current={current}, staleness={staleness} > max={args.max_weight_staleness})"
@@ -707,7 +1217,7 @@ class FullyAsyncRolloutFn:
             if not filter_output.keep:
                 # Dropped, not recycled: no usable gradient signal.
                 response_length_metrics.record("dynamic_filter_dropped", group)
-                filtered_tokens += group_response_tokens(group)
+                progress.filtered_tokens += group_response_tokens(group)
                 self._queue_lifecycle.finish(
                     group,
                     disposition="dynamic_filter_dropped",
@@ -717,16 +1227,20 @@ class FullyAsyncRolloutFn:
                     bound_staleness=group_bound_staleness,
                     detail=filter_output.reason,
                 )
-                metric_gatherer.on_dynamic_filter_drop(reason=filter_output.reason)
+                if filter_output.reason:
+                    progress.dynamic_filter_drop_counts[filter_output.reason] = (
+                        progress.dynamic_filter_drop_counts.get(filter_output.reason, 0) + 1
+                    )
+                self._finish_prompt(prompt_group)
                 continue
 
-            if do_print:
+            if progress.do_print:
                 sample = _first_sample(group)
                 logger.info(
                     f"First rollout sample: {[str(sample.prompt) + sample.response]}, "
                     f"label: {sample.label}, reward: {sample.reward}"
                 )
-                do_print = False
+                progress.do_print = False
 
             if group_bound_staleness is not None:
                 trained_bound_staleness.append(group_bound_staleness)
@@ -747,6 +1261,7 @@ class FullyAsyncRolloutFn:
                 bound_staleness=group_bound_staleness,
             )
             data.append(group)
+            progress.group_ids.append(prompt_group_id(prompt_group))
 
         sample = _first_sample(data[-1])
         logger.info(
@@ -764,7 +1279,13 @@ class FullyAsyncRolloutFn:
         queue_evicted_tokens = self._queue_evicted_tokens
         self._queue_evicted_groups = 0
         self._queue_evicted_tokens = 0
-        wasted_tokens = aborted_tokens + stale_tokens + age_cutoff_tokens + filtered_tokens + queue_evicted_tokens
+        wasted_tokens = (
+            progress.aborted_tokens
+            + progress.stale_tokens
+            + progress.age_cutoff_tokens
+            + progress.filtered_tokens
+            + queue_evicted_tokens
+        )
         metrics = {
             "rollout/fully_async/queue_size": self._queue_size(),
             "queue/occupancy/start_groups": queue_size_start,
@@ -775,15 +1296,15 @@ class FullyAsyncRolloutFn:
             "queue/config/policy_is_queue_max": float(self._queue_policy() == QUEUE_MAX_POLICY),
             "queue/config/policy_is_queue_drop": float(self._queue_policy() == QUEUE_DROP_POLICY),
             "queue/config/factor": getattr(args, "fully_async_queue_factor", 1),
-            "rollout/fully_async/aborted_groups_recycled": aborted_groups_recycled,
-            "rollout/fully_async/stale_groups_recycled": stale_groups_recycled,
-            "rollout/fully_async/stale_groups_dropped": stale_groups_dropped,
+            "rollout/fully_async/aborted_groups_recycled": progress.aborted_groups_recycled,
+            "rollout/fully_async/stale_groups_recycled": progress.stale_groups_recycled,
+            "rollout/fully_async/stale_groups_dropped": progress.stale_groups_dropped,
             "rollout/fully_async/queue_evicted_groups": queue_evicted_groups,
-            "rollout/fully_async/aborted_tokens": aborted_tokens,
-            "rollout/fully_async/stale_tokens": stale_tokens,
-            "rollout/fully_async/age_cutoff_tokens": age_cutoff_tokens,
+            "rollout/fully_async/aborted_tokens": progress.aborted_tokens,
+            "rollout/fully_async/stale_tokens": progress.stale_tokens,
+            "rollout/fully_async/age_cutoff_tokens": progress.age_cutoff_tokens,
             "rollout/fully_async/queue_evicted_tokens": queue_evicted_tokens,
-            "rollout/fully_async/dynamic_filter_tokens": filtered_tokens,
+            "rollout/fully_async/dynamic_filter_tokens": progress.filtered_tokens,
             "rollout/fully_async/kept_tokens": kept_tokens,
             "rollout/fully_async/wasted_token_frac": (
                 wasted_tokens / (wasted_tokens + kept_tokens) if wasted_tokens + kept_tokens else 0.0
@@ -794,13 +1315,17 @@ class FullyAsyncRolloutFn:
             },
             **self._producer_response_lengths.collect_and_reset(),
             **response_length_metrics.collect(),
-            **metric_gatherer.collect(),
+            **{
+                f"rollout/dynamic_filter/drop_{reason}": count
+                for reason, count in progress.dynamic_filter_drop_counts.items()
+            },
+            **self._take_resume_metrics(),
         }
-        if current_version is not None:
+        if progress.current_version is not None:
             # Logged next to the staleness itself: staleness is a difference against
             # this version, and without it a missing staleness metric is impossible to
             # tell apart from a router that never answered.
-            metrics["rollout/fully_async/current_weight_version"] = current_version
+            metrics["rollout/fully_async/current_weight_version"] = progress.current_version
         if offered_mixed_versions:
             metrics["staleness/mixed_version_frac/rollout"] = sum(offered_mixed_versions) / len(offered_mixed_versions)
         if trained_mixed_versions:
@@ -853,8 +1378,8 @@ class FullyAsyncRolloutFn:
         # is what happened, `bound_exceeded` is why. Split from the dynamic-filter
         # drops, which land in the same recycled/dropped bucket if only totals are
         # compared.
-        bound_exceeded_groups = stale_groups_recycled + stale_groups_dropped
-        bound_exceeded_tokens = stale_tokens + age_cutoff_tokens
+        bound_exceeded_groups = progress.stale_groups_recycled + progress.stale_groups_dropped
+        bound_exceeded_tokens = progress.stale_tokens + progress.age_cutoff_tokens
         metrics["staleness/bound_exceeded_groups"] = bound_exceeded_groups
         metrics["staleness/bound_exceeded_tokens"] = bound_exceeded_tokens
         # `staleness/bound/*` means a different quantity under each reference, so the
@@ -885,6 +1410,7 @@ class FullyAsyncRolloutFn:
             metrics["staleness/retry_count_max"] = float(max(retries))
             metrics["staleness/retry_frac_nonzero"] = sum(1 for r in retries if r) / len(retries)
 
+        self._drain_progress.pop(rollout_id, None)
         debug_metadata = self._queue_lifecycle.take_metadata(
             policy=self._queue_policy(),
             capacity_groups=self._queue_capacity_groups(),
@@ -895,4 +1421,12 @@ class FullyAsyncRolloutFn:
         for sample in prompt_group:
             sample.retry_count += 1
             sample.reset_for_retry()
+        if self._checkpoint_enabled:
+            self._pending_prompts[prompt_group_id(prompt_group)] = copy.deepcopy(prompt_group)
         self.data_source.add_samples([prompt_group])
+
+    def _finish_prompt(self, prompt_group: list[Sample]) -> None:
+        if self._checkpoint_enabled:
+            group_id = prompt_group_id(prompt_group)
+            if self._pending_prompts.pop(group_id, None) is None:
+                raise RuntimeError(f"Finished prompt group {group_id} is absent from the pending ledger")

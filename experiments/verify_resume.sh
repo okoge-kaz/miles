@@ -23,9 +23,9 @@
 #   1. --load finds the tracker and start_rollout_id resumes rather than resets
 #      (arguments.py:2752, actor.py:196). A reset would silently restart every
 #      chained job from step 0 and the sweep would never finish a single point.
-#   2. rollout_manager.load restores the data source position, so the second job
-#      does not replay the prompts the first one already trained on
-#      (placement_group.py:182).
+#   2. rollout_manager.load restores the allocation cursor and pending lease
+#      ledger. Prepared trajectories are reused, ready trajectories are checked
+#      against the resumed applied weight version, and active leases regenerate.
 #   3. the retain sweep never deletes the iteration the tracker points at
 #      (Megatron checkpointing.py:865: it reads prev_iteration, writes the new
 #      tracker, and only then deletes prev).
@@ -66,6 +66,7 @@ if [[ "${1:-}" == "--check" ]]; then
         echo "  NO TRACKER: nothing was saved"
     fi
     echo "  dist  : $(ls -d "${CKPT_DIR}"/iter_* 2>/dev/null | xargs -rn1 basename | tr '\n' ' ')"
+    echo "  replay: $(ls "${CKPT_DIR}"/rollout/fully_async_state_*.pt 2>/dev/null | xargs -rn1 basename | tr '\n' ' ')"
     echo "  hf    : $(ls "${CKPT_DIR}/hf" 2>/dev/null | tr '\n' ' ')"
     echo "  du    : $(du -sh "${CKPT_DIR}" 2>/dev/null | cut -f1) total,"\
          "$(du -sh "${CKPT_DIR}/hf" 2>/dev/null | cut -f1) of it hf"
@@ -85,6 +86,8 @@ if [[ "${1:-}" == "--check" ]]; then
         echo
         grep -oE "successfully saved checkpoint from iteration +[0-9]+" "${log}" | sed 's/^/  /'
         grep -oE "(skipping )?deleting checkpoint from iteration +[0-9]+" "${log}" | sed 's/^/  /'
+        grep -E "(Captured|Restored) fully-async rollout state|Reusing prepared fully-async rollout batch" \
+            "${log}" | head -10 | sed 's/^/  /'
     done
     exit 0
 fi
@@ -101,7 +104,7 @@ fi
 # --num-rollout fixed across its chained jobs. It is still worth knowing that
 # --num-rollout is frozen for the lifetime of a run: a run cannot be extended
 # later by raising it.
-COMMON="CONFIG_TAG=${CONFIG_TAG},NUM_ROLLOUT=30,SAVE_INTERVAL=2,SAVE_RETAIN_INTERVAL=4,SKIP_EVAL_BEFORE_TRAIN=1,EVAL_INTERVAL=1000"
+COMMON="CONFIG_TAG=${CONFIG_TAG},NUM_ROLLOUT=30,SAVE_INTERVAL=2,SAVE_RETAIN_INTERVAL=4,SKIP_EVAL_BEFORE_TRAIN=1,EVAL_INTERVAL=1000,FULLY_ASYNC_ROLLOUT_CHECKPOINT=1"
 
 if [[ "${1:-}" != "--submit" ]]; then
     echo "would submit, 3 nodes each:"
@@ -126,7 +129,7 @@ fi
 # happens to every real run: batch stops at 4h and a sweep point needs ~10.
 JOB_A=$(sbatch --parsable \
     -A "${SLURM_ACCOUNT_NAME}" \
-    --partition=batch,batch_short \
+    --partition=batch \
     --job-name=resume-a \
     --nodes=3 --time=00:25:00 \
     --export="ALL,${COMMON},ACTOR_NUM_NODES=1,ROLLOUT_NUM_GPUS=16" \
@@ -135,7 +138,7 @@ echo "phase A: ${JOB_A}"
 
 JOB_B=$(sbatch --parsable \
     -A "${SLURM_ACCOUNT_NAME}" \
-    --partition=batch,batch_short \
+    --partition=batch \
     --job-name=resume-b \
     --nodes=3 --time=00:50:00 \
     --dependency=afterany:"${JOB_A}" \

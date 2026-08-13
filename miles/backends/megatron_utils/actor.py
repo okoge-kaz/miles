@@ -15,11 +15,11 @@ from torch_memory_saver import torch_memory_saver
 from miles.dashboard import hooks as dashboard_hooks
 from miles.ray.train_actor import TrainRayActor
 from miles.utils import train_dump_utils
+from miles.utils.argparse_utils import inplace_modify_args
 from miles.utils.arguments import (
     should_run_actor_logprob_forward,
     validate_fused_one_step_actor_logprobs_runtime,
 )
-from miles.utils.argparse_utils import inplace_modify_args
 from miles.utils.audit_utils.event_logger.logger import event_logger_context
 from miles.utils.audit_utils.witness.allocator import WitnessInfo
 from miles.utils.context_utils import with_defer
@@ -182,7 +182,7 @@ class MegatronTrainRayActor(TrainRayActor):
             dict(no_load_optim=False, no_load_rng=False, finetune=False) if recv_ckpt_src_rank is not None else {}
         )
         with inplace_modify_args(args, heal_load_overrides):
-            (self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id) = initialize_model_and_optimizer(
+            self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id = initialize_model_and_optimizer(
                 args, role, checkpointing_context=checkpointing_context
             )
 
@@ -769,6 +769,17 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if process_groups_are_temporary:
             destroy_process_groups()
+
+    def restore_weight_version(self, version: int) -> int:
+        """Set the next weight transfer's durable version base on every trainer rank."""
+        self._heartbeat.bump()
+        if version < 0:
+            raise ValueError(f"Weight version must be non-negative, got {version}")
+        previous = self.weight_updater.weight_version
+        self.weight_updater.weight_version = version
+        if previous != version and dist.get_rank() == 0:
+            logger.info("Restored actor weight version counter: %d -> %d", previous, version)
+        return version
 
     @with_logs
     def load_other_checkpoint(self, model_tag: str, path: str) -> None:

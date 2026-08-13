@@ -259,6 +259,9 @@ class RayTrainGroup:
     async def update_weights(self, rollout_id: int | None = None):
         """Broadcast weights to rollout engines."""
         log_structured(logger.info, op="update_weights", phase="start", rollout=rollout_id)
+        if getattr(self.args, "fully_async_rollout_checkpoint", False):
+            current_version = await self._rollout_manager.get_current_applied_weight_version.remote()
+            await self.restore_weight_version(current_version)
         # TODO: allow using all cells to update weights (instead of first alive cell)
         # Fetch the updatable engines + lock once (like V1 RayActorGroup) so all
         # ranks observe a consistent engine set; the actor releases the lock itself.
@@ -271,6 +274,13 @@ class RayTrainGroup:
         )
 
         await self._maybe_log_inference_engine_weight_checksums(rollout_id=rollout_id)
+
+    async def restore_weight_version(self, version: int) -> None:
+        """Align every failover cell before the next versioned weight push."""
+        _, results = await self._execute_all_alive_and_catch("restore_weight_version", version)
+        errors = [result for result in results if isinstance(result, BaseException)]
+        if errors:
+            raise RuntimeError(f"Failed to restore weight version {version} on trainer cells") from errors[0]
 
     async def _maybe_log_inference_engine_weight_checksums(self, *, rollout_id: int | None) -> None:
         if not is_event_logger_initialized():
