@@ -1,12 +1,42 @@
 from __future__ import annotations
 
+import os
+
 import pytest
 import ray
 from tests.fast.ray.rollout.conftest import make_args
 
 from miles.ray.rollout.addr_allocator import PortCursors
+from miles.ray.rollout.rollout_server import _initialize_server_groups_with_retry
 from miles.ray.rollout.server_engine import ServerEngine
 from miles.ray.rollout.server_group import ServerGroup
+from miles.utils.misc import get_free_port
+
+
+class _FailOnceSGLangEngine:
+    """Ray actor stand-in that reproduces one bind failure across actor restarts."""
+
+    def __init__(self, args, **kwargs):
+        self.sentinel_path = args.port_retry_test_sentinel
+        self.init_kwargs = None
+
+    def _get_current_node_ip_and_free_port(self, start_port=10000, consecutive=1):
+        return "127.0.0.1", get_free_port(start_port=start_port, consecutive=consecutive)
+
+    def init(self, **kwargs):
+        self.init_kwargs = kwargs
+        try:
+            fd = os.open(self.sentinel_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            return
+        os.close(fd)
+        raise RuntimeError("EADDRINUSE: address already in use")
+
+    def shutdown(self):
+        return None
+
+    def get_init_kwargs(self):
+        return self.init_kwargs
 
 
 def _build_group(
@@ -83,6 +113,28 @@ class TestStartEnginesRealActors:
         # Cleanup: kill the actors we created.
         for e in group.all_engines:
             ray.kill(e.actor_handle)
+
+    def test_startup_failure_recreates_actor_with_fresh_ports(
+        self,
+        monkeypatch,
+        placement_group_factory,
+        tmp_path,
+    ):
+        import miles.ray.rollout.server_group as server_group_module
+
+        monkeypatch.setattr(server_group_module, "SGLangEngine", _FailOnceSGLangEngine)
+        group = _build_group(pg_tuple=placement_group_factory(1), num_engines=1)
+        group.args.port_retry_test_sentinel = str(tmp_path / "fail-once")
+        port_cursors = PortCursors.empty()
+
+        handles, indices = group.start_engines(port_cursors)
+        retry_base_port = port_cursors.next_base_port()
+        retried_indices = _initialize_server_groups_with_retry([group], handles, [indices], port_cursors)
+
+        assert retried_indices == [[0]]
+        init_kwargs = ray.get(group.all_engines[0].actor_handle.get_init_kwargs.remote())
+        assert init_kwargs["port"] >= retry_base_port
+        ray.kill(group.all_engines[0].actor_handle)
 
     def test_start_indices_filters_to_subset(self, patched_sglang_engine, placement_group_factory):
         pg = placement_group_factory(4)
