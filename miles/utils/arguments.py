@@ -40,7 +40,62 @@ def resolve_rollout_function_paths(args) -> tuple[str, str]:
     return rollout_path, eval_path
 
 
+def _validate_fully_async_rollout_checkpoint(args) -> None:
+    checkpoint_enabled = getattr(args, "fully_async_rollout_checkpoint", False)
+    if checkpoint_enabled and not args.fully_async:
+        raise ValueError("--fully-async-rollout-checkpoint requires --fully-async")
+    if not checkpoint_enabled:
+        return
+
+    checks = (
+        (args.train_backend == "megatron", "the Megatron training backend"),
+        (args.rollout_global_dataset, "the global rollout dataset"),
+        (
+            args.data_source_path == "miles.rollout.data_source.RolloutDataSourceWithBuffer",
+            "--data-source-path miles.rollout.data_source.RolloutDataSourceWithBuffer",
+        ),
+        (args.advantage_estimator == "grpo", "--advantage-estimator grpo"),
+        (not args.use_critic, "a critic-free GRPO run"),
+        (args.custom_rm_path is None, "the built-in reward-model function"),
+        (args.custom_reward_post_process_path is None, "the built-in reward post-processing path"),
+        (args.custom_convert_samples_to_train_data_path is None, "the built-in train-data conversion path"),
+        (args.rollout_data_postprocess_path is None, "the built-in rollout data post-processing path"),
+        (args.buffer_filter_path is None, "the default FIFO rollout retry buffer"),
+        (args.rollout_sample_filter_path is None, "no post-generation rollout sample filter"),
+        (not args.load_debug_rollout_data, "live rollout generation rather than --load-debug-rollout-data"),
+        (args.ci_inject_rollout_data_path is None, "no CI rollout-data injection"),
+        (not args.debug_train_only, "rollout generation enabled"),
+        (not args.debug_rollout_only, "trainer consumption enabled"),
+        (not getattr(args, "debug_skip_weight_update", False), "real rollout-engine weight updates"),
+        (getattr(args, "lora_rank", 0) <= 0, "dense model training rather than LoRA"),
+        (
+            not any(
+                getattr(args, flag, False)
+                for flag in (
+                    "use_routing_replay",
+                    "use_rollout_routing_replay",
+                    "use_indexer_replay",
+                    "use_rollout_indexer_replay",
+                )
+            ),
+            "no routing/indexer replay",
+        ),
+        (args.update_weight_transfer_mode != "disk-delta", "a non-delta weight transfer mode"),
+        (args.update_weights_interval == 1, "--update-weights-interval 1"),
+        (args.save is not None, "--save for durable replay sidecars"),
+        (
+            args.save_interval is not None and args.save_interval > 0,
+            "a positive --save-interval for durable replay sidecars",
+        ),
+        (args.fully_async_rollout_checkpoint_keep_last >= 1, "a positive checkpoint retention count"),
+    )
+    for valid, requirement in checks:
+        if not valid:
+            raise ValueError(f"--fully-async-rollout-checkpoint requires {requirement}")
+
+
 def _resolve_rollout_functions(args) -> None:
+    _validate_fully_async_rollout_checkpoint(args)
     if args.fully_async:
         assert enable_experimental_rollout_refactor(), (
             "--fully-async needs the class-based rollout API: set MILES_EXPERIMENTAL_ROLLOUT_REFACTOR=1 "
@@ -463,6 +518,25 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "drains completed groups. Selects `FullyAsyncRolloutFn` as the rollout function; "
                     "evaluation keeps the standard rollout function, which fully async does not serve. "
                     "Requires train_async.py and MILES_EXPERIMENTAL_ROLLOUT_REFACTOR=1."
+                ),
+            )
+            parser.add_argument(
+                "--fully-async-rollout-checkpoint",
+                action="store_true",
+                default=False,
+                help=(
+                    "Checkpoint fully-async prompt leases, completed ready groups, partial drains, and the "
+                    "prepared next trainer batch. Resume can train a restored prepared batch immediately; "
+                    "generation that was active at the snapshot is regenerated from its original prompt."
+                ),
+            )
+            parser.add_argument(
+                "--fully-async-rollout-checkpoint-keep-last",
+                type=int,
+                default=2,
+                help=(
+                    "Number of recent fully-async rollout sidecars to retain. Checkpoints selected by "
+                    "--save-retain-interval are retained in addition to these recent sidecars."
                 ),
             )
             parser.add_argument(
@@ -2673,9 +2747,7 @@ def validate_fused_one_step_actor_logprobs(args: argparse.Namespace) -> None:
     enabled = getattr(args, "fuse_one_step_actor_logprobs", False)
     verify = getattr(args, "verify_fused_one_step_actor_logprobs", False)
     if verify and not enabled:
-        raise ValueError(
-            "--verify-fused-one-step-actor-logprobs requires --fuse-one-step-actor-logprobs"
-        )
+        raise ValueError("--verify-fused-one-step-actor-logprobs requires --fuse-one-step-actor-logprobs")
     if not enabled:
         return
 
@@ -2691,8 +2763,7 @@ def validate_fused_one_step_actor_logprobs(args: argparse.Namespace) -> None:
             and rollout_batch_size * n_samples_per_prompt == global_batch_size
         )
         step_requirement = (
-            "a one-step batch shape: rollout_batch_size * n_samples_per_prompt "
-            "must equal global_batch_size"
+            "a one-step batch shape: rollout_batch_size * n_samples_per_prompt " "must equal global_batch_size"
         )
     else:
         configured_one_step = configured_steps == 1
@@ -2716,8 +2787,7 @@ def validate_fused_one_step_actor_logprobs(args: argparse.Namespace) -> None:
     if enabled_replays:
         flags = ", ".join(f"--{flag.replace('_', '-')}" for flag in enabled_replays)
         raise ValueError(
-            "--fuse-one-step-actor-logprobs does not yet support routing/indexer replay; "
-            f"disable {flags}"
+            "--fuse-one-step-actor-logprobs does not yet support routing/indexer replay; " f"disable {flags}"
         )
 
 
@@ -3308,6 +3378,10 @@ def miles_validate_args(args):
     if args.use_rollout_indexer_replay:
         args.use_indexer_replay = True
         assert args.context_parallel_size == 1, "indexer replay does not support context parallelism yet"
+
+    # Custom config is applied after rollout-path resolution, so repeat the
+    # safety validation here to prevent YAML overrides from bypassing guards.
+    _validate_fully_async_rollout_checkpoint(args)
 
     validate_fused_one_step_actor_logprobs(args)
 

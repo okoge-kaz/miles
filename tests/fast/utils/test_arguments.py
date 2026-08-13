@@ -11,6 +11,7 @@ from miles.backends.sglang_utils.arguments import validate_args as validate_sgla
 from miles.utils.arguments import (
     _maybe_apply_dumper_overrides,
     _resolve_ft_components,
+    _resolve_rollout_functions,
     get_miles_extra_args_provider,
     miles_validate_args,
     validate_async_off_policy_correction,
@@ -19,6 +20,95 @@ from miles.utils.misc import function_registry
 
 PATH_ARGS = ["--rollout-function-path", "--custom-generate-function-path"]
 REQUIRED_ARGS = ["--rollout-batch-size", "64"]
+
+
+def _fully_async_checkpoint_args(**overrides) -> SimpleNamespace:
+    values = {
+        "fully_async": True,
+        "fully_async_rollout_checkpoint": True,
+        "fully_async_rollout_checkpoint_keep_last": 2,
+        "multi_lora": False,
+        "rollout_function_path": None,
+        "eval_function_path": None,
+        "colocate": False,
+        "partial_rollout": False,
+        "recompute_logprobs_via_prefill": False,
+        "rollout_all_samples_process_path": None,
+        "train_backend": "megatron",
+        "rollout_global_dataset": True,
+        "data_source_path": "miles.rollout.data_source.RolloutDataSourceWithBuffer",
+        "advantage_estimator": "grpo",
+        "use_critic": False,
+        "custom_rm_path": None,
+        "custom_reward_post_process_path": None,
+        "custom_convert_samples_to_train_data_path": None,
+        "rollout_data_postprocess_path": None,
+        "buffer_filter_path": None,
+        "rollout_sample_filter_path": None,
+        "load_debug_rollout_data": False,
+        "ci_inject_rollout_data_path": None,
+        "debug_train_only": False,
+        "debug_rollout_only": False,
+        "debug_skip_weight_update": False,
+        "lora_rank": 0,
+        "use_routing_replay": False,
+        "use_rollout_routing_replay": False,
+        "use_indexer_replay": False,
+        "use_rollout_indexer_replay": False,
+        "update_weight_transfer_mode": "p2p",
+        "update_weights_interval": 1,
+        "save": "/tmp/checkpoints",
+        "save_interval": 10,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"fully_async": False}, "requires --fully-async"),
+        ({"train_backend": "fsdp"}, "Megatron training backend"),
+        ({"rollout_global_dataset": False}, "global rollout dataset"),
+        ({"data_source_path": "custom.Source"}, "RolloutDataSourceWithBuffer"),
+        ({"advantage_estimator": "gspo"}, "advantage-estimator grpo"),
+        ({"use_critic": True}, "critic-free GRPO"),
+        ({"custom_rm_path": "custom.rm"}, "built-in reward-model"),
+        ({"custom_reward_post_process_path": "custom.reward"}, "built-in reward"),
+        ({"custom_convert_samples_to_train_data_path": "custom.convert"}, "built-in train-data"),
+        ({"rollout_data_postprocess_path": "custom.postprocess"}, "built-in rollout data post-processing"),
+        ({"buffer_filter_path": "custom.buffer"}, "default FIFO"),
+        ({"rollout_sample_filter_path": "custom.sample_filter"}, "no post-generation rollout sample filter"),
+        ({"load_debug_rollout_data": True}, "live rollout generation"),
+        ({"ci_inject_rollout_data_path": "dump-{rollout_id}.pt"}, "no CI rollout-data injection"),
+        ({"debug_train_only": True}, "rollout generation enabled"),
+        ({"debug_rollout_only": True}, "trainer consumption enabled"),
+        ({"debug_skip_weight_update": True}, "real rollout-engine weight updates"),
+        ({"lora_rank": 8}, "dense model training"),
+        ({"use_routing_replay": True}, "no routing/indexer replay"),
+        ({"use_rollout_routing_replay": True}, "no routing/indexer replay"),
+        ({"use_indexer_replay": True}, "no routing/indexer replay"),
+        ({"use_rollout_indexer_replay": True}, "no routing/indexer replay"),
+        ({"update_weight_transfer_mode": "disk-delta"}, "non-delta weight transfer"),
+        ({"update_weights_interval": 2}, "update-weights-interval 1"),
+        ({"save": None}, "--save for durable replay"),
+        ({"save_interval": None}, "positive --save-interval for durable replay"),
+        ({"save_interval": 0}, "positive --save-interval for durable replay"),
+        ({"fully_async_rollout_checkpoint_keep_last": 0}, "positive checkpoint retention"),
+    ],
+)
+def test_fully_async_rollout_checkpoint_guards(monkeypatch, override, message):
+    monkeypatch.setattr("miles.utils.arguments.enable_experimental_rollout_refactor", lambda: True)
+    args = _fully_async_checkpoint_args(**override)
+    with pytest.raises((AssertionError, ValueError), match=message):
+        _resolve_rollout_functions(args)
+
+
+def test_fully_async_rollout_checkpoint_accepts_supported_grpo_configuration(monkeypatch):
+    monkeypatch.setattr("miles.utils.arguments.enable_experimental_rollout_refactor", lambda: True)
+    args = _fully_async_checkpoint_args()
+    _resolve_rollout_functions(args)
+    assert args.rollout_function_path == "miles.rollout.fully_async_rollout.FullyAsyncRolloutFn"
 
 
 def make_class_with_add_arguments():

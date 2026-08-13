@@ -17,6 +17,24 @@ class _Handle:
         self.train = _RemoteTrain(rank, calls)
 
 
+class _RemoteValue:
+    def __init__(self, value):
+        self.value = value
+
+    def remote(self, *args, **kwargs):
+        async def result():
+            return self.value
+
+        return result()
+
+
+class _RolloutManager:
+    def __init__(self, version):
+        self.get_current_applied_weight_version = _RemoteValue(version)
+        self.get_updatable_engines_and_lock = _RemoteValue("engine-info")
+        self.health_monitoring_pause = _RemoteValue(None)
+
+
 async def test_train_routes_each_critic_payload_to_matching_actor_rank():
     from miles.ray.actor_group import RayTrainGroup
 
@@ -59,3 +77,26 @@ async def test_train_rejects_wrong_number_of_rank_payloads():
 
     with pytest.raises(ValueError, match="one payload per train worker"):
         await group.train(5, {"data_ref": "rollout"}, external_data=[{"values": []}])
+
+
+async def test_full_replay_aligns_v1_weight_version_before_push():
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from miles.ray.actor_group import RayTrainGroup
+
+    group = object.__new__(RayTrainGroup)
+    group.args = SimpleNamespace(
+        debug_train_only=False,
+        debug_rollout_only=False,
+        fully_async_rollout_checkpoint=True,
+        use_fault_tolerance=False,
+    )
+    group.rollout_manager = _RolloutManager(version=7)
+    group._broadcast = AsyncMock(return_value=[])
+
+    await group.update_weights(rollout_id=3)
+
+    assert group._broadcast.await_args_list[0].args == ("restore_weight_version", 7)
+    assert group._broadcast.await_args_list[1].args == ("update_weights",)
+    assert group._broadcast.await_args_list[1].kwargs == {"info": "engine-info"}

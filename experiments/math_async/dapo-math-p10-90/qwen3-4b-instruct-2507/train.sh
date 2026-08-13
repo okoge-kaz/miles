@@ -51,9 +51,15 @@ ROLLOUT_ARGS=(
    --staleness-reference "${STALENESS_REFERENCE}"
    --pause-generation-mode "${PAUSE_GENERATION_MODE}"
 )
+if [[ "${FULLY_ASYNC_ROLLOUT_CHECKPOINT:-0}" != "0" ]]; then
+   ROLLOUT_ARGS+=(--fully-async-rollout-checkpoint)
+fi
 if [[ -n "${ASYNC_MAX_CONCURRENT_SAMPLES:-}" ]]; then
 
    ROLLOUT_ARGS+=(--async-max-concurrent-samples "${ASYNC_MAX_CONCURRENT_SAMPLES}")
+fi
+if [[ -n "${DEBUG_EXIT_AFTER_ROLLOUT:-}" ]]; then
+   ROLLOUT_ARGS+=(--debug-exit-after-rollout "${DEBUG_EXIT_AFTER_ROLLOUT}")
 fi
 
 TELEMETRY_ARGS=(
