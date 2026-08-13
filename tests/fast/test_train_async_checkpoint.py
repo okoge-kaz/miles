@@ -40,6 +40,7 @@ class _RolloutManager:
     def __init__(self, events):
         self.events = events
         self.generate = _RemoteMethod(self._generate)
+        self.record_batch_consumption = _RemoteMethod(self._record_batch_consumption)
         self.acknowledge_trained_batch = _RemoteMethod(self._acknowledge)
         self.save = _RemoteMethod(self._save)
         self.mark_checkpoint_published = _RemoteMethod(self._mark_published)
@@ -54,6 +55,10 @@ class _RolloutManager:
             "data_ref": object(),
             "fully_async_batch_token": f"token-{rollout_id}",
         }
+
+    async def _record_batch_consumption(self, rollout_id):
+        await asyncio.sleep(0)
+        self.events.append(("consume", rollout_id))
 
     def _acknowledge(self, rollout_id, token):
         self.events.append(("ack", rollout_id, token))
@@ -88,6 +93,8 @@ class _ActorModel:
 def _args(**overrides):
     values = {
         "colocate": False,
+        "fully_async": False,
+        "fully_async_queue_policy": "queue-recycle",
         "fully_async_rollout_checkpoint": True,
         "control_server_port": None,
         "ft_components": [],
@@ -175,3 +182,40 @@ async def test_legacy_checkpoint_order_and_async_save_semantics_are_unchanged(mo
     model_event = ("model", 0, False, True, False)
     assert model_event in events
     assert events.index(model_event) < events.index(("sidecar", 0))
+
+
+async def test_queue_recycle_starts_legacy_prefetch_before_consumption(monkeypatch):
+    events = []
+    manager = _RolloutManager(events)
+    actor = _ActorModel(events)
+    _patch_runtime(monkeypatch, manager, actor)
+
+    await train_async.train(
+        _args(
+            fully_async=True,
+            fully_async_rollout_checkpoint=False,
+            debug_exit_after_rollout=1,
+        )
+    )
+
+    assert events.index(("generate", 1)) < events.index(("consume", 0))
+    assert events.index(("consume", 0)) < events.index(("train", 0))
+
+
+@pytest.mark.parametrize("policy", ["queue-max", "queue-drop"])
+async def test_selection_policies_defer_next_batch_until_after_weight_update(monkeypatch, policy):
+    events = []
+    manager = _RolloutManager(events)
+    actor = _ActorModel(events)
+    _patch_runtime(monkeypatch, manager, actor)
+
+    await train_async.train(
+        _args(
+            fully_async=True,
+            fully_async_queue_policy=policy,
+            fully_async_rollout_checkpoint=False,
+        )
+    )
+
+    assert events.index(("consume", 0)) < events.index(("train", 0))
+    assert events.index(("update_weights", 0)) < events.index(("generate", 1))
