@@ -51,9 +51,18 @@ PROMPT_DATA=/data/dapo-math-p10-90/dapo-math-p10-90.jsonl
 : "${GLOBAL_BATCH_SIZE:=3072}"
 : "${NUM_STEPS_PER_ROLLOUT:=1}"
 
-# off-policy degree: how stale a sample may be, and what happens to in-flight
-# generation at a weight update
-: "${MAX_WEIGHT_STALENESS:=2}"
+# queue selection and what happens to in-flight generation at a weight update
+: "${QUEUE_POLICY:=queue-recycle}" # queue-recycle | queue-max | queue-drop
+: "${QUEUE_FACTOR:=1}"                       # queue-drop capacity in training batches
+if [[ "${QUEUE_POLICY}" == queue-drop ]]; then
+   [[ -z "${MAX_WEIGHT_STALENESS:-}" ]] || {
+      echo "QUEUE_POLICY=queue-drop does not use MAX_WEIGHT_STALENESS" >&2
+      exit 1
+   }
+   MAX_WEIGHT_STALENESS=
+else
+   : "${MAX_WEIGHT_STALENESS:=2}"
+fi
 : "${STALENESS_REFERENCE:=prefill}"   # completion | submission | prefill
 : "${PAUSE_GENERATION_MODE:=in_place}"
 : "${ASYNC_MAX_CONCURRENT_SAMPLES:=}"
@@ -99,7 +108,8 @@ export ADVANTAGE_ESTIMATOR ENTROPY_COEF KL_LOSS_COEF EPS_CLIP EPS_CLIP_HIGH EPS_
 export RATIO_DENOMINATOR IS_CORRECTION TIS_CLIP TIS_CLIP_LOW MIS_PROFILE M2PO_BUDGET USE_OPSM OPSM_DELTA
 export LR MAX_RESPONSE_LEN NUM_ROLLOUT TRAIN_SEED ROLLOUT_SEED
 export ROLLOUT_BATCH_SIZE N_SAMPLES_PER_PROMPT GLOBAL_BATCH_SIZE NUM_STEPS_PER_ROLLOUT
-export MAX_WEIGHT_STALENESS STALENESS_REFERENCE PAUSE_GENERATION_MODE ASYNC_MAX_CONCURRENT_SAMPLES
+export QUEUE_POLICY QUEUE_FACTOR MAX_WEIGHT_STALENESS STALENESS_REFERENCE
+export PAUSE_GENERATION_MODE ASYNC_MAX_CONCURRENT_SAMPLES
 export ACTOR_NUM_NODES ACTOR_GPUS_PER_NODE ROLLOUT_NUM_GPUS
 export TENSOR_PARALLEL_SIZE CONTEXT_PARALLEL_SIZE EXPERT_PARALLEL_SIZE
 export MAX_TOKENS_PER_GPU RECOMPUTE_GRANULARITY OVERLAP_COMM

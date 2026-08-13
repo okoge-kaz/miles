@@ -3,6 +3,7 @@ import logging
 import os
 
 from miles.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
+from miles.rollout.queue_policy import should_prefetch_rollout_batches
 from miles.utils import object_store
 from miles.utils.arguments import parse_args, validate_async_off_policy_correction
 from miles.utils.audit_utils.process_identity import MainProcessIdentity
@@ -67,15 +68,24 @@ async def train(args):
             await model.offload()
 
     # async train loop.
+    prefetch_rollout_batches = should_prefetch_rollout_batches(args)
     rollout_data_next_future = rollout_manager.generate.remote(args.start_rollout_id)
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
         # Sync the last generation
         if rollout_data_next_future is not None:
             rollout_data_curr_ref = await rollout_data_next_future
 
+        if args.fully_async:
+            # The legacy policy may have selected this prefetched batch before
+            # the preceding weight update. Sample the authoritative applied
+            # version at the point the trainer actually begins consuming it.
+            await rollout_manager.record_batch_consumption.remote(rollout_id)
+
         # Start the next rollout early.
-        if rollout_id + 1 < args.num_rollout:
+        if prefetch_rollout_batches and rollout_id + 1 < args.num_rollout:
             rollout_data_next_future = rollout_manager.generate.remote(rollout_id + 1)
+        elif not prefetch_rollout_batches:
+            rollout_data_next_future = None
 
         if args.use_critic:
             values = await critic_model.train(rollout_id, rollout_data_curr_ref)
@@ -113,8 +123,9 @@ async def train(args):
 
         if (rollout_id + 1) % args.update_weights_interval == 0:
             # sync generate before update weights to prevent update weight in the middle of generation
-            rollout_data_curr_ref = (await x) if (x := rollout_data_next_future) is not None else None
-            rollout_data_next_future = None
+            if prefetch_rollout_batches:
+                rollout_data_curr_ref = (await x) if (x := rollout_data_next_future) is not None else None
+                rollout_data_next_future = None
             await actor_model.update_weights(rollout_id=rollout_id)
 
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
@@ -130,6 +141,12 @@ async def train(args):
                 rollout_id,
             )
             break
+
+        if not prefetch_rollout_batches and rollout_id + 1 < args.num_rollout:
+            # The persistent rollout worker kept filling its policy queue during
+            # training. Ask it to select the next batch only now, when the trainer
+            # is ready to consume that batch.
+            rollout_data_next_future = rollout_manager.generate.remote(rollout_id + 1)
 
     await rollout_manager.dispose.remote()
 

@@ -9,7 +9,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_
 from miles.dashboard import hooks as dashboard_hooks
 from miles.ray.rollout.addr_allocator import PortCursors
 from miles.ray.rollout.debug_data import RolloutDataInjectionUtil, load_debug_rollout_data, save_debug_rollout_data
-from miles.ray.rollout.metrics import log_eval_rollout_data, log_rollout_data
+from miles.ray.rollout.metrics import log_eval_rollout_data, log_rollout_batch_consumption, log_rollout_data
 from miles.ray.rollout.rollout_data_conversion import postprocess_rollout_data
 from miles.ray.rollout.rollout_server import RolloutServer, start_rollout_servers
 from miles.ray.rollout.router_manager import start_session_server
@@ -45,6 +45,8 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 logger = logging.getLogger(__name__)
+
+ROLLOUT_FN_DEBUG_METADATA_KEY = "rollout_fn_debug"
 
 
 @ray.remote
@@ -90,6 +92,7 @@ class RolloutManager:
             dashboard_hooks.register_router(args)
         self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
         self.rollout_id = -1
+        self._fully_async_selection_versions: dict[int, int | None] = {}
 
         self._metric_checker = MetricChecker.maybe_create(args)
 
@@ -115,6 +118,19 @@ class RolloutManager:
         if commit is not None:
             commit(version)
 
+    def record_batch_consumption(self, rollout_id: int) -> dict[str, int] | None:
+        """Record the applied version immediately before the trainer uses a batch."""
+        current = getattr(self.generate_rollout, "current_applied_weight_version", None)
+        if current is None:
+            return None
+        selection_version = self._fully_async_selection_versions.pop(rollout_id, None)
+        return log_rollout_batch_consumption(
+            rollout_id,
+            self.args,
+            selection_weight_version=selection_version,
+            train_start_weight_version=current(),
+        )
+
     def dispose(self):
         if (close := getattr(self.data_source, "close", None)) is not None:
             close()
@@ -136,9 +152,17 @@ class RolloutManager:
         if (get_buffer_length := getattr(self.data_source, "get_buffer_length", None)) is not None:
             dashboard_hooks.report_data_buffer(get_buffer_length())
         with timer("rollout"):
-            data, metadata, metrics = await self._get_rollout_data(rollout_id=rollout_id)
-        save_debug_rollout_data(self.args, data, rollout_id=rollout_id, evaluation=False, metadata=metadata)
+            data, metadata, metrics, debug_metadata = await self._get_rollout_data(rollout_id=rollout_id)
+        dump_metadata = dict(metadata)
+        if debug_metadata is not None:
+            dump_metadata[ROLLOUT_FN_DEBUG_METADATA_KEY] = debug_metadata
+        save_debug_rollout_data(self.args, data, rollout_id=rollout_id, evaluation=False, metadata=dump_metadata)
         log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
+        if self.args.fully_async:
+            selection_version = None
+            if metrics is not None:
+                selection_version = metrics.get("rollout/fully_async/current_weight_version")
+            self._fully_async_selection_versions[rollout_id] = selection_version
         data = convert_samples_to_train_data(
             self.args,
             data,
@@ -182,6 +206,8 @@ class RolloutManager:
     async def _get_rollout_data(self, rollout_id):
         if self.args.load_debug_rollout_data:
             data, metadata = load_debug_rollout_data(self.args, rollout_id=rollout_id)
+            metadata = dict(metadata)
+            debug_metadata = metadata.pop(ROLLOUT_FN_DEBUG_METADATA_KEY, None)
             metrics = None
         else:
             if self.use_experimental_refactor:
@@ -193,6 +219,7 @@ class RolloutManager:
                     call_rollout_fn, self.generate_rollout, self.args, rollout_id, self.data_source, evaluation=False
                 )
             metrics = data.metrics
+            debug_metadata = data.debug_metadata
             data = data.samples
             data, metadata = postprocess_rollout_data(
                 self.args, data, train_parallel_config=self.train_parallel_config
@@ -200,12 +227,14 @@ class RolloutManager:
             if RolloutDataInjectionUtil.should_inject(self.args, rollout_id):
                 generated_data = data
                 data, metadata = RolloutDataInjectionUtil.load(self.args, rollout_id=rollout_id)
+                metadata = dict(metadata)
+                debug_metadata = metadata.pop(ROLLOUT_FN_DEBUG_METADATA_KEY, None)
                 RolloutDataInjectionUtil.assert_matches_generated(
                     self.args, generated=generated_data, injected=data, rollout_id=rollout_id
                 )
                 metrics = None
 
-        return data, metadata, metrics
+        return data, metadata, metrics, debug_metadata
 
     # -------------------------- checkpointing -----------------------------
 

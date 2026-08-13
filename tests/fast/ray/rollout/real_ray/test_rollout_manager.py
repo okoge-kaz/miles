@@ -489,6 +489,7 @@ class TestGenerate:
         placement_group_factory,
         tmp_path,
         patch_low_level,
+        monkeypatch,
     ):
         args = _make_test_args(tmp_path, models=[("actor", True)])
         # global_batch_size = number of samples we'll produce (postprocess
@@ -498,16 +499,34 @@ class TestGenerate:
 
         manager = _make_manager(args, pg)
         manager.train_parallel_config = {"dp_size": 2}
+        manager.args.fully_async = True
 
         captured: list = []
+        captured_dump_metadata: list[dict] = []
+        captured_consumption: list[dict] = []
+
+        import miles.ray.rollout.rollout_manager as rmgr
+
+        monkeypatch.setattr(
+            rmgr,
+            "save_debug_rollout_data",
+            lambda *args, **kwargs: captured_dump_metadata.append(kwargs["metadata"]),
+        )
+        monkeypatch.setattr(
+            rmgr,
+            "log_rollout_batch_consumption",
+            lambda *args, **kwargs: captured_consumption.append(kwargs) or kwargs,
+        )
 
         def fake_rollout_fn(input):
             captured.append(input)
             return RolloutFnTrainOutput(
                 samples=[make_samples_grouped(n_groups=2, group_size=4)],
-                metrics={"my_metric": 1.23},
+                metrics={"my_metric": 1.23, "rollout/fully_async/current_weight_version": 3},
+                debug_metadata={"schema_version": 1, "records": [{"attempt_id": 9}]},
             )
 
+        fake_rollout_fn.current_applied_weight_version = lambda: 4
         manager.generate_rollout = fake_rollout_fn
 
         result = await manager.generate(rollout_id=42)
@@ -516,6 +535,12 @@ class TestGenerate:
         assert len(captured) == 1
         assert isinstance(captured[0], RolloutFnTrainInput)
         assert captured[0].rollout_id == 42
+        assert captured_dump_metadata == [{"rollout_fn_debug": {"schema_version": 1, "records": [{"attempt_id": 9}]}}]
+        assert manager.record_batch_consumption(42) == {
+            "selection_weight_version": 3,
+            "train_start_weight_version": 4,
+        }
+        assert captured_consumption == [{"selection_weight_version": 3, "train_start_weight_version": 4}]
         # generate returns {"sample_indices": ..., "data_ref": ...};
         # split_train_data_by_dp returns Box(ObjectRef) per dp rank
         assert set(result) == {"sample_indices", "data_ref"}

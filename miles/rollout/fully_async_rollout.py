@@ -17,7 +17,7 @@ explicitly.
 import asyncio
 import logging
 import time
-from collections.abc import Iterator
+from collections import deque
 
 import httpx
 import numpy as np
@@ -25,6 +25,19 @@ import numpy as np
 from miles.rollout.base_types import RolloutFnConstructorInput, RolloutFnInput, RolloutFnOutput, RolloutFnTrainOutput
 from miles.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter
 from miles.rollout.inference_rollout.inference_rollout_common import GenerateState, generate_and_rm_group
+from miles.rollout.queue_policy import LEGACY_QUEUE_POLICY, QUEUE_DROP_POLICY, QUEUE_MAX_POLICY
+from miles.rollout.queue_telemetry import (
+    Group,
+    _distribution_metrics,
+    _first_sample,
+    _iter_samples,
+    _QueueLifecycleRecorder,
+    _ResponseLengthMetrics,
+    group_first_prefill_weight_version,
+    group_oldest_weight_version,
+    group_queue_entry_weight_version,
+    group_response_tokens,
+)
 from miles.utils.http_utils import get
 from miles.utils.misc import load_function
 from miles.utils.types import Sample
@@ -42,40 +55,7 @@ WEIGHT_VERSION_QUERY_TIMEOUT_SECS = 2.0
 # tail collapsed into one overflow bucket.
 STALENESS_HISTOGRAM_MAX = 16
 
-# A finished group is list[Sample], or list[list[Sample]] when a generate function
-# returns multiple samples per trajectory (e.g. multi-agent).
-Group = list[Sample | list[Sample]]
-
-
-def _iter_samples(group: Group) -> Iterator[Sample]:
-    for item in group:
-        if isinstance(item, list):
-            yield from item
-        else:
-            yield item
-
-
-def _first_sample(group: Group) -> Sample:
-    return group[0][0] if isinstance(group[0], list) else group[0]
-
-
-def group_oldest_weight_version(group: Group) -> int | None:
-    """Return the minimum weight version across all trajectories and turns in a group."""
-    versions = [v for s in _iter_samples(group) if (v := s.oldest_weight_version) is not None]
-    return min(versions) if versions else None
-
-
-def group_queue_entry_weight_version(group: Group) -> int | None:
-    """Return the version the group became available to the trainer under.
-
-    The **maximum**, not the minimum. A group is one concurrent request per
-    sample joined by ``asyncio.gather`` (``inference_rollout_common.py:137-146``),
-    so it enters the output queue when its *slowest* sample lands. Taking the
-    minimum would charge a straggler that crossed a weight update to in-queue
-    staleness, when it is the defining case of pre-queue staleness.
-    """
-    versions = [v for s in _iter_samples(group) if (v := s.newest_weight_version) is not None]
-    return max(versions) if versions else None
+QueueItem = tuple[list[Sample], Group]
 
 
 SUBMISSION_VERSION_KEY = "submission_weight_version"
@@ -112,11 +92,6 @@ def group_lifecycle_weight_version(group: Group, key: str) -> int | None:
     if len(numeric_versions) != len(versions) or len(set(numeric_versions)) != 1:
         raise RuntimeError(f"Inconsistent {key} across rollout group: {versions}")
     return numeric_versions[0]
-
-
-def group_first_prefill_weight_version(group: Group) -> int | None:
-    versions = [version for sample in _iter_samples(group) for version in sample.first_prefill_weight_versions]
-    return min(versions) if versions else None
 
 
 def group_has_mixed_forward_versions(group: Group) -> bool:
@@ -266,74 +241,6 @@ class _CachedWeightVersion:
             logger.warning(f"Weight version query failed {self._failures}x, using cached value: {error!r}")
 
 
-def group_response_tokens(group: Group) -> int:
-    """Response tokens generated for a group.
-
-    Call it *before* recycling: ``Sample.reset_for_retry`` clears ``tokens`` and
-    ``response`` (``types.py:236``), so a count taken afterwards is always zero.
-    """
-    return sum(sample.response_length for sample in _iter_samples(group))
-
-
-def _distribution_metrics(values: list[int]) -> dict[str, float]:
-    """Reduce an in-memory integer population to fixed-cardinality scalars."""
-    if not values:
-        return {"count": 0.0, "sum": 0.0}
-    array = np.asarray(values, dtype=float)
-    return {
-        "count": float(array.size),
-        "sum": float(array.sum()),
-        "mean": float(array.mean()),
-        "std": float(array.std()),
-        "p50": float(np.percentile(array, 50)),
-        "p90": float(np.percentile(array, 90)),
-        "p99": float(np.percentile(array, 99)),
-        "max": float(array.max()),
-    }
-
-
-class _ResponseLengthMetrics:
-    """Small integer-only view of queue admission outcomes.
-
-    Queue admission is group-valued, while the loss and token cost are
-    sample-valued. Keep both views: the slowest response is the natural proxy for
-    group completion latency, and the flattened sample lengths describe the data
-    distribution seen (or rejected) by training.
-    """
-
-    _POPULATIONS = (
-        "completed",
-        "trained",
-        "stale_recycled",
-        "dynamic_filter_dropped",
-        "aborted_recycled",
-    )
-
-    def __init__(self) -> None:
-        self._sample_lengths = {population: [] for population in self._POPULATIONS}
-        self._group_max_lengths = {population: [] for population in self._POPULATIONS}
-
-    def record(self, population: str, group: Group) -> None:
-        lengths = [sample.response_length for sample in _iter_samples(group)]
-        if not lengths:
-            return
-        self._sample_lengths[population].extend(lengths)
-        self._group_max_lengths[population].append(max(lengths))
-
-    def collect(self) -> dict[str, float]:
-        metrics: dict[str, float] = {}
-        for population, sample_lengths in self._sample_lengths.items():
-            for view, values in (
-                ("sample_length", sample_lengths),
-                ("group_max_length", self._group_max_lengths[population]),
-            ):
-                metrics |= {
-                    f"queue/selection/{population}/{view}/{name}": value
-                    for name, value in _distribution_metrics(values).items()
-                }
-        return metrics
-
-
 def _staleness_metrics(values: list[int], bound: int | None) -> dict[str, float]:
     """P(L) reduced to bounded scalars: the logger takes scalars, not histograms.
 
@@ -377,8 +284,10 @@ class FullyAsyncRolloutFn:
 
     The worker runs as a long-lived task on the shared rollout event loop, created
     lazily on the first train call. Groups whose samples were aborted (e.g. by a
-    weight update pausing generation) or whose weights are older than
-    ``--max-weight-staleness`` are recycled back into the data source.
+    weight update pausing generation) are recycled back into the data source.
+    Age-bound failures are recycled by the legacy policy and discarded by
+    queue-max; queue-drop instead discards the oldest completed group when its
+    bounded queue overflows.
     """
 
     def __init__(self, input: RolloutFnConstructorInput):
@@ -389,12 +298,27 @@ class FullyAsyncRolloutFn:
         self._sample_filter = load_function(input.args.rollout_sample_filter_path)
         self._weight_version = _CachedWeightVersion()
         self._applied_weight_version = AppliedWeightVersionTracker()
+        self._queue_lifecycle = _QueueLifecycleRecorder(
+            enabled=getattr(input.args, "save_debug_rollout_data", None) is not None
+        )
+        # Producer completions continue while the trainer is busy and therefore
+        # cannot live in one drain call's local accumulator. Drain and reset these
+        # at the same point as the other per-rollout metrics.
+        self._producer_response_lengths = _ResponseLengthMetrics(populations=("generated", "queue_evicted"))
+        self._queue_evicted_groups = 0
+        self._queue_evicted_tokens = 0
         self._worker: asyncio.Task | None = None
-        self._output: asyncio.Queue[tuple[list[Sample], Group]] | None = None
+        self._output: asyncio.Queue[QueueItem] | None = None
         self._output_slots: asyncio.Semaphore | None = None
+        self._policy_output: deque[QueueItem] | None = None
+        self._policy_output_ready: asyncio.Event | None = None
 
     def commit_applied_weight_version(self, version: int) -> None:
         self._applied_weight_version.commit(version)
+
+    def current_applied_weight_version(self) -> int:
+        """Return the last weight version finalized on every rollout engine."""
+        return self._applied_weight_version.current()
 
     async def __call__(self, input: RolloutFnInput) -> RolloutFnOutput:
         if input.evaluation:
@@ -403,11 +327,38 @@ class FullyAsyncRolloutFn:
                 "miles.rollout.inference_rollout.inference_rollout_common.InferenceRolloutFn"
             )
         if self._worker is None:
-            self._output = asyncio.Queue()
-            self._output_slots = asyncio.Semaphore(OUTPUT_QUEUE_MAX_GROUPS)
+            if self._queue_policy() == LEGACY_QUEUE_POLICY:
+                self._output = asyncio.Queue()
+                self._output_slots = asyncio.Semaphore(OUTPUT_QUEUE_MAX_GROUPS)
+            else:
+                self._policy_output = deque()
+                self._policy_output_ready = asyncio.Event()
+                if self._queue_policy() == QUEUE_MAX_POLICY:
+                    self._output_slots = asyncio.Semaphore(self._queue_capacity_groups())
             self._worker = asyncio.create_task(self._worker_loop())
-            logger.info("Started fully-async rollout worker")
+            logger.info(
+                "Started fully-async rollout worker (queue_policy=%s, capacity_groups=%d)",
+                self._queue_policy(),
+                self._queue_capacity_groups(),
+            )
         return await self._drain(input.rollout_id)
+
+    def _queue_policy(self) -> str:
+        return getattr(self.args, "fully_async_queue_policy", LEGACY_QUEUE_POLICY)
+
+    def _queue_capacity_groups(self) -> int:
+        if self._queue_policy() == QUEUE_DROP_POLICY:
+            return getattr(self.args, "fully_async_queue_factor", 1) * self.args.rollout_batch_size
+        if self._queue_policy() == QUEUE_MAX_POLICY:
+            # queue-max waits for a whole batch before dequeueing. Its safety
+            # backpressure limit must therefore never be smaller than that batch.
+            return max(OUTPUT_QUEUE_MAX_GROUPS, self.args.rollout_batch_size)
+        return OUTPUT_QUEUE_MAX_GROUPS
+
+    def _queue_size(self) -> int:
+        if self._queue_policy() == LEGACY_QUEUE_POLICY:
+            return self._output.qsize()
+        return len(self._policy_output)
 
     # -------------------------- producer --------------------------
 
@@ -445,21 +396,30 @@ class FullyAsyncRolloutFn:
         that shape back.
         """
         submission_version = await self._current_weight_version()
+        lifecycle_record = self._queue_lifecycle.begin_attempt(prompt_group, submission_version)
         stamp_submission_weight_version(prompt_group, submission_version)
-        result = await generate_and_rm_group(
-            self.state,
-            prompt_group,
-            sampling_params=self.state.sampling_params.copy(),
-            evaluation=False,
-        )
+        try:
+            result = await generate_and_rm_group(
+                self.state,
+                prompt_group,
+                sampling_params=self.state.sampling_params.copy(),
+                evaluation=False,
+            )
+        except BaseException:
+            self._queue_lifecycle.cancel_attempt(lifecycle_record)
+            raise
         # Stamped again on the result: a generate function may return new Sample
         # objects rather than the ones it was handed.
         stamp_submission_weight_version(result, submission_version)
+        ready_version = self._applied_weight_version.current()
         stamp_group_weight_version(
             result,
             GROUP_READY_VERSION_KEY,
-            self._applied_weight_version.current(),
+            ready_version,
         )
+        self._queue_lifecycle.group_ready(lifecycle_record, result, ready_version)
+        if not any(sample.status == Sample.Status.ABORTED for sample in _iter_samples(result)):
+            self._producer_response_lengths.record("generated", result)
         return prompt_group, result
 
     async def _worker_loop(self):
@@ -469,16 +429,47 @@ class FullyAsyncRolloutFn:
                 active.add(self._submit_one_group())
             done, active = await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
-                # Blocks when the queue is full: training lagging behind rollout
-                # production pauses submission instead of growing the queue unboundedly.
-                item = task.result()
-                await self._output_slots.acquire()
-                stamp_group_weight_version(
-                    item[1],
-                    QUEUE_PUT_VERSION_KEY,
-                    self._applied_weight_version.current(),
+                await self._enqueue_completed_group(task.result())
+
+    async def _enqueue_completed_group(self, item: QueueItem) -> None:
+        policy = self._queue_policy()
+        if policy in (LEGACY_QUEUE_POLICY, QUEUE_MAX_POLICY):
+            # These policies control age at selection time. The 1000-group limit
+            # is only a safety backpressure bound, not their experimental queue
+            # capacity.
+            await self._output_slots.acquire()
+
+        depth_before = self._queue_size()
+        queue_put_version = self._applied_weight_version.current()
+        stamp_group_weight_version(item[1], QUEUE_PUT_VERSION_KEY, queue_put_version)
+
+        if policy == LEGACY_QUEUE_POLICY:
+            self._output.put_nowait(item)
+        else:
+            if policy == QUEUE_DROP_POLICY and depth_before >= self._queue_capacity_groups():
+                _, evicted_group = self._policy_output.popleft()
+                evicted_tokens = group_response_tokens(evicted_group)
+                self._queue_evicted_groups += 1
+                self._queue_evicted_tokens += evicted_tokens
+                self._producer_response_lengths.record("queue_evicted", evicted_group)
+                reference = group_first_prefill_weight_version(evicted_group)
+                self._queue_lifecycle.finish(
+                    evicted_group,
+                    disposition="queue_evicted",
+                    decision_version=queue_put_version,
+                    rollout_id=None,
+                    reference_version=reference,
+                    bound_staleness=queue_put_version - reference if reference is not None else None,
                 )
-                self._output.put_nowait(item)
+            self._policy_output.append(item)
+            self._policy_output_ready.set()
+
+        self._queue_lifecycle.enqueued(
+            item[1],
+            queue_put_version=queue_put_version,
+            depth_before=depth_before,
+            depth_after=self._queue_size(),
+        )
 
     # -------------------------- consumer --------------------------
 
@@ -499,6 +490,7 @@ class FullyAsyncRolloutFn:
                 if queue_get in done:
                     result = queue_get.result()
                     self._output_slots.release()
+                    self._queue_lifecycle.dequeued(result[1], depth_after_observed=self._output.qsize())
                     return result
                 logger.warning(
                     f"No completed rollout groups for {NO_PROGRESS_WARN_SECS}s (queued: {self._output.qsize()})"
@@ -507,16 +499,61 @@ class FullyAsyncRolloutFn:
             if not queue_get.done():
                 queue_get.cancel()
 
+    async def _take_policy_groups(self, count: int) -> list[tuple[QueueItem, int]]:
+        """Wait for and atomically remove ``count`` oldest completed groups."""
+        assert self._queue_policy() != LEGACY_QUEUE_POLICY
+        # Match the legacy queue's fail-fast contract even when a dead worker
+        # left enough completed groups to satisfy this request immediately.
+        if self._worker is not None and self._worker.done():
+            self._worker.result()
+            raise RuntimeError("fully-async rollout worker exited without an exception")
+        while len(self._policy_output) < count:
+            self._policy_output_ready.clear()
+            if len(self._policy_output) >= count:
+                break
+            queue_ready = asyncio.create_task(self._policy_output_ready.wait())
+            try:
+                done, _ = await asyncio.wait(
+                    {queue_ready, self._worker},
+                    return_when=asyncio.FIRST_COMPLETED,
+                    timeout=NO_PROGRESS_WARN_SECS,
+                )
+                if self._worker in done:
+                    self._worker.result()
+                    raise RuntimeError("fully-async rollout worker exited without an exception")
+                if queue_ready not in done:
+                    logger.warning(
+                        "No full rollout batch for %.1fs (queued: %d, needed: %d)",
+                        NO_PROGRESS_WARN_SECS,
+                        len(self._policy_output),
+                        count,
+                    )
+            finally:
+                if not queue_ready.done():
+                    queue_ready.cancel()
+
+        selected = []
+        for _ in range(count):
+            item = self._policy_output.popleft()
+            if self._queue_policy() == QUEUE_MAX_POLICY:
+                self._output_slots.release()
+            depth_after = len(self._policy_output)
+            self._queue_lifecycle.dequeued(item[1], depth_after_observed=depth_after)
+            selected.append((item, depth_after))
+        return selected
+
     async def _drain(self, rollout_id: int) -> RolloutFnTrainOutput:
         args = self.args
         assert args.rollout_global_dataset
 
         target_data_size = args.rollout_batch_size
-        queue_size_start = self._output.qsize()
+        queue_size_start = self._queue_size()
         queue_sizes_after_dequeue: list[int] = []
+        candidates: deque[tuple[QueueItem, int]] = deque()
         data: list[Group] = []
         aborted_groups_recycled = 0
         stale_groups_recycled = 0
+        stale_groups_dropped = 0
         # Two populations, because they answer different questions and only one of
         # them is the study's variable. ``offered`` (logged as
         # ``staleness/bound/rollout/``) is every group the pipeline handed over,
@@ -526,9 +563,8 @@ class FullyAsyncRolloutFn:
         # bound bites and where the dynamic filter drops a group, which is where a
         # reader is most likely to be misled.
         # What `--max-weight-staleness` is tested against, in its two populations.
-        # This is `current - oldest`, which is neither of the two components below:
-        # it is in-queue staleness plus however far the group's samples spread
-        # across versions among themselves.
+        # This is `current - reference`; the reference is completion, submission,
+        # or first prefill according to the configured semantics.
         trained_bound_staleness: list[int] = []
         offered_bound_staleness: list[int] = []
         # The decomposition. Per group, with R the selected bound reference, Q
@@ -547,25 +583,39 @@ class FullyAsyncRolloutFn:
         # because the three ways to waste generation cost wildly different amounts.
         aborted_tokens = 0
         stale_tokens = 0
+        age_cutoff_tokens = 0
         filtered_tokens = 0
         response_length_metrics = _ResponseLengthMetrics()
         metric_gatherer = MetricGatherer()
         do_print = True
 
         while len(data) < target_data_size:
-            prompt_group, group = await self._next_group()
-            queue_sizes_after_dequeue.append(self._output.qsize())
+            if not candidates:
+                if self._queue_policy() == LEGACY_QUEUE_POLICY:
+                    item = await self._next_group()
+                    candidates.append((item, self._queue_size()))
+                else:
+                    needed = target_data_size - len(data)
+                    candidates.extend(await self._take_policy_groups(needed))
+            (prompt_group, group), depth_after_dequeue = candidates.popleft()
+            queue_sizes_after_dequeue.append(depth_after_dequeue)
             assert len(group) == args.n_samples_per_prompt
 
             # A weight update paused generation mid-group: return it for re-sampling.
             if any(s.status == Sample.Status.ABORTED for s in _iter_samples(group)):
                 response_length_metrics.record("aborted_recycled", group)
                 aborted_tokens += group_response_tokens(group)
+                self._queue_lifecycle.finish(
+                    group,
+                    disposition="aborted_recycled",
+                    decision_version=self._applied_weight_version.current(),
+                    rollout_id=rollout_id,
+                )
                 self._recycle(prompt_group)
                 aborted_groups_recycled += 1
                 continue
 
-            response_length_metrics.record("completed", group)
+            response_length_metrics.record("offered", group)
 
             oldest = group_oldest_weight_version(group)
             submitted = group_submission_weight_version(group)
@@ -606,12 +656,29 @@ class FullyAsyncRolloutFn:
                     group_bound_staleness = staleness
                     offered_bound_staleness.append(staleness)
                     if staleness > args.max_weight_staleness:
-                        response_length_metrics.record("stale_recycled", group)
-                        stale_tokens += group_response_tokens(group)
-                        self._recycle(prompt_group)
-                        stale_groups_recycled += 1
+                        rejected_tokens = group_response_tokens(group)
+                        disposition = "stale_recycled"
+                        if self._queue_policy() == QUEUE_MAX_POLICY:
+                            disposition = "age_cutoff_dropped"
+                            response_length_metrics.record(disposition, group)
+                            age_cutoff_tokens += rejected_tokens
+                            stale_groups_dropped += 1
+                        else:
+                            response_length_metrics.record(disposition, group)
+                            stale_tokens += rejected_tokens
+                            stale_groups_recycled += 1
+                        self._queue_lifecycle.finish(
+                            group,
+                            disposition=disposition,
+                            decision_version=current,
+                            rollout_id=rollout_id,
+                            reference_version=reference,
+                            bound_staleness=staleness,
+                        )
+                        if self._queue_policy() == LEGACY_QUEUE_POLICY:
+                            self._recycle(prompt_group)
                         logger.info(
-                            f"Recycled stale group ({args.staleness_reference}_version={reference}, "
+                            f"Rejected stale group ({args.staleness_reference}_version={reference}, "
                             f"current={current}, staleness={staleness} > max={args.max_weight_staleness})"
                         )
                         continue
@@ -641,6 +708,15 @@ class FullyAsyncRolloutFn:
                 # Dropped, not recycled: no usable gradient signal.
                 response_length_metrics.record("dynamic_filter_dropped", group)
                 filtered_tokens += group_response_tokens(group)
+                self._queue_lifecycle.finish(
+                    group,
+                    disposition="dynamic_filter_dropped",
+                    decision_version=current,
+                    rollout_id=rollout_id,
+                    reference_version=reference,
+                    bound_staleness=group_bound_staleness,
+                    detail=filter_output.reason,
+                )
                 metric_gatherer.on_dynamic_filter_drop(reason=filter_output.reason)
                 continue
 
@@ -662,6 +738,14 @@ class FullyAsyncRolloutFn:
                 trained_total.append(group_total)
             trained_mixed_versions.append(mixed_version)
             response_length_metrics.record("trained", group)
+            self._queue_lifecycle.finish(
+                group,
+                disposition="trained",
+                decision_version=current,
+                rollout_id=rollout_id,
+                reference_version=reference,
+                bound_staleness=group_bound_staleness,
+            )
             data.append(group)
 
         sample = _first_sample(data[-1])
@@ -676,17 +760,29 @@ class FullyAsyncRolloutFn:
             self._sample_filter(args, data)
 
         kept_tokens = sum(group_response_tokens(group) for group in data)
-        wasted_tokens = aborted_tokens + stale_tokens + filtered_tokens
+        queue_evicted_groups = self._queue_evicted_groups
+        queue_evicted_tokens = self._queue_evicted_tokens
+        self._queue_evicted_groups = 0
+        self._queue_evicted_tokens = 0
+        wasted_tokens = aborted_tokens + stale_tokens + age_cutoff_tokens + filtered_tokens + queue_evicted_tokens
         metrics = {
-            "rollout/fully_async/queue_size": self._output.qsize(),
+            "rollout/fully_async/queue_size": self._queue_size(),
             "queue/occupancy/start_groups": queue_size_start,
-            "queue/occupancy/end_groups": self._output.qsize(),
-            "queue/occupancy/capacity_groups": OUTPUT_QUEUE_MAX_GROUPS,
+            "queue/occupancy/end_groups": self._queue_size(),
+            "queue/occupancy/capacity_groups": self._queue_capacity_groups(),
             "queue/occupancy/max_in_flight_groups": self._max_in_flight_groups(),
+            "queue/config/policy_is_queue_recycle": float(self._queue_policy() == LEGACY_QUEUE_POLICY),
+            "queue/config/policy_is_queue_max": float(self._queue_policy() == QUEUE_MAX_POLICY),
+            "queue/config/policy_is_queue_drop": float(self._queue_policy() == QUEUE_DROP_POLICY),
+            "queue/config/factor": getattr(args, "fully_async_queue_factor", 1),
             "rollout/fully_async/aborted_groups_recycled": aborted_groups_recycled,
             "rollout/fully_async/stale_groups_recycled": stale_groups_recycled,
+            "rollout/fully_async/stale_groups_dropped": stale_groups_dropped,
+            "rollout/fully_async/queue_evicted_groups": queue_evicted_groups,
             "rollout/fully_async/aborted_tokens": aborted_tokens,
             "rollout/fully_async/stale_tokens": stale_tokens,
+            "rollout/fully_async/age_cutoff_tokens": age_cutoff_tokens,
+            "rollout/fully_async/queue_evicted_tokens": queue_evicted_tokens,
             "rollout/fully_async/dynamic_filter_tokens": filtered_tokens,
             "rollout/fully_async/kept_tokens": kept_tokens,
             "rollout/fully_async/wasted_token_frac": (
@@ -696,6 +792,7 @@ class FullyAsyncRolloutFn:
                 f"queue/occupancy/after_dequeue/{name}": value
                 for name, value in _distribution_metrics(queue_sizes_after_dequeue).items()
             },
+            **self._producer_response_lengths.collect_and_reset(),
             **response_length_metrics.collect(),
             **metric_gatherer.collect(),
         }
@@ -756,32 +853,27 @@ class FullyAsyncRolloutFn:
         # is what happened, `bound_exceeded` is why. Split from the dynamic-filter
         # drops, which land in the same recycled/dropped bucket if only totals are
         # compared.
-        metrics["staleness/bound_exceeded_groups"] = stale_groups_recycled
-        metrics["staleness/bound_exceeded_tokens"] = stale_tokens
+        bound_exceeded_groups = stale_groups_recycled + stale_groups_dropped
+        bound_exceeded_tokens = stale_tokens + age_cutoff_tokens
+        metrics["staleness/bound_exceeded_groups"] = bound_exceeded_groups
+        metrics["staleness/bound_exceeded_tokens"] = bound_exceeded_tokens
         # `staleness/bound/*` means a different quantity under each reference, so the
         # choice is logged next to it rather than left to the run config.
         metrics["staleness/bound_reference_is_submission"] = float(args.staleness_reference == "submission")
         metrics["staleness/bound_reference_is_prefill"] = float(args.staleness_reference == "prefill")
 
-        # Rejecting more groups than were kept means the bound is not being met by
-        # regenerating, which `--staleness-reference submission` makes reachable:
-        # the pre-queue part of the lag is the generation itself, so a retry pays
-        # it again rather than shrinking it.
-        #
-        # This does not deadlock. The drain blocks the training step and the
-        # training step is what publishes the weight update, so a stalled drain
-        # freezes the version; groups submitted after the freeze cross no update
-        # and pass. The equilibrium is the *synchronous* one -- everything in
-        # flight at each boundary discarded, the batch refilled from cold -- which
-        # is a throughput collapse rather than a hang, and is what this warning is
-        # for. `retry_count_max` above says how deep it has gone.
-        if stale_groups_recycled > target_data_size:
+        # Rejecting more groups than were kept means the age cap, rather than the
+        # natural producer/consumer balance, is determining the batch. This does
+        # not deadlock: while drain waits, no training update advances the version,
+        # so newly completed groups eventually pass. It can still collapse overlap
+        # and waste most generation, which is what this warning reports.
+        if bound_exceeded_groups > target_data_size:
             logger.warning(
-                f"Recycled {stale_groups_recycled} groups to keep {target_data_size} at "
+                f"Rejected {bound_exceeded_groups} groups to keep {target_data_size} at "
                 f"--max-weight-staleness {args.max_weight_staleness} "
-                f"(--staleness-reference {args.staleness_reference}). If this persists the pipeline "
-                "has degenerated to synchronous: the batch is being refilled from cold after every "
-                "weight update instead of overlapping with training."
+                f"(--staleness-reference {args.staleness_reference}, queue-policy "
+                f"{self._queue_policy()}). If this persists, the age cap is collapsing "
+                "rollout/training overlap and discarding most generated groups."
             )
 
         # How many times a group that reached training had to be regenerated. The
@@ -793,7 +885,11 @@ class FullyAsyncRolloutFn:
             metrics["staleness/retry_count_max"] = float(max(retries))
             metrics["staleness/retry_frac_nonzero"] = sum(1 for r in retries if r) / len(retries)
 
-        return RolloutFnTrainOutput(samples=data, metrics=metrics)
+        debug_metadata = self._queue_lifecycle.take_metadata(
+            policy=self._queue_policy(),
+            capacity_groups=self._queue_capacity_groups(),
+        )
+        return RolloutFnTrainOutput(samples=data, metrics=metrics, debug_metadata=debug_metadata)
 
     def _recycle(self, prompt_group: list[Sample]) -> None:
         for sample in prompt_group:

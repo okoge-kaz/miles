@@ -4,7 +4,7 @@
 # TIS_CLIP_LOW, MIS_PROFILE, USE_OPSM, OPSM_DELTA, KL_LOSS_COEF, LR,
 # MAX_RESPONSE_LEN, NUM_STEPS_PER_ROLLOUT, ROLLOUT_BATCH_SIZE,
 # GLOBAL_BATCH_SIZE, N_SAMPLES_PER_PROMPT, TRAIN_SEED, ROLLOUT_SEED, and for PLACEMENT=async also
-# MAX_WEIGHT_STALENESS.
+# QUEUE_POLICY and, except for queue-drop, MAX_WEIGHT_STALENESS.
 # Sets RL_ALGORITHM, POLICY_REGIME, CONFIG_TAG, RUN_NAME, CKPT_PATH.
 # Sourced by both run.sbatch and train.sh so the two cannot disagree.
 
@@ -38,15 +38,42 @@ case "${PLACEMENT}" in
            && "${STALENESS_REFERENCE:-completion}" == completion ]] ||
             { echo "PLACEMENT=colocated cannot carry MAX_WEIGHT_STALENESS/PAUSE_GENERATION_MODE/STALENESS_REFERENCE" >&2; exit 1; }
         MAX_WEIGHT_STALENESS=0
+        QUEUE_POLICY=none
+        QUEUE_FACTOR=1
         PAUSE_GENERATION_MODE=none
         STALENESS_REFERENCE=completion
         ;;
     async)
-        : "${MAX_WEIGHT_STALENESS:?}"
+        : "${QUEUE_POLICY:=queue-recycle}"
+        : "${QUEUE_FACTOR:=1}"
         : "${STALENESS_REFERENCE:=completion}"
         [[ "${STALENESS_REFERENCE}" == completion || "${STALENESS_REFERENCE}" == submission \
            || "${STALENESS_REFERENCE}" == prefill ]] ||
             { echo "STALENESS_REFERENCE must be completion, submission, or prefill, got '${STALENESS_REFERENCE}'" >&2; exit 1; }
+        case "${QUEUE_POLICY}" in
+            queue-recycle)
+                : "${MAX_WEIGHT_STALENESS:?}"
+                [[ "${QUEUE_FACTOR}" == 1 ]] ||
+                    { echo "QUEUE_FACTOR is only used by queue-drop" >&2; exit 1; }
+                ;;
+            queue-max)
+                : "${MAX_WEIGHT_STALENESS:?}"
+                [[ "${STALENESS_REFERENCE}" == prefill ]] ||
+                    { echo "queue-max requires STALENESS_REFERENCE=prefill" >&2; exit 1; }
+                [[ "${QUEUE_FACTOR}" == 1 ]] ||
+                    { echo "QUEUE_FACTOR is only used by queue-drop" >&2; exit 1; }
+                ;;
+            queue-drop)
+                [[ -z "${MAX_WEIGHT_STALENESS:-}" ]] ||
+                    { echo "queue-drop cannot use MAX_WEIGHT_STALENESS" >&2; exit 1; }
+                [[ "${QUEUE_FACTOR}" =~ ^[1-9][0-9]*$ ]] ||
+                    { echo "QUEUE_FACTOR must be an integer >= 1" >&2; exit 1; }
+                ;;
+            *)
+                echo "QUEUE_POLICY must be queue-recycle, queue-max, or queue-drop, got '${QUEUE_POLICY}'" >&2
+                exit 1
+                ;;
+        esac
         ;;
     *)
         echo "PLACEMENT must be colocated or async, got '${PLACEMENT}'" >&2
@@ -57,12 +84,13 @@ esac
 TASK_FAMILY=math
 
 # Colocated generation pauses training, so one optimizer step per rollout is
-# on-policy without an async staleness reference. On the async path, completion
-# metadata cannot detect an update crossed during generation; a zero completion
-# bound is therefore not enough to claim on-policy sampling.
+# on-policy without an async staleness reference. queue-max selects only after
+# the preceding update, and a zero prefill bound then enforces on-policy data.
+# queue-recycle selects the next batch early, so even a zero selection-time bound
+# can gain one version before the trainer consumes it.
 if [[ "${NUM_STEPS_PER_ROLLOUT}" -eq 1 \
       && ( "${PLACEMENT}" == colocated \
-           || ( "${MAX_WEIGHT_STALENESS}" -eq 0 && "${STALENESS_REFERENCE}" != completion ) ) ]]; then
+           || ( "${QUEUE_POLICY}" == queue-max && "${MAX_WEIGHT_STALENESS}" -eq 0 ) ) ]]; then
     POLICY_REGIME=on-policy
 else
     POLICY_REGIME=off-policy
@@ -105,10 +133,24 @@ fi
 
 CONFIG_TAG="${CONFIG_TAG:-rollout-length-$(( MAX_RESPONSE_LEN / 1024 ))k-lr${LR}-rbs${ROLLOUT_BATCH_SIZE}-gbs${GLOBAL_BATCH_SIZE}-n${N_SAMPLES_PER_PROMPT}-tseed${TRAIN_SEED}-rseed${ROLLOUT_SEED}}"
 # Suffixed only away from the default, so paths written before the option existed
-# keep their spelling. The reference decides which groups are recycled, so two runs
-# that differ only here are different runs and must not share a directory.
-STALENESS_TAG="max-weight-staleness-${MAX_WEIGHT_STALENESS}"
-[[ "${STALENESS_REFERENCE:-completion}" == completion ]] || STALENESS_TAG="${STALENESS_TAG}-from-${STALENESS_REFERENCE}"
+# keep their spelling. The reference changes the age decision, so two runs that
+# differ only here are different runs and must not share a directory.
+case "${QUEUE_POLICY}" in
+    none|queue-recycle)
+        STALENESS_TAG="max-weight-staleness-${MAX_WEIGHT_STALENESS}"
+        [[ "${STALENESS_REFERENCE:-completion}" == completion ]] ||
+            STALENESS_TAG="${STALENESS_TAG}-from-${STALENESS_REFERENCE}"
+        QUEUE_RUN_TAG="s${MAX_WEIGHT_STALENESS}"
+        ;;
+    queue-max)
+        STALENESS_TAG="queue-max/max-weight-staleness-${MAX_WEIGHT_STALENESS}-from-prefill"
+        QUEUE_RUN_TAG="qmax-s${MAX_WEIGHT_STALENESS}"
+        ;;
+    queue-drop)
+        STALENESS_TAG="queue-drop/q${QUEUE_FACTOR}"
+        QUEUE_RUN_TAG="qdrop-q${QUEUE_FACTOR}"
+        ;;
+esac
 
 # RUN_NAME is the wandb group and the log directory, not a path. It shows the
 # axes this study varies and closes over the rest with a hash; the full identity
@@ -117,8 +159,8 @@ STALENESS_TAG="max-weight-staleness-${MAX_WEIGHT_STALENESS}"
 # resumed job rejoins its group, and two configurations that share the visible
 # part still differ.
 _regime=$([[ "${POLICY_REGIME}" == on-policy ]] && echo onp || echo offp)
-_identity="${MODEL_NAME}-${PLACEMENT}-${_regime}-s${MAX_WEIGHT_STALENESS}-${CONFIG_TAG}-${RL_ALGORITHM}"
-RUN_NAME="${RUN_NAME:-${MODEL_NAME}-${PLACEMENT}-${_regime}-s${MAX_WEIGHT_STALENESS}-$(( MAX_RESPONSE_LEN / 1024 ))k-lr${LR}-$(printf '%s' "${_identity}" | md5sum | cut -c1-8)}"
+_identity="${MODEL_NAME}-${PLACEMENT}-${_regime}-${QUEUE_RUN_TAG}-${CONFIG_TAG}-${RL_ALGORITHM}"
+RUN_NAME="${RUN_NAME:-${MODEL_NAME}-${PLACEMENT}-${_regime}-${QUEUE_RUN_TAG}-$(( MAX_RESPONSE_LEN / 1024 ))k-lr${LR}-$(printf '%s' "${_identity}" | md5sum | cut -c1-8)}"
 
 # wandb_utils.py:52 appends "_" and an 8-character id to the group whenever
 # --wandb-random-suffix is on, which is its default, so the group runs nine

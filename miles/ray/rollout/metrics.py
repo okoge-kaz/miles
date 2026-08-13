@@ -18,6 +18,34 @@ from miles.utils.types import Sample
 logger = logging.getLogger(__name__)
 
 
+def log_rollout_batch_consumption(
+    rollout_id: int,
+    args,
+    *,
+    selection_weight_version: int | None,
+    train_start_weight_version: int,
+) -> dict[str, int]:
+    """Log the version gap introduced between queue selection and training."""
+    log_dict = {
+        "queue/consumption/train_start_weight_version": train_start_weight_version,
+    }
+    if selection_weight_version is not None:
+        gap = train_start_weight_version - selection_weight_version
+        if gap < 0:
+            raise RuntimeError(
+                "Applied weight version moved backwards between queue selection and "
+                f"training: selection={selection_weight_version}, train_start={train_start_weight_version}"
+            )
+        log_dict["queue/consumption/selection_weight_version"] = selection_weight_version
+        log_dict["queue/consumption/selection_to_train_gap"] = gap
+
+    logger.info(f"rollout batch consumption {rollout_id}: {log_dict}")
+    step = compute_rollout_step(args, rollout_id)
+    log_dict["rollout/step"] = step
+    tracking.log(args, log_dict, step_key="rollout/step")
+    return log_dict
+
+
 def log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any] | None = None):
     if (x := args.custom_eval_rollout_log_function_path) is not None:
         custom_log_func = load_function(x)

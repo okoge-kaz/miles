@@ -30,6 +30,7 @@ fi
 
 ROLLOUT_ARGS=(
    --fully-async
+   --fully-async-queue-policy "${QUEUE_POLICY}"
    --prompt-data "${PROMPT_DATA}"
    --input-key prompt
    --label-key label
@@ -47,10 +48,14 @@ ROLLOUT_ARGS=(
    --global-batch-size "${GLOBAL_BATCH_SIZE}"
    --num-steps-per-rollout "${NUM_STEPS_PER_ROLLOUT}"
    --balance-data
-   --max-weight-staleness "${MAX_WEIGHT_STALENESS}"
    --staleness-reference "${STALENESS_REFERENCE}"
    --pause-generation-mode "${PAUSE_GENERATION_MODE}"
 )
+if [[ "${QUEUE_POLICY}" == queue-drop ]]; then
+   ROLLOUT_ARGS+=(--fully-async-queue-factor "${QUEUE_FACTOR}")
+else
+   ROLLOUT_ARGS+=(--max-weight-staleness "${MAX_WEIGHT_STALENESS}")
+fi
 if [[ -n "${ASYNC_MAX_CONCURRENT_SAMPLES:-}" ]]; then
 
    ROLLOUT_ARGS+=(--async-max-concurrent-samples "${ASYNC_MAX_CONCURRENT_SAMPLES}")

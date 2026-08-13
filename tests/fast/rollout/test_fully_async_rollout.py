@@ -5,6 +5,7 @@ register_cpu_ci(est_time=60, suite="stage-a-cpu", labels=[])
 import asyncio
 from argparse import Namespace
 from collections import deque
+from contextlib import suppress
 from dataclasses import replace
 
 import httpx
@@ -79,6 +80,9 @@ def make_args(**overrides) -> Namespace:
         sglang_router_ip="127.0.0.1",
         sglang_router_port=30000,
         staleness_reference="completion",
+        save_debug_rollout_data=None,
+        fully_async_queue_policy="queue-recycle",
+        fully_async_queue_factor=1,
     )
     defaults.update(overrides)
     return Namespace(**defaults)
@@ -110,6 +114,34 @@ async def test_drain_collects_batch_sorted_with_metrics(monkeypatch):
     # The worker persists across calls; a second drain works on the same instance.
     output2 = await fn(RolloutFnTrainInput(rollout_id=1))
     assert len(output2.samples) == 3
+
+
+async def test_queue_lifecycle_dump_is_primitive_and_opt_in(monkeypatch):
+    group = make_group(1, weight_versions=["3"])
+    group[0].response_length = 2
+    group[1].response_length = 4
+    args = make_args(rollout_batch_size=1, save_debug_rollout_data="/tmp/rollout_{rollout_id}.pt")
+    fn = make_fn(monkeypatch, args, FakeDataSource(scripted=[group]))
+    fn.commit_applied_weight_version(3)
+
+    output = await fn(RolloutFnTrainInput(rollout_id=7))
+
+    assert output.debug_metadata["schema_version"] == 1
+    assert output.debug_metadata["policy"] == "queue-recycle"
+    [record] = output.debug_metadata["records"]
+    assert record["disposition"] == "trained"
+    assert record["rollout_id"] == 7
+    assert record["response_lengths"] == [2, 4]
+    assert record["completion_version_min"] == 3
+    assert record["ready_version"] == 3
+    assert record["queue_depth_before_enqueue"] == 0
+    assert record["queue_depth_after_enqueue"] == 1
+    assert record["decision_version"] == 3
+    assert not any(isinstance(value, Sample) for value in record.values())
+
+    no_dump = make_fn(monkeypatch, make_args(rollout_batch_size=1), FakeDataSource())
+    no_dump_output = await no_dump(RolloutFnTrainInput(rollout_id=0))
+    assert no_dump_output.debug_metadata is None
 
 
 async def test_eval_raises(monkeypatch):
@@ -174,8 +206,9 @@ async def test_stale_group_recycled(monkeypatch):
     assert output.metrics["queue/selection/stale_recycled/sample_length/mean"] == pytest.approx(2.0)
     assert output.metrics["queue/selection/stale_recycled/group_max_length/max"] == 3
     assert output.metrics["queue/selection/trained/sample_length/mean"] == pytest.approx(1.0)
-    assert output.metrics["queue/selection/completed/sample_length/count"] == 4
-    assert output.metrics["queue/selection/completed/sample_length/sum"] == 6
+    assert output.metrics["queue/selection/offered/sample_length/count"] == 4
+    assert output.metrics["queue/selection/offered/sample_length/sum"] == 6
+    assert output.metrics["queue/selection/generated/sample_length/count"] >= 4
     assert output.metrics["queue/selection/aborted_recycled/group_max_length/count"] == 0
 
     # `staleness/bound/train/` is what the bound saw for the batch. The group at 5 exceeded the
@@ -455,6 +488,144 @@ async def test_async_max_concurrent_samples_caps_in_flight_groups(monkeypatch):
     release.set()
     output = await drain
     assert len(output.samples) == 4
+
+
+async def test_queue_drop_evicts_oldest_and_keeps_completion_fifo(monkeypatch):
+    args = make_args(
+        rollout_batch_size=2,
+        fully_async_queue_policy="queue-drop",
+        fully_async_queue_factor=1,
+        max_weight_staleness=None,
+        save_debug_rollout_data="/tmp/rollout_{rollout_id}.pt",
+    )
+    fn = make_fn(monkeypatch, args, FakeDataSource())
+    fn._policy_output = deque()
+    fn._policy_output_ready = asyncio.Event()
+
+    groups = [make_group(group_index) for group_index in (1, 2, 3)]
+    for group in groups:
+        record = fn._queue_lifecycle.begin_attempt(group, submission_version=0)
+        fn._queue_lifecycle.group_ready(record, group, ready_version=0)
+        await fn._enqueue_completed_group((group, group))
+
+    assert [item[1][0].group_index for item in fn._policy_output] == [2, 3]
+    assert fn._queue_evicted_groups == 1
+    assert fn._queue_evicted_tokens == N_SAMPLES_PER_PROMPT
+
+    selected = await fn._take_policy_groups(2)
+    assert [item[0][1][0].group_index for item in selected] == [2, 3]
+    assert [depth for _, depth in selected] == [1, 0]
+
+    metadata = fn._queue_lifecycle.take_metadata(policy="queue-drop", capacity_groups=2)
+    [evicted] = metadata["records"]
+    assert evicted["group_index"] == 1
+    assert evicted["disposition"] == "queue_evicted"
+
+
+async def test_queue_max_waits_for_full_batch_then_takes_oldest(monkeypatch):
+    args = make_args(
+        rollout_batch_size=2,
+        fully_async_queue_policy="queue-max",
+        max_weight_staleness=2,
+        staleness_reference="prefill",
+    )
+    fn = make_fn(monkeypatch, args, FakeDataSource())
+    fn._policy_output = deque()
+    fn._policy_output_ready = asyncio.Event()
+    fn._output_slots = asyncio.Semaphore(fully_async.OUTPUT_QUEUE_MAX_GROUPS)
+    never = asyncio.Event()
+    fn._worker = asyncio.create_task(never.wait())
+
+    first, second = make_group(1), make_group(2)
+    await fn._enqueue_completed_group((first, first))
+    take = asyncio.create_task(fn._take_policy_groups(2))
+    await asyncio.sleep(0)
+    assert not take.done()
+
+    await fn._enqueue_completed_group((second, second))
+    selected = await take
+    assert [item[0][1][0].group_index for item in selected] == [1, 2]
+    assert fn._output_slots._value == fully_async.OUTPUT_QUEUE_MAX_GROUPS
+
+    fn._worker.cancel()
+    with suppress(asyncio.CancelledError):
+        await fn._worker
+
+
+async def test_policy_queue_worker_failure_beats_queued_groups(monkeypatch):
+    args = make_args(
+        rollout_batch_size=1,
+        fully_async_queue_policy="queue-drop",
+        max_weight_staleness=None,
+    )
+    fn = make_fn(monkeypatch, args, FakeDataSource())
+    group = make_group(1)
+    fn._policy_output = deque([(group, group)])
+
+    async def fail():
+        raise RuntimeError("generation exploded")
+
+    fn._worker = asyncio.create_task(fail())
+    await asyncio.sleep(0)
+
+    with pytest.raises(RuntimeError, match="generation exploded"):
+        await fn._take_policy_groups(1)
+
+
+def test_queue_max_safety_capacity_cannot_deadlock_a_large_batch(monkeypatch):
+    args = make_args(
+        rollout_batch_size=fully_async.OUTPUT_QUEUE_MAX_GROUPS + 1,
+        fully_async_queue_policy="queue-max",
+        max_weight_staleness=2,
+        staleness_reference="prefill",
+    )
+    fn = make_fn(monkeypatch, args, FakeDataSource())
+
+    assert fn._queue_capacity_groups() == args.rollout_batch_size
+
+
+async def test_queue_max_drops_stale_group_without_recycling_prompt(monkeypatch):
+    stale = make_group(1)
+    allowed = make_group(2)
+    stale[0].response_length = 5
+    stale[1].response_length = 7
+    data_source = FakeDataSource(scripted=[stale, allowed])
+
+    async def generate_with_prefill_version(state, group, sampling_params, evaluation=False):
+        group_index = group[0].group_index
+        await asyncio.sleep(0.001 if group_index <= 2 else 0.01)
+        first_prefill = 1 if group_index == 1 else (2 if group_index == 2 else 3)
+        _stamp_prefill_provenance(
+            group,
+            first=first_prefill,
+            minimum=first_prefill,
+            maximum=3,
+            last=3,
+        )
+        for sample in group:
+            sample.weight_versions = ["3"]
+        return group
+
+    args = make_args(
+        rollout_batch_size=2,
+        fully_async_queue_policy="queue-max",
+        max_weight_staleness=1,
+        staleness_reference="prefill",
+    )
+    fn = make_fn(monkeypatch, args, data_source, generate=generate_with_prefill_version)
+    fn._weight_version = StubWeightVersion(3)
+    fn.commit_applied_weight_version(3)
+
+    output = await fn(RolloutFnTrainInput(rollout_id=0))
+
+    assert data_source.recycled == []
+    assert output.metrics["rollout/fully_async/stale_groups_recycled"] == 0
+    assert output.metrics["rollout/fully_async/stale_groups_dropped"] == 1
+    assert output.metrics["rollout/fully_async/age_cutoff_tokens"] == 12
+    assert output.metrics["queue/selection/age_cutoff_dropped/sample_length/mean"] == 6
+    assert output.metrics["staleness/bound_exceeded_groups"] == 1
+    assert stale not in output.samples
+    assert allowed in output.samples
 
 
 async def test_worker_failure_beats_queued_groups(monkeypatch):

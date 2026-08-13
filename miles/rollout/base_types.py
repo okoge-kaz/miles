@@ -47,6 +47,9 @@ class RolloutFnEvalInput(RolloutFnBaseInput):
 class RolloutFnTrainOutput:
     samples: list[list[Sample]]
     metrics: dict[str, Any] = None
+    # Optional primitive-only diagnostics that belong in the rollout dump but
+    # must not be copied into the trainer's object-store payload.
+    debug_metadata: dict[str, Any] | None = None
 
 
 # TODO make it frozen

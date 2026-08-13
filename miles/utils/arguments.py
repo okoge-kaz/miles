@@ -11,6 +11,7 @@ from sglang_router.launch_router import RouterArgs
 from miles.backends.sglang_utils.arguments import add_sglang_arguments
 from miles.backends.sglang_utils.arguments import validate_args as sglang_validate_args
 from miles.dashboard.args import add_dashboard_arguments, validate_dashboard_args
+from miles.rollout.queue_policy import FULLY_ASYNC_QUEUE_POLICIES, validate_fully_async_queue_args
 from miles.utils.chat_template_utils.tito_tokenizer import TITOTokenizerType
 from miles.utils.environ import enable_experimental_ft_trainer, enable_experimental_rollout_refactor
 from miles.utils.eval_config import EvalDatasetConfig, build_eval_dataset_configs, ensure_dataset_list
@@ -41,6 +42,7 @@ def resolve_rollout_function_paths(args) -> tuple[str, str]:
 
 
 def _resolve_rollout_functions(args) -> None:
+    validate_fully_async_queue_args(args)
     if args.fully_async:
         assert enable_experimental_rollout_refactor(), (
             "--fully-async needs the class-based rollout API: set MILES_EXPERIMENTAL_ROLLOUT_REFACTOR=1 "
@@ -617,15 +619,39 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--fully-async-queue-policy",
+                type=str,
+                default="queue-recycle",
+                choices=FULLY_ASYNC_QUEUE_POLICIES,
+                help=(
+                    "Queue selection policy for --fully-async. "
+                    "'queue-recycle' preserves the existing completion-FIFO, prefetched-drain "
+                    "behavior and recycles groups that exceed --max-weight-staleness under the "
+                    "selected --staleness-reference. 'queue-max' consumes completion-FIFO "
+                    "groups when the trainer is ready and drops groups above a required "
+                    "prefill-referenced max staleness. 'queue-drop' uses a bounded "
+                    "completion-FIFO queue and evicts its oldest group on overflow."
+                ),
+            )
+            parser.add_argument(
+                "--fully-async-queue-factor",
+                type=int,
+                default=1,
+                help=(
+                    "queue-drop capacity q in training batches: capacity_groups = "
+                    "q * rollout_batch_size. Must be at least 1. Other policies require 1."
+                ),
+            )
+            parser.add_argument(
                 "--max-weight-staleness",
                 type=int,
                 default=None,
                 help=(
                     "Maximum allowed gap between a group's weight version and the current engine "
-                    "weight version. Groups exceeding this threshold are recycled back to the data "
-                    "buffer instead of being sent to training. Which version the gap is measured "
-                    "from is --staleness-reference. Only effective in fully async mode. None "
-                    "(default) disables staleness filtering."
+                    "weight version. queue-recycle returns groups exceeding this threshold to the "
+                    "data buffer; queue-max discards them. Which version the gap is measured from "
+                    "is --staleness-reference. Only effective in fully async mode. None (default) "
+                    "disables staleness filtering."
                 ),
             )
             parser.add_argument(
@@ -2673,9 +2699,7 @@ def validate_fused_one_step_actor_logprobs(args: argparse.Namespace) -> None:
     enabled = getattr(args, "fuse_one_step_actor_logprobs", False)
     verify = getattr(args, "verify_fused_one_step_actor_logprobs", False)
     if verify and not enabled:
-        raise ValueError(
-            "--verify-fused-one-step-actor-logprobs requires --fuse-one-step-actor-logprobs"
-        )
+        raise ValueError("--verify-fused-one-step-actor-logprobs requires --fuse-one-step-actor-logprobs")
     if not enabled:
         return
 
@@ -2691,8 +2715,7 @@ def validate_fused_one_step_actor_logprobs(args: argparse.Namespace) -> None:
             and rollout_batch_size * n_samples_per_prompt == global_batch_size
         )
         step_requirement = (
-            "a one-step batch shape: rollout_batch_size * n_samples_per_prompt "
-            "must equal global_batch_size"
+            "a one-step batch shape: rollout_batch_size * n_samples_per_prompt " "must equal global_batch_size"
         )
     else:
         configured_one_step = configured_steps == 1
@@ -2716,8 +2739,7 @@ def validate_fused_one_step_actor_logprobs(args: argparse.Namespace) -> None:
     if enabled_replays:
         flags = ", ".join(f"--{flag.replace('_', '-')}" for flag in enabled_replays)
         raise ValueError(
-            "--fuse-one-step-actor-logprobs does not yet support routing/indexer replay; "
-            f"disable {flags}"
+            "--fuse-one-step-actor-logprobs does not yet support routing/indexer replay; " f"disable {flags}"
         )
 
 
