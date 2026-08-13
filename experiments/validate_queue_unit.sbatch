@@ -3,6 +3,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
+#SBATCH --mem=16G
 #SBATCH --time=00:20:00
 #SBATCH --output=experiments/outputs/queue-unit-%j.log
 
