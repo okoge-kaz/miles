@@ -542,6 +542,18 @@ analyzer implements `IQS = rho` for `rho < 1` and
 term, and intentionally rejects the exact `rho = 1` boundary. Do not apply the
 formula to `queue-recycle` or `queue-max`.
 
+With the same prefill-referenced age bound and one weight update per train
+step, the mechanism predicts the strongest short-response selection pressure
+for `queue-max`, then `queue-recycle`, and the weakest for `queue-drop`.
+`queue-max` tests the age only after the preceding update; `queue-recycle`
+reserves its next batch before that update, while `queue-drop` has no age
+cutoff. This ordering is a hypothesis, not a theorem across configurations:
+retries, startup/final censoring, queue utilization, group tailness, and dynamic
+filtering can change the observed ordering. A single-seed run can validate the
+queue mechanism and compare the `queue-drop` mean staleness with the closed
+form, but it cannot establish a seed-general downstream-task significance
+claim.
+
 The submission-side version is TTL-cached at 1 s; engine-reported prefill
 provenance is not. Full rollout checkpointing currently supports only
 `queue-recycle`; argument validation rejects the two policy-deque layouts rather
