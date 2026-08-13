@@ -37,6 +37,7 @@ from miles.utils.test_utils.ft_test_actions import FTTestActionActorExecutor
 from miles.utils.tracking_utils.structured_log import log_structured
 
 from ...utils.misc import filter_keys
+from ..training_utils.batching_metrics import aggregate_batching_metrics, compute_local_batching_metrics
 from ..training_utils.ci_utils import check_grad_norm, check_kl
 from ..training_utils.data import DataIterator, get_batch
 from ..training_utils.log_utils import aggregate_forward_results, aggregate_train_losses, log_train_step
@@ -732,6 +733,19 @@ def train(
 
     # Run training iterations till done.
     for step_id in range(num_steps_per_rollout):
+        local_batching_metrics = compute_local_batching_metrics(
+            rollout_data=data_iterator[0].rollout_data,
+            micro_batch_size=data_iterator[0].micro_batch_size,
+            micro_batch_indices=data_iterator[0].micro_batch_indices,
+            num_microbatches_by_step=num_microbatches,
+            step_id=step_id,
+            qkv_format=args.qkv_format,
+            tp_size=parallel_state.tp.size,
+            cp_size=parallel_state.cp.size,
+            pad_multiplier=args.data_pad_size_multiplier,
+            allgather_cp=args.allgather_cp,
+        )
+        batching_metrics = aggregate_batching_metrics(local_batching_metrics, parallel_state.effective_dp)
 
         # Run training step.
         loss_dict, grad_norm, train_step_outcome = train_one_step(
@@ -785,6 +799,7 @@ def train(
             role_tag = "" if role == "actor" else f"{role}-"
 
             extra_metrics = {}
+            extra_metrics.update(batching_metrics)
             if args.enable_mtp_training:
                 extra_metrics["mtp_loss"] = mtp_losses
 
