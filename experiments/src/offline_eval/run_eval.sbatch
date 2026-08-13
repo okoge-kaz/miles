@@ -21,6 +21,7 @@
 #   RM_TYPE        verifier; must match the policy (math for non-thinking)
 #   OUT_DIR        where the per-benchmark jsonl goes
 #   EXTRA_MOUNTS   appended to CONTAINER_MOUNTS; required, see the note
+#   UNPAD_VOCAB    1: unpad CKPT into node-local /tmp before loading (0)
 
 set -euo pipefail
 
@@ -38,6 +39,7 @@ RM_TYPE="${RM_TYPE:-math}"
 CONCURRENCY="${CONCURRENCY:-96}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-96}"
 SERVER_PORT="${SERVER_PORT:-30000}"
+UNPAD_VOCAB="${UNPAD_VOCAB:-0}"
 
 # One directory per checkpoint, named after it, so a sweep's results do not mix.
 TAG="${TAG:-$(echo "${CKPT}" | sed 's|^/ckpt/training/||; s|/|_|g')}"
@@ -61,8 +63,15 @@ export PYTHONUNBUFFERED=1
 [[ -d ${CKPT} ]] || { echo \"no such checkpoint: ${CKPT}\"; exit 1; }
 mkdir -p ${OUT_DIR}
 
+EVAL_CKPT=${CKPT}
+if [[ '${UNPAD_VOCAB}' == 1 ]]; then
+    EVAL_CKPT=/tmp/offline-eval-unpadded-${SLURM_JOB_ID}
+    python3 experiments/src/offline_eval/unpad_vocab.py ${CKPT} \${EVAL_CKPT}
+    [[ -d \${EVAL_CKPT} ]] || EVAL_CKPT=${CKPT}
+fi
+
 python3 -m sglang.launch_server \
-    --model-path ${CKPT} \
+    --model-path \${EVAL_CKPT} \
     --host 127.0.0.1 --port ${SERVER_PORT} \
     --dp-size ${GPUS_PER_NODE} --tp-size 1 \
     --mem-fraction-static 0.85 \
@@ -92,7 +101,7 @@ for spec in \$(echo '${BENCHMARKS}' | tr '+' ' '); do
     python3 experiments/src/difficulty_filter/measure_pass_rate.py \
         --prompt-data \${path} \
         --output ${OUT_DIR}/\${name}.jsonl \
-        --model-path ${CKPT} \
+        --model-path \${EVAL_CKPT} \
         --server-url http://127.0.0.1:${SERVER_PORT} \
         --rm-type ${RM_TYPE} \
         --policy \${name} \
