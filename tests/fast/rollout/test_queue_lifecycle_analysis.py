@@ -62,11 +62,12 @@ def test_queue_drop_prediction_rollout_bound_branch():
     ) == pytest.approx({"pre_queue": 1.0, "in_queue": 0.5, "total": 1.5})
 
 
-def test_queue_drop_prediction_saturated_branch_at_equal_throughput():
-    assert queue_drop_prediction(
-        rho=1.0,
-        concurrency_samples=64,
-        batch_samples=64,
-        queue_factor=2,
-        tailness=1,
-    ) == pytest.approx({"pre_queue": 1.0, "in_queue": 2.0, "total": 3.0})
+def test_queue_drop_prediction_rejects_equal_throughput_boundary():
+    with pytest.raises(ValueError, match="boundary"):
+        queue_drop_prediction(
+            rho=1.0,
+            concurrency_samples=64,
+            batch_samples=64,
+            queue_factor=2,
+            tailness=1,
+        )

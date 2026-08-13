@@ -75,17 +75,17 @@ async def train(args):
         if rollout_data_next_future is not None:
             rollout_data_curr_ref = await rollout_data_next_future
 
-        if args.fully_async:
-            # The legacy policy may have selected this prefetched batch before
-            # the preceding weight update. Sample the authoritative applied
-            # version at the point the trainer actually begins consuming it.
-            await rollout_manager.record_batch_consumption.remote(rollout_id)
-
         # Start the next rollout early.
         if prefetch_rollout_batches and rollout_id + 1 < args.num_rollout:
             rollout_data_next_future = rollout_manager.generate.remote(rollout_id + 1)
         elif not prefetch_rollout_batches:
             rollout_data_next_future = None
+
+        if args.fully_async:
+            # Preserve the legacy policy's immediate prefetch above, then sample
+            # the authoritative applied version before the trainer consumes this
+            # batch. No weight update can occur between these two operations.
+            await rollout_manager.record_batch_consumption.remote(rollout_id)
 
         if args.use_critic:
             values = await critic_model.train(rollout_id, rollout_data_curr_ref)

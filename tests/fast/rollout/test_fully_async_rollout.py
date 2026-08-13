@@ -490,6 +490,26 @@ async def test_async_max_concurrent_samples_caps_in_flight_groups(monkeypatch):
     assert len(output.samples) == 4
 
 
+async def test_queue_recycle_preserves_completion_fifo_and_backpressure(monkeypatch):
+    fn = make_fn(monkeypatch, make_args(rollout_batch_size=2), FakeDataSource())
+    fn._output = asyncio.Queue()
+    fn._output_slots = asyncio.Semaphore(fully_async.OUTPUT_QUEUE_MAX_GROUPS)
+    never = asyncio.Event()
+    fn._worker = asyncio.create_task(never.wait())
+
+    first, second = make_group(2), make_group(1)
+    await fn._enqueue_completed_group((first, first))
+    await fn._enqueue_completed_group((second, second))
+
+    selected = [await fn._next_group(), await fn._next_group()]
+    assert [item[1][0].group_index for item in selected] == [2, 1]
+    assert fn._output_slots._value == fully_async.OUTPUT_QUEUE_MAX_GROUPS
+
+    fn._worker.cancel()
+    with suppress(asyncio.CancelledError):
+        await fn._worker
+
+
 async def test_queue_drop_evicts_oldest_and_keeps_completion_fifo(monkeypatch):
     args = make_args(
         rollout_batch_size=2,

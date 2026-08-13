@@ -143,8 +143,13 @@ def queue_drop_prediction(
     pre_queue = concurrency_samples * tailness / (batch_samples * max(1.0, rho))
     if rho < 1:
         in_queue = rho
-    else:
+    elif rho > 1:
         in_queue = (2 * queue_factor + rho - 1) / (2 * rho)
+    else:
+        raise ValueError(
+            "--rho=1 is the boundary between the rollout- and train-bound "
+            "approximations; use the measured non-rounded throughput ratio"
+        )
     return {
         "pre_queue": pre_queue,
         "in_queue": in_queue,

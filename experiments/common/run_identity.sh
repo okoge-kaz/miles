@@ -84,12 +84,15 @@ esac
 TASK_FAMILY=math
 
 # Colocated generation pauses training, so one optimizer step per rollout is
-# on-policy without an async staleness reference. queue-max selects only after
-# the preceding update, and a zero prefill bound then enforces on-policy data.
-# queue-recycle selects the next batch early, so even a zero selection-time bound
-# can gain one version before the trainer consumes it.
+# on-policy without an async staleness reference. Keep queue-recycle's historical
+# categorization so existing max-zero checkpoint paths remain stable; the
+# selection-to-consumption telemetry records its possible extra prefetch version.
+# queue-max selects after the preceding update, so a zero prefill bound is also
+# categorized on-policy.
 if [[ "${NUM_STEPS_PER_ROLLOUT}" -eq 1 \
       && ( "${PLACEMENT}" == colocated \
+           || ( "${QUEUE_POLICY}" == queue-recycle && "${MAX_WEIGHT_STALENESS}" -eq 0 \
+                && "${STALENESS_REFERENCE}" != completion ) \
            || ( "${QUEUE_POLICY}" == queue-max && "${MAX_WEIGHT_STALENESS}" -eq 0 ) ) ]]; then
     POLICY_REGIME=on-policy
 else
