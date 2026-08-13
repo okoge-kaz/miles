@@ -15,9 +15,11 @@ from typing import Any
 
 import torch
 
+from miles.rollout.fully_async_checkpoint_codec import materialize_checkpoint_state
 from miles.utils.types import Sample
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+SUPPORTED_SCHEMA_VERSIONS = frozenset({1, SCHEMA_VERSION})
 STATE_PREFIX = "fully_async_state_"
 STATE_SUFFIX = ".pt"
 CHECKSUM_SUFFIX = ".sha256.json"
@@ -182,10 +184,16 @@ def save_checkpoint(root: str | os.PathLike[str], rollout_id: int, state: dict[s
     checksum_path = Path(f"{path}{CHECKSUM_SUFFIX}")
     checksum_tmp = _temporary_path(path.parent, checksum_path.name)
     try:
-        torch.save(state, data_tmp)
-        data_tmp.chmod(0o644)
-        _fsync_file(data_tmp)
-        digest, size = _file_digest(data_tmp)
+        writer = _HashingWriter(data_tmp)
+        try:
+            torch.save(state, writer)
+            writer.flush()
+            os.fchmod(writer.fileno(), 0o644)
+            os.fsync(writer.fileno())
+            digest = writer.hexdigest()
+            size = writer.size
+        finally:
+            writer.close()
         manifest = {"schema_version": SCHEMA_VERSION, "sha256": digest, "size": size}
         checksum_tmp.write_text(json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8")
         checksum_tmp.chmod(0o644)
@@ -217,7 +225,7 @@ def load_checkpoint(
         manifest = json.loads(checksum_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise RuntimeError(f"Cannot read fully-async rollout checkpoint manifest: {checksum_path}") from error
-    if not isinstance(manifest, dict) or manifest.get("schema_version") != SCHEMA_VERSION:
+    if not isinstance(manifest, dict) or manifest.get("schema_version") not in SUPPORTED_SCHEMA_VERSIONS:
         raise RuntimeError(f"Unsupported fully-async rollout checkpoint manifest: {checksum_path}")
     digest, size = _file_digest(path)
     if manifest.get("size") != size or manifest.get("sha256") != digest:
@@ -229,10 +237,15 @@ def load_checkpoint(
         raise RuntimeError(f"Cannot deserialize fully-async rollout checkpoint: {path}") from error
     if not isinstance(state, dict):
         raise RuntimeError(f"Fully-async rollout checkpoint is not a mapping: {path}")
-    if state.get("schema_version") != SCHEMA_VERSION:
+    if state.get("schema_version") not in SUPPORTED_SCHEMA_VERSIONS:
         raise RuntimeError(
             f"Unsupported fully-async rollout checkpoint schema {state.get('schema_version')}; "
-            f"expected {SCHEMA_VERSION}"
+            f"expected one of {sorted(SUPPORTED_SCHEMA_VERSIONS)}"
+        )
+    if state.get("schema_version") != manifest.get("schema_version"):
+        raise RuntimeError(
+            "Fully-async rollout checkpoint schema does not match its manifest: "
+            f"state={state.get('schema_version')}, manifest={manifest.get('schema_version')}"
         )
     if state.get("checkpoint_rollout_id") != rollout_id:
         raise RuntimeError(
@@ -246,7 +259,7 @@ def load_checkpoint(
     missing_keys = REQUIRED_STATE_KEYS - state.keys()
     if missing_keys:
         raise RuntimeError(f"Fully-async rollout checkpoint is missing fields: {sorted(missing_keys)}")
-    return state
+    return materialize_checkpoint_state(state)
 
 
 def prune_checkpoints(
@@ -308,6 +321,42 @@ def _file_digest(path: Path) -> tuple[str, int]:
             size += len(chunk)
             digest.update(chunk)
     return digest.hexdigest(), size
+
+
+class _HashingWriter:
+    """Hash bytes as torch.save writes them, avoiding a second file read."""
+
+    def __init__(self, path: Path) -> None:
+        self._handle = path.open("wb")
+        self._digest = hashlib.sha256()
+        self._size = 0
+
+    @property
+    def size(self) -> int:
+        return self._size
+
+    def write(self, value) -> int:
+        written = self._handle.write(value)
+        if written != len(value):
+            raise OSError(f"Short write while saving fully-async checkpoint: {written} of {len(value)} bytes")
+        self._digest.update(value)
+        self._size += written
+        return written
+
+    def flush(self) -> None:
+        self._handle.flush()
+
+    def fileno(self) -> int:
+        return self._handle.fileno()
+
+    def tell(self) -> int:
+        return self._handle.tell()
+
+    def hexdigest(self) -> str:
+        return self._digest.hexdigest()
+
+    def close(self) -> None:
+        self._handle.close()
 
 
 def _fsync_file(path: Path) -> None:

@@ -4,20 +4,33 @@ register_cpu_ci(est_time=30, suite="stage-a-cpu", labels=[])
 
 import asyncio
 import copy
+import hashlib
+import json
+import struct
 from argparse import Namespace
 from collections import deque
 from pathlib import Path
 
+import numpy as np
 import pytest
+import torch
 
+import miles.rollout.fully_async_checkpoint as checkpoint_module
 import miles.rollout.fully_async_rollout as fully_async
 from miles.rollout.base_types import RolloutFnConstructorInput, RolloutFnTrainInput
 from miles.rollout.fully_async_checkpoint import (
+    checkpoint_path,
     dataset_fingerprint,
+    decode_group,
     ensure_no_full_replay_sidecar,
     load_checkpoint,
     prune_checkpoints,
     save_checkpoint,
+)
+from miles.rollout.fully_async_checkpoint_codec import (
+    SAMPLE_CODEC_STATE_KEY,
+    CheckpointSampleEncoder,
+    materialize_checkpoint_state,
 )
 from miles.utils.types import Sample
 
@@ -332,9 +345,101 @@ async def test_queue_handoff_and_finished_active_task_are_not_downgraded_to_prom
     assert len(state["ready_items"]) == 2
     assert state["snapshot_counts"]["claimed_groups"] == 1
     assert state["snapshot_counts"]["finished_active_groups"] == 1
-    for ready_state in state["ready_items"]:
+    for ready_state in materialize_checkpoint_state(state)["ready_items"]:
         _, result = fully_async._decode_ready_item(ready_state)
         assert fully_async.group_lifecycle_weight_version(result, fully_async.QUEUE_PUT_VERSION_KEY) == 5
+
+
+def test_packed_sample_codec_is_lossless_and_restores_independent_samples():
+    nan_with_payload = struct.unpack("=d", struct.pack("=Q", 0x7FF8000000001234))[0]
+    sample = Sample(
+        group_index=1,
+        index=2,
+        prompt="prompt",
+        tokens=[-(2**31), 0, 1, 2**31 - 1],
+        response="response",
+        response_length=4,
+        loss_mask=[-1, 0, 1, 1],
+        rollout_log_probs=[-0.0, float("nan"), nan_with_payload, 1.25],
+        teacher_log_probs=[2.5, -3.5, 4.5, 5.5],
+        opd_reverse_kl=[0.25, 0.5, 0.75, 1.0],
+        metadata={"nested": {"value": [1]}},
+    )
+    sample.rollout_routed_experts = np.arange(9, dtype=np.int32).reshape(3, 3)
+    sample.dynamic_attribute = {"preserved": True}
+    sample.validate()
+
+    encoder = CheckpointSampleEncoder()
+    group_state = encoder.encode_group([sample, [sample]])
+    state = _codec_state(group_state, encoder.finish())
+    materialized = materialize_checkpoint_state(state)
+    flat_state, nested_states = materialized["pending_prompts"][0]
+
+    assert len(state[SAMPLE_CODEC_STATE_KEY]["records"]) == 1
+    assert flat_state is not nested_states[0]
+    assert flat_state["tokens"] == sample.tokens
+    assert flat_state["loss_mask"] == sample.loss_mask
+    assert np.asarray(flat_state["rollout_log_probs"], dtype=np.float64).tobytes() == np.asarray(
+        sample.rollout_log_probs, dtype=np.float64
+    ).tobytes()
+    assert flat_state["teacher_log_probs"] == sample.teacher_log_probs
+    assert flat_state["opd_reverse_kl"] == sample.opd_reverse_kl
+    assert np.array_equal(flat_state["rollout_routed_experts"], sample.rollout_routed_experts)
+    assert flat_state["rollout_routed_experts"] is not sample.rollout_routed_experts
+    assert flat_state["dynamic_attribute"] == sample.dynamic_attribute
+
+    decoded_flat, decoded_nested = decode_group(materialized["pending_prompts"][0])
+    decoded_nested = decoded_nested[0]
+    decoded_flat.tokens.append(7)
+    decoded_flat.metadata["nested"]["value"].append(2)
+    assert decoded_nested.tokens == sample.tokens
+    assert decoded_nested.metadata == sample.metadata
+
+
+def test_packed_sample_codec_falls_back_without_changing_unsupported_element_types():
+    sample = Sample(tokens=[2**40], loss_mask=[True], rollout_log_probs=[np.float32(1.5)])
+    encoder = CheckpointSampleEncoder()
+    group_state = encoder.encode_group([sample])
+    materialized = materialize_checkpoint_state(_codec_state(group_state, encoder.finish()))
+    [sample_state] = materialized["pending_prompts"][0]
+
+    assert sample_state["tokens"] == [2**40]
+    assert type(sample_state["tokens"][0]) is int
+    assert sample_state["loss_mask"] == [True]
+    assert type(sample_state["loss_mask"][0]) is bool
+    assert type(sample_state["rollout_log_probs"][0]) is np.float32
+
+
+def test_packed_sample_codec_applies_queue_overlay_without_mutating_or_aliasing_source():
+    sample = Sample(group_index=1, index=2, metadata={"source": 1})
+    encoder = CheckpointSampleEncoder()
+    prompt_state = encoder.encode_group([sample])
+    result_state = encoder.encode_group([sample], metadata_updates={fully_async.QUEUE_PUT_VERSION_KEY: 9})
+    state = _codec_state(prompt_state, encoder.finish())
+    state["ready_items"] = [{"prompt_group": prompt_state, "result": result_state}]
+    materialized = materialize_checkpoint_state(state)
+    [prompt] = materialized["ready_items"][0]["prompt_group"]
+    [result] = materialized["ready_items"][0]["result"]
+
+    assert len(state[SAMPLE_CODEC_STATE_KEY]["records"]) == 2
+    assert fully_async.QUEUE_PUT_VERSION_KEY not in sample.metadata
+    assert fully_async.QUEUE_PUT_VERSION_KEY not in prompt["metadata"]
+    assert result["metadata"][fully_async.QUEUE_PUT_VERSION_KEY] == 9
+    assert prompt is not result
+
+
+def _codec_state(group_state, codec):
+    return {
+        "dataset_fingerprint": "dataset-a",
+        "data_source": {},
+        "applied_weight_version": 0,
+        "pending_prompts": [group_state],
+        "ready_items": [],
+        "drain_progress": [],
+        "prepared_batches": [],
+        "regeneration_group_ids": [],
+        SAMPLE_CODEC_STATE_KEY: codec,
+    }
 
 
 def test_checkpoint_checksum_fingerprint_and_retention(tmp_path: Path):
@@ -356,6 +461,8 @@ def test_checkpoint_checksum_fingerprint_and_retention(tmp_path: Path):
     assert path.stat().st_size == size
     assert path.stat().st_mode & 0o777 == 0o644
     assert Path(f"{path}.sha256.json").stat().st_mode & 0o777 == 0o644
+    manifest = json.loads(Path(f"{path}.sha256.json").read_text(encoding="utf-8"))
+    assert manifest["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
     assert load_checkpoint(tmp_path, 4, expected_fingerprint="dataset-a")["value"] == [1, 2, 3]
     with pytest.raises(RuntimeError, match="resume with --fully-async-rollout-checkpoint"):
         ensure_no_full_replay_sidecar(tmp_path, 4)
@@ -375,6 +482,38 @@ def test_checkpoint_checksum_fingerprint_and_retention(tmp_path: Path):
     assert not (tmp_path / "rollout" / "fully_async_state_6.pt").exists()
     assert (tmp_path / "rollout" / "fully_async_state_7.pt").is_file()
     assert (tmp_path / "rollout" / "fully_async_state_8.pt").is_file()
+
+
+def test_save_checkpoint_does_not_reread_payload_for_checksum(tmp_path: Path, monkeypatch):
+    state = _codec_state([], CheckpointSampleEncoder().finish())
+
+    def fail_if_called(path):
+        raise AssertionError(f"save reread payload at {path}")
+
+    monkeypatch.setattr(checkpoint_module, "_file_digest", fail_if_called)
+    path, size = save_checkpoint(tmp_path, 2, state)
+    assert path.stat().st_size == size
+
+
+def test_load_checkpoint_accepts_legacy_schema_one(tmp_path: Path):
+    state = {
+        **_codec_state([], CheckpointSampleEncoder().finish()),
+        "schema_version": 1,
+        "checkpoint_rollout_id": 7,
+        "value": "legacy",
+    }
+    state.pop(SAMPLE_CODEC_STATE_KEY)
+    path = checkpoint_path(tmp_path, 7)
+    path.parent.mkdir(parents=True)
+    torch.save(state, path)
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    Path(f"{path}.sha256.json").write_text(
+        json.dumps({"schema_version": 1, "sha256": digest, "size": path.stat().st_size}) + "\n",
+        encoding="utf-8",
+    )
+
+    loaded = load_checkpoint(tmp_path, 7, expected_fingerprint="dataset-a")
+    assert loaded["value"] == "legacy"
 
 
 def test_dataset_fingerprint_includes_model_tokenizer_and_chat_template(tmp_path: Path):

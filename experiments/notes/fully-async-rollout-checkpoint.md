@@ -72,9 +72,13 @@ prepared batch. These are fail-fast guards, not silent fallbacks.
 
 Full `Sample` trajectories are saved for the prepared batch, partial drain, and
 the entire ready queue. This can make a sidecar large when the queue is deep or
-responses are long. Checkpoint write time and bytes are logged. The newest two
-sidecars are retained by default, in addition to IDs selected by
-`--save-retain-interval`.
+responses are long. Schema 2 stores per-token lists in contiguous CPU tensors
+and records repeated references to the same live `Sample` only once. Loading
+still creates an independent `Sample` at every occurrence, matching schema 1's
+mutation semantics, and schema 1 sidecars remain readable. The checksum is
+computed while writing instead of rereading the just-written file. Checkpoint
+write time and bytes are logged. The newest two sidecars are retained by
+default, in addition to IDs selected by `--save-retain-interval`.
 
 Resume metrics are emitted on the first restored rollout:
 

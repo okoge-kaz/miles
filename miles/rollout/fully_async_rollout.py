@@ -30,9 +30,13 @@ from miles.rollout.filter_hub.base_types import call_dynamic_filter
 from miles.rollout.fully_async_checkpoint import (
     dataset_fingerprint,
     decode_group,
-    encode_group,
     prompt_group_id,
     rollout_batch_token,
+)
+from miles.rollout.fully_async_checkpoint_codec import (
+    SAMPLE_CODEC_STATE_KEY,
+    CheckpointSampleEncoder,
+    materialize_checkpoint_state,
 )
 from miles.rollout.inference_rollout.inference_rollout_common import GenerateState, generate_and_rm_group
 from miles.utils.http_utils import get
@@ -105,16 +109,23 @@ def _flat_prompt_group(group: Group) -> list[Sample]:
     return list(group)
 
 
-def _encode_ready_item(item: tuple[list[Sample], Group], queue_put_version: int) -> dict[str, Any]:
+def _encode_ready_item(
+    item: tuple[list[Sample], Group],
+    queue_put_version: int,
+    sample_encoder: CheckpointSampleEncoder,
+) -> dict[str, Any]:
     prompt_group, result = item
-    result = copy.deepcopy(result)
+    metadata_updates = None
     if group_lifecycle_weight_version(result, QUEUE_PUT_VERSION_KEY) is None:
         # A completed task may be blocked on queue capacity when the snapshot is
         # taken. Restore promotes it into the reconstructed ready queue, so the
         # durable snapshot boundary is its queue-put version. Do not mutate the
         # live result: failure-free execution may enqueue it under a later version.
-        stamp_group_weight_version(result, QUEUE_PUT_VERSION_KEY, queue_put_version)
-    return {"prompt_group": encode_group(prompt_group), "result": encode_group(result)}
+        metadata_updates = {QUEUE_PUT_VERSION_KEY: queue_put_version}
+    return {
+        "prompt_group": sample_encoder.encode_group(prompt_group),
+        "result": sample_encoder.encode_group(result, metadata_updates=metadata_updates),
+    }
 
 
 def _decode_ready_item(state: dict[str, Any]) -> tuple[list[Sample], Group]:
@@ -505,15 +516,21 @@ class FullyAsyncRolloutFn:
         if missing:
             raise RuntimeError(f"Materialized groups are absent from the pending prompt ledger: {sorted(missing)}")
         regeneration_group_ids = self._regeneration_group_ids(materialized)
+        sample_encoder = CheckpointSampleEncoder()
         state = {
             "dataset_fingerprint": self._dataset_fingerprint,
             "data_source": self.data_source.checkpoint_state(),
             "applied_weight_version": self._applied_weight_version.current(),
-            "pending_prompts": [encode_group(group) for group in self._pending_prompts.values()],
-            "ready_items": [_encode_ready_item(item, self._applied_weight_version.current()) for item in ready_items],
-            "drain_progress": [self._encode_drain_progress(progress) for progress in self._drain_progress.values()],
+            "pending_prompts": [sample_encoder.encode_group(group) for group in self._pending_prompts.values()],
+            "ready_items": [
+                _encode_ready_item(item, self._applied_weight_version.current(), sample_encoder)
+                for item in ready_items
+            ],
+            "drain_progress": [
+                self._encode_drain_progress(progress, sample_encoder) for progress in self._drain_progress.values()
+            ],
             "prepared_batches": [
-                self._encode_prepared_batch(batch_rollout_id, prepared)
+                self._encode_prepared_batch(batch_rollout_id, prepared, sample_encoder)
                 for batch_rollout_id, prepared in self._prepared_batches.items()
             ],
             "regeneration_group_ids": regeneration_group_ids,
@@ -529,6 +546,7 @@ class FullyAsyncRolloutFn:
                 "prepared_batches": len(self._prepared_batches),
             },
         }
+        state[SAMPLE_CODEC_STATE_KEY] = sample_encoder.finish()
         logger.info(
             "Captured fully-async rollout state %d: %s",
             rollout_id,
@@ -542,6 +560,7 @@ class FullyAsyncRolloutFn:
             raise RuntimeError("Fully-async rollout checkpointing is disabled")
         if self._worker is not None:
             raise RuntimeError("Fully-async rollout state must be restored before the worker starts")
+        state = materialize_checkpoint_state(state)
 
         self.data_source.restore_checkpoint_state(state["data_source"])
         applied_version = int(state["applied_weight_version"])
@@ -651,9 +670,12 @@ class FullyAsyncRolloutFn:
         self._queue_gets.clear()
 
     @staticmethod
-    def _encode_drain_progress(progress: _DrainProgress) -> dict[str, Any]:
+    def _encode_drain_progress(
+        progress: _DrainProgress,
+        sample_encoder: CheckpointSampleEncoder,
+    ) -> dict[str, Any]:
         state = {key: copy.deepcopy(value) for key, value in progress.__dict__.items() if key != "data"}
-        state["data"] = [encode_group(group) for group in progress.data]
+        state["data"] = [sample_encoder.encode_group(group) for group in progress.data]
         return state
 
     @staticmethod
@@ -663,10 +685,14 @@ class FullyAsyncRolloutFn:
         return _DrainProgress(**state)
 
     @staticmethod
-    def _encode_prepared_batch(rollout_id: int, prepared: _PreparedBatch) -> dict[str, Any]:
+    def _encode_prepared_batch(
+        rollout_id: int,
+        prepared: _PreparedBatch,
+        sample_encoder: CheckpointSampleEncoder,
+    ) -> dict[str, Any]:
         return {
             "rollout_id": rollout_id,
-            "samples": [encode_group(group) for group in prepared.output.samples],
+            "samples": [sample_encoder.encode_group(group) for group in prepared.output.samples],
             "metrics": copy.deepcopy(prepared.output.metrics),
             "group_ids": list(prepared.group_ids),
             "token": prepared.token,
