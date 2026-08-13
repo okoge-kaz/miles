@@ -198,11 +198,12 @@ MISC_ARGS=(
    --attention-backend flash
 )
 
+# WANDB_API_KEY is inherited through --export=ALL. Never put it in this argv:
+# both shell xtrace and Ray's "Running entrypoint" line are persisted in job logs.
 WANDB_ARGS=(
    --use-wandb
    --wandb-project "${WANDB_PROJECT:-off-policy-${DATASET_TAG}}"
    --wandb-group "${RUN_NAME}"
-   --wandb-key "${WANDB_API_KEY}"
 )
 
 RUNTIME_ENV_JSON=$(cat <<JSON
