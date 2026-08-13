@@ -567,8 +567,10 @@ staleness with the closed form, but it cannot establish a seed-general
 downstream-task significance claim.
 
 The submission-side version is TTL-cached at 1 s; engine-reported prefill
-provenance is not. Full rollout checkpointing currently supports only
-`queue-recycle`; argument validation rejects the two policy-deque layouts rather
-than silently writing an incomplete snapshot.
+provenance is not. Full rollout checkpointing supports all three queue policies.
+The sidecar records policy plus effective capacity and rejects a cross-policy or
+cross-capacity restore. For `queue-drop`, snapshot-time completed-task promotion
+applies oldest-first overflow eviction before serialization, including the same
+length, reward-lifecycle, token, and group accounting as live eviction.
 
 Runs before 2026-08-09 have none of these keys, and nothing back-fills.

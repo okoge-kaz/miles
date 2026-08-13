@@ -72,11 +72,6 @@ def _fully_async_checkpoint_args(**overrides) -> SimpleNamespace:
     ("override", "message"),
     [
         ({"fully_async": False}, "requires --fully-async"),
-        (
-            {"fully_async_queue_policy": "queue-max", "max_weight_staleness": 0, "staleness_reference": "prefill"},
-            "queue-recycle",
-        ),
-        ({"fully_async_queue_policy": "queue-drop"}, "queue-recycle"),
         ({"train_backend": "fsdp"}, "Megatron training backend"),
         ({"rollout_global_dataset": False}, "global rollout dataset"),
         ({"data_source_path": "custom.Source"}, "RolloutDataSourceWithBuffer"),
@@ -113,9 +108,17 @@ def test_fully_async_rollout_checkpoint_guards(monkeypatch, override, message):
         _resolve_rollout_functions(args)
 
 
-def test_fully_async_rollout_checkpoint_accepts_supported_grpo_configuration(monkeypatch):
+@pytest.mark.parametrize(
+    "queue_config",
+    [
+        {},
+        {"fully_async_queue_policy": "queue-max", "max_weight_staleness": 0, "staleness_reference": "prefill"},
+        {"fully_async_queue_policy": "queue-drop", "fully_async_queue_factor": 2},
+    ],
+)
+def test_fully_async_rollout_checkpoint_accepts_supported_grpo_configuration(monkeypatch, queue_config):
     monkeypatch.setattr("miles.utils.arguments.enable_experimental_rollout_refactor", lambda: True)
-    args = _fully_async_checkpoint_args()
+    args = _fully_async_checkpoint_args(**queue_config)
     _resolve_rollout_functions(args)
     assert args.rollout_function_path == "miles.rollout.fully_async_rollout.FullyAsyncRolloutFn"
 

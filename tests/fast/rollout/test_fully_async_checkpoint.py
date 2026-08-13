@@ -142,6 +142,161 @@ async def _wait_until(predicate, timeout: float = 2.0) -> None:
             await asyncio.sleep(0)
 
 
+def _queue_args(policy: str, **overrides) -> Namespace:
+    policy_args = {
+        "fully_async_queue_policy": policy,
+        "fully_async_queue_factor": 1,
+    }
+    if policy == "queue-max":
+        policy_args |= {"max_weight_staleness": 0, "staleness_reference": "prefill"}
+    elif policy == "queue-drop":
+        policy_args["max_weight_staleness"] = None
+    policy_args.update(overrides)
+    return _args(**policy_args)
+
+
+def _ready_item(group_id: int, version: int = 5) -> tuple[list[Sample], list[Sample]]:
+    prompt_group = _prompt_group(group_id)
+    return prompt_group, _complete(copy.deepcopy(prompt_group), version)
+
+
+@pytest.mark.parametrize("policy", ["queue-recycle", "queue-max", "queue-drop"])
+async def test_ready_queue_restores_in_policy_storage(monkeypatch, policy):
+    args = _queue_args(policy, rollout_batch_size=1, fully_async_queue_factor=2 if policy == "queue-drop" else 1)
+    original = _make_fn(monkeypatch, args, _DataSource(), lambda *args, **kwargs: None)
+    items = [_ready_item(group_id) for group_id in (1, 2)]
+    original._pending_prompts = {group_id: _prompt_group(group_id) for group_id in (1, 2)}
+    if policy == "queue-recycle":
+        original._output = asyncio.Queue()
+        for item in items:
+            original._output.put_nowait(item)
+    else:
+        original._policy_output = deque(items)
+        original._policy_output_ready = asyncio.Event()
+        original._policy_output_ready.set()
+
+    state = await original.checkpoint_state(0)
+    restored = _make_fn(monkeypatch, args, _DataSource(), lambda *args, **kwargs: None)
+    await restored.restore_checkpoint_state(state)
+
+    if policy == "queue-recycle":
+        restored_items = list(restored._output._queue)
+        assert restored._policy_output is None
+    else:
+        restored_items = list(restored._policy_output)
+        assert restored._output is None
+        assert restored._policy_output_ready.is_set()
+    assert [item[0][0].group_index for item in restored_items] == [1, 2]
+    assert restored._resume_metrics["resume/fully_async/ready_groups_restored"] == 2
+
+
+async def test_checkpoint_rejects_cross_policy_and_capacity_restore(monkeypatch):
+    recycle = _make_fn(
+        monkeypatch,
+        _queue_args("queue-recycle"),
+        _DataSource(),
+        lambda *args, **kwargs: None,
+    )
+    recycle_state = await recycle.checkpoint_state(0)
+
+    queue_max = _make_fn(monkeypatch, _queue_args("queue-max"), _DataSource(), lambda *args, **kwargs: None)
+    with pytest.raises(RuntimeError, match="queue configuration"):
+        await queue_max.restore_checkpoint_state(recycle_state)
+
+    legacy_state = copy.deepcopy(recycle_state)
+    del legacy_state["queue_config"]
+    restored_recycle = _make_fn(
+        monkeypatch,
+        _queue_args("queue-recycle"),
+        _DataSource(),
+        lambda *args, **kwargs: None,
+    )
+    await restored_recycle.restore_checkpoint_state(legacy_state)
+
+    queue_drop = _make_fn(
+        monkeypatch,
+        _queue_args("queue-drop", fully_async_queue_factor=1),
+        _DataSource(),
+        lambda *args, **kwargs: None,
+    )
+    drop_state = await queue_drop.checkpoint_state(0)
+    different_capacity = _make_fn(
+        monkeypatch,
+        _queue_args("queue-drop", fully_async_queue_factor=2),
+        _DataSource(),
+        lambda *args, **kwargs: None,
+    )
+    with pytest.raises(RuntimeError, match="queue configuration"):
+        await different_capacity.restore_checkpoint_state(drop_state)
+
+
+async def test_queue_drop_snapshot_applies_waiting_completion_evictions(monkeypatch):
+    args = _queue_args(
+        "queue-drop",
+        rollout_batch_size=1,
+        fully_async_queue_factor=2,
+        save_debug_rollout_data="dump-{rollout_id}.pt",
+    )
+    original = _make_fn(monkeypatch, args, _DataSource(), lambda *args, **kwargs: None)
+    items = [_ready_item(group_id) for group_id in (1, 2, 3, 4)]
+    original._pending_prompts = {group_id: _prompt_group(group_id) for group_id in (1, 2, 3, 4)}
+    original._policy_output = deque(items[:2])
+    original._policy_output_ready = asyncio.Event()
+    original._policy_output_ready.set()
+    original._completed_waiting = {group_id: items[group_id - 1] for group_id in (3, 4)}
+
+    for depth_before, (_, group) in enumerate(items):
+        record = original._queue_lifecycle.begin_attempt(group, submission_version=5)
+        original._queue_lifecycle.group_ready(record, group, ready_version=5, reward_values=[1.0, 1.0])
+        original._producer_response_lengths.record("generated", group)
+        if depth_before < 2:
+            fully_async.stamp_group_weight_version(group, fully_async.QUEUE_PUT_VERSION_KEY, 5)
+            original._queue_lifecycle.enqueued(
+                group,
+                queue_put_version=5,
+                depth_before=depth_before,
+                depth_after=depth_before + 1,
+            )
+
+    state = await original.checkpoint_state(0)
+    materialized = materialize_checkpoint_state(state)
+    ready_items = [fully_async._decode_ready_item(item) for item in materialized["ready_items"]]
+    pending_ids = [fully_async.prompt_group_id(decode_group(group)) for group in materialized["pending_prompts"]]
+    telemetry = state["queue_telemetry"]
+
+    assert [item[0][0].group_index for item in ready_items] == [3, 4]
+    assert pending_ids == [3, 4]
+    assert state["snapshot_counts"]["queue_evicted_groups"] == 2
+    assert telemetry["queue_evicted_groups"] == 2
+    assert telemetry["queue_evicted_tokens"] == 4
+    assert telemetry["producer_response_lengths"]["sample_lengths"]["queue_evicted"] == [1, 1, 1, 1]
+    assert [record["group_index"] for record in telemetry["lifecycle"]["terminal_records"]] == [1, 2]
+    assert {record["group_index"] for record in telemetry["lifecycle"]["live_records"].values()} == {3, 4}
+
+    restored = _make_fn(monkeypatch, args, _DataSource(), lambda *args, **kwargs: None)
+    await restored.restore_checkpoint_state(state)
+    assert [item[0][0].group_index for item in restored._policy_output] == [3, 4]
+    assert set(restored._pending_prompts) == {3, 4}
+    assert restored._queue_evicted_groups == 2
+    assert restored._queue_evicted_tokens == 4
+    assert restored.data_source.buffer == []
+
+
+async def test_queue_drop_live_eviction_finishes_pending_prompt(monkeypatch):
+    args = _queue_args("queue-drop", rollout_batch_size=1)
+    fn = _make_fn(monkeypatch, args, _DataSource(), lambda *args, **kwargs: None)
+    fn._policy_output = deque()
+    fn._policy_output_ready = asyncio.Event()
+    fn._pending_prompts = {group_id: _prompt_group(group_id) for group_id in (1, 2)}
+
+    await fn._enqueue_completed_group(_ready_item(1))
+    await fn._enqueue_completed_group(_ready_item(2))
+
+    assert set(fn._pending_prompts) == {2}
+    assert [item[0][0].group_index for item in fn._policy_output] == [2]
+    assert fn._queue_evicted_groups == 1
+
+
 async def test_prepared_batch_is_a_warm_resume_hit_and_active_prompt_is_regenerated(monkeypatch):
     gate = asyncio.Event()
 
@@ -255,6 +410,24 @@ def test_restored_overfull_queue_does_not_release_capacity_early(monkeypatch):
     assert fn._output_slots._value == 1
 
 
+async def test_restored_overfull_queue_max_does_not_release_capacity_early(monkeypatch):
+    fn = _make_fn(
+        monkeypatch,
+        _queue_args("queue-max"),
+        _DataSource(),
+        lambda *args, **kwargs: None,
+    )
+    fn._policy_output = deque(_ready_item(group_id) for group_id in range(fully_async.OUTPUT_QUEUE_MAX_GROUPS + 2))
+    fn._output_slots = asyncio.Semaphore(0)
+
+    await fn._take_policy_groups(1)
+    assert fn._output_slots._value == 0
+    await fn._take_policy_groups(1)
+    assert fn._output_slots._value == 0
+    await fn._take_policy_groups(1)
+    assert fn._output_slots._value == 1
+
+
 async def test_ready_group_rechecks_staleness_after_resume(monkeypatch):
     gate = asyncio.Event()
 
@@ -284,6 +457,49 @@ async def test_ready_group_rechecks_staleness_after_resume(monkeypatch):
     output = await restored(RolloutFnTrainInput(rollout_id=0))
     assert output.samples[0][0].group_index != 1
     assert output.metrics["rollout/fully_async/stale_groups_recycled"] == 1
+    assert output.metrics["resume/fully_async/ready_groups_restored"] == 1
+    await _stop(restored)
+
+
+async def test_queue_max_ready_group_rechecks_prefill_staleness_after_resume(monkeypatch):
+    gate = asyncio.Event()
+
+    async def first_generate(state, group, sampling_params, evaluation=False):
+        if group[0].group_index != 1:
+            await gate.wait()
+        result = _complete(group, 5)
+        for sample in result:
+            sample.first_prefill_weight_versions = [5]
+            sample.min_forward_weight_versions = [5]
+            sample.max_forward_weight_versions = [5]
+            sample.last_forward_weight_versions = [5]
+        return result
+
+    args = _queue_args("queue-max")
+    original = _make_fn(monkeypatch, args, _DataSource([_prompt_group(1), _prompt_group(2)]), first_generate)
+    original._ensure_worker()
+    await _wait_until(lambda: len(original._policy_output) == 1 and len(original._active) == 1)
+    state = await original.checkpoint_state(0)
+    await _stop(original)
+
+    async def resumed_generate(state, group, sampling_params, evaluation=False):
+        result = _complete(group, 6)
+        for sample in result:
+            sample.first_prefill_weight_versions = [6]
+            sample.min_forward_weight_versions = [6]
+            sample.max_forward_weight_versions = [6]
+            sample.last_forward_weight_versions = [6]
+        return result
+
+    restored = _make_fn(monkeypatch, args, _DataSource(), resumed_generate)
+    await restored.restore_checkpoint_state(state)
+    restored._weight_version = _Version(6)
+    restored.commit_applied_weight_version(6)
+
+    output = await restored(RolloutFnTrainInput(rollout_id=0))
+    assert output.samples[0][0].group_index == 2
+    assert output.metrics["rollout/fully_async/stale_groups_dropped"] == 1
+    assert output.metrics["rollout/fully_async/stale_groups_recycled"] == 0
     assert output.metrics["resume/fully_async/ready_groups_restored"] == 1
     await _stop(restored)
 

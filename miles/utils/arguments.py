@@ -13,7 +13,6 @@ from miles.backends.sglang_utils.arguments import validate_args as sglang_valida
 from miles.dashboard.args import add_dashboard_arguments, validate_dashboard_args
 from miles.rollout.queue_policy import (
     FULLY_ASYNC_QUEUE_POLICIES,
-    LEGACY_QUEUE_POLICY,
     validate_fully_async_queue_args,
 )
 from miles.utils.chat_template_utils.tito_tokenizer import TITOTokenizerType
@@ -53,10 +52,6 @@ def _validate_fully_async_rollout_checkpoint(args) -> None:
         return
 
     checks = (
-        (
-            args.fully_async_queue_policy == LEGACY_QUEUE_POLICY,
-            "--fully-async-queue-policy queue-recycle",
-        ),
         (args.train_backend == "megatron", "the Megatron training backend"),
         (args.rollout_global_dataset, "the global rollout dataset"),
         (

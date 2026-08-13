@@ -10,6 +10,11 @@ fresh `CONFIG_TAG`/checkpoint directory, and do not toggle it while resuming a
 run. Enabling it on a legacy checkpoint fails because the committed model has no
 matching replay sidecar. Disabling it on a full-replay checkpoint would discard
 the pending-lease ledger, so Miles detects the sidecar and rejects that downgrade.
+The sidecar records the queue policy and effective group capacity. Resume rejects
+a different policy or capacity instead of interpreting one algorithm's queue as
+another. Sidecars written before this field existed are treated as
+`queue-recycle`, preserving backward compatibility without allowing an ambiguous
+cross-policy restore.
 
 ## Failure semantics
 
@@ -32,19 +37,24 @@ change non-checkpoint training steps or the default cursor-only path.
 
 The sidecar owns the allocation cursor plus a prompt-lease ledger. This avoids
 treating “submitted to generation” as “trained”: prompt groups leave the ledger
-only after a successful trainer ACK, or after a terminal dynamic-filter drop.
-At a scheduled distributed checkpoint, Miles first finishes the next rollout
-future that was already prefetched by `train_async.py`. The failure-free path
-would wait for that same future immediately before its weight push; moving the
-wait before the snapshot makes the next batch a complete prepared batch and
-preserves its pre-update admission/version boundary across resume.
+only after a successful trainer ACK or a terminal queue/filter disposition.
+
+For `queue-recycle`, a scheduled distributed checkpoint first finishes the next
+rollout future that was already prefetched by `train_async.py`. The failure-free
+path would wait for that same future immediately before its weight push; moving
+the wait before the snapshot makes the next batch a complete prepared batch and
+preserves its pre-update admission/version boundary across resume. `queue-max`
+and `queue-drop` intentionally do not reserve that next batch before the
+preceding update, so their scheduled sidecars normally preserve the ready queue
+rather than manufacturing a warm prepared batch.
 
 | Snapshot state | Resume behavior |
 | --- | --- |
 | Prepared next trainer batch | Reuse the complete trajectories immediately; do not re-run the admission/staleness check |
 | Groups already admitted into a partial drain | Keep the admitted trajectories and continue filling that batch |
 | Completed ready queue | Restore full trajectories in queue order, then re-run drain-time staleness/filter checks |
-| Completed but blocked on the queue capacity | Restore as ready trajectories |
+| Completed but blocked on `queue-recycle`/`queue-max` safety capacity | Restore as ready trajectories; restored over-capacity state keeps producer backpressure until consumption falls below the cap |
+| `queue-drop` completion pending worker admission | Apply the same oldest-first overflow eviction at the snapshot boundary, then restore only the bounded queue |
 | Active generation or retry-buffer lease | Restore the original prompt identity/retry count and regenerate |
 | Trainer-ACKed batch | Do not restore; the matching model checkpoint already contains its optimizer update |
 
@@ -62,8 +72,9 @@ to `v+1`, matching the failure-free `--update-weights-interval 1` path. Ready
 groups compare their saved provenance against that resumed current version;
 prepared/admitted groups retain the decision already made before the snapshot.
 
-The first implementation intentionally requires dense, critic-free Megatron
-GRPO, the standard FIFO global data source and built-in reward/data conversion,
+The implementation supports `queue-recycle`, `queue-max`, and `queue-drop`. It
+intentionally requires dense, critic-free Megatron GRPO, the standard FIFO
+global data source and built-in reward/data conversion,
 `--update-weights-interval 1`, and a non-`disk-delta` weight transport. It also
 rejects debug rollout injection and any postprocessing that trims part of a
 prepared batch. These are fail-fast guards, not silent fallbacks.
@@ -89,6 +100,14 @@ binary slice, the main manifest, byte size, dtype, offset, and length are
 validated before restore. Capture time and write time are logged separately.
 The newest two sidecars are retained by default, in addition to IDs selected by
 `--save-retain-interval`.
+
+`queue-drop` never serializes more than its effective completed-group capacity.
+If generation tasks finish at the snapshot boundary before the worker records
+their admission, capture applies the policy's overflow decisions in memory. The
+dropped trajectories themselves are omitted; only compact eviction counts,
+response-length populations, and optional lifecycle/reward records remain.
+`queue-recycle` and `queue-max` preserve capacity-blocked completions because
+their failure-free behavior is backpressure rather than eviction.
 
 Resume metrics are emitted on the first restored rollout:
 

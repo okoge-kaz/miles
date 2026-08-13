@@ -111,6 +111,58 @@ configuration. Whole Slurm elapsed time was 3:51 versus 4:10 on resume, a
 19-second (7.6%) reduction despite model, Ray, and SGLang initialization being
 unchanged.
 
+### Three-policy sidecar extension
+
+The queue-policy extension was validated on 2026-08-13 after merging remote
+revision `b20c5962`. Each case used one node (8 H100 GPUs), split into four
+trainer GPUs and four rollout GPUs, with real DAPO prompts, two prompt groups x
+two responses per trainer batch, a 256-token response cap, and
+`--fully-async-rollout-checkpoint`. The fresh job trained rollout 0 and
+published its model plus sidecar; a separate dependent job loaded both and
+trained rollout 1.
+
+| Policy | Fresh job | Resume job | Restored pending / ready / regenerated / prepared | First resumed rollout |
+|---|---:|---:|---:|---:|
+| `queue-recycle` | 15720395 | 15720412 | 35 / 29 / 4 / 1 | 0.099864 s |
+| `queue-max` | 15720396 | 15720411 | 29 / 25 / 4 / 0 | 0.105536 s |
+| `queue-drop` (`q=1`, capacity 2) | 15720397 | 15720413 | 6 / 2 / 4 / 0 | 0.106803 s |
+
+All six jobs completed with `ExitCode=0:0`. The policy-specific behavior also
+matched the intended contracts:
+
+- `queue-recycle` reported `warm_prepared_batch_hit=1` and reused its prepared
+  batch without starting the worker for that batch;
+- `queue-max` selected restored ready groups only after the resume-time update.
+  With `max_weight_staleness=1`, both trained groups had prefill-bound
+  staleness exactly 1 (`frac_at_bound=1`), confirming that one version gap is
+  accepted rather than re-indexed as on-policy;
+- `queue-drop` restored exactly its two-group capacity plus four active prompt
+  leases for regeneration. Its first resumed metrics recovered 30 prior queue
+  evictions, 15,360 evicted response tokens, and 60 aligned sample lengths from
+  the sidecar. No evicted prompt was regenerated.
+
+The first fresh sidecar publication for each policy measured:
+
+| Policy | Ready / active / prepared groups | Capture | Durable write | Total | Stored bytes |
+|---|---:|---:|---:|---:|---:|
+| `queue-recycle` | 29 / 4 / 1 | 0.006 s | 0.025 s | 0.031 s | 388,161 |
+| `queue-max` | 25 / 4 / 0 | 0.005 s | 0.026 s | 0.030 s | 302,274 |
+| `queue-drop` | 2 / 4 / 0 | 0.004 s | 0.021 s | 0.025 s | 39,456 |
+
+These small smoke snapshots are latency sanity checks rather than replacements
+for the 56.8-MB benchmark above. They show that policy bookkeeping adds no
+visible save-boundary spike. `queue-recycle` and `queue-max` continue to use the
+same packed schema-three representation. `queue-drop` additionally limits
+storage by applying oldest-first overflow at capture and omitting the evicted
+trajectories themselves; it retains only their compact counts, token/length
+statistics, and optional reward-lifecycle records.
+
+The containerized regression suite passed 234 tests (job 15720283), including
+policy storage reconstruction, queue-max staleness rechecks, queue-drop
+snapshot overflow, telemetry persistence, old-sidecar compatibility, and
+cross-policy/capacity rejection. A real-Ray GPU test also passed (job
+15720353).
+
 ## Real-data 20-step restart check
 
 These jobs used a 2048-token response cap, 8 prompts x 4 responses, global

@@ -117,6 +117,17 @@ class _PreparedBatch:
     token: str
 
 
+@dataclass(frozen=True)
+class _QueueCheckpointSnapshot:
+    ready_items: list[QueueItem]
+    pending_prompts: dict[int, list[Sample]]
+    lifecycle_state: dict | None
+    response_length_state: dict
+    queue_evicted_groups: int
+    queue_evicted_tokens: int
+    snapshot_evicted_groups: int
+
+
 def _flat_prompt_group(group: Group) -> list[Sample]:
     if any(isinstance(item, list) for item in group):
         raise RuntimeError("A pending prompt lease must be a flat list of Sample objects")
@@ -524,21 +535,29 @@ class FullyAsyncRolloutFn:
     def _capture_checkpoint_state(self, rollout_id: int) -> dict[str, Any]:
         claimed_items = [task.result() for task in self._queue_gets if task.done() and not task.cancelled()]
         finished_active_items = [task.result() for task in self._active if task.done() and not task.cancelled()]
-        ready_items = list(claimed_items)
-        ready_items.extend(list(self._output._queue) if self._output is not None else [])
-        ready_items.extend(self._completed_waiting.values())
-        ready_items.extend(finished_active_items)
+        queued_items = list(claimed_items)
+        if self._queue_policy() == LEGACY_QUEUE_POLICY:
+            queued_items.extend(list(self._output._queue) if self._output is not None else [])
+        else:
+            queued_items.extend(list(self._policy_output) if self._policy_output is not None else [])
+        promoted_items = list(self._completed_waiting.values())
+        promoted_items.extend(finished_active_items)
+        queue_snapshot = self._build_queue_checkpoint_snapshot(queued_items, promoted_items)
+        ready_items = queue_snapshot.ready_items
         materialized = _materialized_group_ids(ready_items, self._drain_progress, self._prepared_batches)
-        missing = materialized - self._pending_prompts.keys()
+        missing = materialized - queue_snapshot.pending_prompts.keys()
         if missing:
             raise RuntimeError(f"Materialized groups are absent from the pending prompt ledger: {sorted(missing)}")
-        regeneration_group_ids = self._regeneration_group_ids(materialized)
+        regeneration_group_ids = self._regeneration_group_ids(materialized, queue_snapshot.pending_prompts)
         sample_encoder = CheckpointSampleEncoder(self._checkpoint_packed_fields)
         state = {
             "dataset_fingerprint": self._dataset_fingerprint,
+            "queue_config": self._checkpoint_queue_config(),
             "data_source": self.data_source.checkpoint_state(),
             "applied_weight_version": self._applied_weight_version.current(),
-            "pending_prompts": [sample_encoder.encode_group(group) for group in self._pending_prompts.values()],
+            "pending_prompts": [
+                sample_encoder.encode_group(group) for group in queue_snapshot.pending_prompts.values()
+            ],
             "ready_items": [
                 _encode_ready_item(item, self._applied_weight_version.current(), sample_encoder)
                 for item in ready_items
@@ -553,16 +572,19 @@ class FullyAsyncRolloutFn:
             "regeneration_group_ids": regeneration_group_ids,
             "acked_batch_tokens": dict(self._acked_batch_tokens),
             "queue_telemetry": {
-                "lifecycle": self._queue_lifecycle.checkpoint_state(),
-                "producer_response_lengths": self._producer_response_lengths.checkpoint_state(),
+                "lifecycle": queue_snapshot.lifecycle_state,
+                "producer_response_lengths": queue_snapshot.response_length_state,
+                "queue_evicted_groups": queue_snapshot.queue_evicted_groups,
+                "queue_evicted_tokens": queue_snapshot.queue_evicted_tokens,
             },
             "snapshot_counts": {
-                "pending_groups": len(self._pending_prompts),
+                "pending_groups": len(queue_snapshot.pending_prompts),
                 "ready_groups": len(ready_items),
                 "active_groups": len(self._active) - len(finished_active_items),
                 "finished_active_groups": len(finished_active_items),
                 "completed_waiting_groups": len(self._completed_waiting),
                 "claimed_groups": len(claimed_items),
+                "queue_evicted_groups": queue_snapshot.snapshot_evicted_groups,
                 "partial_drains": len(self._drain_progress),
                 "prepared_batches": len(self._prepared_batches),
             },
@@ -576,6 +598,115 @@ class FullyAsyncRolloutFn:
         )
         return state
 
+    def _build_queue_checkpoint_snapshot(
+        self,
+        queued_items: list[QueueItem],
+        promoted_items: list[QueueItem],
+    ) -> _QueueCheckpointSnapshot:
+        pending_prompts = dict(self._pending_prompts)
+        lifecycle_state = self._queue_lifecycle.checkpoint_state()
+        response_length_state = self._producer_response_lengths.checkpoint_state()
+        if self._queue_policy() != QUEUE_DROP_POLICY:
+            return _QueueCheckpointSnapshot(
+                ready_items=queued_items + promoted_items,
+                pending_prompts=pending_prompts,
+                lifecycle_state=lifecycle_state,
+                response_length_state=response_length_state,
+                queue_evicted_groups=self._queue_evicted_groups,
+                queue_evicted_tokens=self._queue_evicted_tokens,
+                snapshot_evicted_groups=0,
+            )
+
+        lifecycle = _QueueLifecycleRecorder(enabled=self._queue_lifecycle.enabled)
+        lifecycle.restore_checkpoint_state(lifecycle_state)
+        response_lengths = _ResponseLengthMetrics(populations=("generated", "queue_evicted"))
+        response_lengths.restore_checkpoint_state(response_length_state)
+        ready_items = deque(queued_items)
+        evicted_groups = 0
+        evicted_tokens = 0
+        for item in promoted_items:
+            depth_before = len(ready_items)
+            queue_put_version = self._applied_weight_version.current()
+            if depth_before >= self._queue_capacity_groups():
+                evicted_item = ready_items.popleft()
+                evicted_tokens += self._record_checkpoint_queue_eviction(
+                    evicted_item,
+                    decision_version=queue_put_version,
+                    pending_prompts=pending_prompts,
+                    lifecycle=lifecycle,
+                    response_lengths=response_lengths,
+                )
+                evicted_groups += 1
+            ready_items.append(item)
+            lifecycle.restore_queue_admission(
+                item[1],
+                queue_put_version=queue_put_version,
+                depth_before=depth_before,
+                depth_after=len(ready_items),
+            )
+
+        return _QueueCheckpointSnapshot(
+            ready_items=list(ready_items),
+            pending_prompts=pending_prompts,
+            lifecycle_state=lifecycle.checkpoint_state(),
+            response_length_state=response_lengths.checkpoint_state(),
+            queue_evicted_groups=self._queue_evicted_groups + evicted_groups,
+            queue_evicted_tokens=self._queue_evicted_tokens + evicted_tokens,
+            snapshot_evicted_groups=evicted_groups,
+        )
+
+    @staticmethod
+    def _record_checkpoint_queue_eviction(
+        item: QueueItem,
+        *,
+        decision_version: int,
+        pending_prompts: dict[int, list[Sample]],
+        lifecycle: _QueueLifecycleRecorder,
+        response_lengths: _ResponseLengthMetrics,
+    ) -> int:
+        prompt_group, group = item
+        group_id = prompt_group_id(prompt_group)
+        if pending_prompts.pop(group_id, None) is None:
+            raise RuntimeError(f"Queue-evicted prompt group {group_id} is absent from the pending ledger")
+        response_lengths.record("queue_evicted", group)
+        reference = group_first_prefill_weight_version(group)
+        lifecycle.finish(
+            group,
+            disposition="queue_evicted",
+            decision_version=decision_version,
+            rollout_id=None,
+            reference_version=reference,
+            bound_staleness=decision_version - reference if reference is not None else None,
+        )
+        return group_response_tokens(group)
+
+    def _checkpoint_queue_config(self) -> dict[str, Any]:
+        return {
+            "policy": self._queue_policy(),
+            "capacity_groups": self._queue_capacity_groups(),
+        }
+
+    def _validate_checkpoint_queue_config(self, state: dict[str, Any]) -> None:
+        stored = state.get("queue_config")
+        if stored is None:
+            stored = {
+                "policy": LEGACY_QUEUE_POLICY,
+                "capacity_groups": OUTPUT_QUEUE_MAX_GROUPS,
+            }
+        try:
+            stored_config = {
+                "policy": stored["policy"],
+                "capacity_groups": int(stored["capacity_groups"]),
+            }
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(f"Invalid fully-async checkpoint queue configuration: {stored!r}") from exc
+        current_config = self._checkpoint_queue_config()
+        if stored_config != current_config:
+            raise RuntimeError(
+                "Fully-async checkpoint queue configuration does not match this run: "
+                f"stored={stored_config}, current={current_config}"
+            )
+
     async def restore_checkpoint_state(self, state: dict[str, Any]) -> None:
         """Restore materialized trajectories and regenerate only active prompt leases."""
         if not self._checkpoint_enabled:
@@ -583,11 +714,14 @@ class FullyAsyncRolloutFn:
         if self._worker is not None:
             raise RuntimeError("Fully-async rollout state must be restored before the worker starts")
         state = materialize_checkpoint_state(state)
+        self._validate_checkpoint_queue_config(state)
 
         self.data_source.restore_checkpoint_state(state["data_source"])
         telemetry_state = state.get("queue_telemetry", {})
         self._queue_lifecycle.restore_checkpoint_state(telemetry_state.get("lifecycle"))
         self._producer_response_lengths.restore_checkpoint_state(telemetry_state.get("producer_response_lengths"))
+        self._queue_evicted_groups = int(telemetry_state.get("queue_evicted_groups", 0))
+        self._queue_evicted_tokens = int(telemetry_state.get("queue_evicted_tokens", 0))
         applied_version = int(state["applied_weight_version"])
         self._applied_weight_version = AppliedWeightVersionTracker(applied_version)
 
@@ -607,18 +741,7 @@ class FullyAsyncRolloutFn:
             # resume does not move list/string conversion back onto its boundary.
             self._checkpoint_packed_fields.cache_group(prompt_group)
             self._checkpoint_packed_fields.cache_group(result)
-        self._output = asyncio.Queue()
-        for depth_before, item in enumerate(ready_items):
-            self._output.put_nowait(item)
-            queue_put_version = group_lifecycle_weight_version(item[1], QUEUE_PUT_VERSION_KEY)
-            if queue_put_version is None:
-                raise RuntimeError("Restored ready group has no queue-put weight version")
-            self._queue_lifecycle.restore_queue_admission(
-                item[1],
-                queue_put_version=queue_put_version,
-                depth_before=depth_before,
-                depth_after=depth_before + 1,
-            )
+        self._restore_ready_queue(ready_items)
 
         self._drain_progress = {}
         for progress_state in state["drain_progress"]:
@@ -661,7 +784,6 @@ class FullyAsyncRolloutFn:
         # objects would turn a partially generated response into the next
         # checkpoint's supposed original prompt.
         self.data_source.add_samples(copy.deepcopy(regeneration_groups))
-        self._output_slots = asyncio.Semaphore(max(0, OUTPUT_QUEUE_MAX_GROUPS - len(ready_items)))
 
         self._resume_metrics = {
             "resume/fully_async/pending_groups_restored": float(len(pending_groups)),
@@ -673,8 +795,44 @@ class FullyAsyncRolloutFn:
         }
         logger.info("Restored fully-async rollout state: %s", self._resume_metrics)
 
-    def _regeneration_group_ids(self, materialized: set[int]) -> list[int]:
-        pending_regeneration_ids = self._pending_prompts.keys() - materialized
+    def _restore_ready_queue(self, ready_items: list[QueueItem]) -> None:
+        policy = self._queue_policy()
+        if policy == LEGACY_QUEUE_POLICY:
+            self._output = asyncio.Queue()
+            for item in ready_items:
+                self._output.put_nowait(item)
+            self._policy_output = None
+            self._policy_output_ready = None
+        else:
+            self._output = None
+            self._policy_output = deque(ready_items)
+            self._policy_output_ready = asyncio.Event()
+            if ready_items:
+                self._policy_output_ready.set()
+
+        for depth_before, item in enumerate(ready_items):
+            queue_put_version = group_lifecycle_weight_version(item[1], QUEUE_PUT_VERSION_KEY)
+            if queue_put_version is None:
+                raise RuntimeError("Restored ready group has no queue-put weight version")
+            self._queue_lifecycle.restore_queue_admission(
+                item[1],
+                queue_put_version=queue_put_version,
+                depth_before=depth_before,
+                depth_after=depth_before + 1,
+            )
+        if policy in (LEGACY_QUEUE_POLICY, QUEUE_MAX_POLICY):
+            available_slots = max(0, self._queue_capacity_groups() - len(ready_items))
+            self._output_slots = asyncio.Semaphore(available_slots)
+        else:
+            self._output_slots = None
+
+    def _regeneration_group_ids(
+        self,
+        materialized: set[int],
+        pending_prompts: dict[int, list[Sample]] | None = None,
+    ) -> list[int]:
+        pending_prompts = self._pending_prompts if pending_prompts is None else pending_prompts
+        pending_regeneration_ids = pending_prompts.keys() - materialized
         retry_group_ids = [prompt_group_id(group) for group in self.data_source.checkpoint_retry_buffer_groups()]
         if len(retry_group_ids) != len(set(retry_group_ids)) or not set(retry_group_ids) <= set(
             pending_regeneration_ids
@@ -685,7 +843,7 @@ class FullyAsyncRolloutFn:
             )
         active_group_ids = [
             group_id
-            for group_id in self._pending_prompts
+            for group_id in pending_prompts
             if group_id in pending_regeneration_ids and group_id not in retry_group_ids
         ]
         # Requests that were already running at the snapshot regain the in-flight
@@ -939,7 +1097,7 @@ class FullyAsyncRolloutFn:
             self._output.put_nowait(item)
         else:
             if policy == QUEUE_DROP_POLICY and depth_before >= self._queue_capacity_groups():
-                _, evicted_group = self._policy_output.popleft()
+                evicted_prompt_group, evicted_group = self._policy_output.popleft()
                 evicted_tokens = group_response_tokens(evicted_group)
                 self._queue_evicted_groups += 1
                 self._queue_evicted_tokens += evicted_tokens
@@ -953,6 +1111,7 @@ class FullyAsyncRolloutFn:
                     reference_version=reference,
                     bound_staleness=queue_put_version - reference if reference is not None else None,
                 )
+                self._finish_prompt(evicted_prompt_group)
             self._policy_output.append(item)
             self._policy_output_ready.set()
 
@@ -1040,7 +1199,7 @@ class FullyAsyncRolloutFn:
         for _ in range(count):
             item = self._policy_output.popleft()
             if self._queue_policy() == QUEUE_MAX_POLICY:
-                self._output_slots.release()
+                self._release_output_slot()
             depth_after = len(self._policy_output)
             self._queue_lifecycle.dequeued(item[1], depth_after_observed=depth_after)
             selected.append((item, depth_after))
@@ -1048,7 +1207,7 @@ class FullyAsyncRolloutFn:
 
     def _release_output_slot(self) -> None:
         """Release capacity only after a restored overfull queue reaches its cap."""
-        if self._output.qsize() < self._queue_capacity_groups():
+        if self._queue_size() < self._queue_capacity_groups():
             self._output_slots.release()
 
     async def _drain(self, rollout_id: int) -> RolloutFnTrainOutput:
