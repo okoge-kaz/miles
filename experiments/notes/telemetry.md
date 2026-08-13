@@ -505,10 +505,14 @@ The choice is also logged as `staleness/bound_reference_is_submission` and
 means every group offered before the check; `train` means the groups that
 survived selection.
 
-Under `submission` or `prefill`, `s=N` permits N intervening applied policy
-versions from the selected start event to queue selection. For the legacy
-prefetched driver path, inspect `queue/consumption/selection_to_train_gap` as
-well: actual trainer consumption can follow selection by one additional update.
+Under `submission` or `prefill`, `s=N` accepts a group exactly when the tested
+version gap is at most N; equality is accepted. In particular, queue-max with
+the prefill reference treats `s=0` as on-policy and `s=1` as permitting one
+policy-version gap. Its selection after the preceding update does not shift or
+re-index that definition. Queue-recycle uses the same inequality at its
+historical drain point. `queue/consumption/selection_to_train_gap` is a separate
+scheduling diagnostic, not an offset to apply to the configured queue-max
+bound.
 
 A bound tighter than the pipeline can meet collapses overlap rather than
 deadlocking. While drain waits, training cannot publish a new version, so fresh
@@ -542,17 +546,16 @@ analyzer implements `IQS = rho` for `rho < 1` and
 term, and intentionally rejects the exact `rho = 1` boundary. Do not apply the
 formula to `queue-recycle` or `queue-max`.
 
-With the same prefill-referenced age bound and one weight update per train
-step, the mechanism predicts the strongest short-response selection pressure
-for `queue-max`, then `queue-recycle`, and the weakest for `queue-drop`.
-`queue-max` tests the age only after the preceding update; `queue-recycle`
-reserves its next batch before that update, while `queue-drop` has no age
-cutoff. This ordering is a hypothesis, not a theorem across configurations:
-retries, startup/final censoring, queue utilization, group tailness, and dynamic
-filtering can change the observed ordering. A single-seed run can validate the
-queue mechanism and compare the `queue-drop` mean staleness with the closed
-form, but it cannot establish a seed-general downstream-task significance
-claim.
+Do not infer a queue-max versus queue-recycle length-bias ordering by shifting
+one policy's configured bound because of driver prefetch. The robust claims are
+that queue-max's permanent age rejection preferentially removes long responses,
+whereas queue-drop is approximately length-unbiased in steady state.
+Queue-recycle retries an over-age prompt under fresh weights, so where it falls
+between those policies is an empirical question involving retries, startup and
+final censoring, queue utilization, group tailness, and dynamic filtering. A
+single-seed run can validate the queue mechanism and compare the queue-drop mean
+staleness with the closed form, but it cannot establish a seed-general
+downstream-task significance claim.
 
 The submission-side version is TTL-cached at 1 s; engine-reported prefill
 provenance is not. Full rollout checkpointing currently supports only

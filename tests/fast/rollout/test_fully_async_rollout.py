@@ -604,7 +604,7 @@ def test_queue_max_safety_capacity_cannot_deadlock_a_large_batch(monkeypatch):
     assert fn._queue_capacity_groups() == args.rollout_batch_size
 
 
-async def test_queue_max_drops_stale_group_without_recycling_prompt(monkeypatch):
+async def test_queue_max_at_one_accepts_one_step_and_drops_two_step_without_recycling(monkeypatch):
     stale = make_group(1)
     allowed = make_group(2)
     stale[0].response_length = 5
@@ -644,8 +644,40 @@ async def test_queue_max_drops_stale_group_without_recycling_prompt(monkeypatch)
     assert output.metrics["rollout/fully_async/age_cutoff_tokens"] == 12
     assert output.metrics["queue/selection/age_cutoff_dropped/sample_length/mean"] == 6
     assert output.metrics["staleness/bound_exceeded_groups"] == 1
+    assert output.metrics["staleness/bound/train/count_1"] == 1
+    assert output.metrics["staleness/bound/train/max"] == 1
     assert stale not in output.samples
     assert allowed in output.samples
+
+
+async def test_queue_max_at_zero_rejects_one_step_and_accepts_on_policy(monkeypatch):
+    one_step_stale = make_group(1)
+    on_policy = make_group(2)
+    data_source = FakeDataSource(scripted=[one_step_stale, on_policy])
+
+    async def generate_with_prefill_version(state, group, sampling_params, evaluation=False):
+        first_prefill = 2 if group[0].group_index == 1 else 3
+        _stamp_prefill_provenance(group, first=first_prefill, maximum=3, last=3)
+        return group
+
+    args = make_args(
+        rollout_batch_size=1,
+        fully_async_queue_policy="queue-max",
+        max_weight_staleness=0,
+        staleness_reference="prefill",
+    )
+    fn = make_fn(monkeypatch, args, data_source, generate=generate_with_prefill_version)
+    fn._weight_version = StubWeightVersion(3)
+    fn.commit_applied_weight_version(3)
+
+    output = await fn(RolloutFnTrainInput(rollout_id=0))
+
+    assert output.metrics["rollout/fully_async/stale_groups_dropped"] == 1
+    assert output.metrics["staleness/bound/rollout/count_1"] == 1
+    assert output.metrics["staleness/bound/train/count_0"] == 1
+    assert output.metrics["staleness/bound/train/max"] == 0
+    assert one_step_stale not in output.samples
+    assert on_policy in output.samples
 
 
 async def test_worker_failure_beats_queued_groups(monkeypatch):

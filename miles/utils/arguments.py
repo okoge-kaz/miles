@@ -733,7 +733,8 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "weight version. queue-recycle returns groups exceeding this threshold to the "
                     "data buffer; queue-max discards them. Which version the gap is measured from "
                     "is --staleness-reference. Only effective in fully async mode. None (default) "
-                    "disables staleness filtering."
+                    "disables staleness filtering. A group exactly at the bound is accepted: with "
+                    "the prefill reference, 0 means on-policy and 1 permits one policy-version gap."
                 ),
             )
             parser.add_argument(
