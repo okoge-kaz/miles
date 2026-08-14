@@ -2,6 +2,7 @@
 # This is a unified version supporting both local search and Google search, with optional log probability collection
 
 import asyncio
+import logging
 import os
 import re
 
@@ -11,12 +12,23 @@ from miles.rollout.sglang_rollout import GenerateState
 from miles.utils.http_utils import post
 from miles.utils.types import Sample
 
+logger = logging.getLogger(__name__)
+
+REQUIRED_STOP_STRINGS = frozenset({"</search>", "</answer>"})
+
+
+class SearchBackendError(RuntimeError):
+    """A search action could not obtain a valid observation."""
+
+
 # Configuration for Search-R1
 SEARCH_R1_CONFIGS = {
     # ============== General Configuration ==============
     "max_turns": 2,
     "topk": 3,
     "search_concurrency": 256,
+    "search_timeout": 60,
+    "search_max_attempts": 3,
     # ============== Search Backend Selection ==============
     "search_backend": "local",  # Options: "local" or "google"
     # ============== Local Search Configuration ==============
@@ -48,10 +60,29 @@ SEARCH_R1_CONFIGS = {
 # non-zero from the model's own knowledge, and nothing in the metrics says the
 # retriever was never used.
 def _env_int(name, default):
-    try:
-        return int(os.environ[name])
-    except (KeyError, ValueError):
+    raw = os.environ.get(name)
+    if raw is None:
         return default
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise ValueError(f"{name} must be an integer, got {raw!r}") from error
+    if value <= 0:
+        raise ValueError(f"{name} must be positive, got {value}")
+    return value
+
+
+def _env_float(name, default):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError as error:
+        raise ValueError(f"{name} must be a number, got {raw!r}") from error
+    if not 0 <= value <= 1:
+        raise ValueError(f"{name} must be between 0 and 1, got {value}")
+    return value
 
 
 SEARCH_R1_CONFIGS["max_turns"] = _env_int("SEARCH_R1_MAX_TURNS", SEARCH_R1_CONFIGS["max_turns"])
@@ -59,6 +90,11 @@ SEARCH_R1_CONFIGS["topk"] = _env_int("SEARCH_R1_TOPK", SEARCH_R1_CONFIGS["topk"]
 SEARCH_R1_CONFIGS["search_concurrency"] = _env_int(
     "SEARCH_R1_SEARCH_CONCURRENCY", SEARCH_R1_CONFIGS["search_concurrency"]
 )
+SEARCH_R1_CONFIGS["search_timeout"] = _env_int("SEARCH_R1_SEARCH_TIMEOUT", SEARCH_R1_CONFIGS["search_timeout"])
+SEARCH_R1_CONFIGS["search_max_attempts"] = _env_int(
+    "SEARCH_R1_SEARCH_MAX_ATTEMPTS", SEARCH_R1_CONFIGS["search_max_attempts"]
+)
+SEARCH_R1_CONFIGS["format_score"] = _env_float("SEARCH_R1_FORMAT_SCORE", SEARCH_R1_CONFIGS["format_score"])
 if os.environ.get("SEARCH_R1_SEARCH_URL"):
     SEARCH_R1_CONFIGS["local"]["search_url"] = os.environ["SEARCH_R1_SEARCH_URL"]
 
@@ -72,10 +108,15 @@ def _passages2string(retrieval_result):
     """
     format_reference = ""
     for idx, doc_item in enumerate(retrieval_result):
-        content = doc_item["document"]["contents"]
+        try:
+            content = doc_item["document"]["contents"]
+        except (KeyError, TypeError) as error:
+            raise SearchBackendError(f"search result {idx} has no document contents") from error
+        if not isinstance(content, str) or not content.strip():
+            raise SearchBackendError(f"search result {idx} has empty document contents")
         title = content.split("\n")[0]
         text = "\n".join(content.split("\n")[1:])
-        format_reference += f"Doc {idx+1}(Title: {title}) {text}\n"
+        format_reference += f"Doc {idx + 1}(Title: {title}) {text}\n"
 
     return format_reference
 
@@ -87,29 +128,39 @@ async def search(query: str) -> str:
     """
     backend = SEARCH_R1_CONFIGS["search_backend"]
 
-    if backend == "local":
-        from local_search_server import local_search
+    try:
+        if backend == "local":
+            from local_search_server import local_search
 
-        local_config = SEARCH_R1_CONFIGS["local"]
-        result = await local_search(
-            local_config["search_url"],
-            query,
-            SEARCH_R1_CONFIGS["topk"],
-            proxy=local_config["proxy"],
-        )
-    elif backend == "google":
-        from google_search_server import google_search
+            local_config = SEARCH_R1_CONFIGS["local"]
+            result = await local_search(
+                local_config["search_url"],
+                query,
+                SEARCH_R1_CONFIGS["topk"],
+                timeout=SEARCH_R1_CONFIGS["search_timeout"],
+                proxy=local_config["proxy"],
+                max_attempts=SEARCH_R1_CONFIGS["search_max_attempts"],
+            )
+            if not result:
+                raise SearchBackendError("local retriever returned no passages")
+        elif backend == "google":
+            from google_search_server import google_search
 
-        google_config = SEARCH_R1_CONFIGS["google"]
-        result = await google_search(
-            google_config["api_key"],
-            query,
-            SEARCH_R1_CONFIGS["topk"],
-            snippet_only=google_config["snippet_only"],
-            proxy=google_config["proxy"],
-        )
-    else:
-        raise ValueError(f"Unknown search backend: {backend}. " f"Must be either 'local' or 'google'.")
+            google_config = SEARCH_R1_CONFIGS["google"]
+            result = await google_search(
+                google_config["api_key"],
+                query,
+                SEARCH_R1_CONFIGS["topk"],
+                timeout=SEARCH_R1_CONFIGS["search_timeout"],
+                snippet_only=google_config["snippet_only"],
+                proxy=google_config["proxy"],
+            )
+        else:
+            raise ValueError(f"Unknown search backend: {backend}. Must be either 'local' or 'google'.")
+    except SearchBackendError:
+        raise
+    except Exception as error:
+        raise SearchBackendError(f"{backend} search failed: {error}") from error
 
     return _passages2string(result)
 
@@ -128,7 +179,9 @@ def postprocess_responses(resp: str) -> str:
     return (
         resp.split("</search>")[0] + "</search>"
         if "</search>" in resp
-        else resp.split("</answer>")[0] + "</answer>" if "</answer>" in resp else resp
+        else resp.split("</answer>")[0] + "</answer>"
+        if "</answer>" in resp
+        else resp
     )
 
 
@@ -145,10 +198,10 @@ def postprocess_predictions(prediction: str):
     return action, content
 
 
-async def execute_predictions(prediction: str) -> str:
+async def execute_predictions(prediction: str) -> tuple[str, bool]:
     action, content = postprocess_predictions(prediction)
 
-    if action == "search":
+    if action == "search" and content:
         search_query = content
         async with SEMAPHORE:
             search_results = await search(search_query)
@@ -166,22 +219,69 @@ If I want to give the final answer, I should put the answer between <answer> and
     return next_obs, done
 
 
+def _validate_sampling_params(sampling_params: dict) -> None:
+    stops = sampling_params.get("stop") or []
+    if isinstance(stops, str):
+        stops = [stops]
+    missing = REQUIRED_STOP_STRINGS.difference(stops)
+    if missing:
+        raise ValueError(
+            f"Search-R1 requires SGLang to stop at both action boundaries; missing stop strings: {sorted(missing)}"
+        )
+    if sampling_params.get("no_stop_trim") is not True:
+        raise ValueError(
+            "Search-R1 requires no_stop_trim=True so returned text and token/logprob arrays retain the tag"
+        )
+
+
+def _populate_sample(
+    sample: Sample,
+    prompt_text: str,
+    prompt_token_ids: list[int],
+    response: str,
+    response_token_ids: list[int],
+    loss_mask: list[int],
+    rollout_log_probs: list[float] | None,
+) -> None:
+    sample.tokens = prompt_token_ids + response_token_ids
+    sample.response_length = len(response_token_ids)
+    sample.response = response
+    sample.loss_mask = loss_mask
+    sample.prompt = prompt_text
+    sample.rollout_log_probs = rollout_log_probs
+    sample.validate()
+
+
+def _record_rollout_metrics(sample: Sample, *, turns: int, search_calls: int, error: str | None = None) -> None:
+    sample.metadata = dict(sample.metadata or {})
+    sample.metadata["search_r1_turns"] = turns
+    sample.metadata["search_r1_search_calls"] = search_calls
+    if error is not None:
+        sample.metadata["search_r1_error"] = error
+
+
 async def generate(args, sample: Sample, sampling_params) -> Sample:
     assert not args.partial_rollout, "Partial rollout is not supported for this function at the moment."
+    _validate_sampling_params(sampling_params)
 
     state = GenerateState(args)
 
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
 
-    # Handle partial rollout samples: continue generation from existing response
     prompt_text = sample.prompt
-    prompt_tokens_ids = state.tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
+    if not isinstance(prompt_text, str):
+        raise TypeError(
+            "Search-R1 requires a rendered string prompt; pass --apply-chat-template for the training parquet"
+        )
+    prompt_token_ids = state.tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
     response = ""
     response_token_ids = []
     loss_mask = []
     rollout_log_probs = [] if SEARCH_R1_CONFIGS["return_logprob"] else None
+    turns_used = 0
+    search_calls = 0
 
-    for _turn_idx in range(SEARCH_R1_CONFIGS["max_turns"]):
+    for turn_index in range(SEARCH_R1_CONFIGS["max_turns"]):
         payload = {
             "text": prompt_text + response,
             "sampling_params": sampling_params,
@@ -191,10 +291,23 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             payload["return_logprob"] = True
 
         output = await post(url, payload)
+        meta_info = output["meta_info"]
+        finish_type = meta_info["finish_reason"]["type"]
+        turns_used = turn_index + 1
+        sample.update_from_meta_info(args, meta_info)
 
         # abort
-        if output["meta_info"]["finish_reason"]["type"] == "abort":
-            sample.status = Sample.Status.ABORTED
+        if finish_type == "abort":
+            _populate_sample(
+                sample,
+                prompt_text,
+                prompt_token_ids,
+                response,
+                response_token_ids,
+                loss_mask,
+                rollout_log_probs,
+            )
+            _record_rollout_metrics(sample, turns=turns_used, search_calls=search_calls, error="sglang_abort")
             return sample
 
         cur_response = output["text"]
@@ -202,7 +315,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         # Extract tokens and log probs based on configuration
         if SEARCH_R1_CONFIGS["return_logprob"]:
             # Extract log probs from output - required for TIS metrics
-            if "output_token_logprobs" not in output["meta_info"]:
+            if "output_token_logprobs" not in meta_info:
                 raise RuntimeError(
                     "output_token_logprobs not found in output meta_info. "
                     "Make sure 'return_logprob': True is set in the payload."
@@ -211,8 +324,8 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             # Use token IDs and log probs directly from output_token_logprobs
             # This ensures perfect alignment between tokens and log probs
             # output_token_logprobs format: [[log_prob, token_id, ...], ...]
-            cur_response_token_ids = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
-            cur_response_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
+            cur_response_token_ids = [item[1] for item in meta_info["output_token_logprobs"]]
+            cur_response_log_probs = [item[0] for item in meta_info["output_token_logprobs"]]
         else:
             # When not collecting log probs, we can safely postprocess the response
             cur_response = postprocess_responses(cur_response)
@@ -226,11 +339,32 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         # Add log probs if enabled
         if SEARCH_R1_CONFIGS["return_logprob"]:
             rollout_log_probs += cur_response_log_probs
+            assert len(response_token_ids) == len(rollout_log_probs), (
+                f"Token/logp length mismatch: {len(response_token_ids)} tokens vs {len(rollout_log_probs)} logps"
+            )
 
-        if output["meta_info"]["finish_reason"]["type"] == "length":
+        if finish_type == "length":
             break
 
-        next_obs, done = await execute_predictions(cur_response)
+        action, _ = postprocess_predictions(cur_response)
+        if action == "search":
+            search_calls += 1
+        try:
+            next_obs, done = await execute_predictions(cur_response)
+        except SearchBackendError as error:
+            sample.status = Sample.Status.ABORTED
+            _populate_sample(
+                sample,
+                prompt_text,
+                prompt_token_ids,
+                response,
+                response_token_ids,
+                loss_mask,
+                rollout_log_probs,
+            )
+            _record_rollout_metrics(sample, turns=turns_used, search_calls=search_calls, error=str(error))
+            logger.warning("Aborting Search-R1 trajectory after retriever failure: %s", error)
+            return sample
         if done:
             break
 
@@ -245,28 +379,20 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             rollout_log_probs += [0.0] * len(obs_tokens_ids)
 
             # Verify alignment when collecting log probs
-            assert len(response_token_ids) == len(
-                rollout_log_probs
-            ), f"Token/logp length mismatch: {len(response_token_ids)} tokens vs {len(rollout_log_probs)} logps"
+            assert len(response_token_ids) == len(rollout_log_probs), (
+                f"Token/logp length mismatch: {len(response_token_ids)} tokens vs {len(rollout_log_probs)} logps"
+            )
 
-    # Store statistics for wandb logging
-    sample.tokens = prompt_tokens_ids + response_token_ids
-    sample.response_length = len(response_token_ids)
-    sample.response = response
-    sample.loss_mask = loss_mask
-    sample.prompt = prompt_text
-
-    # Store log probs if enabled
-    if SEARCH_R1_CONFIGS["return_logprob"]:
-        sample.rollout_log_probs = rollout_log_probs if rollout_log_probs else None
-
-    match output["meta_info"]["finish_reason"]["type"]:
-        case "length":
-            sample.status = Sample.Status.TRUNCATED
-        case "abort":
-            sample.status = Sample.Status.ABORTED
-        case "stop":
-            sample.status = Sample.Status.COMPLETED
+    _populate_sample(
+        sample,
+        prompt_text,
+        prompt_token_ids,
+        response,
+        response_token_ids,
+        loss_mask,
+        rollout_log_probs,
+    )
+    _record_rollout_metrics(sample, turns=turns_used, search_calls=search_calls)
 
     return sample
 
@@ -284,7 +410,7 @@ async def reward_func(args, sample, **kwargs):
     score = compute_score_em(
         solution_str=sample.prompt + sample.response,
         ground_truth=sample.label["ground_truth"],
-        format_score=SEARCH_R1_CONFIGS["format_score"],
+        structure_format_score=SEARCH_R1_CONFIGS["format_score"],
     )
 
     return score

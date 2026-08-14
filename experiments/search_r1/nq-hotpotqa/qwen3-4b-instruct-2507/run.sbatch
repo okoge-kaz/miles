@@ -29,13 +29,26 @@ source "${REPO_ROOT}/experiments/env.sh"
 
 : "${WANDB_API_KEY:?set WANDB_API_KEY, or put an api.wandb.ai entry in ~/.netrc}"
 
-for asset in "${DATASET_DIR}/search-r1/e5_Flat.index" "${DATASET_DIR}/search-r1/wiki-18.jsonl" \
+for asset in "${DATASET_DIR}/searchr1-nq-hotpotqa/train.parquet" \
+             "${DATASET_DIR}/search-r1/e5_Flat.index" \
+             "${DATASET_DIR}/search-r1/wiki-18.jsonl" \
+             "${DATASET_DIR}/search-r1/eval/nq-miles.jsonl" \
+             "${DATASET_DIR}/search-r1/eval/hotpotqa-miles.jsonl" \
+             "${DATASET_DIR}/search-r1/eval/triviaqa-miles.jsonl" \
+             "${DATASET_DIR}/search-r1/eval/popqa-miles.jsonl" \
+             "${DATASET_DIR}/search-r1/eval/2wikimultihopqa-miles.jsonl" \
+             "${DATASET_DIR}/search-r1/eval/musique-miles.jsonl" \
+             "${DATASET_DIR}/search-r1/eval/bamboogle-miles.jsonl" \
              "${HF_CKPT_DIR}/e5-base-v2/.download_complete"; do
-    [[ -e "${asset}" ]] || { echo "missing ${asset}; run experiments/setup/prepare_search_r1.sbatch first"; exit 1; }
+    [[ -e "${asset}" ]] || {
+        echo "missing ${asset}; stage datasets.txt assets, then run experiments/setup/prepare_search_r1.sbatch"
+        exit 1
+    }
 done
 
 MODEL_NAME=Qwen3-4B-Instruct-2507
 PLACEMENT=colocated
+TASK_FAMILY=search_r1
 DATASET_TAG=search-r1-nq-hotpotqa
 PROMPT_DATA=/data/searchr1-nq-hotpotqa/train.parquet
 
@@ -46,6 +59,7 @@ PROMPT_DATA=/data/searchr1-nq-hotpotqa/train.parquet
 : "${EPS_CLIP_C:=}"
 : "${RATIO_DENOMINATOR:=actor}"
 : "${IS_CORRECTION:=none}"
+: "${KL_LOSS_COEF:=0.00}"
 : "${TIS_CLIP:=2.0}"
 : "${TIS_CLIP_LOW:=0}"
 : "${MIS_PROFILE:=}"
@@ -63,12 +77,21 @@ PROMPT_DATA=/data/searchr1-nq-hotpotqa/train.parquet
 
 : "${SEARCH_MAX_TURNS:=3}"
 : "${SEARCH_TOPK:=3}"
-# Searches in flight against the retriever. The upstream default is 256, which is
-# far past what one uvicorn worker doing brute-force search over a 21M-vector flat
-# index can accept: the listen backlog overflows and aiohttp reports it as
-# ECONNREFUSED / ECONNRESET, i.e. as empty observations rather than as an error.
+# Searches in flight against the retriever. The server coalesces nearby requests
+# into one native batch; this bound limits how many trajectories can wait behind
+# a 21M-vector flat-index scan and keeps timeout behavior predictable.
 : "${SEARCH_CONCURRENCY:=16}"
+: "${SEARCH_TIMEOUT:=60}"
+: "${SEARCH_MAX_ATTEMPTS:=3}"
+# The Search-R1 paper uses outcome exact match. Set 0.2 to reproduce the
+# optional format shaping used by the legacy Miles example.
+: "${SEARCH_FORMAT_SCORE:=0.0}"
 : "${RETRIEVER_PORT:=8000}"
+# Native PyTorch/FAISS calls are serialized through one dynamic batch worker;
+# nearby rollout requests share one encoder pass and one 65 GB index scan.
+: "${RETRIEVER_BATCH_MAX_REQUESTS:=64}"
+: "${RETRIEVER_BATCH_WAIT_MS:=50}"
+: "${RETRIEVER_FAISS_THREADS:=32}"
 
 : "${ACTOR_NUM_NODES:=1}"
 : "${ACTOR_GPUS_PER_NODE:=8}"
@@ -90,16 +113,26 @@ PROMPT_DATA=/data/searchr1-nq-hotpotqa/train.parquet
 : "${NUM_ROLLOUT:=3000}"
 : "${DYNAMIC_SAMPLING:=1}"
 : "${DUMP_TRAIN_DATA:=0}"
-# Raise on a bring-up run: eval here is the whole benchmark, not a sample of it.
-: "${EVAL_INTERVAL:=20}"
+# Reported evaluation is run from HF exports, off the training critical path.
+: "${EVAL_INTERVAL:=0}"
+: "${SKIP_EVAL_BEFORE_TRAIN:=1}"
 
-export ADVANTAGE_ESTIMATOR ENTROPY_COEF EPS_CLIP EPS_CLIP_HIGH EPS_CLIP_C RATIO_DENOMINATOR IS_CORRECTION TIS_CLIP TIS_CLIP_LOW MIS_PROFILE USE_OPSM OPSM_DELTA TRAIN_SEED ROLLOUT_SEED MODEL_NAME PLACEMENT DATASET_TAG PROMPT_DATA LR MAX_RESPONSE_LEN NUM_STEPS_PER_ROLLOUT
-export ROLLOUT_MAX_CONTEXT_LEN SEARCH_MAX_TURNS SEARCH_TOPK SEARCH_CONCURRENCY RETRIEVER_PORT
+# torch_dist is for resume; HF snapshots are the lightweight inference series
+# consumed by experiments/src/offline_eval/run_search_r1_eval.sbatch.
+: "${SAVE_INTERVAL:=20}"
+: "${SAVE_RETAIN_INTERVAL:=100}"
+: "${SAVE_HF:=1}"
+: "${HF_SAVE_INTERVAL:=20}"
+
+export ADVANTAGE_ESTIMATOR ENTROPY_COEF EPS_CLIP EPS_CLIP_HIGH EPS_CLIP_C RATIO_DENOMINATOR IS_CORRECTION KL_LOSS_COEF TIS_CLIP TIS_CLIP_LOW MIS_PROFILE USE_OPSM OPSM_DELTA TRAIN_SEED ROLLOUT_SEED MODEL_NAME PLACEMENT TASK_FAMILY DATASET_TAG PROMPT_DATA LR MAX_RESPONSE_LEN NUM_STEPS_PER_ROLLOUT
+export ROLLOUT_MAX_CONTEXT_LEN SEARCH_MAX_TURNS SEARCH_TOPK SEARCH_CONCURRENCY SEARCH_TIMEOUT SEARCH_MAX_ATTEMPTS SEARCH_FORMAT_SCORE RETRIEVER_PORT
+export RETRIEVER_BATCH_MAX_REQUESTS RETRIEVER_BATCH_WAIT_MS RETRIEVER_FAISS_THREADS
 export ACTOR_NUM_NODES ACTOR_GPUS_PER_NODE ROLLOUT_NUM_GPUS
 export TENSOR_PARALLEL_SIZE CONTEXT_PARALLEL_SIZE EXPERT_PARALLEL_SIZE MAX_TOKENS_PER_GPU
 export ROLLOUT_NUM_GPUS_PER_ENGINE SGLANG_MEM_FRACTION
 export ROLLOUT_BATCH_SIZE N_SAMPLES_PER_PROMPT GLOBAL_BATCH_SIZE NUM_ROLLOUT
-export DYNAMIC_SAMPLING DUMP_TRAIN_DATA EVAL_INTERVAL
+export DYNAMIC_SAMPLING DUMP_TRAIN_DATA EVAL_INTERVAL SKIP_EVAL_BEFORE_TRAIN
+export SAVE_INTERVAL SAVE_RETAIN_INTERVAL SAVE_HF HF_SAVE_INTERVAL
 
 source "${REPO_ROOT}/experiments/common/run_identity.sh"
 export RUN_NAME CONFIG_TAG CKPT_PATH

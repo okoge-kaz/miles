@@ -29,9 +29,9 @@ export PYTHONPATH="/root/miles/examples/experimental/search-r1:${PYTHONPATH:-}"
 
 # --- retriever ---------------------------------------------------------------
 # One process per node, holding the 65 GB FAISS index and the e5 query encoder.
-# It has to be up before the first rollout: generate_with_search treats a failed
-# search as an empty observation, so a missing retriever does not crash the run,
-# it silently trains on unanswerable prompts.
+# It has to be up before the first rollout. Runtime request failures are retried
+# and then abort the affected trajectory, but a dead server would otherwise
+# waste every rollout attempt.
 # The address the rollout uses. RAY_HEAD_IP is node 0's routable address, which
 # is what a Ray actor can reach; loopback is not, even co-located.
 RETRIEVER_HOST="${RAY_HEAD_IP:-127.0.0.1}"
@@ -47,9 +47,30 @@ if [[ "${SLURM_NODEID:-0}" == "0" ]]; then
         --corpus /data/search-r1/wiki-18.jsonl \
         --encoder /ckpt/hf/e5-base-v2 \
         --port "${RETRIEVER_PORT}" \
-        --topk "${SEARCH_TOPK}" &
+        --topk "${SEARCH_TOPK}" \
+        --faiss-threads "${RETRIEVER_FAISS_THREADS}" \
+        --batch-max-requests "${RETRIEVER_BATCH_MAX_REQUESTS}" \
+        --batch-wait-ms "${RETRIEVER_BATCH_WAIT_MS}" &
     RETRIEVER_PID=$!
-    trap 'kill ${RETRIEVER_PID} 2>/dev/null || true' EXIT
+
+    cleanup() {
+        local status=$?
+        trap - EXIT
+        touch "${RAY_DONE_FLAG}" 2>/dev/null || true
+        if [[ -n "${RAY_CLIENT_PID:-}" ]] && kill -0 "${RAY_CLIENT_PID}" 2>/dev/null; then
+            kill "${RAY_CLIENT_PID}" 2>/dev/null || true
+            wait "${RAY_CLIENT_PID}" 2>/dev/null || true
+        fi
+        if kill -0 "${RETRIEVER_PID}" 2>/dev/null; then
+            kill "${RETRIEVER_PID}" 2>/dev/null || true
+        fi
+        wait "${RETRIEVER_PID}" 2>/dev/null || true
+        exit "${status}"
+    }
+    # ray_cluster.sh installs its own EXIT trap. Compose that notification with
+    # retriever cleanup instead of replacing it (which would strand worker nodes
+    # in a multi-node variant of this recipe).
+    trap cleanup EXIT
 
     echo "waiting for retriever on ${RETRIEVER_HOST}:${RETRIEVER_PORT}"
     for _ in $(seq 1 240); do
@@ -85,8 +106,15 @@ CKPT_ARGS=(
    --ref-load      /ckpt/megatron/Qwen3-4B-Instruct-2507_torch_dist
    --load          "${CKPT_PATH}"
    --save          "${CKPT_PATH}"
-   --save-interval 20
+   --save-interval "${SAVE_INTERVAL}"
+   --save-retain-interval "${SAVE_RETAIN_INTERVAL}"
 )
+if [[ "${SAVE_HF}" != "0" ]]; then
+   CKPT_ARGS+=(--save-hf "${CKPT_PATH}/hf/{rollout_id}")
+   if [[ -n "${HF_SAVE_INTERVAL:-}" ]]; then
+      CKPT_ARGS+=(--hf-save-interval "${HF_SAVE_INTERVAL}")
+   fi
+fi
 
 ROLLOUT_ARGS=(
    --prompt-data "${PROMPT_DATA}"
@@ -106,6 +134,9 @@ ROLLOUT_ARGS=(
    # never a long chain. The retrieved passages dominate the token count and
    # they are not generated, so this stays small.
    --rollout-max-response-len "${MAX_RESPONSE_LEN}"
+   # Keep the closing action tag in text/tokens/logprobs. generate_with_search
+   # parses it to decide whether to retrieve or finish.
+   --rollout-stop '</search>' '</answer>'
    # Context has to hold max_turns worth of retrieved passages on top of the
    # question, which is what actually bounds the trajectory.
    --rollout-max-context-len "${ROLLOUT_MAX_CONTEXT_LEN}"
@@ -117,7 +148,11 @@ ROLLOUT_ARGS=(
    --custom-rm-path generate_with_search.reward_func
 )
 if [[ "${DYNAMIC_SAMPLING:-1}" == "1" ]]; then
-   ROLLOUT_ARGS+=(--dynamic-sampling-filter-path miles.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std)
+   ROLLOUT_ARGS+=(--dynamic-sampling-filter-path miles.rollout.filter_hub.dynamic_sampling_filters.check_no_aborted_and_reward_nonzero_std)
+else
+   # Infrastructure failures are never valid training data, even when active
+   # sampling by reward variance is intentionally disabled.
+   ROLLOUT_ARGS+=(--dynamic-sampling-filter-path miles.rollout.filter_hub.dynamic_sampling_filters.check_no_aborted)
 fi
 
 TELEMETRY_ARGS=(
@@ -138,16 +173,19 @@ else
    TELEMETRY_ARGS+=(--use-rollout-entropy)
 fi
 
-# The seven FlashRAG QA sets Search-R1 reports, so the numbers are comparable to
-# published ones instead of to a held-out split of our own.
-EVAL_ARGS=(
-   --eval-interval "${EVAL_INTERVAL}"
-   --eval-config /root/miles/experiments/configs/eval_search_r1.yaml
-)
-# miles evaluates once before the first training step regardless of the interval,
-# so a bring-up run reaches the eval path before it has proved the training one.
-if [[ "${SKIP_EVAL_BEFORE_TRAIN:-0}" != "0" ]]; then
-   EVAL_ARGS+=(--skip-eval-before-train)
+# EVAL_INTERVAL=0 deliberately passes no eval arguments.  Search-R1 evaluation
+# starts a tool environment and thousands of multi-turn episodes, so it belongs
+# in run_search_r1_eval.sbatch against the HF snapshots above, outside the
+# wall-clock path being measured.
+EVAL_ARGS=()
+if [[ "${EVAL_INTERVAL}" != "0" ]]; then
+   EVAL_ARGS=(
+      --eval-interval "${EVAL_INTERVAL}"
+      --eval-config /root/miles/experiments/configs/eval_search_r1.yaml
+   )
+   if [[ "${SKIP_EVAL_BEFORE_TRAIN:-0}" != "0" ]]; then
+      EVAL_ARGS+=(--skip-eval-before-train)
+   fi
 fi
 
 PERF_ARGS=(
@@ -174,7 +212,7 @@ GRPO_ARGS=(
    --rollout-seed "${ROLLOUT_SEED}"
    --advantage-estimator "${ADVANTAGE_ESTIMATOR}"
    --use-kl-loss
-   --kl-loss-coef 0.00
+   --kl-loss-coef "${KL_LOSS_COEF}"
    --kl-loss-type low_var_kl
    --entropy-coef "${ENTROPY_COEF}"
    --eps-clip "${EPS_CLIP}"
@@ -228,7 +266,8 @@ WANDB_ARGS=(
    --use-wandb
    --wandb-project "off-policy-${DATASET_TAG}"
    --wandb-group "${RUN_NAME}"
-   --wandb-key "${WANDB_API_KEY}"
+   # wandb reads WANDB_API_KEY from the inherited environment. Passing it as a
+   # CLI argument would expose it in Megatron's full argument dump.
 )
 
 RUNTIME_ENV_JSON="{
@@ -240,10 +279,16 @@ RUNTIME_ENV_JSON="{
     \"SEARCH_R1_MAX_TURNS\": \"${SEARCH_MAX_TURNS}\",
     \"SEARCH_R1_TOPK\": \"${SEARCH_TOPK}\",
     \"SEARCH_R1_SEARCH_CONCURRENCY\": \"${SEARCH_CONCURRENCY}\",
+    \"SEARCH_R1_SEARCH_TIMEOUT\": \"${SEARCH_TIMEOUT}\",
+    \"SEARCH_R1_SEARCH_MAX_ATTEMPTS\": \"${SEARCH_MAX_ATTEMPTS}\",
+    \"SEARCH_R1_FORMAT_SCORE\": \"${SEARCH_FORMAT_SCORE}\",
     \"no_proxy\": \"${RETRIEVER_HOST},127.0.0.1,localhost\"
   }
 }"
 
+# Keep the full command out of shell xtrace. W&B gets its API key only from the
+# inherited environment, while Ray still streams the training logs normally.
+set +x
 ray job submit --address="http://127.0.0.1:8265" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 train.py \
@@ -260,4 +305,26 @@ ray job submit --address="http://127.0.0.1:8265" \
    "${PERF_ARGS[@]}" \
    "${EVAL_ARGS[@]}" \
    "${SGLANG_ARGS[@]}" \
-   "${MISC_ARGS[@]}"
+   "${MISC_ARGS[@]}" &
+RAY_CLIENT_PID=$!
+
+# A missing retriever must fail the whole job. Aborted trajectories are useful
+# for a transient request failure, but they are not a substitute for a live
+# environment: dynamic sampling can otherwise fill a batch with answers that
+# never searched and silently train a parametric-memory QA workload.
+while kill -0 "${RAY_CLIENT_PID}" 2>/dev/null && kill -0 "${RETRIEVER_PID}" 2>/dev/null; do
+    sleep 5
+done
+
+if ! kill -0 "${RETRIEVER_PID}" 2>/dev/null; then
+    retriever_status=0
+    wait "${RETRIEVER_PID}" || retriever_status=$?
+    echo "retriever exited unexpectedly with status ${retriever_status}; terminating the Ray job client"
+    kill "${RAY_CLIENT_PID}" 2>/dev/null || true
+    wait "${RAY_CLIENT_PID}" 2>/dev/null || true
+    exit 1
+fi
+
+ray_status=0
+wait "${RAY_CLIENT_PID}" || ray_status=$?
+exit "${ray_status}"

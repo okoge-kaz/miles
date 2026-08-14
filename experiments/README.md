@@ -229,6 +229,13 @@ every AIME year at `n=16` and a 32768 generation budget, run against the HF
 snapshots `--save-hf` leaves behind, in a separate job that costs the training run
 nothing. See `math_async/dapo-math-p10-90/README.md` §2.
 
+Search-R1 uses the analogous
+`experiments/src/offline_eval/run_search_r1_eval.sbatch`.  Its dedicated client
+reuses the training multi-turn generation/reward functions, runs the local
+wiki-18 retriever, and reports both exact match and interaction cost (search
+calls, LLM turns, and masked observation tokens).  The Search-R1 recipe exports
+HF snapshots every 20 rollouts and leaves in-run evaluation off by default.
+
 Everything listed must already be in `prompt`/`label` shape, since the global
 `--input-key`/`--label-key` apply to eval too. `setup/build_math_jsonl.py`
 converts a raw `problem`/`answer` file into that shape; AIME-2025 and MATH-500

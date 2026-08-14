@@ -3,7 +3,7 @@ import torch
 from miles.rollout.filter_hub.base_types import DynamicFilterOutput
 from miles.utils.types import Sample
 
-__all__ = ["check_reward_nonzero_std", "check_no_aborted"]
+__all__ = ["check_reward_nonzero_std", "check_no_aborted", "check_no_aborted_and_reward_nonzero_std"]
 
 
 def _flatten_samples(samples: list[Sample | list[Sample]]):
@@ -29,3 +29,11 @@ def check_no_aborted(args, samples: list[Sample | list[Sample]], **kwargs):
     if any(s.status == Sample.Status.ABORTED for s in _flatten_samples(samples)):
         return DynamicFilterOutput(keep=False, reason="group_has_aborted")
     return DynamicFilterOutput(keep=True)
+
+
+def check_no_aborted_and_reward_nonzero_std(args, samples: list[Sample | list[Sample]], **kwargs):
+    """Reject infrastructure failures before inspecting numeric rewards."""
+    status_result = check_no_aborted(args, samples, **kwargs)
+    if not status_result.keep:
+        return status_result
+    return check_reward_nonzero_std(args, samples, **kwargs)

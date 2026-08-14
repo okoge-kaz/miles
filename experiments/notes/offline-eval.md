@@ -64,6 +64,64 @@ partition=batch,batch_short` without a kill.
 per prompt and skips indices already present, so re-submitting after a
 wall-clock kill continues rather than restarting.
 
+## Search-R1
+
+Search-R1 has a separate runner because the AIME client performs one generation
+request per answer.  A search trajectory must instead alternate LLM generation
+and retrieval, append each `<information>...</information>` observation, and
+resume generation.  The offline driver imports the same
+`generate_with_search.generate` and `reward_func` functions as training; it does
+not maintain a second inference implementation.
+
+Evaluate one checkpoint:
+
+```
+sbatch -A coreai_horizon_dilations \
+  --export=ALL,CKPT=/ckpt/training/search_r1/.../hf/19,UNPAD_VOCAB=1 \
+  experiments/src/offline_eval/run_search_r1_eval.sbatch
+```
+
+The job starts an 8-way data-parallel SGLang server and the CPU e5/wiki-18
+retriever, then evaluates NQ, HotpotQA, TriviaQA, PopQA, 2WikiMultiHopQA,
+MuSiQue, and Bamboogle.  Defaults match training: temperature/top-p 1.0,
+512 generated tokens per LLM turn, at most three LLM turns, top-3 passages, and
+outcome exact match with no format shaping.  Six sets are capped at 500 prompts;
+Bamboogle contains 125, for 3,125 trajectories per checkpoint at avg@1.
+
+```
+python3 experiments/src/offline_eval/report_search_r1.py \
+  $DATASET_DIR/offline_eval/search_r1/<tag>
+```
+
+In addition to EM, the report gives retriever calls per trajectory (`search`),
+LLM generation calls per trajectory (`turns`), search-use and final-answer
+rates, truncation, generated tokens, and injected observation tokens.  The
+observation count is derived from `loss_mask == 0` and includes both retrieval
+blocks and invalid-action feedback; it is therefore also a check that
+environment text did not become policy loss.  Aborted trajectories are treated
+as infrastructure failures, leave their prompt incomplete, and make the job
+fail rather than lowering model accuracy silently.  Re-submission resumes from
+the completed prompt records.
+
+For a checkpoint series, first inspect, then probe one checkpoint end-to-end,
+then fan out:
+
+```
+SOURCE_ROOT=<host Search-R1 run root> SWEEP_NAME=<name> \
+  experiments/src/offline_eval/submit_search_r1_sweep.sh check
+SOURCE_ROOT=<host Search-R1 run root> SWEEP_NAME=<name> \
+  experiments/src/offline_eval/submit_search_r1_sweep.sh probe
+SOURCE_ROOT=<host Search-R1 run root> SWEEP_NAME=<name> \
+  experiments/src/offline_eval/submit_search_r1_sweep.sh all
+```
+
+`<search>` and `<information>` are deliberately ordinary text, not tokenizer
+special tokens.  SGLang matches `</search>`/`</answer>` as stop strings, while
+the host inserts and normally tokenizes the information block before the next
+turn.  The offline driver records the tag token IDs and fails if any tag does
+not encode/decode exactly; adding special tokens would change the vocabulary and
+would require training new embedding rows.
+
 ## What is measured, and why it differs from in-run eval
 
 In-run eval was AIME-2025 only at n=8 and existed to show that a run is learning.

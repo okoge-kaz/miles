@@ -22,10 +22,12 @@
 # A run that lifts nq while bamboogle stays flat has learned the retriever's
 # quirks on the training distribution, not multi-hop QA.
 #
-# Cost: eval shares the training engines, and every sample is a multi-turn
-# episode with retrieval between turns, so this is far dearer per prompt than a
-# math eval. Hence avg@1 on capped subsets.
-#   7 sets x 500 x 1 = 3500 episodes per eval interval
+# This remains available for an explicitly requested in-run diagnostic.  The
+# recipe default is EVAL_INTERVAL=0; reportable numbers come from
+# src/offline_eval/run_search_r1_eval.sbatch against saved HF checkpoints so
+# evaluation cannot perturb training wall-clock.  Every sample is a multi-turn
+# episode with retrieval between turns, hence avg@1 on capped subsets.
+#   6 sets x 500 + Bamboogle 125 = 3125 episodes per checkpoint
 
 eval:
   defaults:

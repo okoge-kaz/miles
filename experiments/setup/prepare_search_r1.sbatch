@@ -96,7 +96,37 @@ date -u +%FT%TZ > /ckpt/hf/e5-base-v2/.download_complete
 '
 fi
 
+# --- 4. train/eval task data -------------------------------------------------
+# stage_all.sh downloads these two Hugging Face datasets. Convert FlashRAG's
+# bare question/answer rows to the same prompt/label schema as the training
+# parquet, so the rollout and reward paths are identical during evaluation.
+TRAIN_DATA="${DATASET_DIR}/searchr1-nq-hotpotqa/train.parquet"
+FLASHRAG_DIR="${DATASET_DIR}/flashrag-datasets"
+EVAL_DIR="${SEARCH_DIR}/eval"
+
+[[ -s "${TRAIN_DATA}" ]] || {
+    echo "missing ${TRAIN_DATA}; stage searchr1-nq-hotpotqa from experiments/setup/datasets.txt"
+    exit 1
+}
+[[ -d "${FLASHRAG_DIR}" ]] || {
+    echo "missing ${FLASHRAG_DIR}; stage flashrag-datasets from experiments/setup/datasets.txt"
+    exit 1
+}
+
+python3 "${REPO_ROOT}/experiments/src/search_r1/build_eval.py" \
+    --flashrag-dir "${FLASHRAG_DIR}" \
+    --out-dir "${EVAL_DIR}"
+
+for name in nq hotpotqa triviaqa popqa 2wikimultihopqa musique bamboogle; do
+    [[ -s "${EVAL_DIR}/${name}-miles.jsonl" ]] || {
+        echo "missing converted eval set ${EVAL_DIR}/${name}-miles.jsonl"
+        exit 1
+    }
+done
+
 echo
 echo "search-r1 assets ready:"
 ls -la "${SEARCH_DIR}"
 echo "  encoder: ${E5}"
+echo "  train:   ${TRAIN_DATA}"
+echo "  eval:    ${EVAL_DIR}"

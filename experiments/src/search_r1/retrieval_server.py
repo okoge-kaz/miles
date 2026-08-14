@@ -17,12 +17,33 @@ and a flat inner-product scan is bandwidth-bound anyway.
 """
 
 import argparse
+import asyncio
 import json
 import logging
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class SearchRequest:
+    """One HTTP request after validation, without its event-loop future."""
+
+    queries: tuple[str, ...]
+    topk: int
+    return_scores: bool
+
+
+@dataclass
+class _PendingRequest:
+    request: SearchRequest
+    future: asyncio.Future
 
 
 def load_corpus(path):
@@ -80,11 +101,145 @@ class Encoder:
         return emb.cpu().numpy().astype(np.float32)
 
 
-def build_app(index, titles, texts, encoder, default_topk):
+def search_batch(index, titles, texts, encoder, requests):
+    """Run concurrent HTTP requests as one encoder and FAISS operation.
+
+    FAISS and the PyTorch encoder are native, threaded objects. Calling the same
+    instances from FastAPI's request thread pool is not safe: the first
+    concurrent rollout searches can terminate the whole server. Batching also
+    turns N full scans of the 65 GB flat index into one matrix search.
+    """
+    queries = [query for request in requests for query in request.queries]
+    max_topk = max(request.topk for request in requests)
+    embeddings = encoder(queries)
+    scores, ids = index.search(embeddings, max_topk)
+
+    responses = []
+    row_offset = 0
+    for request in requests:
+        result_groups = []
+        for row_scores, row_ids in zip(
+            scores[row_offset : row_offset + len(request.queries)],
+            ids[row_offset : row_offset + len(request.queries)],
+            strict=True,
+        ):
+            hits = []
+            for score, idx in zip(row_scores[: request.topk], row_ids[: request.topk], strict=True):
+                idx = int(idx)
+                if idx < 0:
+                    continue
+                doc = {"contents": f'"{titles[idx]}"\n{texts[idx]}'}
+                hit = {"document": doc}
+                if request.return_scores:
+                    hit["score"] = float(score)
+                hits.append(hit)
+            result_groups.append(hits)
+        responses.append({"result": result_groups})
+        row_offset += len(request.queries)
+    return responses
+
+
+class RequestBatcher:
+    """Serialize native retrieval while coalescing nearby HTTP requests."""
+
+    def __init__(
+        self,
+        search: Callable[[list[SearchRequest]], list[dict[str, Any]]],
+        max_requests: int,
+        wait_ms: int,
+    ):
+        if max_requests < 1:
+            raise ValueError(f"max_requests must be positive, got {max_requests}")
+        if wait_ms < 0:
+            raise ValueError(f"wait_ms must be non-negative, got {wait_ms}")
+        self._search = search
+        self._max_requests = max_requests
+        self._wait_seconds = wait_ms / 1000
+        self._queue: asyncio.Queue | None = None
+        self._worker: asyncio.Task | None = None
+        self._executor: ThreadPoolExecutor | None = None
+
+    async def start(self):
+        self._queue = asyncio.Queue()
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="search-r1-retrieval")
+        self._worker = asyncio.create_task(self._run(), name="search-r1-retrieval-batcher")
+
+    async def stop(self):
+        if self._worker is None:
+            return
+        self._worker.cancel()
+        with suppress(asyncio.CancelledError):
+            await self._worker
+        self._worker = None
+        self._executor.shutdown(wait=True, cancel_futures=True)
+        self._executor = None
+
+    async def submit(self, request):
+        if self._queue is None or self._worker is None or self._worker.done():
+            raise RuntimeError("retrieval batch worker is not running")
+        future = asyncio.get_running_loop().create_future()
+        await self._queue.put(_PendingRequest(request=request, future=future))
+        return await future
+
+    async def _collect_batch(self):
+        first = await self._queue.get()
+        pending = [first]
+        deadline = asyncio.get_running_loop().time() + self._wait_seconds
+        while len(pending) < self._max_requests:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                break
+            try:
+                pending.append(await asyncio.wait_for(self._queue.get(), timeout=remaining))
+            except TimeoutError:
+                break
+        return pending
+
+    async def _run(self):
+        while True:
+            pending = await self._collect_batch()
+            requests = [item.request for item in pending]
+            query_count = sum(len(request.queries) for request in requests)
+            logger.info("retrieval batch: %d requests, %d queries", len(requests), query_count)
+            try:
+                responses = await asyncio.get_running_loop().run_in_executor(self._executor, self._search, requests)
+                if len(responses) != len(pending):
+                    raise RuntimeError(
+                        f"retrieval returned {len(responses)} responses for {len(pending)} HTTP requests"
+                    )
+            except Exception as error:
+                logger.exception("retrieval batch failed")
+                for item in pending:
+                    if not item.future.done():
+                        item.future.set_exception(error)
+            else:
+                for item, response in zip(pending, responses, strict=True):
+                    if not item.future.done():
+                        item.future.set_result(response)
+            finally:
+                for _ in pending:
+                    self._queue.task_done()
+
+
+def build_app(index, titles, texts, encoder, default_topk, batch_max_requests=64, batch_wait_ms=50):
     from fastapi import FastAPI
+    from fastapi import HTTPException
     from pydantic import BaseModel
 
-    app = FastAPI()
+    def run_batch(requests):
+        return search_batch(index, titles, texts, encoder, requests)
+
+    batcher = RequestBatcher(run_batch, max_requests=batch_max_requests, wait_ms=batch_wait_ms)
+
+    @asynccontextmanager
+    async def lifespan(_app):
+        await batcher.start()
+        try:
+            yield
+        finally:
+            await batcher.stop()
+
+    app = FastAPI(lifespan=lifespan)
 
     class Query(BaseModel):
         queries: list[str]
@@ -96,24 +251,14 @@ def build_app(index, titles, texts, encoder, default_topk):
         return {"status": "ok", "passages": len(titles)}
 
     @app.post("/retrieve")
-    def retrieve(req: Query):
-        topk = req.topk or default_topk
-        emb = encoder(req.queries)
-        scores, ids = index.search(emb, topk)
-        results = []
-        for row_scores, row_ids in zip(scores, ids, strict=True):
-            hits = []
-            for score, idx in zip(row_scores, row_ids, strict=True):
-                if idx < 0:
-                    continue
-                # The shape local_search_server.py expects, verbatim.
-                doc = {"contents": f'"{titles[idx]}"\n{texts[idx]}'}
-                hit = {"document": doc}
-                if req.return_scores:
-                    hit["score"] = float(score)
-                hits.append(hit)
-            results.append(hits)
-        return {"result": results}
+    async def retrieve(req: Query):
+        topk = req.topk if req.topk is not None else default_topk
+        if not req.queries or any(not query.strip() for query in req.queries):
+            raise HTTPException(status_code=400, detail="queries must contain non-empty strings")
+        if topk < 1:
+            raise HTTPException(status_code=400, detail="topk must be positive")
+        request = SearchRequest(queries=tuple(req.queries), topk=topk, return_scores=req.return_scores)
+        return await batcher.submit(request)
 
     return app
 
@@ -132,7 +277,14 @@ def main():
     ap.add_argument("--topk", type=int, default=3)
     ap.add_argument("--encoder-device", default="cpu")
     ap.add_argument("--faiss-threads", type=int, default=32)
+    ap.add_argument("--batch-max-requests", type=int, default=64)
+    ap.add_argument("--batch-wait-ms", type=int, default=50)
     args = ap.parse_args()
+
+    if args.batch_max_requests < 1:
+        ap.error("--batch-max-requests must be positive")
+    if args.batch_wait_ms < 0:
+        ap.error("--batch-wait-ms must be non-negative")
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 
@@ -155,7 +307,16 @@ def main():
 
     encoder = Encoder(args.encoder, device=args.encoder_device)
     logger.info("serving on %s:%d", args.host, args.port)
-    uvicorn.run(build_app(index, titles, texts, encoder, args.topk), host=args.host, port=args.port, log_level="warning")
+    app = build_app(
+        index,
+        titles,
+        texts,
+        encoder,
+        args.topk,
+        batch_max_requests=args.batch_max_requests,
+        batch_wait_ms=args.batch_wait_ms,
+    )
+    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
 
 if __name__ == "__main__":

@@ -5,7 +5,8 @@
 # MAX_RESPONSE_LEN, NUM_STEPS_PER_ROLLOUT, ROLLOUT_BATCH_SIZE,
 # GLOBAL_BATCH_SIZE, N_SAMPLES_PER_PROMPT, TRAIN_SEED, ROLLOUT_SEED, and for PLACEMENT=async also
 # QUEUE_POLICY and, except for queue-drop, MAX_WEIGHT_STALENESS.
-# Sets RL_ALGORITHM, POLICY_REGIME, CONFIG_TAG, RUN_NAME, CKPT_PATH.
+# Optionally accepts TASK_FAMILY (default: math). Sets RL_ALGORITHM,
+# POLICY_REGIME, CONFIG_TAG, RUN_NAME, CKPT_PATH.
 # Sourced by both run.sbatch and train.sh so the two cannot disagree.
 
 : "${MODEL_NAME:?}"
@@ -81,7 +82,7 @@ case "${PLACEMENT}" in
         ;;
 esac
 
-TASK_FAMILY=math
+TASK_FAMILY="${TASK_FAMILY:-math}"
 
 # Colocated generation pauses training, so one optimizer step per rollout is
 # on-policy without an async staleness reference. Keep queue-recycle's historical
