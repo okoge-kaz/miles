@@ -207,5 +207,57 @@ would have been logged `pre_queue = 0, in_queue = 1`; the shipped code logs
 Still not measured: the magnitude at production response length, and any run in
 which `in_queue` is non-zero (`queue_size` was 0 in every rollout of both smokes,
 so nothing ever waited).
+
 - Checkpoint save/resume was not exercised (`NUM_ROLLOUT=3` < `SAVE_INTERVAL=10`).
   The change does not touch that path.
+
+## 2026-08-11 — deferred actor startup warmup
+
+Status: design note only; do not implement yet.
+
+The first trainer call has a large cold-start transient that is not explained by
+batch size. Across the staleness/node-ratio jobs, rollout step 0 was 3.1–10.1x
+slower than the median of steps 1–9. For example, `s4-t2r6` spent 383.2 s in
+`train_wait`, 617.9 s in actor log-prob forward, 286.9 s in actor training and
+14.9 s updating weights. The next step's corresponding log-prob and actor-train
+times were about 31.0 s and 120.9 s. The first batch contained fewer tokens than
+steady state, and its log-prob completion times ranged from about 48 s to 618 s
+across ranks before converging to 30–31 s on the next call. The likely cause is
+distributed CUDA first use (module/kernel loading, allocator state, pipeline/TP
+communication, autograd/gradient-reduction setup), with every rank waiting for
+the coldest one; the logs do not isolate one compiler or kernel as the sole
+cause.
+
+If this becomes worth addressing, the deliberately small first change is to
+overlap a **forward-only actor warmup** with the first rollout generation:
+
+1. Perform the initial actor-to-rollout-engine weight sync as today.
+2. Start the first `rollout_manager.generate` future.
+3. Concurrently run a synthetic packed batch through actor `forward_only` on
+   every training rank, using the real dtype and TP/PP/CP layout and a
+   representative sequence length; discard the log-prob result.
+4. Wait for both futures, then train the real rollout batch normally.
+
+This warmup must not call `optimizer.step`, advance the scheduler, change model
+weights or increment the policy version. Its objective is not to make startup
+staleness exactly zero; it is to move the anomalous first log-prob setup work
+onto time in which the independent rollout nodes are already generating. A
+producer startup gate is therefore intentionally out of scope for the first
+change. The fully-async producer may still accumulate an initial version-0
+backlog during the overlap, but the interval before the first weight update
+should be shorter than the current serial `initial generation -> cold trainer`
+path.
+
+If forward-only warmup leaves a material first-backward penalty, a second change
+can add a forward/backward dry run with the optimizer disabled, followed by
+gradient clearing and RNG restoration. Do not use a zero learning rate as a
+substitute: Adam moments and step counters would still change. Warming the actual
+optimizer path by snapshotting and restoring the full model/optimizer/scheduler
+state is not justified unless measurements show that optimizer first use is a
+large remaining term.
+
+Before adding either code path, first test `CUDA_MODULE_LOADING=EAGER` in one
+otherwise identical run. For any implementation, verify per-rank warmup time,
+real step-0 log-prob/actor-train time versus steady state, unchanged model and
+optimizer checksums/state, and the resulting startup
+`staleness/{pre_queue,in_queue,total}` trace.
