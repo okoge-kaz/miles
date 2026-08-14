@@ -10,6 +10,7 @@ source "${SCRIPT_REPO_ROOT}/experiments/env.sh"
 SOURCE_ROOT="${SOURCE_ROOT:-/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/hiso/async-rl/checkpoints/training/math/dapo-math-p10-90/Qwen3-4B-Instruct-2507/grpo-clip0.2-0.28-tis2.0/async/off-policy}"
 SWEEP_NAME="${SWEEP_NAME:-hiso-offpolicy-20260813}"
 MODE="${1:-check}"
+EVAL_TIME_LIMIT="${EVAL_TIME_LIMIT:-01:30:00}"
 HOST_RESULT_ROOT="${DATASET_DIR}/offline_eval/${SWEEP_NAME}"
 HOST_OLYMPIAD="${DATASET_DIR}/olympiadbench/OE_TO_maths_en_COMP.jsonl"
 HOST_OLYMPIAD_PYTHONPATH="${DATASET_DIR}/python/antlr4-python3-runtime-4.11.1"
@@ -137,6 +138,7 @@ submit_one() {
         job_id=$(sbatch --parsable \
             -A "${SLURM_ACCOUNT_NAME}" \
             --partition=batch,batch_short \
+            --time="${EVAL_TIME_LIMIT}" \
             --job-name="ob-${safe_tag}" \
             --export="ALL,CKPT=${CONTAINER_SOURCE}/${relative},TAG=${safe_tag},OUT_DIR=${out_dir},EXTRA_MOUNTS=${SOURCE_ROOT}:${CONTAINER_SOURCE},UNPAD_VOCAB=1,BENCHMARKS=${OLYMPIAD_SPEC},N_SAMPLES=8,RM_TYPE=olympiadbench,CUSTOM_RM_PATH=${OLYMPIAD_RM},EXTRA_PYTHONPATH=${OLYMPIAD_PYTHONPATH}" \
             experiments/src/offline_eval/run_eval.sbatch)
@@ -152,6 +154,7 @@ submit_one() {
             job_id=$(sbatch --parsable \
                 -A "${SLURM_ACCOUNT_NAME}" \
                 --partition=batch,batch_short \
+                --time="${EVAL_TIME_LIMIT}" \
                 --job-name="a32-${safe_tag}" \
                 --export="ALL,CKPT=${CONTAINER_SOURCE}/${relative},TAG=${safe_tag},OUT_DIR=${out_dir},EXTRA_MOUNTS=${SOURCE_ROOT}:${CONTAINER_SOURCE},UNPAD_VOCAB=1,BENCHMARKS=${AIME_EXTRA_SPEC},N_SAMPLES=16,RM_TYPE=math" \
                 experiments/src/offline_eval/run_eval.sbatch)
@@ -159,6 +162,7 @@ submit_one() {
             job_id=$(sbatch --parsable \
                 -A "${SLURM_ACCOUNT_NAME}" \
                 --partition=batch,batch_short \
+                --time="${EVAL_TIME_LIMIT}" \
                 --job-name="a32-${safe_tag}" \
                 --export="ALL,CKPT=${CONTAINER_SOURCE}/${relative},TAG=${safe_tag},OUT_DIR=${out_dir},EXTRA_MOUNTS=${SOURCE_ROOT}:${CONTAINER_SOURCE},UNPAD_VOCAB=1,BENCHMARKS=${AIME_FULL_SPEC},N_SAMPLES=32,RM_TYPE=math" \
                 experiments/src/offline_eval/run_eval.sbatch)
