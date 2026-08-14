@@ -41,6 +41,7 @@ class _RolloutManager:
         self.events = events
         self.generate = _RemoteMethod(self._generate)
         self.record_batch_consumption = _RemoteMethod(self._record_batch_consumption)
+        self.record_batch_trained = _RemoteMethod(self._record_batch_trained)
         self.acknowledge_trained_batch = _RemoteMethod(self._acknowledge)
         self.save = _RemoteMethod(self._save)
         self.mark_checkpoint_published = _RemoteMethod(self._mark_published)
@@ -59,6 +60,10 @@ class _RolloutManager:
     async def _record_batch_consumption(self, rollout_id):
         await asyncio.sleep(0)
         self.events.append(("consume", rollout_id))
+
+    async def _record_batch_trained(self, rollout_id, *, actor_trained):
+        await asyncio.sleep(0)
+        self.events.append(("trained_telemetry", rollout_id, actor_trained))
 
     def _acknowledge(self, rollout_id, token):
         self.events.append(("ack", rollout_id, token))
@@ -200,6 +205,7 @@ async def test_queue_recycle_starts_legacy_prefetch_before_consumption(monkeypat
 
     assert events.index(("generate", 1)) < events.index(("consume", 0))
     assert events.index(("consume", 0)) < events.index(("train", 0))
+    assert events.index(("train", 0)) < events.index(("trained_telemetry", 0, True))
 
 
 @pytest.mark.parametrize("policy", ["queue-max", "queue-drop"])

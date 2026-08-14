@@ -1,6 +1,7 @@
 """GPU smoke test for scheduler-authoritative SGLang policy provenance.
 
-Run against a patched SGLang server started with ``--weight-version 10``.
+Run against a patched SGLang server started with ``--weight-version 10`` and
+``--enable-response-weight-version-segments``.
 The test opens a versioned begin/end session without transferring bytes, matching
 the P2P lifecycle where weights are written out of band between those calls.
 """
@@ -57,6 +58,16 @@ def _assert_versions(meta: dict, *, first: int, minimum: int, maximum: int, last
     assert actual == expected, f"policy provenance mismatch: expected={expected}, actual={actual}"
 
 
+def _assert_segments(meta: dict, expected_versions: list[int]) -> None:
+    segments = meta.get("response_weight_version_segments")
+    assert segments, f"response weight-version segments are missing: {meta}"
+    assert segments[0][0] == 0
+    assert segments[-1][1] == meta["completion_tokens"]
+    assert all(left[1] == right[0] for left, right in zip(segments, segments[1:]))
+    assert all(start < end for start, end, _version in segments)
+    assert [version for _start, _end, version in segments] == expected_versions
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", default="http://127.0.0.1:30000")
@@ -65,6 +76,7 @@ def main() -> None:
 
     baseline = _generate(args.base_url, max_new_tokens=8)
     _assert_versions(baseline, first=10, minimum=10, maximum=10, last=10)
+    _assert_segments(baseline, [10])
 
     _post(args.base_url, "slow_down", {"forward_sleep_time": 0.01})
     with ThreadPoolExecutor(max_workers=1) as executor:
@@ -84,12 +96,14 @@ def main() -> None:
         mixed = future.result(timeout=300.0)
 
     _assert_versions(mixed, first=10, minimum=10, maximum=11, last=11)
+    _assert_segments(mixed, [10, 11])
     assert mixed["response_weight_version"] == "11"
     assert mixed["weight_version"] == "11"
 
     _post(args.base_url, "slow_down", {"forward_sleep_time": None})
     refreshed = _generate(args.base_url, max_new_tokens=8)
     _assert_versions(refreshed, first=11, minimum=11, maximum=11, last=11)
+    _assert_segments(refreshed, [11])
 
     print(
         json.dumps(

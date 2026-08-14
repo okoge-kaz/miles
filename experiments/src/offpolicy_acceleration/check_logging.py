@@ -57,6 +57,7 @@ def audit(dump_dir: Path | None, slurm_log: Path | None) -> list[Check]:
     checks += _guard_checks(records, metrics_seen)
     checks += _drift_checks(metrics_seen)
     checks += _lag_checks(dump_dir, metrics_seen)
+    checks += _telemetry_checks(dump_dir, records, metrics_seen)
     checks += _factor_checks(dump_dir)
     checks += _engine_checks(dump_dir)
     checks += _resume_checks(records)
@@ -143,8 +144,12 @@ def _eval_checks(dump_dir: Path | None, records, metrics_seen) -> list[Check]:
             "PASS" if dumps else "WARN",
             f"{len(dumps)} eval dumps" if dumps else "only the logged scalar mean per benchmark",
             "paired-over-prompts bootstrap; separating prompt from rollout variance",
-            "" if dumps else "pass --dump-details; log_eval_rollout_data logs only the mean, so the "
-            "dumps are the only per-prompt record",
+            (
+                ""
+                if dumps
+                else "pass --dump-details; log_eval_rollout_data logs only the mean, so the "
+                "dumps are the only per-prompt record"
+            ),
         )
     )
     return checks
@@ -159,8 +164,12 @@ def _guard_checks(records, metrics_seen) -> list[Check]:
             "PASS" if live else "WARN",
             "train/entropy_loss varies" if live else "train/entropy_loss is identically 0",
             "the entropy criterion of the convergence definition",
-            "" if live else "pass --observe-training-entropy; without it "
-            "calculate_entropy is False (losses.py:99) and the metric is a constant 0",
+            (
+                ""
+                if live
+                else "pass --observe-training-entropy; without it "
+                "calculate_entropy is False (losses.py:99) and the metric is a constant 0"
+            ),
         )
     ]
     for metric, unlocks in (
@@ -205,7 +214,9 @@ def _drift_checks(metrics_seen) -> list[Check]:
 
 def _lag_checks(dump_dir: Path | None, metrics_seen) -> list[Check]:
     exact = "rollout/fully_async/avg_staleness" in metrics_seen
-    distribution = "rollout/fully_async/staleness_p90" in metrics_seen
+    distribution = any(
+        key in metrics_seen for key in ("rollout/fully_async/staleness_p90", "staleness/bound/rollout/p90")
+    )
     checks = [
         Check(
             "realized lag distribution (logged)",
@@ -217,15 +228,21 @@ def _lag_checks(dump_dir: Path | None, metrics_seen) -> list[Check]:
         Check(
             "staleness reference version",
             "PASS" if "rollout/fully_async/current_weight_version" in metrics_seen else "WARN",
-            "current_weight_version logged" if "rollout/fully_async/current_weight_version" in metrics_seen
-            else "absent: a missing staleness metric is indistinguishable from a dead router query",
+            (
+                "current_weight_version logged"
+                if "rollout/fully_async/current_weight_version" in metrics_seen
+                else "absent: a missing staleness metric is indistinguishable from a dead router query"
+            ),
             "telling 'never stale' apart from 'never measured'",
         ),
         Check(
             "wasted generation (tokens)",
             "PASS" if "rollout/fully_async/wasted_token_frac" in metrics_seen else "WARN",
-            "token-level waste logged" if "rollout/fully_async/wasted_token_frac" in metrics_seen
-            else "only group counts, no token volume",
+            (
+                "token-level waste logged"
+                if "rollout/fully_async/wasted_token_frac" in metrics_seen
+                else "only group counts, no token volume"
+            ),
             "sample- and token-efficiency claims alongside the wall-clock ones",
         ),
         Check(
@@ -233,11 +250,15 @@ def _lag_checks(dump_dir: Path | None, metrics_seen) -> list[Check]:
             "PASS" if exact else "FAIL",
             "avg_staleness logged" if exact else "avg_staleness never logged",
             "reporting realized lag next to the configured bound",
-            "" if exact else "two independent causes: --max-weight-staleness must be set at all "
-            "(use 1000000 for the unbounded arm, not unset), AND the router /model_info query must "
-            "succeed -- when it does not, `current` is None, the cap silently enforces nothing and "
-            "no staleness metric is emitted. Check the log for "
-            "'--max-weight-staleness cannot be enforced'",
+            (
+                ""
+                if exact
+                else "two independent causes: --max-weight-staleness must be set at all "
+                "(use 1000000 for the unbounded arm, not unset), AND the router /model_info query must "
+                "succeed -- when it does not, `current` is None, the cap silently enforces nothing and "
+                "no staleness metric is emitted. Check the log for "
+                "'--max-weight-staleness cannot be enforced'"
+            ),
         ),
         Check(
             "version bracket",
@@ -252,14 +273,240 @@ def _lag_checks(dump_dir: Path | None, metrics_seen) -> list[Check]:
         Check(
             "realized lag distribution P(L)",
             "PASS" if train_dumps else "WARN",
-            f"{len(train_dumps)} rollout dumps carry per-sample weight_versions"
-            if train_dumps
-            else "no rollout dumps; only per-step aggregates",
+            (
+                f"{len(train_dumps)} rollout dumps carry per-sample weight_versions"
+                if train_dumps
+                else "no rollout dumps; only per-step aggregates"
+            ),
             "percentiles and the tail of P(L), which the logged mean/max cannot give",
             "" if train_dumps else "pass --dump-details",
         )
     )
     return checks
+
+
+def _telemetry_checks(dump_dir: Path | None, records, metrics_seen) -> list[Check]:
+    """Audit the additive async-compute diagnostics without redefining legacy lag."""
+    useful = {
+        "rollout/fully_async/useful_rollout/generated_tokens",
+        "rollout/fully_async/useful_rollout/loss_input_tokens",
+        "rollout/fully_async/useful_rollout/efficiency",
+        "rollout/fully_async/useful_rollout/accounting_error_tokens",
+    }
+    waste = {
+        f"rollout/fully_async/waste/all_discarded/{component}"
+        for component in ("decode_tokens", "prefill_uncached_tokens", "tool_env_seconds", "reward_seconds")
+    }
+    reasons = {
+        f"rollout/fully_async/recycle_reason/{reason}/groups"
+        for reason in (
+            "stale_at_generation_completion",
+            "stale_during_reward_finalize",
+            "stale_during_queue_backpressure",
+            "stale_in_output_queue",
+            "actor_weight_sync_overlap",
+        )
+    } | {
+        "rollout/fully_async/recycle_aux/group_straggler_collateral/groups",
+        "staleness/late_stale_trained/forward_handoff_groups",
+    }
+    selection = {f"selection_bias/{population}/samples" for population in ("generated", "consumed", "recycled")}
+    prequeue = {
+        f"staleness/pre_queue_phase/version/{phase}/sequence_mean"
+        for phase in ("active", "group_wait", "postprocess", "total")
+    } | {
+        "staleness/pre_queue_phase/version/identity_max_abs_error",
+        "staleness/pre_queue_phase/exact_sample_frac",
+    }
+    throughput = {
+        "throughput/generated_tokens_per_second",
+        "throughput/accepted_tokens_per_second",
+        "throughput/optimizer_updates_per_second",
+        "throughput/cohort_useful_efficiency",
+        "queue/depth_time_mean",
+        "queue/trainer_starvation_seconds",
+        "queue/rollout_backpressure_seconds",
+        "queue/rollout_idle_capacity_seconds",
+        "queue/active_group_capacity_time_mean",
+        "queue/consumption/wall_wait_seconds/p90",
+        "perf/step_time",
+    }
+    checks = [
+        _metric_set_check(
+            "strict useful-rollout accounting",
+            useful,
+            metrics_seen,
+            "generated-token efficiency after recycle, trimming, and the final loss mask",
+            "run fully async with the additive telemetry build; custom sample converters intentionally mark it unavailable",
+        ),
+        _metric_set_check(
+            "reason-coded waste vector",
+            waste,
+            metrics_seen,
+            "decode/prefill token waste and tool/reward wall-time waste without summing unlike units",
+        ),
+        _metric_set_check(
+            "recycle lifecycle reason codes",
+            reasons,
+            metrics_seen,
+            "generation, reward, backpressure, queue, straggler, sync, and late-forward attribution",
+        ),
+        _metric_set_check(
+            "selection populations",
+            selection,
+            metrics_seen,
+            "P(feature | generated/consumed/recycled) and marginal selection bias",
+        ),
+        _metric_set_check(
+            "pre-queue phase split",
+            prequeue,
+            metrics_seen,
+            "active generation vs group straggler wait vs postprocessing attribution",
+        ),
+        _metric_set_check(
+            "same-window throughput and queueing",
+            throughput,
+            metrics_seen,
+            "whether node-ratio changes are generation-, queue-, trainer-, or sync-limited",
+        ),
+    ]
+
+    logprob_timers = {
+        key
+        for key in metrics_seen
+        if key
+        in {
+            "perf/log_probs_time",
+            "perf/legacy_actor_log_probs_time",
+            "perf/ref_log_probs_time",
+        }
+    }
+    fused_logprobs = "train/fused_one_step_logprobs_enabled" in metrics_seen
+    checks.append(
+        Check(
+            "log-probability forward timing",
+            "PASS" if logprob_timers or fused_logprobs else "WARN",
+            (
+                ", ".join(sorted(logprob_timers))
+                if logprob_timers
+                else (
+                    "fused one-step path: forward is included in perf/actor_train_time"
+                    if fused_logprobs
+                    else "no log-probability timer or fused-path marker found"
+                )
+            ),
+            "separating an explicit log-probability forward when the algorithm actually runs one",
+            "retain the standard perf stream" if not logprob_timers and not fused_logprobs else "",
+        )
+    )
+
+    accounting_errors = [
+        abs(float(record["metrics"]["rollout/fully_async/useful_rollout/accounting_error_tokens"]))
+        for record in records
+        if "rollout/fully_async/useful_rollout/accounting_error_tokens" in record["metrics"]
+    ]
+    if accounting_errors:
+        maximum = max(accounting_errors)
+        checks.append(
+            Check(
+                "useful-token partition invariant",
+                "PASS" if maximum == 0 else "FAIL",
+                f"max absolute accounting error {maximum:g} tokens",
+                "a defensible denominator for useful rollout efficiency",
+                "inspect recycle, postprocess-trim, and loss-mask partitions" if maximum else "",
+            )
+        )
+
+    effective = any(key.startswith(("train/staleness_gradient/", "staleness_gradient/")) for key in metrics_seen)
+    effective_suffixes = (
+        "/consumed_sequence_mass",
+        "/effective_contribution_mass",
+        "/ppo_clip_fraction",
+        "/final_mask_fraction",
+        "/policy_rollout_ratio_token_ess",
+        "/policy_rollout_ratio_sequence_ess",
+    )
+    missing_effective = [
+        suffix for suffix in effective_suffixes if not any(key.endswith(suffix) for key in metrics_seen)
+    ]
+    checks.append(
+        Check(
+            "effective-contribution staleness bins",
+            "PASS" if effective and not missing_effective else "WARN",
+            (
+                "consumed/effective mass, clipping, masks, and ESS are logged by lag bin"
+                if effective and not missing_effective
+                else "feature disabled" if not effective else f"missing suffixes: {', '.join(missing_effective)}"
+            ),
+            "which staleness region survives the actual objective for TIS/MIS/VCPO comparisons",
+            "pass --log-staleness-gradient-metrics" if not effective else "",
+        )
+    )
+
+    exact_segments = "staleness/token_lag/exact/covered_response_token_frac" in metrics_seen
+    checks.append(
+        Check(
+            "exact response-token weight versions",
+            "PASS" if exact_segments else "WARN",
+            "exact token coverage is logged" if exact_segments else "only per-request forward-version summaries",
+            "token-weighted lag when one response crosses a weight update",
+            "pass --sglang-enable-response-weight-version-segments" if not exact_segments else "",
+        )
+    )
+
+    sync_timers = {
+        key
+        for key in metrics_seen
+        if key
+        in {
+            "perf/update_weights_implementation_time",
+            "perf/finalize_and_resume_engines_time",
+            "perf/ref_model_update_time",
+        }
+    }
+    checks.append(
+        Check(
+            "weight synchronization timing",
+            "PASS" if sync_timers else "WARN",
+            ", ".join(sorted(sync_timers)) if sync_timers else "no weight-sync timer found",
+            "separating actor synchronization delay from generation and queue delay",
+            "retain the standard perf timer stream" if not sync_timers else "",
+        )
+    )
+
+    rollout_dumps = sorted((dump_dir / "rollout_data").glob("[0-9]*.pt")) if dump_dir else []
+    policy_dumps = sorted((dump_dir / "policy_loss_debug").glob("*.pt")) if dump_dir else []
+    checks.append(
+        Check(
+            "joinable sample-level selection records",
+            "PASS" if rollout_dumps and policy_dumps else "WARN",
+            f"{len(rollout_dumps)} rollout dumps, {len(policy_dumps)} policy-loss dumps",
+            "P(accepted | length, reward, difficulty) and clip/mask/log-ratio joins",
+            (
+                "pass --dump-details (policy-loss debug remains feature-gated by that debug mode)"
+                if not rollout_dumps or not policy_dumps
+                else ""
+            ),
+        )
+    )
+    return checks
+
+
+def _metric_set_check(
+    name: str,
+    required: set[str],
+    metrics_seen: set[str],
+    unlocks: str,
+    fix: str = "run the current telemetry build",
+) -> Check:
+    missing = sorted(required - metrics_seen)
+    return Check(
+        name,
+        "PASS" if not missing else "WARN",
+        "all required scalar series logged" if not missing else f"missing: {', '.join(missing)}",
+        unlocks,
+        "" if not missing else fix,
+    )
 
 
 def _factor_checks(dump_dir: Path | None) -> list[Check]:
@@ -334,9 +581,13 @@ def _resume_checks(records: list[dict[str, Any]]) -> list[Check]:
             f"{report['n_allocations']} allocation(s); {report['active_h']:.2f} active h of "
             f"{report['span_h']:.2f} h span, {report['excluded_h']:.2f} h excluded as queue gaps",
             "the wall-clock axis, which is the study's primary metric",
-            "" if not resumed else "pass every allocation's log to extract_run.py with a repeated "
-            "--slurm-log so the replayed steps dedupe correctly; never compute wall-clock as "
-            "ts - meta.start_ts, which the dashboard rewrites on each resume (collector.py:153)",
+            (
+                ""
+                if not resumed
+                else "pass every allocation's log to extract_run.py with a repeated "
+                "--slurm-log so the replayed steps dedupe correctly; never compute wall-clock as "
+                "ts - meta.start_ts, which the dashboard rewrites on each resume (collector.py:153)"
+            ),
         )
     ]
 

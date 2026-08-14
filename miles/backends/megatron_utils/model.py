@@ -474,6 +474,11 @@ def train_one_step(
                 "advantages",
                 "returns",
                 "rollout_log_probs",
+                "sample_staleness",
+                "sample_indices",
+                "sample_group_indices",
+                "generation_attempt_numbers",
+                "training_steps",
                 "max_seq_lens",
                 "witness_ids",
                 "opd_reverse_kl",
@@ -482,6 +487,8 @@ def train_one_step(
             args.qkv_format,
             allgather_cp=args.allgather_cp,
         )
+        if getattr(args, "dump_details", None) is not None:
+            batch["optimizer_step_ids"] = [step_id] * len(batch["total_lengths"])
 
         if "adapter_token_counts" in batch:
             from megatron.bridge.peft.multi_lora_layers import set_tokens_per_adapter_slot

@@ -86,7 +86,7 @@ export DOCKER_IMAGE="${DOCKER_IMAGE:-radixark/miles:latest}"
 # The prefill-staleness runs require SGLang's scheduler-authoritative policy
 # provenance fields, which are present in this derived image. An explicitly set
 # SQSH_IMAGE still takes precedence for historical reproduction.
-export SQSH_IMAGE="${SQSH_IMAGE:-${CONTAINER_DIR}/miles-prefill-weight-version-23aaf6597.sqsh}"
+export SQSH_IMAGE="${SQSH_IMAGE:-${CONTAINER_DIR}/miles-staleness-weight-boundaries-f994b9aed.sqsh}"
 
 # In-container paths. Keep these stable: every train.sh references them.
 #   /root/miles       miles checkout (over the image's copy)

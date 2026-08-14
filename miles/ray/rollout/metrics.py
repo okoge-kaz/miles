@@ -24,9 +24,10 @@ def log_rollout_batch_consumption(
     *,
     selection_weight_version: int | None,
     train_start_weight_version: int,
-) -> dict[str, int]:
+    extra_metrics: dict[str, float | int] | None = None,
+) -> dict[str, float | int]:
     """Log the version gap introduced between queue selection and training."""
-    log_dict = {
+    historical_metrics: dict[str, float | int] = {
         "queue/consumption/train_start_weight_version": train_start_weight_version,
     }
     if selection_weight_version is not None:
@@ -36,12 +37,32 @@ def log_rollout_batch_consumption(
                 "Applied weight version moved backwards between queue selection and "
                 f"training: selection={selection_weight_version}, train_start={train_start_weight_version}"
             )
-        log_dict["queue/consumption/selection_weight_version"] = selection_weight_version
-        log_dict["queue/consumption/selection_to_train_gap"] = gap
+        historical_metrics["queue/consumption/selection_weight_version"] = selection_weight_version
+        historical_metrics["queue/consumption/selection_to_train_gap"] = gap
 
+    log_dict = dict(extra_metrics or {})
+    for key, value in historical_metrics.items():
+        if key in log_dict and log_dict[key] != value:
+            raise RuntimeError(
+                f"Conflicting rollout consumption metric {key}: " f"historical={value}, telemetry={log_dict[key]}"
+            )
+        log_dict[key] = value
     logger.info(f"rollout batch consumption {rollout_id}: {log_dict}")
     step = compute_rollout_step(args, rollout_id)
     log_dict["rollout/step"] = step
+    tracking.log(args, log_dict, step_key="rollout/step")
+    return log_dict
+
+
+def log_rollout_pipeline_throughput(
+    rollout_id: int,
+    args,
+    metrics: dict[str, float | int],
+) -> dict[str, float | int]:
+    """Log the wall window closed by a successful actor train call."""
+    log_dict = dict(metrics)
+    logger.info(f"rollout pipeline throughput {rollout_id}: {log_dict}")
+    log_dict["rollout/step"] = compute_rollout_step(args, rollout_id)
     tracking.log(args, log_dict, step_key="rollout/step")
     return log_dict
 

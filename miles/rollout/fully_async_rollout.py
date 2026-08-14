@@ -17,6 +17,7 @@ explicitly.
 import asyncio
 import copy
 import gc
+import inspect
 import logging
 import time
 from collections import deque
@@ -41,6 +42,7 @@ from miles.rollout.fully_async_checkpoint_codec import (
     CheckpointSampleEncoder,
     materialize_checkpoint_state,
 )
+from miles.rollout.fully_async_telemetry import FullyAsyncPipelineTelemetry
 from miles.rollout.inference_rollout.inference_rollout_common import GenerateState, generate_and_rm_group
 from miles.rollout.queue_policy import LEGACY_QUEUE_POLICY, QUEUE_DROP_POLICY, QUEUE_MAX_POLICY
 from miles.rollout.queue_telemetry import (
@@ -56,6 +58,41 @@ from miles.rollout.queue_telemetry import (
     group_queue_entry_weight_version,
     group_response_tokens,
     group_reward_values,
+)
+from miles.rollout.recycle_compute_metrics import (
+    ADMITTED_TOKENS_KEY,
+    BOUND_REFERENCE_VERSION_KEY,
+    DRAIN_TIME_KEY,
+    DRAIN_VERSION_KEY,
+    GENERATED_TOKENS_KEY,
+    GROUP_GENERATION_COMPLETE_TIME_KEY,
+    GROUP_GENERATION_COMPLETE_VERSION_KEY,
+    GROUP_READY_TIME_KEY,
+    GROUP_READY_VERSION_KEY,
+    LIFECYCLE_EXACT_KEY,
+    QUEUE_PUT_TIME_KEY,
+    QUEUE_PUT_VERSION_KEY,
+    RECYCLE_AUX_REASONS,
+    RECYCLE_DEBUG_SCHEMA_VERSION,
+    RECYCLE_REASONS,
+    SAMPLE_GENERATION_COMPLETE_TIME_KEY,
+    SAMPLE_GENERATION_COMPLETE_VERSION_KEY,
+    SUBMISSION_VERSION_KEY,
+    TRAJECTORY_START_TIME_KEY,
+    TRAJECTORY_START_VERSION_KEY,
+    aborted_recycle_reason,
+    add_discard_accounting,
+    add_selection_population,
+    classify_stale_recycle_stage,
+    discard_waste_metrics,
+    group_generation_completion_version,
+    recycle_record,
+    reset_attempt_telemetry,
+    selection_population_metrics,
+    stamp_attempt_wall_seconds,
+    stamp_sample_lifecycle_boundary,
+    stamp_sample_reference_versions,
+    straggler_collateral_indices,
 )
 from miles.utils.http_utils import get
 from miles.utils.misc import load_function
@@ -107,6 +144,13 @@ class _DrainProgress:
         default_factory=lambda: {population: [] for population in DEFAULT_RESPONSE_LENGTH_POPULATIONS}
     )
     dynamic_filter_drop_counts: dict[str, int] = field(default_factory=dict)
+    recycle_reason_groups: dict[str, int] = field(default_factory=dict)
+    recycle_reason_tokens: dict[str, int] = field(default_factory=dict)
+    recycle_aux_groups: dict[str, int] = field(default_factory=dict)
+    recycle_aux_tokens: dict[str, int] = field(default_factory=dict)
+    waste_by_reason: dict[str, dict[str, float]] = field(default_factory=dict)
+    selection_populations: dict[str, dict[str, list[float]]] = field(default_factory=dict)
+    discard_records: list[dict[str, Any]] = field(default_factory=list)
     do_print: bool = True
 
 
@@ -224,12 +268,6 @@ def _materialized_group_ids(
     if len(all_ids) != len(set(all_ids)):
         raise RuntimeError("A fully-async prompt group appears in more than one materialized lifecycle state")
     return set(all_ids)
-
-
-SUBMISSION_VERSION_KEY = "submission_weight_version"
-GROUP_READY_VERSION_KEY = "group_ready_weight_version"
-QUEUE_PUT_VERSION_KEY = "queue_put_weight_version"
-DRAIN_VERSION_KEY = "drain_weight_version"
 
 
 class AppliedWeightVersionTracker:
@@ -409,6 +447,19 @@ class _CachedWeightVersion:
             logger.warning(f"Weight version query failed {self._failures}x, using cached value: {error!r}")
 
 
+def _record_reason(
+    progress: _DrainProgress,
+    *,
+    reason: str,
+    tokens: int,
+    auxiliary: bool = False,
+) -> None:
+    group_counts = progress.recycle_aux_groups if auxiliary else progress.recycle_reason_groups
+    token_counts = progress.recycle_aux_tokens if auxiliary else progress.recycle_reason_tokens
+    group_counts[reason] = group_counts.get(reason, 0) + 1
+    token_counts[reason] = token_counts.get(reason, 0) + tokens
+
+
 def _staleness_metrics(values: list[int], bound: int | None) -> dict[str, float]:
     """P(L) reduced to bounded scalars: the logger takes scalars, not histograms.
 
@@ -473,8 +524,13 @@ class FullyAsyncRolloutFn:
         # cannot live in one drain call's local accumulator. Drain and reset these
         # at the same point as the other per-rollout metrics.
         self._producer_response_lengths = _ResponseLengthMetrics(populations=("generated", "queue_evicted"))
+        self._producer_selection_populations: dict[str, dict[str, list[float]]] = {}
         self._queue_evicted_groups = 0
         self._queue_evicted_tokens = 0
+        generate_group_parameters = inspect.signature(generate_and_rm_group).parameters
+        self._generation_lifecycle_supported = "lifecycle_version_provider" in generate_group_parameters
+        self._generation_completion_callback_supported = "on_group_generation_complete" in generate_group_parameters
+        self._pipeline_telemetry = FullyAsyncPipelineTelemetry()
         self._worker: asyncio.Task | None = None
         self._output: asyncio.Queue[QueueItem] | None = None
         self._output_slots: asyncio.Semaphore | None = None
@@ -504,6 +560,29 @@ class FullyAsyncRolloutFn:
     async def current_applied_weight_version(self) -> int:
         """Return the last weight version finalized on every rollout engine."""
         return self._applied_weight_version.current()
+
+    async def pipeline_telemetry_snapshot(self) -> dict[str, float]:
+        """Sample producer/consumer counters on the rollout event loop."""
+        return self._pipeline_telemetry.snapshot(
+            active_groups=len(self._active),
+            max_active_groups=self._max_in_flight_groups(),
+        )
+
+    async def complete_trained_batch_telemetry_on_loop(
+        self,
+        *,
+        accepted_tokens: int | None,
+        optimizer_updates: int,
+    ) -> dict[str, float]:
+        """Close one throughput window after a successful actor train call."""
+        self._pipeline_telemetry.add_trained_batch(
+            accepted_tokens=accepted_tokens,
+            optimizer_updates=optimizer_updates,
+        )
+        return self._pipeline_telemetry.snapshot(
+            active_groups=len(self._active),
+            max_active_groups=self._max_in_flight_groups(),
+        )
 
     async def acknowledge_trained_batch(self, rollout_id: int, token: str) -> None:
         """Commit consumption only after the trainer reports a successful update."""
@@ -574,6 +653,7 @@ class FullyAsyncRolloutFn:
             "queue_telemetry": {
                 "lifecycle": queue_snapshot.lifecycle_state,
                 "producer_response_lengths": queue_snapshot.response_length_state,
+                "producer_selection_populations": copy.deepcopy(self._producer_selection_populations),
                 "queue_evicted_groups": queue_snapshot.queue_evicted_groups,
                 "queue_evicted_tokens": queue_snapshot.queue_evicted_tokens,
             },
@@ -720,6 +800,7 @@ class FullyAsyncRolloutFn:
         telemetry_state = state.get("queue_telemetry", {})
         self._queue_lifecycle.restore_checkpoint_state(telemetry_state.get("lifecycle"))
         self._producer_response_lengths.restore_checkpoint_state(telemetry_state.get("producer_response_lengths"))
+        self._producer_selection_populations = copy.deepcopy(telemetry_state.get("producer_selection_populations", {}))
         self._queue_evicted_groups = int(telemetry_state.get("queue_evicted_groups", 0))
         self._queue_evicted_tokens = int(telemetry_state.get("queue_evicted_tokens", 0))
         applied_version = int(state["applied_weight_version"])
@@ -742,6 +823,7 @@ class FullyAsyncRolloutFn:
             self._checkpoint_packed_fields.cache_group(prompt_group)
             self._checkpoint_packed_fields.cache_group(result)
         self._restore_ready_queue(ready_items)
+        self._pipeline_telemetry.set_queue_depth(self._queue_size())
 
         self._drain_progress = {}
         for progress_state in state["drain_progress"]:
@@ -869,6 +951,7 @@ class FullyAsyncRolloutFn:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._worker = None
         self._active.clear()
+        self._pipeline_telemetry.set_active_groups(0, self._max_in_flight_groups())
         self._queue_gets.clear()
 
     @staticmethod
@@ -968,6 +1051,9 @@ class FullyAsyncRolloutFn:
             if self._queue_policy() == QUEUE_MAX_POLICY and self._output_slots is None:
                 available_slots = max(0, self._queue_capacity_groups() - len(self._policy_output))
                 self._output_slots = asyncio.Semaphore(available_slots)
+        self._pipeline_telemetry.set_queue_depth(self._queue_size())
+        self._pipeline_telemetry.set_active_groups(len(self._active), self._max_in_flight_groups())
+        self._pipeline_telemetry.reset_window()
         self._worker = asyncio.create_task(self._worker_loop())
         logger.info(
             "Started fully-async rollout worker (queue_policy=%s, capacity_groups=%d)",
@@ -1031,27 +1117,93 @@ class FullyAsyncRolloutFn:
         trajectory into several samples, and ``generate_and_rm_group`` does not accept
         that shape back.
         """
+        attempt_start = time.monotonic()
+        reset_attempt_telemetry(_iter_samples(prompt_group))
         submission_version = await self._current_weight_version()
         lifecycle_record = self._queue_lifecycle.begin_attempt(prompt_group, submission_version)
         stamp_submission_weight_version(prompt_group, submission_version)
+        trajectory_start_version = self._applied_weight_version.current()
+        trajectory_start_time = time.time()
+        stamp_sample_lifecycle_boundary(
+            _iter_samples(prompt_group),
+            version_key=TRAJECTORY_START_VERSION_KEY,
+            version=trajectory_start_version,
+            time_key=TRAJECTORY_START_TIME_KEY,
+            wall_time=trajectory_start_time,
+        )
+        generate_kwargs = {
+            "sampling_params": self.state.sampling_params.copy(),
+            "evaluation": False,
+        }
+        if self._generation_lifecycle_supported:
+            generate_kwargs["lifecycle_version_provider"] = self._applied_weight_version.current
+        generation_count_recorded = False
+
+        def record_generated_group(samples: list[Sample]) -> None:
+            nonlocal generation_count_recorded
+            self._pipeline_telemetry.add_generated_group(sum(sample.response_length for sample in samples))
+            generation_count_recorded = True
+
+        if self._generation_completion_callback_supported:
+            generate_kwargs["on_group_generation_complete"] = record_generated_group
         try:
-            result = await generate_and_rm_group(
-                self.state,
-                prompt_group,
-                sampling_params=self.state.sampling_params.copy(),
-                evaluation=False,
-            )
+            result = await generate_and_rm_group(self.state, prompt_group, **generate_kwargs)
         except BaseException:
             self._queue_lifecycle.cancel_attempt(lifecycle_record)
             raise
         # Stamped again on the result: a generate function may return new Sample
         # objects rather than the ones it was handed.
         stamp_submission_weight_version(result, submission_version)
+        result_samples = list(_iter_samples(result))
+        for sample in result_samples:
+            if not isinstance(sample.metadata.get(TRAJECTORY_START_VERSION_KEY), int) or not isinstance(
+                sample.metadata.get(TRAJECTORY_START_TIME_KEY), float
+            ):
+                stamp_sample_lifecycle_boundary(
+                    [sample],
+                    version_key=TRAJECTORY_START_VERSION_KEY,
+                    version=trajectory_start_version,
+                    time_key=TRAJECTORY_START_TIME_KEY,
+                    wall_time=trajectory_start_time,
+                )
+        lifecycle_complete = all(
+            isinstance(sample.metadata.get(SAMPLE_GENERATION_COMPLETE_VERSION_KEY), int)
+            and isinstance(sample.metadata.get(GROUP_GENERATION_COMPLETE_VERSION_KEY), int)
+            for sample in result_samples
+        )
+        if not lifecycle_complete:
+            fallback_version = self._applied_weight_version.current()
+            fallback_time = time.time()
+            stamp_sample_lifecycle_boundary(
+                result_samples,
+                version_key=SAMPLE_GENERATION_COMPLETE_VERSION_KEY,
+                version=fallback_version,
+                time_key=SAMPLE_GENERATION_COMPLETE_TIME_KEY,
+                wall_time=fallback_time,
+            )
+            stamp_sample_lifecycle_boundary(
+                result_samples,
+                version_key=GROUP_GENERATION_COMPLETE_VERSION_KEY,
+                version=fallback_version,
+                time_key=GROUP_GENERATION_COMPLETE_TIME_KEY,
+                wall_time=fallback_time,
+            )
+            for sample in result_samples:
+                sample.metadata[LIFECYCLE_EXACT_KEY] = False
+        stamp_attempt_wall_seconds(_iter_samples(result), time.monotonic() - attempt_start)
         ready_version = self._applied_weight_version.current()
+        ready_time = time.time()
         stamp_group_weight_version(
             result,
             GROUP_READY_VERSION_KEY,
             ready_version,
+        )
+        stamp_sample_lifecycle_boundary(
+            result_samples,
+            version_key=GROUP_READY_VERSION_KEY,
+            version=ready_version,
+            time_key=GROUP_READY_TIME_KEY,
+            wall_time=ready_time,
         )
         reward_values = None
         if lifecycle_record is not None:
@@ -1064,15 +1216,24 @@ class FullyAsyncRolloutFn:
         )
         if not any(sample.status == Sample.Status.ABORTED for sample in _iter_samples(result)):
             self._producer_response_lengths.record("generated", result)
+        add_selection_population(
+            self._producer_selection_populations,
+            population_name="generated",
+            samples=_iter_samples(result),
+        )
         if self._checkpoint_packed_fields is not None:
             self._checkpoint_packed_fields.cache_group(result)
+        if not generation_count_recorded:
+            self._pipeline_telemetry.add_generated_group(group_response_tokens(result))
         return prompt_group, result
 
     async def _worker_loop(self):
         while True:
             while len(self._active) < self._max_in_flight_groups():
                 self._active.add(self._submit_one_group())
+            self._pipeline_telemetry.set_active_groups(len(self._active), self._max_in_flight_groups())
             done, self._active = await asyncio.wait(self._active, return_when=asyncio.FIRST_COMPLETED)
+            self._pipeline_telemetry.set_active_groups(len(self._active), self._max_in_flight_groups())
             completed = [(id(task), task.result()) for task in done]
             if self._checkpoint_enabled:
                 self._completed_waiting.update(completed)
@@ -1087,11 +1248,21 @@ class FullyAsyncRolloutFn:
             # These policies control age at selection time. The 1000-group limit
             # is only a safety backpressure bound, not their experimental queue
             # capacity.
+            backpressure_start = time.monotonic()
             await self._output_slots.acquire()
+            self._pipeline_telemetry.add_rollout_backpressure(time.monotonic() - backpressure_start)
 
         depth_before = self._queue_size()
         queue_put_version = self._applied_weight_version.current()
+        queue_put_time = time.time()
         stamp_group_weight_version(item[1], QUEUE_PUT_VERSION_KEY, queue_put_version)
+        stamp_sample_lifecycle_boundary(
+            _iter_samples(item[1]),
+            version_key=QUEUE_PUT_VERSION_KEY,
+            version=queue_put_version,
+            time_key=QUEUE_PUT_TIME_KEY,
+            wall_time=queue_put_time,
+        )
 
         if policy == LEGACY_QUEUE_POLICY:
             self._output.put_nowait(item)
@@ -1121,6 +1292,7 @@ class FullyAsyncRolloutFn:
             depth_before=depth_before,
             depth_after=self._queue_size(),
         )
+        self._pipeline_telemetry.set_queue_depth(self._queue_size())
 
     # -------------------------- consumer --------------------------
 
@@ -1130,9 +1302,11 @@ class FullyAsyncRolloutFn:
             raise RuntimeError("fully-async rollout worker exited without an exception")
         if not self._output.empty():
             result = self._output.get_nowait()
+            self._pipeline_telemetry.set_queue_depth(self._output.qsize())
             self._release_output_slot()
             self._queue_lifecycle.dequeued(result[1], depth_after_observed=self._output.qsize())
             return result
+        starvation_start = time.monotonic()
         queue_get = asyncio.create_task(self._output.get())
         if self._checkpoint_enabled:
             self._queue_gets.add(queue_get)
@@ -1150,6 +1324,8 @@ class FullyAsyncRolloutFn:
                     raise RuntimeError("fully-async rollout worker exited without an exception")
                 if queue_get in done:
                     result = queue_get.result()
+                    self._pipeline_telemetry.add_trainer_starvation(time.monotonic() - starvation_start)
+                    self._pipeline_telemetry.set_queue_depth(self._output.qsize())
                     self._release_output_slot()
                     self._queue_lifecycle.dequeued(result[1], depth_after_observed=self._output.qsize())
                     return result
@@ -1170,6 +1346,7 @@ class FullyAsyncRolloutFn:
         if self._worker is not None and self._worker.done():
             self._worker.result()
             raise RuntimeError("fully-async rollout worker exited without an exception")
+        starvation_start = time.monotonic() if len(self._policy_output) < count else None
         while len(self._policy_output) < count:
             self._policy_output_ready.clear()
             if len(self._policy_output) >= count:
@@ -1194,6 +1371,8 @@ class FullyAsyncRolloutFn:
             finally:
                 if not queue_ready.done():
                     queue_ready.cancel()
+        if starvation_start is not None:
+            self._pipeline_telemetry.add_trainer_starvation(time.monotonic() - starvation_start)
 
         selected = []
         for _ in range(count):
@@ -1203,6 +1382,7 @@ class FullyAsyncRolloutFn:
             depth_after = len(self._policy_output)
             self._queue_lifecycle.dequeued(item[1], depth_after_observed=depth_after)
             selected.append((item, depth_after))
+        self._pipeline_telemetry.set_queue_depth(len(self._policy_output))
         return selected
 
     def _release_output_slot(self) -> None:
@@ -1282,11 +1462,55 @@ class FullyAsyncRolloutFn:
             # A weight update paused generation mid-group: return it for re-sampling.
             if any(s.status == Sample.Status.ABORTED for s in _iter_samples(group)):
                 response_length_metrics.record("aborted_recycled", group)
-                progress.aborted_tokens += group_response_tokens(group)
+                samples = list(_iter_samples(group))
+                tokens = group_response_tokens(group)
+                current = self._applied_weight_version.current()
+                submitted = group_submission_weight_version(group)
+                ready = group_lifecycle_weight_version(group, GROUP_READY_VERSION_KEY)
+                queue_put = group_lifecycle_weight_version(group, QUEUE_PUT_VERSION_KEY)
+                stamp_sample_lifecycle_boundary(
+                    _iter_samples(group),
+                    version_key=DRAIN_VERSION_KEY,
+                    version=current,
+                    time_key=DRAIN_TIME_KEY,
+                    wall_time=time.time(),
+                )
+                add_selection_population(
+                    progress.selection_populations,
+                    population_name="recycled",
+                    samples=samples,
+                )
+                reason = aborted_recycle_reason(
+                    submission_version=submitted,
+                    group_ready_version=ready,
+                )
+                waste = add_discard_accounting(
+                    progress.waste_by_reason,
+                    reason=reason,
+                    samples=samples,
+                )
+                _record_reason(progress, reason=reason, tokens=tokens)
+                if getattr(args, "save_debug_rollout_data", None) is not None:
+                    progress.discard_records.append(
+                        recycle_record(
+                            samples,
+                            disposition="aborted_recycled",
+                            reason_code=reason,
+                            reference_mode=args.staleness_reference,
+                            reference_version=None,
+                            generation_completion_version=group_generation_completion_version(samples),
+                            group_ready_version=ready,
+                            queue_put_version=queue_put,
+                            drain_version=current,
+                            bound=args.max_weight_staleness,
+                            waste=waste,
+                        )
+                    )
+                progress.aborted_tokens += tokens
                 self._queue_lifecycle.finish(
                     group,
                     disposition="aborted_recycled",
-                    decision_version=self._applied_weight_version.current(),
+                    decision_version=current,
                     rollout_id=rollout_id,
                 )
                 self._recycle(prompt_group)
@@ -1298,9 +1522,16 @@ class FullyAsyncRolloutFn:
             oldest = group_oldest_weight_version(group)
             submitted = group_submission_weight_version(group)
             ready = group_lifecycle_weight_version(group, GROUP_READY_VERSION_KEY)
+            queue_put = group_lifecycle_weight_version(group, QUEUE_PUT_VERSION_KEY)
             current = self._applied_weight_version.current()
             progress.current_version = current
-            stamp_group_weight_version(group, DRAIN_VERSION_KEY, current)
+            stamp_sample_lifecycle_boundary(
+                _iter_samples(group),
+                version_key=DRAIN_VERSION_KEY,
+                version=current,
+                time_key=DRAIN_TIME_KEY,
+                wall_time=time.time(),
+            )
 
             first_prefill = group_first_prefill_weight_version(group)
             if args.staleness_reference == "prefill":
@@ -1321,6 +1552,9 @@ class FullyAsyncRolloutFn:
                 reference = submitted
             else:
                 reference = first_prefill
+            if reference is not None:
+                stamp_group_weight_version(group, BOUND_REFERENCE_VERSION_KEY, reference)
+            stamp_sample_reference_versions(_iter_samples(group), args.staleness_reference)
 
             group_bound_staleness: int | None = None
             if args.max_weight_staleness is not None:
@@ -1334,19 +1568,66 @@ class FullyAsyncRolloutFn:
                     group_bound_staleness = staleness
                     offered_bound_staleness.append(staleness)
                     if staleness > args.max_weight_staleness:
-                        rejected_tokens = group_response_tokens(group)
-                        disposition = "stale_recycled"
-                        if self._queue_policy() == QUEUE_MAX_POLICY:
-                            disposition = "age_cutoff_dropped"
-                            response_length_metrics.record(disposition, group)
-                            progress.age_cutoff_tokens += rejected_tokens
-                            progress.stale_groups_dropped += 1
-                            self._finish_prompt(prompt_group)
-                        else:
-                            response_length_metrics.record(disposition, group)
-                            progress.stale_tokens += rejected_tokens
-                            progress.stale_groups_recycled += 1
-                            self._recycle(prompt_group)
+                        samples = list(_iter_samples(group))
+                        tokens = group_response_tokens(group)
+                        disposition = (
+                            "age_cutoff_dropped" if self._queue_policy() == QUEUE_MAX_POLICY else "stale_recycled"
+                        )
+                        generation_completion = group_generation_completion_version(samples)
+                        reason = classify_stale_recycle_stage(
+                            reference_version=reference,
+                            generation_completion_version=generation_completion,
+                            group_ready_version=ready,
+                            queue_put_version=queue_put,
+                            drain_version=current,
+                            bound=args.max_weight_staleness,
+                        )
+                        collateral = straggler_collateral_indices(
+                            samples,
+                            reference_mode=args.staleness_reference,
+                            drain_version=current,
+                            bound=args.max_weight_staleness,
+                        )
+                        waste = add_discard_accounting(
+                            progress.waste_by_reason,
+                            reason=reason,
+                            samples=samples,
+                        )
+                        outcome_population = "dropped" if disposition == "age_cutoff_dropped" else "recycled"
+                        add_selection_population(
+                            progress.selection_populations,
+                            population_name=outcome_population,
+                            samples=samples,
+                        )
+                        _record_reason(progress, reason=reason, tokens=tokens)
+                        if collateral:
+                            collateral_tokens = sum(
+                                sample.response_length for sample in samples if sample.index in collateral
+                            )
+                            _record_reason(
+                                progress,
+                                reason="group_straggler_collateral",
+                                tokens=collateral_tokens,
+                                auxiliary=True,
+                            )
+                        if getattr(args, "save_debug_rollout_data", None) is not None:
+                            progress.discard_records.append(
+                                recycle_record(
+                                    samples,
+                                    disposition=disposition,
+                                    reason_code=reason,
+                                    reference_mode=args.staleness_reference,
+                                    reference_version=reference,
+                                    generation_completion_version=generation_completion,
+                                    group_ready_version=ready,
+                                    queue_put_version=queue_put,
+                                    drain_version=current,
+                                    bound=args.max_weight_staleness,
+                                    waste=waste,
+                                    collateral_indices=collateral,
+                                )
+                            )
+                        response_length_metrics.record(disposition, group)
                         self._queue_lifecycle.finish(
                             group,
                             disposition=disposition,
@@ -1355,6 +1636,14 @@ class FullyAsyncRolloutFn:
                             reference_version=reference,
                             bound_staleness=staleness,
                         )
+                        if disposition == "age_cutoff_dropped":
+                            progress.age_cutoff_tokens += tokens
+                            progress.stale_groups_dropped += 1
+                            self._finish_prompt(prompt_group)
+                        else:
+                            progress.stale_tokens += tokens
+                            progress.stale_groups_recycled += 1
+                            self._recycle(prompt_group)
                         logger.info(
                             f"Rejected stale group ({args.staleness_reference}_version={reference}, "
                             f"current={current}, staleness={staleness} > max={args.max_weight_staleness})"
@@ -1385,7 +1674,36 @@ class FullyAsyncRolloutFn:
             if not filter_output.keep:
                 # Dropped, not recycled: no usable gradient signal.
                 response_length_metrics.record("dynamic_filter_dropped", group)
-                progress.filtered_tokens += group_response_tokens(group)
+                samples = list(_iter_samples(group))
+                tokens = group_response_tokens(group)
+                waste = add_discard_accounting(
+                    progress.waste_by_reason,
+                    reason="dynamic_filter_dropped",
+                    samples=samples,
+                )
+                add_selection_population(
+                    progress.selection_populations,
+                    population_name="dropped",
+                    samples=samples,
+                )
+                if getattr(args, "save_debug_rollout_data", None) is not None:
+                    progress.discard_records.append(
+                        recycle_record(
+                            samples,
+                            disposition="dynamic_filter_dropped",
+                            reason_code="dynamic_filter_dropped",
+                            reference_mode=args.staleness_reference,
+                            reference_version=reference,
+                            generation_completion_version=group_generation_completion_version(samples),
+                            group_ready_version=ready,
+                            queue_put_version=queue_put,
+                            drain_version=current,
+                            bound=args.max_weight_staleness,
+                            waste=waste,
+                            detail=filter_output.reason,
+                        )
+                    )
+                progress.filtered_tokens += tokens
                 self._queue_lifecycle.finish(
                     group,
                     disposition="dynamic_filter_dropped",
@@ -1420,6 +1738,28 @@ class FullyAsyncRolloutFn:
                 trained_total.append(group_total)
             trained_mixed_versions.append(mixed_version)
             response_length_metrics.record("trained", group)
+            accepted_samples = list(_iter_samples(group))
+            add_selection_population(
+                progress.selection_populations,
+                population_name="admitted",
+                samples=accepted_samples,
+            )
+            if getattr(args, "save_debug_rollout_data", None) is not None:
+                progress.discard_records.append(
+                    recycle_record(
+                        accepted_samples,
+                        disposition="admitted",
+                        reason_code="accepted_for_training",
+                        reference_mode=args.staleness_reference,
+                        reference_version=reference,
+                        generation_completion_version=group_generation_completion_version(accepted_samples),
+                        group_ready_version=ready,
+                        queue_put_version=queue_put,
+                        drain_version=current,
+                        bound=args.max_weight_staleness,
+                        waste={},
+                    )
+                )
             self._queue_lifecycle.finish(
                 group,
                 disposition="trained",
@@ -1439,6 +1779,7 @@ class FullyAsyncRolloutFn:
 
         data.sort(key=lambda group: _first_sample(group).index)
 
+        admitted_tokens_before_sample_filter = sum(group_response_tokens(group) for group in data)
         if self._sample_filter is not None:
             self._sample_filter(args, data)
 
@@ -1454,6 +1795,9 @@ class FullyAsyncRolloutFn:
             + progress.filtered_tokens
             + queue_evicted_tokens
         )
+        generated_tokens = wasted_tokens + admitted_tokens_before_sample_filter
+        producer_selection_populations = self._producer_selection_populations
+        self._producer_selection_populations = {}
         metrics = {
             "rollout/fully_async/queue_size": self._queue_size(),
             "queue/occupancy/start_groups": queue_size_start,
@@ -1477,6 +1821,8 @@ class FullyAsyncRolloutFn:
             "rollout/fully_async/wasted_token_frac": (
                 wasted_tokens / (wasted_tokens + kept_tokens) if wasted_tokens + kept_tokens else 0.0
             ),
+            GENERATED_TOKENS_KEY: generated_tokens,
+            ADMITTED_TOKENS_KEY: admitted_tokens_before_sample_filter,
             **{
                 f"queue/occupancy/after_dequeue/{name}": value
                 for name, value in _distribution_metrics(queue_sizes_after_dequeue).items()
@@ -1488,7 +1834,26 @@ class FullyAsyncRolloutFn:
                 for reason, count in progress.dynamic_filter_drop_counts.items()
             },
             **self._take_resume_metrics(),
+            **discard_waste_metrics(progress.waste_by_reason),
+            **selection_population_metrics(
+                producer_selection_populations,
+                population_names=("generated",),
+            ),
+            **selection_population_metrics(
+                progress.selection_populations,
+                population_names=("admitted", "recycled", "dropped"),
+            ),
         }
+        for reason in RECYCLE_REASONS:
+            count = progress.recycle_reason_groups.get(reason, 0)
+            metrics[f"rollout/fully_async/recycle_reason/{reason}/groups"] = count
+            metrics[f"rollout/fully_async/recycle_reason/{reason}/tokens"] = progress.recycle_reason_tokens.get(
+                reason, 0
+            )
+        for reason in RECYCLE_AUX_REASONS:
+            count = progress.recycle_aux_groups.get(reason, 0)
+            metrics[f"rollout/fully_async/recycle_aux/{reason}/groups"] = count
+            metrics[f"rollout/fully_async/recycle_aux/{reason}/tokens"] = progress.recycle_aux_tokens.get(reason, 0)
         if progress.current_version is not None:
             # Logged next to the staleness itself: staleness is a difference against
             # this version, and without it a missing staleness metric is impossible to
@@ -1578,11 +1943,19 @@ class FullyAsyncRolloutFn:
             metrics["staleness/retry_count_max"] = float(max(retries))
             metrics["staleness/retry_frac_nonzero"] = sum(1 for r in retries if r) / len(retries)
 
-        self._drain_progress.pop(rollout_id, None)
         debug_metadata = self._queue_lifecycle.take_metadata(
             policy=self._queue_policy(),
             capacity_groups=self._queue_capacity_groups(),
         )
+        if getattr(args, "save_debug_rollout_data", None) is not None:
+            if debug_metadata is None:
+                debug_metadata = {}
+            debug_metadata["recycle_compute"] = {
+                "schema_version": RECYCLE_DEBUG_SCHEMA_VERSION,
+                "records": progress.discard_records,
+            }
+
+        self._drain_progress.pop(rollout_id, None)
         return RolloutFnTrainOutput(samples=data, metrics=metrics, debug_metadata=debug_metadata)
 
     def _recycle(self, prompt_group: list[Sample]) -> None:

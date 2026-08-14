@@ -2,6 +2,7 @@ from typing import Any
 
 import torch
 
+from miles.rollout.recycle_compute_metrics import DRAIN_VERSION_KEY, SAMPLE_REFERENCE_VERSION_KEY
 from miles.utils import object_store
 from miles.utils.object_store import ValueSpec
 from miles.utils.seqlen_balancing import get_seqlen_balanced_partitions
@@ -27,6 +28,10 @@ ROLLOUT_DATA_VALUE_SPEC: dict[str, ValueSpec] = {
     "truncated": ValueSpec(codec="ndarray", dtype="int64"),
     "round_number": ValueSpec(codec="ndarray", dtype="int64"),
     "sample_indices": ValueSpec(codec="ndarray", dtype="int64"),
+    "sample_group_indices": ValueSpec(codec="ndarray", dtype="int64"),
+    "generation_attempt_numbers": ValueSpec(codec="ndarray", dtype="int64"),
+    "training_steps": ValueSpec(codec="ndarray", dtype="int64"),
+    "sample_staleness": ValueSpec(codec="ndarray", dtype="int64"),
     "multimodal_train_inputs": ValueSpec(codec="ragged_tensor_dict"),
     "prompt": ValueSpec(codec="msgpack_ragged"),
     "metadata": ValueSpec(codec="msgpack_ragged"),
@@ -75,6 +80,28 @@ def convert_samples_to_train_data(
         "truncated": [1 if sample.status == Sample.Status.TRUNCATED else 0 for sample in samples],
         "sample_indices": [sample.index for sample in samples],
     }
+    if getattr(args, "dump_details", None) is not None:
+        if all(sample.group_index is not None for sample in samples):
+            train_data["sample_group_indices"] = [sample.group_index for sample in samples]
+        train_data["generation_attempt_numbers"] = [sample.retry_count for sample in samples]
+        if (training_step := metadata.get("training_step")) is not None:
+            train_data["training_steps"] = [int(training_step)] * len(samples)
+
+    if getattr(args, "log_staleness_gradient_metrics", False) or getattr(args, "dump_details", None) is not None:
+        staleness_rows = []
+        for sample in samples:
+            reference = sample.metadata.get(SAMPLE_REFERENCE_VERSION_KEY)
+            drain = sample.metadata.get(DRAIN_VERSION_KEY)
+            if not isinstance(reference, int) or not isinstance(drain, int):
+                staleness_rows = []
+                break
+            if drain < reference:
+                raise RuntimeError(
+                    f"Negative sample staleness for sample {sample.index}: " f"drain={drain}, reference={reference}"
+                )
+            staleness_rows.append(drain - reference)
+        if staleness_rows:
+            train_data["sample_staleness"] = staleness_rows
 
     # loss mask
     # TODO: compress the loss mask
@@ -245,6 +272,10 @@ def split_train_data_by_dp_raw(args, data: dict[str, Any], *, dp_size: int) -> l
             "loss_masks",
             "round_number",
             "sample_indices",
+            "sample_group_indices",
+            "generation_attempt_numbers",
+            "training_steps",
+            "sample_staleness",
             "rollout_log_probs",
             "rollout_routed_experts",
             "rollout_indexer_topk",

@@ -1426,6 +1426,33 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--lambd", type=float, default=1.0, help="PPO GAE lambd")
             parser.add_argument("--normalize-advantages", action="store_true", default=False)
             parser.add_argument(
+                "--log-staleness-gradient-metrics",
+                action="store_true",
+                default=False,
+                help=(
+                    "Log consumed and effective policy-gradient contribution by sample staleness. "
+                    "Uses tensors already present in policy loss and performs no extra model forward."
+                ),
+            )
+            parser.add_argument(
+                "--staleness-gradient-max-bin",
+                type=int,
+                default=16,
+                help=(
+                    "Largest exact staleness bin for --log-staleness-gradient-metrics; "
+                    "larger values share one overflow bin."
+                ),
+            )
+            parser.add_argument(
+                "--log-staleness-gradient-ratio-histogram",
+                action="store_true",
+                default=False,
+                help=(
+                    "Also log a fixed signed log-ratio histogram and histogram-derived p95 in each "
+                    "staleness bin. This adds metric cardinality but stores no raw token arrays."
+                ),
+            )
+            parser.add_argument(
                 "--disable-grpo-std-normalization",
                 action="store_false",
                 dest="grpo_std_normalization",
@@ -3349,6 +3376,25 @@ def miles_validate_args(args):
             f"--async-max-concurrent-samples ({args.async_max_concurrent_samples}) must be at least "
             f"--n-samples-per-prompt ({args.n_samples_per_prompt}): the worker submits whole groups, "
             f"so one group already puts n_samples_per_prompt trajectories in flight"
+        )
+
+    assert getattr(args, "staleness_gradient_max_bin", 16) >= 0, "--staleness-gradient-max-bin must be non-negative"
+    if getattr(args, "log_staleness_gradient_ratio_histogram", False):
+        assert getattr(
+            args, "log_staleness_gradient_metrics", False
+        ), "--log-staleness-gradient-ratio-histogram requires --log-staleness-gradient-metrics"
+    if getattr(args, "log_staleness_gradient_metrics", False):
+        assert args.fully_async, "--log-staleness-gradient-metrics requires --fully-async"
+        assert (
+            args.loss_type == "policy_loss"
+        ), "--log-staleness-gradient-metrics currently instruments the built-in policy loss"
+        assert getattr(args, "custom_pg_loss_reducer_function_path", None) is None, (
+            "--log-staleness-gradient-metrics cannot infer exact objective normalization from "
+            "a custom policy-gradient loss reducer"
+        )
+        assert getattr(args, "custom_convert_samples_to_train_data_path", None) is None, (
+            "--log-staleness-gradient-metrics requires the built-in sample-to-train-data "
+            "converter to carry sample staleness"
         )
 
     _resolve_rollout_functions(args)

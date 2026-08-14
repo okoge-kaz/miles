@@ -12,13 +12,18 @@ set -euo pipefail
 : "${VALIDATION_DUMPER:=0}"
 : "${VALIDATION_DETERMINISTIC:=0}"
 : "${VALIDATION_SAVE_TRAIN_DATA:=0}"
+: "${VALIDATION_FULLY_ASYNC:=0}"
+: "${VALIDATION_STALENESS_METRICS:=0}"
+: "${VALIDATION_STALENESS_RATIO_HISTOGRAM:=0}"
+: "${VALIDATION_DISABLE_KL_CHECKER:=0}"
 : "${VALIDATION_ROLLOUT_BATCH_SIZE:=192}"
 : "${VALIDATION_N_SAMPLES_PER_PROMPT:=16}"
 : "${VALIDATION_GLOBAL_BATCH_SIZE:=$((VALIDATION_ROLLOUT_BATCH_SIZE * VALIDATION_N_SAMPLES_PER_PROMPT))}"
 : "${VALIDATION_MAX_TOKENS_PER_GPU:=32768}"
+: "${VALIDATION_CODE_ROOT:=/root/miles}"
 
-cd /root/miles
-source /root/miles/scripts/models/qwen3-4B-Instruct-2507.sh
+cd "${VALIDATION_CODE_ROOT}"
+source "${VALIDATION_CODE_ROOT}/scripts/models/qwen3-4B-Instruct-2507.sh"
 
 mkdir -p "${VALIDATION_OUTPUT}"
 
@@ -60,6 +65,11 @@ rollout_args=(
     --num-steps-per-rollout 1
     --balance-data
 )
+driver="${VALIDATION_CODE_ROOT}/train.py"
+if [[ "${VALIDATION_FULLY_ASYNC}" == 1 ]]; then
+    rollout_args+=(--fully-async)
+    driver="${VALIDATION_CODE_ROOT}/train_async.py"
+fi
 
 optimizer_args=(
     --optimizer adam
@@ -118,6 +128,20 @@ telemetry_args=(
     --no-dump-policy-loss-debug
     --no-dump-train-data
 )
+if [[ "${VALIDATION_STALENESS_METRICS}" == 1 ]]; then
+    if [[ "${VALIDATION_FULLY_ASYNC}" != 1 ]]; then
+        echo "VALIDATION_STALENESS_METRICS=1 requires VALIDATION_FULLY_ASYNC=1" >&2
+        exit 1
+    fi
+    telemetry_args+=(--log-staleness-gradient-metrics)
+fi
+if [[ "${VALIDATION_STALENESS_RATIO_HISTOGRAM}" == 1 ]]; then
+    if [[ "${VALIDATION_STALENESS_METRICS}" != 1 ]]; then
+        echo "VALIDATION_STALENESS_RATIO_HISTOGRAM=1 requires VALIDATION_STALENESS_METRICS=1" >&2
+        exit 1
+    fi
+    telemetry_args+=(--log-staleness-gradient-ratio-histogram)
+fi
 if [[ "${VALIDATION_DUMPER}" == 1 ]]; then
     telemetry_args+=(
         --dumper-dir "${VALIDATION_OUTPUT}/dumper"
@@ -147,15 +171,18 @@ misc_args=(
     --ci-disable-logprobs-checker
     --ci-save-grad-norm "${VALIDATION_OUTPUT}/grad_norm-{rollout_id}-{step_id}.pt"
 )
+if [[ "${VALIDATION_DISABLE_KL_CHECKER}" == 1 ]]; then
+    misc_args+=(--ci-disable-kl-checker)
+fi
 
-runtime_env='{"env_vars":{"PYTHONPATH":"/root/Megatron-LM/:/root/miles","MILES_EXPERIMENTAL_ROLLOUT_REFACTOR":"1","CUDA_DEVICE_MAX_CONNECTIONS":"1","NCCL_NVLS_ENABLE":"1","PYTORCH_CUDA_ALLOC_CONF":"expandable_segments:True","no_proxy":"127.0.0.1"}}'
+runtime_env="{\"env_vars\":{\"PYTHONPATH\":\"/root/Megatron-LM/:${VALIDATION_CODE_ROOT}\",\"MILES_EXPERIMENTAL_ROLLOUT_REFACTOR\":\"1\",\"CUDA_DEVICE_MAX_CONNECTIONS\":\"1\",\"NCCL_NVLS_ENABLE\":\"1\",\"PYTORCH_CUDA_ALLOC_CONF\":\"expandable_segments:True\",\"no_proxy\":\"127.0.0.1\"}}"
 if [[ "${VALIDATION_DETERMINISTIC}" == 1 ]]; then
-    runtime_env='{"env_vars":{"PYTHONPATH":"/root/Megatron-LM/:/root/miles","MILES_EXPERIMENTAL_ROLLOUT_REFACTOR":"1","CUDA_DEVICE_MAX_CONNECTIONS":"1","NCCL_NVLS_ENABLE":"1","PYTORCH_CUDA_ALLOC_CONF":"expandable_segments:True","NCCL_ALGO":"Ring","NVTE_ALLOW_NONDETERMINISTIC_ALGO":"0","CUBLAS_WORKSPACE_CONFIG":":4096:8","no_proxy":"127.0.0.1"}}'
+    runtime_env="{\"env_vars\":{\"PYTHONPATH\":\"/root/Megatron-LM/:${VALIDATION_CODE_ROOT}\",\"MILES_EXPERIMENTAL_ROLLOUT_REFACTOR\":\"1\",\"CUDA_DEVICE_MAX_CONNECTIONS\":\"1\",\"NCCL_NVLS_ENABLE\":\"1\",\"PYTORCH_CUDA_ALLOC_CONF\":\"expandable_segments:True\",\"NCCL_ALGO\":\"Ring\",\"NVTE_ALLOW_NONDETERMINISTIC_ALGO\":\"0\",\"CUBLAS_WORKSPACE_CONFIG\":\":4096:8\",\"no_proxy\":\"127.0.0.1\"}}"
 fi
 
 ray job submit --address="http://127.0.0.1:8265" \
     --runtime-env-json="${runtime_env}" \
-    -- python3 train.py \
+    -- python3 "${driver}" \
     "${MODEL_ARGS[@]}" \
     "${checkpoint_args[@]}" \
     "${rollout_args[@]}" \

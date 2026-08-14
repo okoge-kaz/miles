@@ -161,6 +161,7 @@ def _merge_sample_pair(a: Sample, b: Sample, tokenizer) -> Sample:
             max_forward_weight_versions=a.max_forward_weight_versions + b.max_forward_weight_versions,
             last_forward_weight_versions=a.last_forward_weight_versions + b.last_forward_weight_versions,
             response_weight_versions=a.response_weight_versions + b.response_weight_versions,
+            response_weight_version_segments=(a.response_weight_version_segments + b.response_weight_version_segments),
             rollout_log_probs=a.rollout_log_probs + [0.0] * obs_len + b.rollout_log_probs,
             teacher_log_probs=_merge_optional_per_token("teacher_log_probs"),
             opd_reverse_kl=_merge_optional_per_token("opd_reverse_kl"),

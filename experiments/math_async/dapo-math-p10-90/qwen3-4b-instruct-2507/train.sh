@@ -71,12 +71,26 @@ TELEMETRY_ARGS=(
    --dump-details "${CKPT_PATH}/dump"
    --use-miles-dashboard
    --observe-training-entropy
-   --no-dump-policy-loss-debug
 )
+if [[ "${DUMP_POLICY_LOSS_DEBUG:-0}" != "0" ]]; then
+   TELEMETRY_ARGS+=(--dump-policy-loss-debug)
+else
+   TELEMETRY_ARGS+=(--no-dump-policy-loss-debug)
+fi
 if [[ "${DUMP_TRAIN_DATA}" == "0" ]]; then
    TELEMETRY_ARGS+=(--no-dump-train-data)
 else
    TELEMETRY_ARGS+=(--use-rollout-entropy)
+fi
+if [[ "${LOG_STALENESS_GRADIENT_METRICS:-0}" != "0" ]]; then
+   TELEMETRY_ARGS+=(--log-staleness-gradient-metrics)
+fi
+if [[ "${LOG_STALENESS_GRADIENT_RATIO_HISTOGRAM:-0}" != "0" ]]; then
+   if [[ "${LOG_STALENESS_GRADIENT_METRICS:-0}" == "0" ]]; then
+      echo "LOG_STALENESS_GRADIENT_RATIO_HISTOGRAM requires LOG_STALENESS_GRADIENT_METRICS=1" >&2
+      exit 1
+   fi
+   TELEMETRY_ARGS+=(--log-staleness-gradient-ratio-histogram)
 fi
 
 # EVAL_INTERVAL=0 passes no --eval-interval at all, which is what leaves
@@ -188,6 +202,9 @@ if [[ -n "${SGLANG_MAX_RUNNING_REQUESTS:-}" ]]; then
 fi
 if [[ -n "${SGLANG_CUDA_GRAPH_MAX_BS:-}" ]]; then
    SGLANG_ARGS+=(--sglang-cuda-graph-max-bs "${SGLANG_CUDA_GRAPH_MAX_BS}")
+fi
+if [[ "${SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS:-0}" != "0" ]]; then
+   SGLANG_ARGS+=(--sglang-enable-response-weight-version-segments)
 fi
 
 MISC_ARGS=(

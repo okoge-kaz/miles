@@ -15,6 +15,7 @@ from miles.ray.rollout.train_data_conversion import (
     split_train_data_by_dp,
     split_train_data_by_dp_raw,
 )
+from miles.rollout.recycle_compute_metrics import DRAIN_VERSION_KEY, SAMPLE_REFERENCE_VERSION_KEY
 from miles.utils import object_store
 from miles.utils.types import Sample
 
@@ -130,6 +131,60 @@ class TestConvertSamplesToTrainData:
             custom_reward_post_process_func=None,
         )
         assert out["round_number"][0] == 7
+
+    def test_sample_staleness_is_derived_from_lifecycle_versions(self):
+        args = make_args(
+            rewards_normalization=False,
+            log_staleness_gradient_metrics=True,
+        )
+        samples = [make_sample(), make_sample()]
+        for sample, reference in zip(samples, (3, 5), strict=True):
+            sample.metadata[SAMPLE_REFERENCE_VERSION_KEY] = reference
+            sample.metadata[DRAIN_VERSION_KEY] = 7
+        out = convert_samples_to_train_data(
+            args,
+            samples,
+            metadata={},
+            custom_convert_samples_to_train_data_func=None,
+            custom_reward_post_process_func=None,
+        )
+        assert out["sample_staleness"] == [4, 2]
+
+    def test_sample_staleness_is_not_sent_to_trainer_when_diagnostics_are_off(self):
+        args = make_args(
+            rewards_normalization=False,
+            log_staleness_gradient_metrics=False,
+            dump_details=None,
+        )
+        sample = make_sample()
+        sample.metadata[SAMPLE_REFERENCE_VERSION_KEY] = 3
+        sample.metadata[DRAIN_VERSION_KEY] = 7
+
+        out = convert_samples_to_train_data(
+            args,
+            [sample],
+            metadata={},
+            custom_convert_samples_to_train_data_func=None,
+            custom_reward_post_process_func=None,
+        )
+
+        assert "sample_staleness" not in out
+
+    def test_sample_staleness_is_omitted_when_provenance_is_incomplete(self):
+        args = make_args(
+            rewards_normalization=False,
+            log_staleness_gradient_metrics=True,
+        )
+        sample = make_sample()
+        sample.metadata[DRAIN_VERSION_KEY] = 7
+        out = convert_samples_to_train_data(
+            args,
+            [sample],
+            metadata={},
+            custom_convert_samples_to_train_data_func=None,
+            custom_reward_post_process_func=None,
+        )
+        assert "sample_staleness" not in out
 
     def test_optional_field_raw_reward_overridden_from_metadata(self):
         args = make_args(rewards_normalization=False)

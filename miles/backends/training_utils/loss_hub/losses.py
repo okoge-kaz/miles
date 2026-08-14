@@ -14,12 +14,13 @@ from miles.backends.training_utils.loss_hub.logit_processors import get_log_prob
 from miles.backends.training_utils.loss_hub.math_utils import (
     compute_approx_kl,
     compute_ess_ratio_contribution,
-    compute_sequence_level_ess_parts,
     compute_gspo_kl,
     compute_m2po_clip_bounds,
     compute_opsm_mask,
     compute_policy_loss,
+    compute_sequence_level_ess_parts,
 )
+from miles.backends.training_utils.loss_hub.staleness_metrics import compute_staleness_gradient_parts
 from miles.backends.training_utils.parallel import get_parallel_state
 from miles.utils.misc import load_function
 from miles.utils.types import RolloutBatch
@@ -105,8 +106,7 @@ def _fused_shadow_validation_metrics(
     legacy_list = batch.get("legacy_actor_log_probs")
     if not legacy_list:
         raise RuntimeError(
-            "--verify-fused-one-step-actor-logprobs requires legacy_actor_log_probs "
-            "from the shadow actor forward"
+            "--verify-fused-one-step-actor-logprobs requires legacy_actor_log_probs " "from the shadow actor forward"
         )
 
     legacy = torch.cat(legacy_list, dim=0).detach()
@@ -119,14 +119,10 @@ def _fused_shadow_validation_metrics(
             f"rollout={tuple(rollout.shape)}"
         )
 
-    metrics = _absolute_difference_metrics(
-        "verify_anchor_logprob_abs", legacy - anchor, active_tokens, reducer
-    )
+    metrics = _absolute_difference_metrics("verify_anchor_logprob_abs", legacy - anchor, active_tokens, reducer)
     legacy_tis = torch.exp(legacy - rollout)
     fused_tis = torch.exp(anchor - rollout)
-    metrics |= _absolute_difference_metrics(
-        "verify_tis_weight_abs", legacy_tis - fused_tis, active_tokens, reducer
-    )
+    metrics |= _absolute_difference_metrics("verify_tis_weight_abs", legacy_tis - fused_tis, active_tokens, reducer)
 
     legacy_clipped = torch.clamp(legacy_tis, min=args.tis_clip_low, max=args.tis_clip)
     fused_clipped = torch.clamp(fused_tis, min=args.tis_clip_low, max=args.tis_clip)
@@ -334,26 +330,19 @@ def policy_loss_function(
     pg_loss, pg_clipfrac = compute_policy_loss(
         ppo_kl, advantages, eps_clip, eps_clip_high, getattr(args, "eps_clip_c", None)
     )
-
-    if getattr(args, "dump_details", None) is not None:
-        from miles.backends.training_utils.debug_dump import maybe_dump_policy_loss_debug
-
-        maybe_dump_policy_loss_debug(
-            args=args,
-            batch=batch,
-            train_log_probs=train_log_probs_list,
-            old_log_probs=old_log_probs_list,
-            rollout_log_probs=batch.get("rollout_log_probs"),
-            advantages=batch["advantages"],
-            local_loss_masks=local_loss_mask_list,
-            ppo_kl=ppo_kl,
-            pg_loss=pg_loss,
-        )
+    pg_clipfrac_tokens = pg_clipfrac
+    debug_base_pg_loss = (
+        pg_loss.detach().clone()
+        if getattr(args, "dump_details", None) is not None and getattr(args, "dump_policy_loss_debug", True)
+        else None
+    )
 
     if args.use_opsm:
         pg_loss = pg_loss * opsm_mask
 
     # Apply off-policy correction using importance sampling if enabled
+    tis_metrics: dict[str, torch.Tensor] = {}
+    modified_response_masks = batch["loss_masks"]
     if args.get_mismatch_metrics or args.use_tis:
         # NOTE:
         # `tis_func` may apply rejection-sampling style masking (RS) and return `modified_response_masks`.
@@ -407,6 +396,54 @@ def policy_loss_function(
         )
     else:
         pg_loss_reducer = sum_of_sample_mean
+
+    policy_log_ratio = None
+    if batch.get("rollout_log_probs") is not None and (
+        getattr(args, "log_staleness_gradient_metrics", False) or debug_base_pg_loss is not None
+    ):
+        policy_log_ratio = log_probs.detach() - torch.cat(batch["rollout_log_probs"], dim=0).detach()
+
+    staleness_gradient_parts: dict[str, torch.Tensor] = {}
+    if getattr(args, "log_staleness_gradient_metrics", False):
+        assert batch.get("sample_staleness") is not None, (
+            "--log-staleness-gradient-metrics requires complete per-sample "
+            "reference/drain weight-version provenance"
+        )
+        assert (
+            "rollout_log_probs" in batch
+        ), "staleness-gradient metrics require rollout_log_probs to measure the current/behavior ratio"
+        assert policy_log_ratio is not None
+        staleness_gradient_parts = compute_staleness_gradient_parts(
+            args=args,
+            batch=batch,
+            original_local_masks=local_loss_mask_list,
+            final_masks=modified_response_masks,
+            pg_loss_tokens=pg_loss,
+            ppo_clipfrac=pg_clipfrac_tokens,
+            policy_log_ratio=policy_log_ratio,
+            objective_log_ratio=-ppo_kl_tokens.detach(),
+            tis_metrics=tis_metrics,
+        )
+
+    if debug_base_pg_loss is not None:
+        from miles.backends.training_utils.debug_dump import maybe_dump_policy_loss_debug
+
+        maybe_dump_policy_loss_debug(
+            args=args,
+            batch=batch,
+            train_log_probs=train_log_probs_list,
+            old_log_probs=old_log_probs_list,
+            rollout_log_probs=batch.get("rollout_log_probs"),
+            advantages=batch["advantages"],
+            local_loss_masks=local_loss_mask_list,
+            ppo_kl=ppo_kl,
+            pg_loss=debug_base_pg_loss,
+            final_pg_loss=pg_loss,
+            final_loss_masks=modified_response_masks,
+            ppo_clipfrac=pg_clipfrac_tokens,
+            policy_log_ratio=policy_log_ratio,
+            tis_metrics=tis_metrics,
+        )
 
     # ESS (Effective Sample Size) ratio from per-token IS weights
     # w = π_new/π_old = exp(-ppo_kl).  A value of 1.0 is on-policy; near 0
@@ -576,6 +613,7 @@ def policy_loss_function(
         "ess_ratio": ess_ratio_sum.squeeze(),
     }
     reported_loss |= {name: value.clone().detach() for name, value in fused_metrics.items()}
+    reported_loss |= staleness_gradient_parts
 
     if train_rollout_logprob_abs_diff is not None:
         reported_loss["train_rollout_logprob_abs_diff"] = train_rollout_logprob_abs_diff.clone().detach()

@@ -433,18 +433,19 @@ class FSDPTrainRayActor(TrainRayActor):
             stack.enter_context(store_get_result)
             if self.args.debug_rollout_only:
                 return
-            self._train_core(rollout_id=rollout_id, rollout_data=rollout_data)
+            optimizer_updates = self._train_core(rollout_id=rollout_id, rollout_data=rollout_data)
 
         train_metric_utils.log_perf_data_raw(
             rollout_id=rollout_id,
             args=self.args,
             is_primary_rank=dist.get_rank() == 0,
             compute_total_fwd_flops=None,
+            extra_metrics={"perf/optimizer_updates": optimizer_updates},
         )
 
         self._heartbeat.bump()
 
-    def _train_core(self, rollout_id: int, rollout_data) -> None:
+    def _train_core(self, rollout_id: int, rollout_data) -> int:
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
         data_iterator = data_iterator[0]
 
@@ -488,6 +489,11 @@ class FSDPTrainRayActor(TrainRayActor):
                             "returns",
                             "ref_log_probs",
                             "rollout_log_probs",
+                            "sample_staleness",
+                            "sample_indices",
+                            "sample_group_indices",
+                            "generation_attempt_numbers",
+                            "training_steps",
                         ],
                         self.args.data_pad_size_multiplier,
                         self.args.qkv_format,
@@ -550,7 +556,11 @@ class FSDPTrainRayActor(TrainRayActor):
             self.ref_model.load_state_dict(actor_state)
             self.ref_model.cpu()
 
+        return num_steps_per_rollout
+
     def _train_step(self, batch, step_id, num_microbatches):
+        if getattr(self.args, "dump_details", None) is not None:
+            batch["optimizer_step_ids"] = [step_id] * len(batch["total_lengths"])
         model_args = self._get_model_inputs_args(batch)
         # bf16 logits (see log_probs phase); per-response chunks are upcast to fp32 in the loss path.
         with precision_forward_context(self.precision_policy):

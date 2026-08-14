@@ -18,9 +18,9 @@ source "${REPO_ROOT}/experiments/env.sh"
 
 BASE_IMAGE="${BASE_IMAGE:-${CONTAINER_DIR}/miles-latest-20260803.sqsh}"
 SGLANG_REPO="${SGLANG_REPO:-okoge-kaz/sglang}"
-SGLANG_BRANCH="${SGLANG_BRANCH:-miles-prefill-weight-version}"
-SGLANG_COMMIT="${SGLANG_COMMIT:-23aaf6597dbbe47f9ceb6090e10372c844fed960}"
-OUTPUT_IMAGE="${OUTPUT_IMAGE:-${CONTAINER_DIR}/miles-prefill-weight-version-${SGLANG_COMMIT:0:9}.sqsh}"
+SGLANG_BRANCH="${SGLANG_BRANCH:-miles-staleness-weight-boundaries}"
+SGLANG_COMMIT="${SGLANG_COMMIT:-f994b9aedfd0b1465dbb8f4e2a02eb789fc76dce}"
+OUTPUT_IMAGE="${OUTPUT_IMAGE:-${CONTAINER_DIR}/miles-staleness-weight-boundaries-${SGLANG_COMMIT:0:9}.sqsh}"
 
 test -f "${BASE_IMAGE}"
 test ! -e "${OUTPUT_IMAGE}"
@@ -52,6 +52,7 @@ time enroot start -r -w "${CONTAINER_NAME}" bash -lc "
     git checkout -f ${SGLANG_COMMIT}
     test \"\$(git rev-parse HEAD)\" = ${SGLANG_COMMIT}
     python -c 'import sglang; print(sglang.__file__)'
+    python -m pytest -q test/registered/unit/managers/test_policy_weight_version.py
 "
 
 echo "Exporting ${OUTPUT_IMAGE}"
