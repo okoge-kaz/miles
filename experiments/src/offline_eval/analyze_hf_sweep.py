@@ -29,7 +29,9 @@ class Evaluation:
     setting: str
     step: int
     values: dict[str, np.ndarray]
+    base_values: dict[str, np.ndarray]
     truncated: dict[str, float]
+    n_samples: int
 
 
 def _load_records(path: Path) -> list[dict]:
@@ -42,29 +44,81 @@ def _load_records(path: Path) -> list[dict]:
     return records
 
 
-def discover(eval_root: Path) -> list[Evaluation]:
+def discover(eval_root: Path, extra_suffix: str | None = None) -> list[Evaluation]:
     evaluations: list[Evaluation] = []
     for step_dir in sorted(eval_root.glob("**/step-*")):
         match = STEP_PATTERN.fullmatch(step_dir.name)
         if not step_dir.is_dir() or match is None:
             continue
         values: dict[str, np.ndarray] = {}
+        base_values: dict[str, np.ndarray] = {}
         truncated: dict[str, float] = {}
+        observed_n_samples: set[int] = set()
         for benchmark in BENCHMARKS:
             records = _load_records(step_dir / f"{benchmark}.jsonl")
-            values[benchmark] = np.asarray([float(record["pass_rate"]) for record in records])
+            sample_counts = {int(record["n_samples"]) for record in records}
+            assert len(sample_counts) == 1, f"{benchmark}: inconsistent n_samples"
+            base_n_samples = sample_counts.pop()
+            if extra_suffix is None:
+                base_values[benchmark] = np.asarray(
+                    [float(record["pass_rate"]) for record in records]
+                )
+                combined_records = records
+                evaluation_n_samples = base_n_samples
+            elif base_n_samples == 32:
+                for record in records:
+                    assert len(record["rewards"]) == 32
+                base_values[benchmark] = np.asarray(
+                    [float(np.mean(record["rewards"][:16])) for record in records]
+                )
+                combined_records = records
+                evaluation_n_samples = 32
+            else:
+                assert base_n_samples == 16, (
+                    f"{benchmark}: expected a 16- or 32-sample base, found "
+                    f"{base_n_samples}"
+                )
+                base_values[benchmark] = np.asarray(
+                    [float(record["pass_rate"]) for record in records]
+                )
+                extra = _load_records(step_dir / f"{benchmark}{extra_suffix}.jsonl")
+                assert all(int(record["n_samples"]) == 16 for record in extra)
+                combined_records = []
+                for base_record, extra_record in zip(records, extra, strict=True):
+                    rewards = [*base_record["rewards"], *extra_record["rewards"]]
+                    assert len(rewards) == 32
+                    combined_records.append(
+                        {
+                            "pass_rate": float(np.mean(rewards)),
+                            "truncated_frac": (
+                                float(base_record["truncated_frac"])
+                                + float(extra_record["truncated_frac"])
+                            )
+                            / 2,
+                        }
+                    )
+                evaluation_n_samples = 32
+            observed_n_samples.add(evaluation_n_samples)
+            values[benchmark] = np.asarray(
+                [float(record["pass_rate"]) for record in combined_records]
+            )
             fractions = [
                 float(record["truncated_frac"])
-                for record in records
+                for record in combined_records
                 if record.get("truncated_frac") is not None
             ]
             truncated[benchmark] = float(np.mean(fractions)) if fractions else math.nan
+        assert len(observed_n_samples) == 1, (
+            f"{step_dir}: inconsistent effective n_samples: {observed_n_samples}"
+        )
         evaluations.append(
             Evaluation(
                 setting=step_dir.parent.relative_to(eval_root).as_posix(),
                 step=int(match.group(1)),
                 values=values,
+                base_values=base_values,
                 truncated=truncated,
+                n_samples=evaluation_n_samples,
             )
         )
     assert evaluations, f"no complete evaluations found under {eval_root}"
@@ -79,10 +133,28 @@ def _summary(values: np.ndarray) -> tuple[float, float]:
     return float(np.mean(values)), float(stats.sem(values))
 
 
+def _monte_carlo_se(values: np.ndarray, n_samples: int) -> float:
+    """SE from generation sampling, conditional on the fixed benchmark questions."""
+    assert n_samples > 1
+    return float(np.sqrt(np.sum(values * (1 - values)) / (len(values) ** 2 * (n_samples - 1))))
+
+
 def write_score_tables(evaluations: list[Evaluation], out_dir: Path) -> None:
     with (out_dir / "scores_by_year.csv").open("w", newline="") as handle:
         writer = csv.writer(handle)
-        writer.writerow(("setting", "step", "benchmark", "n", "score", "se", "truncated_frac"))
+        writer.writerow(
+            (
+                "setting",
+                "step",
+                "benchmark",
+                "n_problems",
+                "n_samples",
+                "score",
+                "problem_se",
+                "monte_carlo_se",
+                "truncated_frac",
+            )
+        )
         for evaluation in evaluations:
             for benchmark in BENCHMARKS:
                 mean, se = _summary(evaluation.values[benchmark])
@@ -92,18 +164,42 @@ def write_score_tables(evaluations: list[Evaluation], out_dir: Path) -> None:
                         evaluation.step,
                         benchmark,
                         len(evaluation.values[benchmark]),
+                        evaluation.n_samples,
                         mean,
                         se,
+                        _monte_carlo_se(
+                            evaluation.values[benchmark], evaluation.n_samples
+                        ),
                         evaluation.truncated[benchmark],
                     )
                 )
 
     with (out_dir / "scores_mean.csv").open("w", newline="") as handle:
         writer = csv.writer(handle)
-        writer.writerow(("setting", "step", "n", "mean_score", "se"))
+        writer.writerow(
+            (
+                "setting",
+                "step",
+                "n_problems",
+                "n_samples",
+                "mean_score",
+                "problem_se",
+                "monte_carlo_se",
+            )
+        )
         for evaluation in evaluations:
             mean, se = _summary(_pooled(evaluation))
-            writer.writerow((evaluation.setting, evaluation.step, 90, mean, se))
+            writer.writerow(
+                (
+                    evaluation.setting,
+                    evaluation.step,
+                    90,
+                    evaluation.n_samples,
+                    mean,
+                    se,
+                    _monte_carlo_se(_pooled(evaluation), evaluation.n_samples),
+                )
+            )
 
 
 def _paired_test(left: np.ndarray, right: np.ndarray) -> tuple[float, float]:
@@ -167,7 +263,9 @@ def write_pairwise(rows: list[dict], out_dir: Path) -> None:
         writer.writerows(rows)
 
 
-def plot_trajectories(evaluations: list[Evaluation], out_dir: Path) -> None:
+def plot_trajectories(
+    evaluations: list[Evaluation], out_dir: Path, ci_kind: str
+) -> None:
     settings = sorted({item.setting for item in evaluations})
     groups = sorted({setting.rsplit("/", maxsplit=1)[0] for setting in settings})
     assert len(groups) == 4, f"expected four staleness groups, found {len(groups)}"
@@ -176,7 +274,11 @@ def plot_trajectories(evaluations: list[Evaluation], out_dir: Path) -> None:
         for setting in (name for name in settings if name.startswith(f"{group}/")):
             points = [item for item in evaluations if item.setting == setting]
             steps = np.asarray([item.step for item in points])
-            means, errors = zip(*[_summary(_pooled(item)) for item in points], strict=True)
+            means = [_summary(_pooled(item))[0] for item in points]
+            if ci_kind == "monte-carlo":
+                errors = [_monte_carlo_se(_pooled(item), item.n_samples) for item in points]
+            else:
+                errors = [_summary(_pooled(item))[1] for item in points]
             means_array = np.asarray(means) * 100
             confidence = np.asarray(errors) * 1.96 * 100
             (line,) = axis.plot(
@@ -203,7 +305,12 @@ def plot_trajectories(evaluations: list[Evaluation], out_dir: Path) -> None:
         axis.legend(fontsize=9)
     fig.supxlabel("Checkpoint step")
     fig.supylabel("Mean AIME 2024/2025/2026 score (%)")
-    fig.suptitle("Off-policy checkpoint evaluation trajectories (mean ± 95% CI)")
+    ci_label = (
+        "Monte Carlo 95% CI (fixed 90 questions)"
+        if ci_kind == "monte-carlo"
+        else "problem-resampling 95% CI"
+    )
+    fig.suptitle(f"AIME avg@{evaluations[0].n_samples} trajectories ({ci_label})")
     fig.tight_layout(rect=(0.02, 0.02, 1, 0.96))
     fig.savefig(out_dir / "mean_trajectory.png", dpi=180)
     fig.savefig(out_dir / "mean_trajectory.pdf")
@@ -237,8 +344,9 @@ def write_report(evaluations: list[Evaluation], tests: list[dict], out_dir: Path
     lines = [
         "# Hiso off-policy HF checkpoint evaluation",
         "",
-        "Scores are avg@16 over 30 problems per AIME year. The mean pools all 90 "
-        "problem-level avg@16 values; error bands use the standard error over problems.",
+        f"Scores are avg@{evaluations[0].n_samples} over 30 problems per AIME year. "
+        "The mean pools all 90 problem-level values. Monte Carlo uncertainty from "
+        "generation sampling and problem-resampling uncertainty are reported separately.",
         "",
         "## Per-setting trajectories",
         "",
@@ -287,6 +395,25 @@ def write_report(evaluations: list[Evaluation], tests: list[dict], out_dir: Path
         for setting in settings
         if (points := [item for item in evaluations if item.setting == setting])
     )
+    pooled = [_pooled(evaluation) for evaluation in evaluations]
+    mc_ci = [
+        1.96 * _monte_carlo_se(values, evaluation.n_samples)
+        for values, evaluation in zip(pooled, evaluations, strict=True)
+    ]
+    problem_ci = [1.96 * _summary(values)[1] for values in pooled]
+    base_mc_ci = [
+        1.96
+        * _monte_carlo_se(
+            np.concatenate([evaluation.base_values[name] for name in BENCHMARKS]),
+            16,
+        )
+        for evaluation in evaluations
+    ]
+    base_problem_ci = [
+        1.96
+        * _summary(np.concatenate([evaluation.base_values[name] for name in BENCHMARKS]))[1]
+        for evaluation in evaluations
+    ]
     lines.extend(
         [
             "",
@@ -299,6 +426,14 @@ def write_report(evaluations: list[Evaluation], tests: list[dict], out_dir: Path
             f"- Mean truncation fraction across the three benchmarks ranges from "
             f"{_percent(min(truncation_rates))} to {_percent(max(truncation_rates))} "
             "across checkpoints.",
+            f"- Mean Monte Carlo 95% CI half-width: avg@16 "
+            f"{100 * np.mean(base_mc_ci):.2f} pp; avg@{evaluations[0].n_samples} "
+            f"{100 * np.mean(mc_ci):.2f} pp "
+            f"({100 * (1 - np.mean(mc_ci) / np.mean(base_mc_ci)):.1f}% reduction).",
+            f"- Mean problem-resampling 95% CI half-width: avg@16 "
+            f"{100 * np.mean(base_problem_ci):.2f} pp; avg@{evaluations[0].n_samples} "
+            f"{100 * np.mean(problem_ci):.2f} pp. More generations do not materially "
+            "increase the number or diversity of benchmark problems.",
             *_trajectory_analysis(evaluations),
             "",
             "## Pairwise significance",
@@ -344,17 +479,27 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--eval-root", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
+    parser.add_argument(
+        "--extra-suffix",
+        help="combine each base file with <benchmark><suffix>.jsonl (for example _extra16)",
+    )
+    parser.add_argument(
+        "--ci-kind",
+        choices=("problem", "monte-carlo"),
+        default="problem",
+        help="uncertainty band shown in the trajectory plot",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
-    evaluations = discover(args.eval_root)
+    evaluations = discover(args.eval_root, args.extra_suffix)
     tests = pairwise_tests(evaluations)
     write_score_tables(evaluations, args.out)
     write_pairwise(tests, args.out)
-    plot_trajectories(evaluations, args.out)
+    plot_trajectories(evaluations, args.out, args.ci_kind)
     write_report(evaluations, tests, args.out)
     settings = {item.setting for item in evaluations}
     print(f"wrote analysis for {len(evaluations)} checkpoints across {len(settings)} settings to {args.out}")

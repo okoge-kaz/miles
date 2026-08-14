@@ -19,6 +19,8 @@
 #   MAX_NEW_TOKENS generation cap (32768)
 #   TEMPERATURE / TOP_P  sampling (1.0 / 1.0, matching training)
 #   RM_TYPE        verifier; must match the policy (math for non-thinking)
+#   CUSTOM_RM_PATH optional module.function custom verifier
+#   EXTRA_PYTHONPATH optional dependency directory prepended inside the container
 #   OUT_DIR        where the per-benchmark jsonl goes
 #   EXTRA_MOUNTS   appended to CONTAINER_MOUNTS; required, see the note
 #   UNPAD_VOCAB    1: unpad CKPT into node-local /tmp before loading (0)
@@ -36,6 +38,8 @@ MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-32768}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
 TOP_P="${TOP_P:-1.0}"
 RM_TYPE="${RM_TYPE:-math}"
+CUSTOM_RM_PATH="${CUSTOM_RM_PATH:-}"
+EXTRA_PYTHONPATH="${EXTRA_PYTHONPATH:-}"
 CONCURRENCY="${CONCURRENCY:-96}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-96}"
 SERVER_PORT="${SERVER_PORT:-30000}"
@@ -89,6 +93,14 @@ done
 curl -sf http://127.0.0.1:${SERVER_PORT}/health >/dev/null || { echo 'sglang never became healthy'; exit 1; }
 
 pids=""
+custom_rm_arg=""
+if [[ -n '${CUSTOM_RM_PATH}' ]]; then
+    custom_rm_arg='--custom-rm-path ${CUSTOM_RM_PATH}'
+fi
+extra_pythonpath_arg=""
+if [[ -n '${EXTRA_PYTHONPATH}' ]]; then
+    extra_pythonpath_arg='PYTHONPATH=${EXTRA_PYTHONPATH}':\${PYTHONPATH}
+fi
 for spec in \$(echo '${BENCHMARKS}' | tr '+' ' '); do
     name=\${spec%%:*}
     path=\${spec#*:}
@@ -98,12 +110,13 @@ for spec in \$(echo '${BENCHMARKS}' | tr '+' ' '); do
     fi
     echo \"=== \${name} (\${path}) starting ===\"
     # Backgrounded, not sequential -- see the note.
-    python3 experiments/src/difficulty_filter/measure_pass_rate.py \
+    env \${extra_pythonpath_arg} python3 experiments/src/difficulty_filter/measure_pass_rate.py \
         --prompt-data \${path} \
         --output ${OUT_DIR}/\${name}.jsonl \
         --model-path \${EVAL_CKPT} \
         --server-url http://127.0.0.1:${SERVER_PORT} \
         --rm-type ${RM_TYPE} \
+        \${custom_rm_arg} \
         --policy \${name} \
         --n-samples ${N_SAMPLES} \
         --temperature ${TEMPERATURE} \
