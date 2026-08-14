@@ -249,6 +249,11 @@ async def test_queue_drop_snapshot_applies_waiting_completion_evictions(monkeypa
         record = original._queue_lifecycle.begin_attempt(group, submission_version=5)
         original._queue_lifecycle.group_ready(record, group, ready_version=5, reward_values=[1.0, 1.0])
         original._producer_response_lengths.record("generated", group)
+        fully_async.add_selection_population(
+            original._producer_selection_populations,
+            population_name="generated",
+            samples=fully_async._iter_samples(group),
+        )
         if depth_before < 2:
             fully_async.stamp_group_weight_version(group, fully_async.QUEUE_PUT_VERSION_KEY, 5)
             original._queue_lifecycle.enqueued(
@@ -270,6 +275,7 @@ async def test_queue_drop_snapshot_applies_waiting_completion_evictions(monkeypa
     assert telemetry["queue_evicted_groups"] == 2
     assert telemetry["queue_evicted_tokens"] == 4
     assert telemetry["producer_response_lengths"]["sample_lengths"]["queue_evicted"] == [1, 1, 1, 1]
+    assert len(telemetry["producer_selection_populations"]["generated"]["_sample_count"]) == 8
     assert [record["group_index"] for record in telemetry["lifecycle"]["terminal_records"]] == [1, 2]
     assert {record["group_index"] for record in telemetry["lifecycle"]["live_records"].values()} == {3, 4}
 
@@ -279,6 +285,7 @@ async def test_queue_drop_snapshot_applies_waiting_completion_evictions(monkeypa
     assert set(restored._pending_prompts) == {3, 4}
     assert restored._queue_evicted_groups == 2
     assert restored._queue_evicted_tokens == 4
+    assert len(restored._producer_selection_populations["generated"]["_sample_count"]) == 8
     assert restored.data_source.buffer == []
 
 

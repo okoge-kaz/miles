@@ -15,9 +15,9 @@
 set -euo pipefail
 
 REPO_ROOT="${SLURM_SUBMIT_DIR}"
-SGLANG_COMMIT="23aaf6597dbbe47f9ceb6090e10372c844fed960"
+SGLANG_COMMIT="f994b9aedfd0b1465dbb8f4e2a02eb789fc76dce"
 
-export SQSH_IMAGE="${SQSH_IMAGE:-/lustre/fs1/portfolios/coreai/projects/coreai_horizon_dilations/users/kfujii/container/miles-prefill-weight-version-${SGLANG_COMMIT:0:9}.sqsh}"
+export SQSH_IMAGE="${SQSH_IMAGE:-/lustre/fs1/portfolios/coreai/projects/coreai_horizon_dilations/users/kfujii/container/miles-staleness-weight-boundaries-${SGLANG_COMMIT:0:9}.sqsh}"
 export CONFIG_TAG="prefill-version-smoke-${SGLANG_COMMIT:0:9}-${SLURM_JOB_ID}"
 export RUN_NAME="prefill-version-smoke-${SGLANG_COMMIT:0:9}-${SLURM_JOB_ID}"
 # Ray's Unix-domain socket path is limited to 107 bytes. /root/.cache is a
@@ -29,7 +29,7 @@ export ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-4}"
 export N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-2}"
 export GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-8}"
 export NUM_STEPS_PER_ROLLOUT="${NUM_STEPS_PER_ROLLOUT:-1}"
-export MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-512}"
+export MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-1024}"
 export ASYNC_MAX_CONCURRENT_SAMPLES="${ASYNC_MAX_CONCURRENT_SAMPLES:-8}"
 
 export ACTOR_NUM_NODES=1
@@ -51,6 +51,10 @@ export SAVE_INTERVAL=1000
 export SAVE_RETAIN_INTERVAL=1000
 export SAVE_HF=0
 export DUMP_TRAIN_DATA=1
+export DUMP_POLICY_LOSS_DEBUG=1
+export LOG_STALENESS_GRADIENT_METRICS=1
+export LOG_STALENESS_GRADIENT_RATIO_HISTOGRAM=0
+export SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS=1
 
 # Keep this validation self-contained and avoid creating an external run.
 export WANDB_MODE=offline

@@ -529,7 +529,21 @@ class TestGenerate:
         async def current_applied_weight_version():
             return 4
 
+        completed_training = []
+
+        async def complete_trained_batch_telemetry_on_loop(*, accepted_tokens, optimizer_updates):
+            completed_training.append((accepted_tokens, optimizer_updates))
+            return {
+                "window_seconds": 2.0,
+                "generated_tokens": 40.0,
+                "completed_training_batches": 1.0,
+                "accepted_tokens": float(accepted_tokens),
+                "accepted_tokens_available": 1.0,
+                "optimizer_updates": float(optimizer_updates),
+            }
+
         fake_rollout_fn.current_applied_weight_version = current_applied_weight_version
+        fake_rollout_fn.complete_trained_batch_telemetry_on_loop = complete_trained_batch_telemetry_on_loop
         manager.generate_rollout = fake_rollout_fn
 
         result = await manager.generate(rollout_id=42)
@@ -538,12 +552,22 @@ class TestGenerate:
         assert len(captured) == 1
         assert isinstance(captured[0], RolloutFnTrainInput)
         assert captured[0].rollout_id == 42
-        assert captured_dump_metadata == [{"rollout_fn_debug": {"schema_version": 1, "records": [{"attempt_id": 9}]}}]
-        assert await manager.record_batch_consumption(42) == {
-            "selection_weight_version": 3,
-            "train_start_weight_version": 4,
-        }
-        assert captured_consumption == [{"selection_weight_version": 3, "train_start_weight_version": 4}]
+        assert len(captured_dump_metadata) == 1
+        rollout_debug = captured_dump_metadata[0]["rollout_fn_debug"]
+        assert rollout_debug["schema_version"] == 1
+        assert rollout_debug["records"] == [{"attempt_id": 9}]
+        recycle_debug = rollout_debug["recycle_compute"]
+        assert recycle_debug["schema_version"] == 2
+        assert all(record["disposition"] == "consumed" for record in recycle_debug["records"])
+        assert all(record["training_step"] == 42 for record in recycle_debug["records"])
+        assert sum(len(record["sample_indices"]) for record in recycle_debug["records"]) == 8
+        consumption = await manager.record_batch_consumption(42)
+        assert consumption["selection_weight_version"] == 3
+        assert consumption["train_start_weight_version"] == 4
+        assert consumption["extra_metrics"]["queue/consumption/selection_to_train_gap"] == 1
+        assert captured_consumption == [consumption]
+        await manager.record_batch_trained(42, actor_trained=True)
+        assert completed_training == [(32, 1)]
         # generate returns {"sample_indices": ..., "data_ref": ...};
         # split_train_data_by_dp returns Box(ObjectRef) per dp rank
         assert set(result) == {"sample_indices", "data_ref"}

@@ -20,8 +20,8 @@ import typer
 CACHE_DIR = "/tmp/miles-docker-cache"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_SGLANG_REPO = "okoge-kaz/sglang"
-DEFAULT_SGLANG_BRANCH = "miles-prefill-weight-version"
-DEFAULT_SGLANG_COMMIT = "23aaf6597dbbe47f9ceb6090e10372c844fed960"
+DEFAULT_SGLANG_BRANCH = "miles-staleness-weight-boundaries"
+DEFAULT_SGLANG_COMMIT = "f994b9aedfd0b1465dbb8f4e2a02eb789fc76dce"
 
 VARIANTS = {
     "cu13": {

@@ -82,22 +82,31 @@ async def train(args):
         elif not prefetch_rollout_batches:
             rollout_data_next_future = None
 
-        if getattr(args, "fully_async", False):
-            # Preserve the legacy policy's immediate prefetch above, then sample
-            # the authoritative applied version before the trainer consumes this
-            # batch. No weight update can occur between these two operations.
+        if args.fully_async:
+            # Preserve the immediate prefetch above, then sample the authoritative
+            # applied version before the trainer call. No weight update can occur
+            # between these operations, so post-selection forward lag stays
+            # separate from the historical drain-time staleness metrics.
             await rollout_manager.record_batch_consumption.remote(rollout_id)
 
+        actor_trained = False
         if args.use_critic:
             values = await critic_model.train(rollout_id, rollout_data_curr_ref)
             if args.offload_train:
                 await critic_model.offload()
             if rollout_id >= args.num_critic_only_steps:
                 await actor_model.train(rollout_id, rollout_data_curr_ref, external_data=values)
+                actor_trained = True
                 if args.offload_train:
                     await actor_model.offload()
         else:
             await actor_model.train(rollout_id, rollout_data_curr_ref)
+            actor_trained = True
+        if args.fully_async:
+            await rollout_manager.record_batch_trained.remote(
+                rollout_id,
+                actor_trained=actor_trained,
+            )
         if fully_async_checkpoint:
             await rollout_manager.acknowledge_trained_batch.remote(
                 rollout_id,

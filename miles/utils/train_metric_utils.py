@@ -46,6 +46,9 @@ def log_perf_data_raw(
         if total_time > 0:
             log_dict["perf/step_time"] = total_time
             log_dict["perf/wait_time_ratio"] = log_dict["perf/train_wait_time"] / total_time
+            optimizer_updates = log_dict.get("perf/optimizer_updates")
+            if optimizer_updates is not None:
+                log_dict["perf/optimizer_updates_per_second"] = optimizer_updates / total_time
 
     logger.info(f"perf {rollout_id}: {log_dict}")
 

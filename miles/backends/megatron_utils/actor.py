@@ -584,7 +584,10 @@ class MegatronTrainRayActor(TrainRayActor):
 
             commit_trained_batch(rollout_data, rollout_id, self._multi_lora_pending_push)
 
-        log_perf_data(rollout_id, self.args, extra_metrics=self.weight_updater.pop_metrics())
+        perf_metrics = self.weight_updater.pop_metrics()
+        if train_step_outcome == TrainStepOutcome.NORMAL:
+            perf_metrics["perf/optimizer_updates"] = len(num_microbatches)
+        log_perf_data(rollout_id, self.args, extra_metrics=perf_metrics)
 
         self._heartbeat.bump()
         return train_step_outcome

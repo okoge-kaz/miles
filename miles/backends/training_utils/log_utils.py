@@ -7,6 +7,7 @@ import psutil
 import torch
 import torch.distributed as dist
 
+from miles.backends.training_utils.loss_hub.staleness_metrics import finalize_staleness_gradient_metrics
 from miles.utils import train_metric_utils
 from miles.utils.flops_utils import calculate_fwd_flops
 from miles.utils.ft_utils.process_group_utils import MultiPGUtil
@@ -130,6 +131,9 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
                 "multimodal_train_inputs",
                 "loss_masks",
                 "sample_indices",
+                "sample_group_indices",
+                "generation_attempt_numbers",
+                "training_steps",
                 "rollout_routed_experts",
                 "rollout_indexer_topk",
                 "max_seq_lens",
@@ -386,8 +390,9 @@ def aggregate_train_losses(
 
     Args:
         losses_reduced: List of log_dict from each micro-batch.
-            Each log_dict has format: {"keys": list[str], "values": torch.Tensor}
-        parallel_state: Parallel state containing dp_group and cp_size.
+            Each log_dict has the historical ``keys``/``values`` vector and may
+            also carry isolated ``diagnostic_keys``/``diagnostic_values`` additive
+            parts for high-dynamic-range diagnostics.
 
     Returns:
         Dictionary mapping metric names to averaged values.
@@ -397,25 +402,39 @@ def aggregate_train_losses(
         return {}
 
     keys = losses_reduced[0]["keys"]
+    diagnostic_keys = losses_reduced[0].get("diagnostic_keys", [])
 
     values = None
+    diagnostic_values = None
     for log_dict in losses_reduced:
+        if log_dict.get("diagnostic_keys", []) != diagnostic_keys:
+            raise ValueError("Diagnostic metric keys changed across micro-batches")
         if values is None:
             values = log_dict["values"].clone()
         else:
             values += log_dict["values"]
+        if diagnostic_keys:
+            if diagnostic_values is None:
+                diagnostic_values = log_dict["diagnostic_values"].clone()
+            else:
+                diagnostic_values += log_dict["diagnostic_values"]
 
     assert len(keys) + 1 == values.numel(), f"Expected {len(keys) + 1} values, got {values.numel()}"
 
     for group in parallel_state.effective_dp_cp.groups_inner_to_outer:
         MultiPGUtil.all_reduce(values, [group], op=dist.ReduceOp.SUM)
+        if diagnostic_values is not None:
+            MultiPGUtil.all_reduce(diagnostic_values, [group], op=dist.ReduceOp.SUM)
 
     loss_reduced = {}
     values = values.tolist()
     num_samples_or_tokens = values[0]
 
-    for key, value in zip(keys, values[1:], strict=False):
+    for key, value in zip(keys, values[1:], strict=True):
         loss_reduced[key] = value * parallel_state.cp.size / num_samples_or_tokens
+    if diagnostic_values is not None:
+        for key, value in zip(diagnostic_keys, diagnostic_values.tolist(), strict=True):
+            loss_reduced[key] = value * parallel_state.cp.size / num_samples_or_tokens
 
     # Sequence-level ESS: rho = (sum w)^2 / (B * sum w^2), which is a ratio of
     # sums and so cannot be averaged the way every other metric here can. The
@@ -429,6 +448,8 @@ def aggregate_train_losses(
         c = loss_reduced.pop(f"{src}_n", None)
         if a is not None and b is not None and c is not None and b > 0.0 and c > 0.0:
             loss_reduced[dst] = (a * a) / (b * c)
+
+    finalize_staleness_gradient_metrics(loss_reduced)
 
     return loss_reduced
 

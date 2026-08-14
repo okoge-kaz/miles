@@ -7,6 +7,8 @@ as one line per step per stream:
     [2026-08-04 21:54:45.347 rollout_manager]  metrics.py:53   - eval 0:   {...}
     [2026-08-04 22:01:46.242 actor_cell0_rank0] log_utils.py:460 - step 0:  {...}
     [2026-08-04 22:01:46.242 actor_cell0_rank0] log_utils.py:... - rollout 0: {...}
+    [2026-08-04 22:01:46.243 rollout_manager]  metrics.py:50   - rollout batch consumption 0: {...}
+    [2026-08-04 22:01:46.244 rollout_manager]  metrics.py:64   - rollout pipeline throughput 0: {...}
 
 so ``experiments/outputs/training/.../<job>.log`` is a complete, timestamped copy
 of everything wandb received -- and it exists for every run ever launched here,
@@ -45,7 +47,8 @@ ANSI = re.compile(r"\x1b\[[0-9;]*m")
 # "[2026-08-04 21:58:08.454 rollout_manager] file.py:79 - <kind> <id>: {<dict>}"
 LINE = re.compile(
     r"\[(?P<stamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+) [^\]]*\]\s*"
-    r"\S+:\d+\s*-\s*(?P<kind>eval|perf|rollout|step) (?P<id>\d+): (?P<payload>\{.*\})\s*$"
+    r"\S+:\d+\s*-\s*(?P<kind>rollout batch consumption|rollout pipeline throughput|"
+    r"eval|perf|rollout|step) (?P<id>\d+): (?P<payload>\{.*\})\s*$"
 )
 NUMBER = re.compile(r"'(?P<key>[^']+)':\s*(?P<value>-?(?:\d+\.?\d*(?:[eE][+-]?\d+)?|nan|inf|-inf))")
 
@@ -56,6 +59,8 @@ KIND_STEP_KEY = {
     "eval": "eval/step",
     "perf": "rollout/step",
     "rollout": "rollout/step",
+    "rollout batch consumption": "rollout/step",
+    "rollout pipeline throughput": "rollout/step",
     "step": "train/step",
 }
 
@@ -80,14 +85,14 @@ def parse_log(path: Path) -> list[dict[str, Any]]:
     with the cluster's shifts every stamp equally and cancels.
     """
     records: list[dict[str, Any]] = []
-    seen: set[tuple[str, int]] = set()
+    seen: set[tuple[str, int, str]] = set()
     for line in _iter_lines(path):
         match = LINE.search(ANSI.sub("", line))
         if not match:
             continue
-        key = (match["kind"], int(match["id"]))
+        key = (match["kind"], int(match["id"]), match["payload"])
         if key in seen:
-            continue  # a second training cell logging the same step
+            continue  # a second training cell repeating the same payload
         seen.add(key)
         metrics = parse_payload(match["payload"])
         if not metrics:
@@ -107,10 +112,10 @@ def parse_log(path: Path) -> list[dict[str, Any]]:
 
 
 def merge_step_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Fold the ``perf``/``rollout``/``step`` lines of one id into one record.
+    """Fold metric-stream lines of one id into one record.
 
-    They are three separate log lines for the same optimizer step, and every
-    consumer downstream wants them as one row keyed by step.
+    They are separate log lines for the same optimizer step, and every consumer
+    downstream wants them as one row keyed by step.
     """
     merged: dict[tuple[str, int], dict[str, Any]] = {}
     for record in records:

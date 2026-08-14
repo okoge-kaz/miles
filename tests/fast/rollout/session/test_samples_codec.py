@@ -32,6 +32,7 @@ def _computed_sample(**overrides) -> Sample:
     s.max_forward_weight_versions = [11, 11]
     s.last_forward_weight_versions = [11, 11]
     s.response_weight_versions = ["11", "11"]
+    s.response_weight_version_segments = [[[0, 1, 10], [1, 2, 11]], [[0, 2, 11]]]
     s.prefix_cache_info = Sample.PrefixCacheInfo.from_dict({"cached_tokens": 2, "total_prompt_tokens": 3})
     s.metadata = {
         "lifecycle": [{"t0": 1.0, "t1": 2.0, "turn": 1}],
@@ -82,6 +83,7 @@ class TestSamplesWireCodec:
         assert out.max_forward_weight_versions == [11, 11]
         assert out.last_forward_weight_versions == [11, 11]
         assert out.response_weight_versions == ["11", "11"]
+        assert out.response_weight_version_segments == [[[0, 1, 10], [1, 2, 11]], [[0, 2, 11]]]
         assert out.prefix_cache_info.to_dict() == {"cached_tokens": 2, "total_prompt_tokens": 3}
         assert out.rollout_routed_experts.dtype == np.int32
         assert np.array_equal(out.rollout_routed_experts, np.arange(24, dtype=np.int32).reshape(4, 3, 2))
@@ -138,6 +140,7 @@ class TestSamplesWireCodec:
             "max_forward_weight_versions",
             "last_forward_weight_versions",
             "response_weight_versions",
+            "response_weight_version_segments",
         }
 
         def remove_new_fields(meta, _tensors):

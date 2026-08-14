@@ -37,6 +37,7 @@ within an arm — reported per level by `equivalence.variance_components`.
 | `analyze.py` | extracts → `results.json` + `summary.csv` | numpy |
 | `figures.py` | `results.json` → five paper figures | numpy, matplotlib |
 | `check_logging.py` | audits a run against what the protocol needs | stdlib |
+| `analyze_staleness_telemetry.py` | rollout debug dumps → selection/recycle summary and joinable sample rows | torch |
 
 Split the same way `difficulty_filter` splits measurement from filtering: the one
 step that needs torch and the training image runs once per run, and every
@@ -55,6 +56,12 @@ python -m experiments.src.offpolicy_acceleration.extract_run \
   --out $WS/offpolicy-study/extracts \
   --arm stale2-retract --seed 0 --with-lag \
   --factor MAX_WEIGHT_STALENESS=2 --factor PAUSE_GENERATION_MODE=retract
+
+# 1b. selection bias and reason-coded discarded compute from the same dump
+python -m experiments.src.offpolicy_acceleration.analyze_staleness_telemetry \
+  --dump-details /ckpt/training/math/dapo-math/Qwen3-4B/<config-tag>/dump \
+  --out $WS/offpolicy-study/selection/<config-tag>.json \
+  --rows-out $WS/offpolicy-study/selection/<config-tag>.jsonl
 
 # 2. anywhere
 uv run --with numpy python -m experiments.src.offpolicy_acceleration.analyze \
@@ -141,8 +148,8 @@ what the measurement gap was and how it now stands.
 | 4 | `train/entropy_loss` identically 0 (`losses.py:99`) | **fixed** — `--observe-training-entropy` added to all 20 recipes |
 | 5 | factors and seed absent from `meta.json` | **fixed** — study knobs added to `_SNAPSHOT_KEYS` (`dashboard/args.py`) |
 | 6 | wall-clock discontinuous across Slurm allocations; `meta.json` overwritten on resume (`collector.py:153`) | **fixed in this tooling** — `log_source.active_elapsed_hours` never reads `start_ts` |
-| 7 | wasted generation counted in groups, not tokens | **fixed** — `aborted_tokens`, `stale_tokens`, `dynamic_filter_tokens`, `kept_tokens`, `wasted_token_frac` |
-| 8 | no ESS of the rollout-vs-train importance weights | **fixed** — `train/rollout_ess_ratio` |
+| 7 | wasted generation counted in groups, not tokens | **fixed** — strict generated→admitted→loss-input token ledger plus a reason-coded decode/prefill/tool/reward waste vector |
+| 8 | no ESS of the rollout-vs-train importance weights | **fixed** — global ESS plus token/sequence ESS in each staleness bin |
 | 9 | `policy_loss_debug/` is 76% of the dump and unconditional | **fixed** — `--no-dump-policy-loss-debug`, in all recipes |
 
 **`train/ess_ratio` does not measure staleness**, and this is the one that most
@@ -201,26 +208,26 @@ engine's `/metrics` every 2 s into `{dump}/dashboard/engine_series`
 sum+count pairs and `sglang_num_aborted_requests_total`. The async recipes
 already pass it. Widen with `--dashboard-sglang-metrics` if needed.
 
-Two things it still will not give, worth deciding on up front:
+Two things require different sources, worth deciding on up front:
 
 * **Per-request latency and length distributions.** Only histogram `_sum` /
   `_count` pairs are scraped, so the engine side yields means, not tails. The
   per-sample `response_length` in the rollout dumps covers the output-length
   distribution properly; use that for the length axis and reserve the engine
   series for queueing and throughput.
-* **Per-request start/finish timestamps**, which would let a lag be attributed to
-  a specific slow generation. Nothing collects them today. If the study wants to
-  claim "long-tail generations cause the stale groups" rather than observe it
-  correlationally, that is a new instrumentation ask — the cheapest version is
-  recording each sample's generation start and end in `Sample.metadata`, which
-  the dumps then carry for free.
+* **Per-request start/finish timestamps are in the rollout lifecycle records, not
+  the engine scraper.** With `--dump-details`, each attempt carries generation
+  duration and active/group-wait/postprocess/queue boundaries. They support the
+  correlation "long generations are selected out". Establishing that latency
+  *causes* the selection still requires changing a queue policy, bound, or service
+  rate; the timestamp alone is observational.
 
 ### Recommended deltas before the study starts
 
 | where | change | unlocks |
 |---|---|---|
 | every recipe | `--observe-training-entropy` | the entropy collapse criterion (gap 4) |
-| `loss_hub/corrections.py` | ESS of the TIS weights, beside `tis_abs` | gap 8, the long-sequence claim |
+| every algorithm-comparison recipe | `--log-staleness-gradient-metrics` | consumed/effective staleness, clipping, masks, token/sequence ESS by lag |
 | every async recipe | `MAX_WEIGHT_STALENESS=1000000` for the unbounded arm | realized staleness on every arm (gap 2) |
 | every recipe | raise `--n-samples-per-eval-prompt`, or add a larger held-out set | a `δ` small enough to be interesting (gap 1) |
 | `common/run_identity.sh` | `SEED` in `CONFIG_TAG`, `--seed` / `--rollout-seed` in `train.sh` | seed replication at all |

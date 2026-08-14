@@ -16,8 +16,8 @@ FROM lmsysorg/sglang:${SGLANG_IMAGE_TAG} AS sglang
 # ======================================== Arguments =============================================
 
 ARG SGLANG_REPO=okoge-kaz/sglang
-ARG SGLANG_BRANCH=miles-prefill-weight-version
-ARG SGLANG_COMMIT=23aaf6597dbbe47f9ceb6090e10372c844fed960
+ARG SGLANG_BRANCH=miles-staleness-weight-boundaries
+ARG SGLANG_COMMIT=f994b9aedfd0b1465dbb8f4e2a02eb789fc76dce
 
 ARG MEGATRON_REPO=radixark/Megatron-LM
 ARG MEGATRON_BRANCH=miles-main

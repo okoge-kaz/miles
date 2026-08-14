@@ -15,6 +15,45 @@ from miles.utils.audit_utils.event_logger.models import TrainAdvantageComputatio
 from miles.utils.multi_lora import is_multi_lora_enabled
 from miles.utils.types import RolloutBatch
 
+_STALENESS_GRADIENT_PART_PREFIX = "_staleness_gradient_part/"
+
+
+def _pack_logging_values(
+    count: int | torch.Tensor,
+    metrics: dict[str, torch.Tensor],
+    *,
+    device: torch.device,
+) -> dict[str, list[str] | torch.Tensor]:
+    """Keep the historical vector unchanged and isolate opt-in diagnostics."""
+
+    standard_metrics = {
+        key: value for key, value in metrics.items() if not key.startswith(_STALENESS_GRADIENT_PART_PREFIX)
+    }
+    diagnostic_metrics = {
+        key: value for key, value in metrics.items() if key.startswith(_STALENESS_GRADIENT_PART_PREFIX)
+    }
+    detached_values = [
+        value.detach() if isinstance(value, torch.Tensor) else value for value in (count, *standard_metrics.values())
+    ]
+    packed: dict[str, list[str] | torch.Tensor] = {
+        "keys": list(standard_metrics),
+        # This is deliberately the historical packing path. Optional float64
+        # ESS parts must not change the reduction precision of existing logs.
+        "values": torch.tensor(detached_values, device=device),
+    }
+    if not diagnostic_metrics:
+        return packed
+
+    def as_scalar(value: int | float | torch.Tensor) -> torch.Tensor:
+        tensor = value.detach() if isinstance(value, torch.Tensor) else torch.as_tensor(value)
+        if tensor.numel() != 1:
+            raise ValueError(f"Training metric must be scalar, got shape {tuple(tensor.shape)}")
+        return tensor.to(device=device, dtype=torch.float64).reshape(())
+
+    packed["diagnostic_keys"] = list(diagnostic_metrics)
+    packed["diagnostic_values"] = torch.stack([as_scalar(value) for value in diagnostic_metrics.values()])
+    return packed
+
 
 def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) -> None:
     """Compute advantages and returns in-place based on `args.advantage_estimator`.
@@ -194,16 +233,11 @@ def loss_function(
     return (
         loss,
         torch.tensor(num_tokens if args.calculate_per_token_loss else 1, device=logits.device),
-        {
-            "keys": list(log.keys()),
-            "values": torch.tensor(
-                [
-                    num_samples if not args.calculate_per_token_loss else num_tokens,
-                ]
-                + list(log.values()),
-                device=logits.device,
-            ),
-        },
+        _pack_logging_values(
+            num_samples if not args.calculate_per_token_loss else num_tokens,
+            log,
+            device=logits.device,
+        ),
     )
 
 

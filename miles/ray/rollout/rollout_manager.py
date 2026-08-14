@@ -10,7 +10,12 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_
 from miles.dashboard import hooks as dashboard_hooks
 from miles.ray.rollout.addr_allocator import PortCursors
 from miles.ray.rollout.debug_data import RolloutDataInjectionUtil, load_debug_rollout_data, save_debug_rollout_data
-from miles.ray.rollout.metrics import log_eval_rollout_data, log_rollout_batch_consumption, log_rollout_data
+from miles.ray.rollout.metrics import (
+    log_eval_rollout_data,
+    log_rollout_batch_consumption,
+    log_rollout_data,
+    log_rollout_pipeline_throughput,
+)
 from miles.ray.rollout.rollout_data_conversion import postprocess_rollout_data
 from miles.ray.rollout.rollout_server import RolloutServer, start_rollout_servers
 from miles.ray.rollout.router_manager import start_session_server
@@ -37,6 +42,14 @@ from miles.rollout.fully_async_checkpoint import (
 )
 from miles.rollout.fully_async_checkpoint import save_checkpoint as save_fully_async_checkpoint
 from miles.rollout.inference_rollout.compatibility import call_rollout_function, load_rollout_function
+from miles.rollout.recycle_compute_metrics import (
+    GENERATED_TOKENS_KEY,
+    append_final_consumed_records,
+    batch_consumption_metrics,
+    build_batch_consumption_snapshot,
+    finalize_useful_rollout_metrics,
+    pipeline_throughput_metrics,
+)
 from miles.utils import object_store
 from miles.utils.async_utils import run
 from miles.utils.audit_utils.event_analyzer import analyzer as event_analyzer
@@ -112,7 +125,8 @@ class RolloutManager:
             dashboard_hooks.register_router(args)
         self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
         self.rollout_id = -1
-        self._fully_async_selection_versions: dict[int, int | None] = {}
+        self._fully_async_consumption_snapshots: dict[int, dict] = {}
+        self._fully_async_inflight_training: dict[int, tuple[int | None, int, int | None]] = {}
 
         self._metric_checker = MetricChecker.maybe_create(args)
 
@@ -148,14 +162,67 @@ class RolloutManager:
             return await asyncio.to_thread(run, current_on_loop())
         return 0
 
-    async def record_batch_consumption(self, rollout_id: int) -> dict[str, int]:
-        """Record the applied version immediately before the trainer uses a batch."""
-        selection_version = self._fully_async_selection_versions.pop(rollout_id, None)
+    async def record_batch_consumption(self, rollout_id: int) -> dict[str, float | int]:
+        """Log the authoritative applied version immediately before training."""
+        snapshot = self._fully_async_consumption_snapshots.pop(
+            rollout_id,
+            {"selection_weight_version": None, "bound": None, "groups": []},
+        )
+        train_start_version = await self.get_current_applied_weight_version()
+        metrics = batch_consumption_metrics(
+            snapshot,
+            train_start_version=train_start_version,
+        )
+        raw_accepted_tokens = snapshot.get("loss_input_tokens")
+        accepted_tokens = int(raw_accepted_tokens) if isinstance(raw_accepted_tokens, int) else None
+        raw_generated_tokens = snapshot.get("cohort_generated_tokens")
+        cohort_generated_tokens = int(raw_generated_tokens) if isinstance(raw_generated_tokens, int) else None
+        self._fully_async_inflight_training[rollout_id] = (
+            accepted_tokens,
+            int(snapshot.get("optimizer_updates", 1)),
+            cohort_generated_tokens,
+        )
         return log_rollout_batch_consumption(
             rollout_id,
             self.args,
-            selection_weight_version=selection_version,
-            train_start_weight_version=await self.get_current_applied_weight_version(),
+            selection_weight_version=snapshot.get("selection_weight_version"),
+            train_start_weight_version=train_start_version,
+            extra_metrics=metrics,
+        )
+
+    async def record_batch_trained(
+        self,
+        rollout_id: int,
+        *,
+        actor_trained: bool,
+    ) -> dict[str, float | int] | None:
+        """Record completed actor work after training succeeds."""
+        if rollout_id not in self._fully_async_inflight_training:
+            raise RuntimeError(f"Missing fully-async consumption snapshot for trained rollout {rollout_id}")
+        accepted_tokens, optimizer_updates, cohort_generated_tokens = self._fully_async_inflight_training.pop(
+            rollout_id
+        )
+        if not actor_trained:
+            return None
+        complete_on_loop = getattr(self.generate_rollout, "complete_trained_batch_telemetry_on_loop", None)
+        if complete_on_loop is None:
+            return None
+        pipeline_snapshot = await asyncio.to_thread(
+            run,
+            complete_on_loop(
+                accepted_tokens=accepted_tokens,
+                optimizer_updates=optimizer_updates,
+            ),
+        )
+        metrics = pipeline_throughput_metrics(
+            pipeline_snapshot,
+            cohort_accepted_tokens=accepted_tokens,
+            cohort_generated_tokens=cohort_generated_tokens,
+        )
+        return log_rollout_pipeline_throughput(
+            rollout_id,
+            self.args,
+            metrics,
         )
 
     async def dispose(self):
@@ -191,7 +258,21 @@ class RolloutManager:
             selection_version = None
             if metrics is not None:
                 selection_version = metrics.get("rollout/fully_async/current_weight_version")
-            self._fully_async_selection_versions[rollout_id] = selection_version
+            self._fully_async_consumption_snapshots[rollout_id] = build_batch_consumption_snapshot(
+                data,
+                selection_version=selection_version,
+                bound=getattr(self.args, "max_weight_staleness", None),
+                optimizer_updates=(
+                    len(data) // int(metadata.get("dynamic_global_batch_size", self.args.global_batch_size))
+                ),
+                cohort_generated_tokens=(
+                    int(metrics[GENERATED_TOKENS_KEY])
+                    if metrics is not None and GENERATED_TOKENS_KEY in metrics
+                    else None
+                ),
+                has_custom_converter=self.custom_convert_samples_to_train_data_func is not None,
+            )
+        metadata["training_step"] = rollout_id
         data = convert_samples_to_train_data(
             self.args,
             data,
@@ -267,6 +348,18 @@ class RolloutManager:
                 checkpoint_sample_indices = [sample.index for group in data for sample in _iter_group_samples(group)]
             data, metadata = postprocess_rollout_data(
                 self.args, data, train_parallel_config=self.train_parallel_config
+            )
+            finalize_useful_rollout_metrics(
+                data,
+                metrics,
+                has_custom_converter=self.custom_convert_samples_to_train_data_func is not None,
+            )
+            append_final_consumed_records(
+                debug_metadata,
+                data,
+                reference_mode=getattr(self.args, "staleness_reference", "completion"),
+                bound=getattr(self.args, "max_weight_staleness", None),
+                training_step=rollout_id,
             )
             if checkpoint_sample_indices is not None:
                 postprocessed_indices = [sample.index for sample in data]

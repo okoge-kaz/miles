@@ -11,7 +11,8 @@
 set -euo pipefail
 
 REPO_ROOT="${SLURM_SUBMIT_DIR}"
-IMAGE="/lustre/fs1/portfolios/coreai/projects/coreai_horizon_dilations/users/kfujii/container/miles-latest-20260803.sqsh"
+source "${REPO_ROOT}/experiments/env.sh"
+IMAGE="${SQSH_IMAGE}"
 CHECKPOINT_ROOT="/lustre/fs1/portfolios/coreai/projects/coreai_horizon_dilations/users/kfujii/checkpoints/hf"
 
 srun \
@@ -21,15 +22,13 @@ srun \
     --no-container-mount-home \
     bash -lc '
         set -euo pipefail
-        cd /sgl-workspace/sglang
-        git fetch https://github.com/okoge-kaz/sglang.git miles-prefill-weight-version
-        git checkout -f 23aaf6597dbbe47f9ceb6090e10372c844fed960
 
         python -m sglang.launch_server \
             --model-path /ckpt/hf/Qwen3-1.7B \
             --host 127.0.0.1 \
             --port 30000 \
             --weight-version 10 \
+            --enable-response-weight-version-segments \
             --disable-cuda-graph \
             --mem-fraction-static 0.7 \
             >/tmp/sglang-prefill-smoke-server.log 2>&1 &

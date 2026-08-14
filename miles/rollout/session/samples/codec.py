@@ -42,6 +42,7 @@ SAMPLES_VALUE_SPEC: dict[str, ValueSpec] = {
     "max_forward_weight_versions": ValueSpec("json"),
     "last_forward_weight_versions": ValueSpec("json"),
     "response_weight_versions": ValueSpec("json"),
+    "response_weight_version_segments": ValueSpec("json"),
     "prefix_cache_info": ValueSpec("json"),
     "metadata": ValueSpec("json"),
 }
@@ -64,6 +65,7 @@ _BACKWARD_COMPAT_VERSION_FIELDS = frozenset(
         "max_forward_weight_versions",
         "last_forward_weight_versions",
         "response_weight_versions",
+        "response_weight_version_segments",
     }
 )
 

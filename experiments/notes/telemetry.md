@@ -574,3 +574,347 @@ applies oldest-first overflow eviction before serialization, including the same
 length, reward-lifecycle, token, and group accounting as live eviction.
 
 Runs before 2026-08-09 have none of these keys, and nothing back-fills.
+
+## Additive recycle, contribution, and pipeline telemetry (2026-08-13)
+
+This instrumentation is additive.  The historical meanings of
+`rollout/fully_async/{avg,max}_staleness`, `staleness/bound/*`, and
+`staleness/{pre_queue,in_queue,total}/*` above are unchanged.  New analyses use
+new namespaces so a dashboard spanning old and new jobs cannot silently change
+its estimand.
+
+### The generated-token ledger
+
+For one drained cohort, the strict accounting boundary is:
+
+```
+generated response tokens
+  = recycle/abort/filter/age-cutoff/queue-eviction discards
+  + admitted response tokens
+
+admitted response tokens
+  = postprocess-trimmed tokens
+  + selected response tokens
+
+selected response tokens
+  = final loss-input tokens
+  + final loss-masked tokens
+```
+
+The corresponding keys are under
+`rollout/fully_async/useful_rollout/`.  In particular,
+
+```
+efficiency = loss_input_tokens / generated_tokens
+```
+
+is the cohort definition of useful rollout efficiency.  It is bounded by one,
+and `accounting_error_tokens` must be exactly zero.  A custom sample converter
+can change the final boundary outside the built-in path, so the metric reports
+`available=0` instead of guessing.
+
+The same-window pipeline view is deliberately named differently:
+`throughput/window_useful_efficiency = accepted tokens in this trainer window /
+generated tokens completed in this wall window`.  Queue inventory can cross a
+window boundary, so this ratio can temporarily exceed one.  For comparisons use
+`throughput/cohort_useful_efficiency`; use the window ratio only to diagnose
+transients.
+
+Discarded compute is a vector, never one heterogeneous scalar:
+
+| component | unit | implementation boundary |
+|---|---|---|
+| `decode_tokens` | response tokens | generated response length |
+| `prefill_uncached_tokens` | prompt tokens | SGLang prompt tokens minus cached tokens |
+| `tool_env_seconds` | wall seconds | `Sample.non_generation_time` |
+| `reward_seconds` | wall seconds | measured reward/verifier calls, apportioned once across scored samples |
+
+Keys are `rollout/fully_async/waste/<reason>/<component>` and
+`.../all_discarded/<component>`.  Adding the four values together is invalid;
+turn them into cost or joules only after applying an explicitly reported hardware
+cost model.
+
+The token components are workload-unit proxies, not direct GPU FLOPs.
+`decode_tokens` counts returned response tokens and therefore does not charge
+speculative draft/rejected tokens; `tool_env_seconds` is summed sample resource
+time and can exceed critical-path wall time when environments overlap.
+
+`prefill_uncached_tokens` is exact only for generation paths that populate
+SGLang's prompt/cache metadata. A custom generator that leaves both prompt
+counters at zero makes this component unavailable in practice; zero must not be
+interpreted as proof of a fully cached prefill without checking that provenance.
+
+Reason keys have fixed cardinality, including zero-valued series:
+
+- `stale_at_generation_completion`
+- `stale_during_reward_finalize`
+- `stale_during_queue_backpressure`
+- `stale_in_output_queue`
+- `stale_stage_unknown`
+- `generation_aborted`
+- `actor_weight_sync_overlap`
+
+`rollout/fully_async/recycle_aux/group_straggler_collateral/*` is an auxiliary
+label: it counts samples that would have passed the same bound independently but
+were recycled with their stale group.  It is not added again to total waste.
+Likewise, `staleness/late_stale_trained/forward_handoff_*` is a diagnostic for a
+group that crossed the bound after queue selection but before the trainer
+forward; it was trained, not recycled.
+
+### Pre-queue critical-path split
+
+For each sample, four lifecycle boundaries are stamped by the rollout event loop:
+
+```
+A = trajectory generation/environment work starts
+G_i = this sample finishes generation/environment interaction
+G = the last generation task in its prompt group finishes
+Q = group reward/postprocess finishes and the group is trainable
+```
+
+Both applied-weight-version and wall-second views are logged under
+`staleness/pre_queue_phase/{version,wall_seconds}/`:
+
+```
+active      = G_i - A
+group_wait  = G - G_i
+postprocess = Q - G
+total       = Q - A
+```
+
+`identity_max_abs_error` must be zero.  This is an additive *critical-path*
+partition: reward work for an early sample may overlap a straggler's generation;
+that overlap is assigned to `group_wait`, not double-counted as postprocess.
+`exact_sample_frac` distinguishes the built-in lifecycle callback from a coarse
+fallback for custom generation functions.
+
+The mitigation mapping is now testable rather than inferred from one total:
+
+| dominant component | first intervention to test |
+|---|---|
+| active | decode/prefill/tool/environment acceleration |
+| group wait | group scheduling, partial admission, straggler handling |
+| postprocess | verifier/reward/serialization pipeline |
+| in queue | train/rollout allocation and backpressure |
+| selection-to-forward gap | updates-per-rollout or trainer scheduling |
+
+### Generated, consumed, recycled, and dropped populations
+
+The queue-policy branch already owns response-length telemetry, so it remains
+the canonical source rather than being duplicated under a second namespace:
+
+- `queue/selection/generated/*` is the non-aborted producer-completion window;
+- `queue/selection/{offered,trained}/*` is the selection cohort before/after
+  admission controls;
+- `queue/selection/{stale_recycled,age_cutoff_dropped,dynamic_filter_dropped,
+  aborted_recycled,queue_evicted}/*` gives each terminal mechanism.
+
+Each population has sample-length and group-max-length count, sum, mean, std,
+p50, p90, p99, and max. `selection_bias/consumed/response_length/*` is the one
+additional response-length view: it is after rollout postprocessing and final
+loss-input selection, a boundary the queue metrics do not observe.
+
+`selection_bias/<population>/<field>/{mean,max,p50,p90,p99}` supplies the
+non-length marginals for `generated`, `admitted`, `consumed`, `recycled`, and
+`dropped`: generation duration, reward, group reward mean/variance, numeric
+difficulty when supplied, tool/reward time, the three pre-queue phases,
+in-queue staleness, and queue wait. The `generated` accumulator is stamped at
+producer completion, includes attempts later evicted by queue-drop, and is
+checkpointed with the existing queue telemetry.
+
+The scalar `dropped` population is producer-side dynamic-filter removal. Rows
+trimmed later by sample filtering or rollout postprocessing remain visible in
+`generated` versus `consumed`; the offline reconciler labels them explicitly as
+`postprocess_trimmed`.
+
+Marginals answer whether the trained distribution shifted, but not a joint
+conditional.  With `--dump-details`, schema-v2 primitive records contain the
+group/prompt index, sample index, generation attempt id, disposition and reason,
+versions, lengths, durations, rewards, difficulty, phase splits, waste vector,
+and final training step/loss-input tokens.  Run:
+
+```
+python -m experiments.src.offpolicy_acceleration.analyze_staleness_telemetry \
+  --dump-details <run>/dump \
+  --out <run>/selection-summary.json \
+  --rows-out <run>/selection-rows.jsonl
+```
+
+The tool reconciles an admitted attempt with the final postprocessed loss input,
+labels admitted rows that disappeared as `postprocess_trimmed`, and reports
+`P(consumed | length)`, `P(consumed | reward)`, and the non-parametric joint
+`P(consumed | length, reward, difficulty)`.  It can join trainer debug rows by
+`(training_step, generation_attempt_id, sample_index)` to add clip fraction,
+mask fraction, sequence log-ratio, and absolute policy-objective contribution.
+Tensor-parallel duplicates are ignored, context-parallel token parts are summed,
+and repeated optimizer updates are kept separate before their diagnostics are
+aggregated; `optimizer_updates_observed` records that multiplicity.
+Queue-drop evictions use the existing canonical queue lifecycle record; the
+analyzer adapts that row rather than writing a duplicate response-length record.
+Fields that the older compact lifecycle schema cannot identify, such as exact
+per-sample generation duration, remain missing instead of being imputed.
+The full records are debug-only because their storage and CPU transfer are not a
+reasonable default for production training.
+
+### Consumed versus effective-contribution staleness
+
+Pass `--log-staleness-gradient-metrics` to enable fixed bins `s_0` through
+`s_<max>` plus one overflow bin (default max 16).  No additional model forward is
+performed.  The implementation reuses the final tokenwise policy objective after
+PPO/dual clipping, OPSM, TIS/MIS correction, rejection masks, and the actual loss
+reducer.  Its contribution proxy is therefore
+
+```
+abs(final tokenwise policy-gradient objective) * final reducer weight
+```
+
+This is used rather than reconstructing
+`mask * abs(advantage) * abs(ratio)` from earlier intermediates.  It is closer
+to the loss that was differentiated, but remains an objective-contribution
+proxy, not a gradient norm: it does not contain parameter Jacobians or
+cross-token cancellation.
+
+The bin value is the consumed sample's own `drain_version - selected_reference`
+(`prefill`, `submission`, or `completion` according to the run). It is not the
+historical group-weighted scalar and does not silently include a later trainer
+handoff; crossings after drain are reported separately under
+`staleness/late_stale_trained/`.
+
+For each lag bin, the log contains:
+
+- consumed sequence, response-token, and pre-loss-token mass;
+- effective-contribution mass and absolute contribution per pre-loss token;
+- initial, correction, and final mask fractions;
+- PPO and importance-correction clip fractions;
+- mean absolute policy/rollout and PPO-objective (`current/old_actor`) log-ratios;
+- current/rollout token and sequence ESS;
+- non-zero contribution fraction.
+
+This path consists of detached `torch.bincount` reductions over tensors already
+resident on the training GPU, followed by the existing distributed metric
+reduction.  It does not copy token arrays to CPU or touch the autograd graph.
+In deterministic training mode, the deterministic-algorithm guard is disabled
+only while dispatching these detached CUDA bincounts and is restored before the
+loss returns. Training kernels and gradients remain deterministic; the new
+diagnostic sums themselves may differ in their last floating-point bits because
+CUDA bincount uses atomic additions.
+`--log-staleness-gradient-ratio-histogram` adds a fixed 15-bin signed log-ratio
+histogram and a capped approximate p95; it is separate because it emits many
+more scalar series.  Custom policy-gradient reducers are rejected for this
+metric rather than reported with the wrong normalization.
+
+### Exact token versions and throughput
+
+The SGLang flag `--sglang-enable-response-weight-version-segments` returns compact
+`[start, end, applied_weight_version]` runs for response tokens.  It is off by
+default.  Consecutive forwards under one version merge, speculative accepted
+tokens form one segment, stop-trimmed tails are clipped before returning, and the
+normal disabled path adds no response metadata.  Miles reports coverage and the
+exact token-weighted lag distribution under `staleness/token_lag/exact/*`.
+Malformed, overlapping, gapped, or future-version segments are excluded rather
+than repaired, with explicit invalid segment/turn/sample counters.
+
+The pipeline telemetry closes one non-overlapping wall window immediately after
+each successful actor train call. Generated tokens, accepted loss-input tokens,
+and completed optimizer updates therefore refer to the same elapsed interval;
+the first and final batches are not shifted into adjacent windows.
+
+It reports:
+
+- `throughput/{generated,accepted,useful}_tokens_per_second`;
+- `throughput/optimizer_updates_per_second`;
+- time-weighted `queue/depth_time_mean` and instantaneous `depth_current`;
+- trainer starvation and rollout backpressure seconds;
+- equivalent full-capacity rollout idle seconds, time-mean utilization, and
+  instantaneous active rollout capacity fraction;
+- queue wait mean/p50/p90/p99;
+- existing `perf/step_time`, `perf/log_probs_time`, actor-train, and weight-sync
+  timers.
+
+Accepted/useful token rates are marked unavailable for a custom train-data
+converter, because Miles cannot prove which response tokens that converter
+actually sends to the loss. Generated-token rate and queue timings remain
+available.
+
+`throughput/useful_tokens_per_second` is intentionally the reported form of
+`eta_useful * generated_tokens_per_second`; algebraically it equals
+`accepted_tokens_per_second`. Both names are kept because the former exposes
+the efficiency decomposition and the latter is the direct service rate.
+
+The pre-existing `perf/optimizer_updates_per_second` is not renamed or replaced:
+it divides updates by the trainer's local `perf/step_time` boundary.
+`throughput/optimizer_updates_per_second` closes on the rollout event loop after
+successful actor training and shares its wall window with generated and accepted
+tokens.  They should be close in steady state, but only the latter supports the
+same-window service-rate decomposition.  Keeping the namespaces separate avoids
+silently changing the historical `perf/*` estimand.
+
+The queue-depth mean integrates depth over time; it is not the mean of samples
+taken only when a training step finishes.
+
+### Validation envelope (2026-08-13)
+
+Job 15728682 compared this branch with a detached clean checkout of
+`experiments/cw-dfw-math-rl` on one 8-H100 interactive node.  All arms used the
+same fixed 128-sample dump with non-zero policy loss and lags 0, 1, 2, 4, 8, and
+17.  The deterministic three-step check compared 99 common training scalars per
+step and three saved gradient-norm files.  Clean versus always-on telemetry, and
+telemetry-off versus gradient bins plus histogram, were bitwise equal as logged;
+the maximum absolute difference was zero in both comparisons.
+
+The performance check discarded two warmup steps and measured eight steps:
+
+| increment | median `perf/step_time` | median `perf/actor_train_time` | peak HBM |
+|---|---:|---:|---:|
+| always-on telemetry minus clean target | +0.071% (+22.3 ms) | -0.008% (-2.4 ms) | +0 MiB |
+| gradient bins minus telemetry off | +0.668% (+209.8 ms) | +0.661% (+204.4 ms) | +4 MiB |
+| ratio histogram minus gradient bins | +0.109% (+34.5 ms) | +0.087% (+27.1 ms) | +0 MiB |
+
+These are short-run operational measurements, not confidence intervals.  They
+bound the observed cost in the production training path and show why the bins
+and histogram remain opt-in.  The always-on Python hot-path benchmark processed
+3072 samples / 3.21M generated tokens in 61.1 ms for final accounting; the
+individual generated/consumed population and pre-queue passes were 29.5 ms and
+33.9 ms.  One discarded group's waste vector took 8.4 us.
+
+The SGLang opt-in scheduler stamp added at most 5.6 ns per request through batch
+size 128 in the microbenchmark (the batch-512 delta was below timing noise).
+Response-segment recording cost about 0.20 us per generated token when a weight
+version lasted 32 or 512 tokens, and 1.69 us in the adversarial case where every
+token changed version.  It remains disabled unless exact token provenance is
+requested.
+
+The separate real-engine smoke, job 15727740, completed three optimizer updates
+with exact response-token segment coverage 1.0, zero useful-token accounting
+error, and the consumption/throughput streams present.  Its short 1024-token
+responses all truncated and had zero reward variance, so it validates live
+integration rather than non-zero contribution; job 15728682 supplies the latter.
+
+### What can be causal
+
+The useful causal skeleton for interpretation is:
+
+```
+node ratio / queue policy / update cadence
+  -> generation-to-training service ratio
+  -> queue depth, wait, starvation, backpressure
+  -> realized staleness and recycle reason
+  -> generated-to-consumed selection
+  -> trained length/reward/difficulty distribution
+  -> objective contribution by staleness
+  -> learning curve
+
+prompt difficulty / tools / response length
+  -> active, group-wait, and reward latency
+  -> both staleness and probability of consumption
+```
+
+Within one observational run, correlations and conditional acceptance rates can
+locate a mechanism but cannot identify its causal effect: prompt difficulty and
+response length are common causes of both latency and reward.  A causal statement
+requires changing one upstream control while holding the rest fixed—for example
+randomizing the max-staleness rule, queue capacity/policy, train:rollout node
+ratio, or update cadence—and then checking the predicted mediator chain.  An
+algorithm comparison can causally attribute a change in effective-contribution
+staleness to the algorithm only when both arms receive the same generated batch
+or are paired on the same attempt records; otherwise selection changed first.

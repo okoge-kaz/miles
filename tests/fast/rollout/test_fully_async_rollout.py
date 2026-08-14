@@ -234,7 +234,25 @@ async def test_stale_group_recycled(monkeypatch):
     assert output.metrics["staleness/bound/rollout/frac_at_bound"] == pytest.approx(0.5)
 
     # Tokens counted before reset_for_retry cleared them.
-    assert output.metrics["rollout/fully_async/stale_tokens"] == 4
+    stale_response_tokens = 4
+    assert output.metrics["rollout/fully_async/stale_tokens"] == stale_response_tokens
+    assert (
+        output.metrics[
+            "rollout/fully_async/recycle_reason/stale_during_reward_finalize/groups"
+        ]
+        == 1
+    )
+    assert (
+        output.metrics[
+            "rollout/fully_async/waste/stale_during_reward_finalize/decode_tokens"
+        ]
+        == stale_response_tokens
+    )
+    assert output.metrics["selection_bias/generated/samples"] >= 2 * N_SAMPLES_PER_PROMPT
+    assert output.metrics["selection_bias/recycled/samples"] == N_SAMPLES_PER_PROMPT
+    assert output.metrics["selection_bias/admitted/samples"] == N_SAMPLES_PER_PROMPT
+    assert output.metrics[fully_async.GENERATED_TOKENS_KEY] == stale_response_tokens + N_SAMPLES_PER_PROMPT
+    assert output.metrics[fully_async.ADMITTED_TOKENS_KEY] == N_SAMPLES_PER_PROMPT
 
     # Named for the cause, under the section that owns it, so the bound's cost does
     # not have to be reconstructed by differencing group counts -- which would fold
@@ -328,6 +346,29 @@ async def test_wasted_token_accounting(monkeypatch):
     assert output.metrics["rollout/fully_async/aborted_tokens"] == N_SAMPLES_PER_PROMPT
     assert output.metrics["rollout/fully_async/kept_tokens"] == N_SAMPLES_PER_PROMPT
     assert output.metrics["rollout/fully_async/wasted_token_frac"] == pytest.approx(0.5)
+
+
+async def test_generated_token_denominator_precedes_post_generation_sample_filter(monkeypatch):
+    fn = make_fn(
+        monkeypatch,
+        make_args(rollout_batch_size=1),
+        FakeDataSource(),
+    )
+
+    def trim_all_responses(args, data):
+        del args
+        for group in data:
+            for sample in group:
+                sample.response = ""
+                sample.response_length = 0
+                sample.loss_mask = []
+
+    fn._sample_filter = trim_all_responses
+    output = await fn(RolloutFnTrainInput(rollout_id=0))
+
+    assert output.metrics[fully_async.GENERATED_TOKENS_KEY] == N_SAMPLES_PER_PROMPT
+    assert output.metrics[fully_async.ADMITTED_TOKENS_KEY] == N_SAMPLES_PER_PROMPT
+    assert output.metrics["rollout/fully_async/kept_tokens"] == 0
 
 
 def test_staleness_histogram_reports_the_shape_not_just_moments():
