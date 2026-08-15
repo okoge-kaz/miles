@@ -7,6 +7,8 @@
 #     experiments/staleness_ratio_sweep.sh --submit        # fresh dependency chains; existing paths refuse
 #     experiments/staleness_ratio_sweep.sh --resume        # dependency chains from valid checkpoints
 #     experiments/staleness_ratio_sweep.sh --submit --clean-checkpoints  # explicitly start over
+#     CHAIN_JOBS=3 experiments/staleness_ratio_sweep.sh --resume \
+#         --staleness 1 --ratio 2:6 --append-after 12345678
 #     experiments/staleness_ratio_sweep.sh --staleness 2    # one row of the grid
 #     experiments/staleness_ratio_sweep.sh --ratio 1:7,2:6  # one pair of columns
 #     experiments/staleness_ratio_sweep.sh --include-colocated  # add one s=0 on-policy arm
@@ -74,6 +76,7 @@ GPN=$(read_default ACTOR_GPUS_PER_NODE)
 NUM_ROLLOUT="${NUM_ROLLOUT:-$(read_default NUM_ROLLOUT)}"
 
 STALENESS_FILTER=""; RATIO_FILTER=""; INCLUDE_COLOCATED=0; COLOCATED_ONLY=0
+APPEND_AFTER=""
 SUBMIT=0; RESUME=0; CLEAN_CHECKPOINTS=0; CHECK=0
 while (( $# )); do
     case "$1" in
@@ -81,6 +84,7 @@ while (( $# )); do
         --ratio)     RATIO_FILTER="$2"; shift 2 ;;       # comma-separated, e.g. 1:7,2:6
         --submit)    SUBMIT=1; shift ;;
         --resume)    RESUME=1; shift ;;
+        --append-after) APPEND_AFTER="$2"; shift 2 ;;
         --clean-checkpoints) CLEAN_CHECKPOINTS=1; shift ;;
         --include-colocated) INCLUDE_COLOCATED=1; shift ;;
         --colocated-only) INCLUDE_COLOCATED=1; COLOCATED_ONLY=1; shift ;;
@@ -96,6 +100,13 @@ fi
 if (( CLEAN_CHECKPOINTS == 1 && SUBMIT == 0 )); then
     echo "--clean-checkpoints requires --submit and cannot be used with --resume" >&2
     exit 1
+fi
+if [[ -n "${APPEND_AFTER}" ]]; then
+    (( RESUME == 1 )) || { echo "--append-after requires --resume" >&2; exit 1; }
+    [[ "${APPEND_AFTER}" =~ ^[0-9]+$ ]] || {
+        echo "--append-after must be a numeric Slurm job id" >&2
+        exit 1
+    }
 fi
 [[ "${CHAIN_JOBS}" =~ ^[1-9][0-9]*$ ]] || { echo "CHAIN_JOBS must be a positive integer" >&2; exit 1; }
 [[ "${NUM_ROLLOUT}" =~ ^[1-9][0-9]*$ ]] || { echo "NUM_ROLLOUT must be a positive integer" >&2; exit 1; }
@@ -351,12 +362,20 @@ fi
 
 n_jobs=$(points | wc -l)
 n_jobs=$(( n_jobs + INCLUDE_COLOCATED ))
+if [[ -n "${APPEND_AFTER}" ]] && (( n_jobs != 1 )); then
+    echo "--append-after requires exactly one selected arm; narrow with" \
+         "--staleness/--ratio or --colocated-only" >&2
+    exit 1
+fi
 
 printf 'lr %s, %s, %d nodes per job, %s wall, rseed %s\n' \
     "${LR}" "${IS_CORRECTION}" "${TOTAL_NODES}" "${WALL}" "${ROLLOUT_SEED}"
 printf 'wandb project %s\n' "${WANDB_PROJECT}"
 printf '%s rollouts, %s dependent %s jobs per arm; gbs %s, tp %s, cp %s.\n' \
     "${NUM_ROLLOUT}" "${CHAIN_JOBS}" "${WALL}" "${GBS}" "${TP}" "${CP}"
+if [[ -n "${APPEND_AFTER}" ]]; then
+    printf 'The new chain will append after Slurm job %s.\n' "${APPEND_AFTER}"
+fi
 printf 'Megatron checkpoints are retained every %s rollouts.\n' "${SAVE_RETAIN_INTERVAL}"
 if (( SAVE_HF == 1 )); then
     printf 'HF checkpoints are retained every %s rollouts for offline eval.\n' "${HF_SAVE_INTERVAL}"
@@ -398,23 +417,56 @@ fi
 prepare_shared_output_permissions
 
 # A point already in the queue owns its checkpoint directory. Deleting it under a
-# running job corrupts that run and produces a measurement of neither.
-while read -r s t r dp; do
-    name=$(name_of "${s}" "${t}" "${r}")
-    if [[ -n "$(squeue -h -n "${name}" -o '%i' 2>/dev/null)" ]]; then
-        echo "refusing: ${name} is already queued or running as" \
-             "$(squeue -h -n "${name}" -o '%i' | tr '\n' ' ')" >&2
-        echo "cancel it first, or narrow this submission with --staleness/--ratio" >&2
-        exit 1
+# running job corrupts that run and produces a measurement of neither. Append
+# mode is the one exception: it verifies that the supplied dependency belongs to
+# the single selected arm, then starts the new chain only after that job exits.
+if [[ -n "${APPEND_AFTER}" ]]; then
+    if (( INCLUDE_COLOCATED == 1 )); then
+        expected_append_name=$(colo_name_of)
+    else
+        read -r append_s append_t append_r append_dp < <(points)
+        expected_append_name=$(name_of "${append_s}" "${append_t}" "${append_r}")
     fi
-done < <(points)
-if (( INCLUDE_COLOCATED == 1 )); then
-    name=$(colo_name_of)
-    if [[ -n "$(squeue -h -n "${name}" -o '%i' 2>/dev/null)" ]]; then
-        echo "refusing: ${name} is already queued or running as" \
-             "$(squeue -h -n "${name}" -o '%i' | tr '\n' ' ')" >&2
-        echo "cancel it first, or omit --include-colocated" >&2
+    append_record=$(squeue -h -j "${APPEND_AFTER}" -o '%j|%u' 2>/dev/null)
+    IFS='|' read -r actual_append_name actual_append_user <<<"${append_record}"
+    [[ "${actual_append_name}" == "${expected_append_name}" ]] || {
+        echo "refusing: --append-after ${APPEND_AFTER} is '${actual_append_name:-not queued}'," \
+             "expected '${expected_append_name}'" >&2
         exit 1
+    }
+    [[ "${actual_append_user}" == "${USER}" ]] || {
+        echo "refusing: --append-after ${APPEND_AFTER} belongs to" \
+             "'${actual_append_user:-unknown}', expected '${USER}'" >&2
+        exit 1
+    }
+    append_children=$(
+        squeue -h -u "${USER}" -o '%i|%E' |
+            awk -F'|' -v id="${APPEND_AFTER}" \
+                '$2 ~ ("(^|[^0-9])" id "([^0-9]|$)") { print $1 }'
+    )
+    [[ -z "${append_children}" ]] || {
+        echo "refusing: --append-after ${APPEND_AFTER} is not the chain tail;" \
+             "jobs ${append_children//$'\n'/ } already depend on it" >&2
+        exit 1
+    }
+else
+    while read -r s t r dp; do
+        name=$(name_of "${s}" "${t}" "${r}")
+        if [[ -n "$(squeue -h -n "${name}" -o '%i' 2>/dev/null)" ]]; then
+            echo "refusing: ${name} is already queued or running as" \
+                 "$(squeue -h -n "${name}" -o '%i' | tr '\n' ' ')" >&2
+            echo "cancel it first, or narrow this submission with --staleness/--ratio" >&2
+            exit 1
+        fi
+    done < <(points)
+    if (( INCLUDE_COLOCATED == 1 )); then
+        name=$(colo_name_of)
+        if [[ -n "$(squeue -h -n "${name}" -o '%i' 2>/dev/null)" ]]; then
+            echo "refusing: ${name} is already queued or running as" \
+                 "$(squeue -h -n "${name}" -o '%i' | tr '\n' ' ')" >&2
+            echo "cancel it first, or omit --include-colocated" >&2
+            exit 1
+        fi
     fi
 fi
 
@@ -493,6 +545,7 @@ fi
 submit_async_chain() {  # staleness train_nodes rollout_nodes dp
     local s=$1 t=$2 r=$3 dp=$4 name host jid raw_jid k dependency_label
     local -a dependency=()
+    [[ -z "${APPEND_AFTER}" ]] || dependency=("--dependency=afterany:${APPEND_AFTER}")
 
     name=$(name_of "${s}" "${t}" "${r}")
     host=$(host_ckpt_of "${s}" "${name}")
@@ -522,6 +575,7 @@ submit_async_chain() {  # staleness train_nodes rollout_nodes dp
 submit_colocated_chain() {
     local name host jid raw_jid k dependency_label
     local -a dependency=()
+    [[ -z "${APPEND_AFTER}" ]] || dependency=("--dependency=afterany:${APPEND_AFTER}")
 
     name=$(colo_name_of)
     host=$(colo_host_ckpt_of "${name}")
