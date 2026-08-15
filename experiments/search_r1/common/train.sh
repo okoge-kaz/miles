@@ -1,6 +1,7 @@
 #!/bin/bash
 #
-# Search-R1: the policy emits <search>query</search>, a local retriever answers
+# Shared Search-R1 worker for the sync and fully-async recipes. The policy emits
+# <search>query</search>, a local retriever answers
 # with wiki-18 passages, those tokens are appended with loss_mask 0, and decoding
 # resumes. `examples/experimental/search-r1/generate_with_search.py` owns the
 # loop; this recipe only wires it up.
@@ -15,6 +16,11 @@ set -ex
 
 export PYTHONBUFFERED=16
 export HF_HOME=/root/.cache/huggingface
+if [[ "${PLACEMENT}" == "async" ]]; then
+    export MILES_EXPERIMENTAL_ROLLOUT_REFACTOR=1
+else
+    export MILES_EXPERIMENTAL_ROLLOUT_REFACTOR=0
+fi
 
 NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
 HAS_NVLINK=$([ "$NVLINK_COUNT" -gt 0 ] && echo 1 || echo 0)
@@ -23,12 +29,12 @@ cd /root/miles
 source /root/miles/scripts/models/qwen3-4B-Instruct-2507.sh
 source /root/miles/experiments/common/ray_cluster.sh
 
-# The generate/reward functions are imported by bare module name, so their
+# The custom generation function is imported by bare module name, so its
 # directory has to be importable rather than just on the repo path.
 export PYTHONPATH="/root/miles/examples/experimental/search-r1:${PYTHONPATH:-}"
 
 # --- retriever ---------------------------------------------------------------
-# One process per node, holding the 65 GB FAISS index and the e5 query encoder.
+# One process on the Ray head, holding the 65 GB FAISS index and e5 encoder.
 # It has to be up before the first rollout. Runtime request failures are retried
 # and then abort the affected trajectory, but a dead server would otherwise
 # waste every rollout attempt.
@@ -37,10 +43,13 @@ export PYTHONPATH="/root/miles/examples/experimental/search-r1:${PYTHONPATH:-}"
 RETRIEVER_HOST="${RAY_HEAD_IP:-127.0.0.1}"
 
 if [[ "${SLURM_NODEID:-0}" == "0" ]]; then
-    # Not in the image. faiss-cpu on purpose: the index is searched on CPU so the
-    # GPUs stay with the policy, and the GPU build would want its own CUDA stack.
-    pip install --no-input --quiet faiss-cpu fastapi uvicorn \
-        || { echo "retriever dep install failed"; exit 1; }
+    # faiss-cpu on purpose: the index is searched on CPU so the GPUs stay with
+    # the policy. A cluster-specific image can bake these packages and avoid
+    # requiring package-index egress at job startup.
+    if ! python3 -c 'import faiss, fastapi, uvicorn' 2>/dev/null; then
+        pip install --no-input --quiet faiss-cpu fastapi uvicorn \
+            || { echo "retriever dep install failed"; exit 1; }
+    fi
 
     python3 /root/miles/experiments/src/search_r1/retrieval_server.py \
         --index /data/search-r1/e5_Flat.index \
@@ -86,7 +95,7 @@ if [[ "${SLURM_NODEID:-0}" == "0" ]]; then
     # This check exists because the failure it catches is silent: a bring-up run
     # on 2026-08-05 had a healthy retriever that the Ray actors could not reach
     # (loopback bind), and every search returned an empty observation. The run
-    # completed, dynamic sampling was happy, and reward came back 0.328 -- earned
+    # completed and reward came back 0.328 -- earned
     # entirely from the model's parametric memory, with the retriever unused.
     # Without this probe that looks like a working Search-R1 run.
     _probe=$(curl -sf -X POST "http://${RETRIEVER_HOST}:${RETRIEVER_PORT}/retrieve" \
@@ -118,8 +127,8 @@ fi
 
 ROLLOUT_ARGS=(
    --prompt-data "${PROMPT_DATA}"
-   # Search-R1's parquet carries the question under `prompt` and the answer set
-   # under `reward_model`. `prompt` is a one-message chat *list*, not a string,
+   # Search-R1 rows carry the question under `prompt` and the answer set under
+   # `reward_model`. `prompt` is a one-message chat *list*, not a string,
    # so --apply-chat-template is required: without it data.py hands the raw list
    # through untouched (data.py:220-226) and generate_with_search tokenizes a
    # Python list as if it were text.
@@ -141,36 +150,70 @@ ROLLOUT_ARGS=(
    # question, which is what actually bounds the trajectory.
    --rollout-max-context-len "${ROLLOUT_MAX_CONTEXT_LEN}"
    --rollout-temperature 1
+   --rollout-top-p 1
+   --rollout-top-k -1
    --global-batch-size "${GLOBAL_BATCH_SIZE}"
    --num-steps-per-rollout "${NUM_STEPS_PER_ROLLOUT}"
    --balance-data
    --custom-generate-function-path generate_with_search.generate
-   --custom-rm-path generate_with_search.reward_func
+   --rm-type search_r1
+   --search-r1-format-score "${SEARCH_FORMAT_SCORE}"
 )
-if [[ "${DYNAMIC_SAMPLING:-1}" == "1" ]]; then
-   ROLLOUT_ARGS+=(--dynamic-sampling-filter-path miles.rollout.filter_hub.dynamic_sampling_filters.check_no_aborted_and_reward_nonzero_std)
-else
-   # Infrastructure failures are never valid training data, even when active
-   # sampling by reward variance is intentionally disabled.
-   ROLLOUT_ARGS+=(--dynamic-sampling-filter-path miles.rollout.filter_hub.dynamic_sampling_filters.check_no_aborted)
+if [[ "${PLACEMENT}" == "async" ]]; then
+   ROLLOUT_ARGS+=(
+      --fully-async
+      --fully-async-queue-policy "${QUEUE_POLICY}"
+      --staleness-reference "${STALENESS_REFERENCE}"
+      --pause-generation-mode "${PAUSE_GENERATION_MODE}"
+   )
+   if [[ "${QUEUE_POLICY}" == queue-drop ]]; then
+      ROLLOUT_ARGS+=(--fully-async-queue-factor "${QUEUE_FACTOR}")
+   else
+      ROLLOUT_ARGS+=(--max-weight-staleness "${MAX_WEIGHT_STALENESS}")
+   fi
+   if [[ "${FULLY_ASYNC_ROLLOUT_CHECKPOINT:-0}" != "0" ]]; then
+      ROLLOUT_ARGS+=(--fully-async-rollout-checkpoint)
+   fi
+   if [[ -n "${ASYNC_MAX_CONCURRENT_SAMPLES:-}" ]]; then
+      ROLLOUT_ARGS+=(--async-max-concurrent-samples "${ASYNC_MAX_CONCURRENT_SAMPLES}")
+   fi
+   if [[ -n "${DEBUG_EXIT_AFTER_ROLLOUT:-}" ]]; then
+      ROLLOUT_ARGS+=(--debug-exit-after-rollout "${DEBUG_EXIT_AFTER_ROLLOUT}")
+   fi
 fi
+# Difficulty selection is entirely offline. Deliberately pass neither a reward
+# filter nor the abort-only filter here: both use the online top-up path and make
+# generated trajectories per update depend on run-time outcomes. Retriever
+# health is enforced by the endpoint probe and process watchdog below; aborted
+# trajectory metrics must remain zero in a valid run.
 
 TELEMETRY_ARGS=(
    --dump-details "${CKPT_PATH}/dump"
    --use-miles-dashboard
-   # Training-side entropy is a constant 0 without this: calculate_entropy is
-   # `entropy_coef != 0 or observe_training_entropy` (loss_hub/losses.py) and the
-   # coefficient is 0 here. Forward-only and detached, so no backward cost.
-   --observe-training-entropy
-   # policy_loss_debug/ is one file per micro-batch per rank, so it scales with
-   # training calls rather than rollout steps: 1.17 GB in 2512 files over 12
-   # rollout steps, against 287 MB of rollout dumps. Only a loss-level debug reads it.
-   --no-dump-policy-loss-debug
 )
+if [[ "${OBSERVE_TRAINING_ENTROPY:-0}" != "0" ]]; then
+   # Forward-only and detached, but still material on long retrieved contexts.
+   TELEMETRY_ARGS+=(--observe-training-entropy)
+fi
+if [[ "${DUMP_POLICY_LOSS_DEBUG:-0}" != "0" ]]; then
+   TELEMETRY_ARGS+=(--dump-policy-loss-debug)
+else
+   TELEMETRY_ARGS+=(--no-dump-policy-loss-debug)
+fi
 if [[ "${DUMP_TRAIN_DATA}" == "0" ]]; then
    TELEMETRY_ARGS+=(--no-dump-train-data)
 else
    TELEMETRY_ARGS+=(--use-rollout-entropy)
+fi
+if [[ "${LOG_STALENESS_GRADIENT_METRICS:-0}" != "0" ]]; then
+   TELEMETRY_ARGS+=(--log-staleness-gradient-metrics)
+fi
+if [[ "${LOG_STALENESS_GRADIENT_RATIO_HISTOGRAM:-0}" != "0" ]]; then
+   if [[ "${LOG_STALENESS_GRADIENT_METRICS:-0}" == "0" ]]; then
+      echo "LOG_STALENESS_GRADIENT_RATIO_HISTOGRAM requires LOG_STALENESS_GRADIENT_METRICS=1" >&2
+      exit 1
+   fi
+   TELEMETRY_ARGS+=(--log-staleness-gradient-ratio-histogram)
 fi
 
 # EVAL_INTERVAL=0 deliberately passes no eval arguments.  Search-R1 evaluation
@@ -196,13 +239,22 @@ PERF_ARGS=(
    --expert-model-parallel-size "${EXPERT_PARALLEL_SIZE}"
    --expert-tensor-parallel-size 1
 
-   --recompute-granularity full
-   --recompute-method uniform
-   --recompute-num-layers 1
+   --recompute-granularity "${RECOMPUTE_GRANULARITY}"
 
    --use-dynamic-batch-size
    --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
 )
+if [[ "${PLACEMENT}" == "async" ]]; then
+   # Trainer only: SGLang keeps its default allocator. Colocated training uses
+   # torch_memory_saver, which is incompatible with expandable segments.
+   PERF_ARGS+=(--train-env-vars '{"PYTORCH_CUDA_ALLOC_CONF":"expandable_segments:True"}')
+fi
+if [[ "${RECOMPUTE_GRANULARITY}" == "full" ]]; then
+   PERF_ARGS+=(--recompute-method uniform --recompute-num-layers 1)
+fi
+if [[ "${OVERLAP_COMM}" != "0" ]]; then
+   PERF_ARGS+=(--overlap-grad-reduce --overlap-param-gather)
+fi
 if [[ "${CONTEXT_PARALLEL_SIZE}" -gt 1 ]]; then
    PERF_ARGS+=(--cp-comm-type a2a)
 fi
@@ -211,19 +263,27 @@ GRPO_ARGS=(
    --seed         "${TRAIN_SEED}"
    --rollout-seed "${ROLLOUT_SEED}"
    --advantage-estimator "${ADVANTAGE_ESTIMATOR}"
-   --use-kl-loss
-   --kl-loss-coef "${KL_LOSS_COEF}"
-   --kl-loss-type low_var_kl
    --entropy-coef "${ENTROPY_COEF}"
    --eps-clip "${EPS_CLIP}"
    --eps-clip-high "${EPS_CLIP_HIGH}"
 )
+if [[ "${FUSE_ONE_STEP_ACTOR_LOGPROBS:-0}" != "0" ]]; then
+   GRPO_ARGS+=(--fuse-one-step-actor-logprobs)
+fi
+if [[ "${VERIFY_FUSED_ONE_STEP_ACTOR_LOGPROBS:-0}" != "0" ]]; then
+   if [[ "${FUSE_ONE_STEP_ACTOR_LOGPROBS:-0}" == "0" ]]; then
+      echo "VERIFY_FUSED_ONE_STEP_ACTOR_LOGPROBS requires FUSE_ONE_STEP_ACTOR_LOGPROBS=1" >&2
+      exit 1
+   fi
+   GRPO_ARGS+=(--verify-fused-one-step-actor-logprobs)
+fi
 TIS_BOUNDS=(--tis-clip "${TIS_CLIP}" --tis-clip-low "${TIS_CLIP_LOW}")
 case "${IS_CORRECTION}" in
    none)   ;;
    tis)    GRPO_ARGS+=(--use-tis "${TIS_BOUNDS[@]}") ;;
    icepop) GRPO_ARGS+=(--use-tis "${TIS_BOUNDS[@]}"
                        --custom-tis-function-path miles.backends.training_utils.loss_hub.corrections.icepop_function) ;;
+   m2po)   GRPO_ARGS+=(--use-m2po --m2po-budget "${M2PO_BUDGET}") ;;
    mis)    GRPO_ARGS+=(--use-tis
                        --custom-tis-function-path examples.infra_features.train_infer_mismatch_helper.mis.compute_mis_weights_with_cp
                        --custom-config-path "/root/miles/experiments/configs/mis/${MIS_PROFILE}.yaml") ;;
@@ -239,6 +299,9 @@ fi
 if [[ "${USE_OPSM}" != "0" ]]; then
    GRPO_ARGS+=(--use-opsm --opsm-delta "${OPSM_DELTA}")
 fi
+if awk "BEGIN{exit !(${KL_LOSS_COEF} != 0)}"; then
+   GRPO_ARGS+=(--use-kl-loss --kl-loss-coef "${KL_LOSS_COEF}" --kl-loss-type low_var_kl)
+fi
 
 OPTIMIZER_ARGS=(
    --optimizer adam
@@ -253,6 +316,15 @@ SGLANG_ARGS=(
    --rollout-num-gpus-per-engine "${ROLLOUT_NUM_GPUS_PER_ENGINE}"
    --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION}"
 )
+if [[ -n "${SGLANG_MAX_RUNNING_REQUESTS:-}" ]]; then
+   SGLANG_ARGS+=(--sglang-max-running-requests "${SGLANG_MAX_RUNNING_REQUESTS}")
+fi
+if [[ -n "${SGLANG_CUDA_GRAPH_MAX_BS:-}" ]]; then
+   SGLANG_ARGS+=(--sglang-cuda-graph-max-bs "${SGLANG_CUDA_GRAPH_MAX_BS}")
+fi
+if [[ "${SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS:-0}" != "0" ]]; then
+   SGLANG_ARGS+=(--sglang-enable-response-weight-version-segments)
+fi
 
 MISC_ARGS=(
    --attention-dropout 0.0
@@ -264,7 +336,7 @@ MISC_ARGS=(
 
 WANDB_ARGS=(
    --use-wandb
-   --wandb-project "off-policy-${DATASET_TAG}"
+   --wandb-project "async-search-r1"
    --wandb-group "${RUN_NAME}"
    # wandb reads WANDB_API_KEY from the inherited environment. Passing it as a
    # CLI argument would expose it in Megatron's full argument dump.
@@ -273,6 +345,7 @@ WANDB_ARGS=(
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
     \"PYTHONPATH\": \"/root/Megatron-LM/:/root/miles:/root/miles/examples/experimental/search-r1\",
+    \"MILES_EXPERIMENTAL_ROLLOUT_REFACTOR\": \"${MILES_EXPERIMENTAL_ROLLOUT_REFACTOR}\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
     \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\",
     \"SEARCH_R1_SEARCH_URL\": \"http://${RETRIEVER_HOST}:${RETRIEVER_PORT}/retrieve\",
@@ -282,20 +355,33 @@ RUNTIME_ENV_JSON="{
     \"SEARCH_R1_SEARCH_TIMEOUT\": \"${SEARCH_TIMEOUT}\",
     \"SEARCH_R1_SEARCH_MAX_ATTEMPTS\": \"${SEARCH_MAX_ATTEMPTS}\",
     \"SEARCH_R1_FORMAT_SCORE\": \"${SEARCH_FORMAT_SCORE}\",
+    \"SEARCH_R1_RETURN_LOGPROB\": \"1\",
     \"no_proxy\": \"${RETRIEVER_HOST},127.0.0.1,localhost\"
   }
 }"
 
 # Keep the full command out of shell xtrace. W&B gets its API key only from the
 # inherited environment, while Ray still streams the training logs normally.
+if [[ "${PLACEMENT}" == "async" ]]; then
+   ENTRYPOINT_ARGS=(
+      python3 train_async.py
+      --actor-num-nodes "${ACTOR_NUM_NODES}"
+      --actor-num-gpus-per-node "${ACTOR_GPUS_PER_NODE}"
+      --rollout-num-gpus "${ROLLOUT_NUM_GPUS}"
+   )
+else
+   ENTRYPOINT_ARGS=(
+      python3 train.py
+      --actor-num-nodes "${ACTOR_NUM_NODES}"
+      --actor-num-gpus-per-node "${ACTOR_GPUS_PER_NODE}"
+      --colocate
+   )
+fi
 set +x
 ray job submit --address="http://127.0.0.1:8265" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
-   -- python3 train.py \
-   --actor-num-nodes "${ACTOR_NUM_NODES}" \
-   --actor-num-gpus-per-node "${ACTOR_GPUS_PER_NODE}" \
-   --colocate \
-   ${MODEL_ARGS[@]} \
+   -- "${ENTRYPOINT_ARGS[@]}" \
+   "${MODEL_ARGS[@]}" \
    "${CKPT_ARGS[@]}" \
    "${ROLLOUT_ARGS[@]}" \
    "${OPTIMIZER_ARGS[@]}" \
@@ -310,8 +396,8 @@ RAY_CLIENT_PID=$!
 
 # A missing retriever must fail the whole job. Aborted trajectories are useful
 # for a transient request failure, but they are not a substitute for a live
-# environment: dynamic sampling can otherwise fill a batch with answers that
-# never searched and silently train a parametric-memory QA workload.
+# environment: otherwise a run can keep answering from parametric memory after
+# retrieval has disappeared.
 while kill -0 "${RAY_CLIENT_PID}" 2>/dev/null && kill -0 "${RETRIEVER_PID}" 2>/dev/null; do
     sleep 5
 done

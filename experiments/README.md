@@ -209,8 +209,9 @@ does not encode — the staleness bound, the pause mode, the batch shape, a
 filtered prompt file, a tuning job.
 The dump directory follows the same path.
 
-wandb is always on and keyed the same way: project `off-policy-<dataset>` (e.g.
-`off-policy-dapo-math-p10-90`), group `RUN_NAME`. `run.sbatch` fails at submit time if
+wandb is always on: math uses project `off-policy-<dataset>` (e.g.
+`off-policy-dapo-math-p10-90`), while both Search-R1 placements use
+`async-search-r1`; the group is `RUN_NAME`. `run.sbatch` fails at submit time if
 `WANDB_API_KEY` is unset rather than quietly running without logging; `env.sh`
 resolves it from `~/.netrc`.
 

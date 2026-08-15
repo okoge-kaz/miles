@@ -6,7 +6,7 @@
 export SLURM_ACCOUNT_NAME="${SLURM_ACCOUNT_NAME:-coreai_horizon_dilations}"
 export GPU_PARTITION="${GPU_PARTITION:-batch}"       # batch 4h / batch_long 8h / batch_large_long 14d
 export CPU_PARTITION="${CPU_PARTITION:-cpu}"         # cpu 1d / cpu_long 7d
-export GPUS_PER_NODE=8                               # every pool0-* node is H100 x8, 128 CPUs
+export GPUS_PER_NODE="${GPUS_PER_NODE:-8}"           # pool0 default: H100 x8, 128 CPUs
 
 # --- Workspace on lustre ----------------------------------------------------
 # Split by whether a job READS or WRITES the directory.

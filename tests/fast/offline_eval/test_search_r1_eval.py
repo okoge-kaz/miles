@@ -1,10 +1,16 @@
 import json
 import math
+from types import SimpleNamespace
 
-from experiments.src.offline_eval.measure_search_r1 import EpisodeResult
-from experiments.src.offline_eval.measure_search_r1 import _done_indices
-from experiments.src.offline_eval.measure_search_r1 import build_record
-from experiments.src.offline_eval.measure_search_r1 import protocol_tokenization
+from experiments.src.offline_eval import measure_search_r1
+from experiments.src.offline_eval.measure_search_r1 import (
+    EpisodeResult,
+    _configure_search_environment,
+    _done_indices,
+    _load_rows,
+    build_record,
+    protocol_tokenization,
+)
 from experiments.src.offline_eval.report_search_r1 import summarise
 
 
@@ -92,6 +98,16 @@ def test_protocol_tags_may_be_multiple_non_special_tokens():
     result = protocol_tokenization(Tokenizer())
 
     assert all(not item["atomic_special_token"] for item in result.values())
+    assert set(result) == {
+        "<think>",
+        "</think>",
+        "<search>",
+        "</search>",
+        "<information>",
+        "</information>",
+        "<answer>",
+        "</answer>",
+    }
     assert result["<search>"]["token_ids"] == [ord(character) for character in "<search>"]
 
 
@@ -100,3 +116,59 @@ def test_resume_ignores_a_partial_trailing_record(tmp_path):
     output.write_text(json.dumps({"index": 2}) + "\n{" + "\n")
 
     assert _done_indices(str(output)) == {2}
+
+
+def test_parquet_training_rows_keep_stable_indices(monkeypatch):
+    raw_rows = [
+        {
+            "prompt": [{"role": "user", "content": "first"}],
+            "reward_model": {"ground_truth": {"target": ["one"]}},
+            "metadata": {"source": "nq"},
+        },
+        {
+            "prompt": [{"role": "user", "content": "second"}],
+            "reward_model": {"ground_truth": {"target": ["two"]}},
+            "metadata": {"source": "hotpotqa"},
+        },
+    ]
+
+    class FakeBatch:
+        def to_pylist(self):
+            return raw_rows
+
+    class FakeParquetFile:
+        def __init__(self, path):
+            assert path == "train.parquet"
+
+        def iter_batches(self):
+            return iter([FakeBatch()])
+
+    monkeypatch.setattr(measure_search_r1, "pq", SimpleNamespace(ParquetFile=FakeParquetFile))
+
+    rows = _load_rows(
+        "train.parquet",
+        input_key="prompt",
+        label_key="reward_model",
+        metadata_key="metadata",
+        limit=None,
+    )
+
+    assert [row["index"] for row in rows] == [0, 1]
+    assert rows[1]["label"]["ground_truth"]["target"] == ["two"]
+
+
+def test_offline_measurement_disables_unused_rollout_logprobs(monkeypatch):
+    args = SimpleNamespace(
+        search_url="http://127.0.0.1:8000/retrieve",
+        max_turns=3,
+        search_topk=3,
+        search_concurrency=16,
+        search_timeout=60,
+        search_max_attempts=3,
+        format_score=0.0,
+    )
+    monkeypatch.delenv("SEARCH_R1_RETURN_LOGPROB", raising=False)
+
+    _configure_search_environment(args)
+
+    assert measure_search_r1.os.environ["SEARCH_R1_RETURN_LOGPROB"] == "0"

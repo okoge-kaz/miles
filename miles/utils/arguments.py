@@ -2328,6 +2328,15 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="Type of the reward model",
             )
             parser.add_argument(
+                "--search-r1-format-score",
+                type=float,
+                default=0.0,
+                help=(
+                    "Partial reward for a valid Search-R1 action/answer sequence when "
+                    "--rm-type search_r1 is selected. Outcome-only training uses 0."
+                ),
+            )
+            parser.add_argument(
                 "--reward-key",
                 type=str,
                 default=None,

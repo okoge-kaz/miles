@@ -975,6 +975,10 @@ def test_dataset_fingerprint_includes_model_tokenizer_and_chat_template(tmp_path
     args.rollout_stop = ["<END>"]
     assert dataset_fingerprint(args, source) != initial
 
+    del args.rollout_stop
+    args.search_r1_format_score = 0.2
+    assert dataset_fingerprint(args, source) != initial
+
 
 def test_checkpoint_retention_counts_existing_sparse_sidecars(tmp_path: Path):
     state = {

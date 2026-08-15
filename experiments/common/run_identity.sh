@@ -136,6 +136,15 @@ if awk "BEGIN{exit !(${KL_LOSS_COEF} != 0)}"; then
 fi
 
 CONFIG_TAG="${CONFIG_TAG:-rollout-length-$(( MAX_RESPONSE_LEN / 1024 ))k-lr${LR}-rbs${ROLLOUT_BATCH_SIZE}-gbs${GLOBAL_BATCH_SIZE}-n${N_SAMPLES_PER_PROMPT}-tseed${TRAIN_SEED}-rseed${ROLLOUT_SEED}}"
+if [[ "${TASK_FAMILY}" == search_r1 ]]; then
+    : "${SEARCH_MAX_TURNS:?}"
+    : "${SEARCH_TOPK:?}"
+    : "${SEARCH_FORMAT_SCORE:?}"
+    # These change generated trajectories or rewards. In particular, never
+    # restore a fully-async replay sidecar under different search semantics.
+    # The offline difficulty window is part of DATASET_TAG, not a run-time knob.
+    CONFIG_TAG="${CONFIG_TAG}-action${MAX_RESPONSE_LEN}-turns${SEARCH_MAX_TURNS}-topk${SEARCH_TOPK}-fmt${SEARCH_FORMAT_SCORE}"
+fi
 # Suffixed only away from the default, so paths written before the option existed
 # keep their spelling. The reference changes the age decision, so two runs that
 # differ only here are different runs and must not share a directory.

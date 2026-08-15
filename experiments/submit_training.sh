@@ -30,12 +30,17 @@ if [[ ! -f "experiments/${RECIPE}/run.sbatch" ]]; then
     exit 1
 fi
 
-# Mirror the recipe path, like the checkpoints do: math/<dataset>/<model>/.
-LOG_DIR="experiments/outputs/training/math/$(dirname "${RECIPE#*/}")/$(basename "${RECIPE}")"
+# Mirror the recipe path, like the checkpoints do: <task>/<dataset>/<model>/.
+# Sync/async are placement axes, not separate task families.
+RECIPE_TASK="${RECIPE%%/*}"
+TASK_FAMILY="${RECIPE_TASK%_sync}"
+TASK_FAMILY="${TASK_FAMILY%_async}"
+LOG_DIR="experiments/outputs/training/${TASK_FAMILY}/$(dirname "${RECIPE#*/}")/$(basename "${RECIPE}")"
 mkdir -p "${LOG_DIR}"
 
 jid=$(sbatch --parsable \
       -A "${SLURM_ACCOUNT_NAME:-coreai_horizon_dilations}" \
+      -p "${GPU_PARTITION:-batch}" \
       --job-name="${RUN_NAME}" \
       --output="${LOG_DIR}/%x-%j.log" \
       --export="ALL,RUN_NAME=${RUN_NAME}" \

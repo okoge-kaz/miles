@@ -254,6 +254,16 @@ def test_recompute_logprobs_via_prefill_flag_is_parsed():
     assert args.recompute_logprobs_via_prefill is True
 
 
+def test_search_r1_format_score_is_parsed():
+    parser = argparse.ArgumentParser()
+    get_miles_extra_args_provider()(parser)
+
+    args = parser.parse_args(["--rm-type", "search_r1", "--search-r1-format-score", "0.2"] + REQUIRED_ARGS)
+
+    assert args.rm_type == "search_r1"
+    assert args.search_r1_format_score == 0.2
+
+
 def test_sglang_parallel_sizes_keep_server_args_destinations():
     parser = add_sglang_arguments(argparse.ArgumentParser())
     args = parser.parse_args(

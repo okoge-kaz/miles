@@ -25,9 +25,23 @@ from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
+try:
+    import pyarrow.parquet as pq
+except ImportError:
+    pq = None
+
 
 ACTION_STOPS = ("</search>", "</answer>")
-PROTOCOL_TAGS = ("<search>", "</search>", "<information>", "</information>", "<answer>", "</answer>")
+PROTOCOL_TAGS = (
+    "<think>",
+    "</think>",
+    "<search>",
+    "</search>",
+    "<information>",
+    "</information>",
+    "<answer>",
+    "</answer>",
+)
 
 
 @dataclass(frozen=True)
@@ -49,7 +63,7 @@ class EpisodeResult:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--prompt-data", required=True, help="Miles-format Search-R1 JSONL")
+    parser.add_argument("--prompt-data", required=True, help="Miles-format Search-R1 JSONL or parquet")
     parser.add_argument("--output", required=True, help="resumable per-prompt JSONL")
     parser.add_argument("--model-path", required=True, help="HF checkpoint used by SGLang and the tokenizer")
     parser.add_argument("--server-url", default="http://127.0.0.1:30000")
@@ -110,6 +124,10 @@ def _configure_search_environment(args: argparse.Namespace) -> None:
         "SEARCH_R1_SEARCH_TIMEOUT": args.search_timeout,
         "SEARCH_R1_SEARCH_MAX_ATTEMPTS": args.search_max_attempts,
         "SEARCH_R1_FORMAT_SCORE": args.format_score,
+        # Difficulty measurement and offline EM do not consume behavior-policy
+        # log-probs. Avoid asking SGLang to score every generated token; training
+        # leaves this unset and retains log-probs for TIS/token alignment.
+        "SEARCH_R1_RETURN_LOGPROB": 0,
     }
     for name, value in values.items():
         os.environ[name] = str(value)
@@ -173,7 +191,9 @@ def protocol_tokenization(tokenizer) -> dict[str, dict]:
         token_ids = tokenizer.encode(tag, add_special_tokens=False)
         decoded = tokenizer.decode(token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
         if not token_ids or decoded != tag:
-            raise RuntimeError(f"protocol tag does not round-trip through the tokenizer: {tag!r} -> {token_ids} -> {decoded!r}")
+            raise RuntimeError(
+                f"protocol tag does not round-trip through the tokenizer: {tag!r} -> {token_ids} -> {decoded!r}"
+            )
         result[tag] = {
             "token_ids": token_ids,
             "atomic_special_token": len(token_ids) == 1 and token_ids[0] in all_special_ids,
@@ -181,23 +201,37 @@ def protocol_tokenization(tokenizer) -> dict[str, dict]:
     return result
 
 
+def _iter_input_rows(path: str):
+    suffix = Path(path).suffix
+    if suffix == ".jsonl":
+        with open(path) as source:
+            for line in source:
+                if line.strip():
+                    yield json.loads(line)
+        return
+    if suffix == ".parquet":
+        if pq is None:
+            raise SystemExit("pyarrow is required to read Search-R1 parquet prompt data")
+        parquet_file = pq.ParquetFile(path)
+        for batch in parquet_file.iter_batches():
+            yield from batch.to_pylist()
+        return
+    raise SystemExit(f"unsupported prompt data {path!r}; expected .jsonl or .parquet")
+
+
 def _load_rows(path: str, *, input_key: str, label_key: str, metadata_key: str, limit: int | None) -> list[dict]:
     rows = []
-    with open(path) as source:
-        for index, line in enumerate(source):
-            if not line.strip():
-                continue
-            raw = json.loads(line)
-            rows.append(
-                {
-                    "index": index,
-                    "prompt": raw[input_key],
-                    "label": raw[label_key],
-                    "metadata": dict(raw.get(metadata_key) or {}),
-                }
-            )
-            if limit is not None and len(rows) >= limit:
-                break
+    for index, raw in enumerate(_iter_input_rows(path)):
+        rows.append(
+            {
+                "index": index,
+                "prompt": raw[input_key],
+                "label": raw[label_key],
+                "metadata": dict(raw.get(metadata_key) or {}),
+            }
+        )
+        if limit is not None and len(rows) >= limit:
+            break
     return rows
 
 
@@ -373,6 +407,7 @@ def _write_meta(args: argparse.Namespace, tokenization: dict) -> None:
         "policy": args.policy or Path(args.model_path).name,
         "model_path": args.model_path,
         "prompt_data": args.prompt_data,
+        "rm_type": "search_r1",
         "n_samples": args.n_samples,
         "temperature": args.temperature,
         "top_p": args.top_p,
@@ -386,10 +421,55 @@ def _write_meta(args: argparse.Namespace, tokenization: dict) -> None:
         "protocol_tokenization": tokenization,
     }
     path = str(Path(args.output).with_suffix(".meta.json"))
+    if Path(args.output).exists() and Path(args.output).stat().st_size:
+        if not Path(path).exists():
+            raise SystemExit(f"refusing to resume {args.output}: missing provenance sidecar {path}")
+        with open(path) as source:
+            previous = json.load(source)
+        if previous != metadata:
+            changed = sorted(key for key in set(previous) | set(metadata) if previous.get(key) != metadata.get(key))
+            raise SystemExit(
+                f"refusing to mix incompatible Search-R1 measurements in {args.output}; "
+                f"changed metadata keys: {changed}"
+            )
     with open(path, "w") as destination:
         json.dump(metadata, destination, indent=2, ensure_ascii=False)
         destination.write("\n")
     print(f"meta -> {path}", flush=True)
+
+
+async def _measure_rows(runtime, args, generate_args, state, rows, semaphore, output, audit, lock, counters):
+    queue = asyncio.Queue()
+    for row in rows:
+        queue.put_nowait(row)
+
+    async def worker():
+        while True:
+            try:
+                row = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            try:
+                await _measure_one(
+                    runtime,
+                    args,
+                    generate_args,
+                    state,
+                    row,
+                    semaphore,
+                    output,
+                    audit,
+                    lock,
+                    counters,
+                )
+            finally:
+                queue.task_done()
+
+    # The training parquet has ~170k prompts. Creating every prompt/sample task
+    # up front would allocate more than a million coroutines at n=8. Keep only a
+    # bounded prompt window while the trajectory semaphore controls server load.
+    worker_count = min(len(rows), args.concurrency)
+    await asyncio.gather(*(worker() for _ in range(worker_count)))
 
 
 async def main_async(args: argparse.Namespace) -> None:
@@ -440,11 +520,17 @@ async def main_async(args: argparse.Namespace) -> None:
     audit = open(args.dump_responses, audit_mode) if args.dump_responses and todo else None
     try:
         with open(args.output, "a") as output:
-            await asyncio.gather(
-                *(
-                    _measure_one(runtime, args, generate_args, state, row, semaphore, output, audit, lock, counters)
-                    for row in todo
-                )
+            await _measure_rows(
+                runtime,
+                args,
+                generate_args,
+                state,
+                todo,
+                semaphore,
+                output,
+                audit,
+                lock,
+                counters,
             )
     finally:
         if audit is not None:

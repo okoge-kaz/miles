@@ -45,6 +45,8 @@ measurement no longer describes it.
 | `measure_pass_rate.py` | the expensive half: generate `k` samples per prompt, score, record |
 | `apply_filter.py` | the cheap half: turn a measurement + a window into a prompt file |
 | `run_measure.sbatch` | Slurm entry point (SGLang on 8 GPUs, then the driver) |
+| `run_measure_search_r1.sbatch` | Search-R1 entry point: E5 retrieval plus multi-turn generation |
+| `measure_search_r1_job.sh` | container-side Search-R1 server/measurement worker |
 
 ## Relationship to the built-in filters
 
@@ -155,8 +157,9 @@ python -m experiments.src.difficulty_filter.apply_filter \
   --policy Qwen3-4B-Instruct-2507
 ```
 
-The output keeps every input line verbatim and appends a `difficulty` block, so
+The output preserves every input row field and appends a `difficulty` block, so
 it stays a drop-in `--prompt-data` while remaining traceable to its measurement.
+Both JSONL and parquet sources are accepted; filtered output is JSONL.
 
 Use it by giving the filtered file its own dataset directory. `PROMPT_DATA` is
 fixed by `<task>/<dataset>/`, not overridden per run, so a filtered prompt set is
@@ -171,3 +174,42 @@ cp -r experiments/math_sync/dapo-math experiments/math_sync/dapo-math-p20-80
 
 experiments/submit_training.sh math_sync/dapo-math-p20-80/qwen3-4b-instruct-2507 filtered-math
 ```
+
+## Search-R1
+
+Search difficulty cannot be measured with the single-turn math driver. The
+answer distribution depends on the policy's search queries and the passages E5
+returns, so `run_measure_search_r1.sbatch` calls the same
+`generate_with_search.generate` path as training, including retrieved-token
+masking, action stops, max turns, and outcome reward.
+
+The Search recipes use the math study's `p10-90` convention explicitly:
+Qwen3-4B-Instruct-2507, n=8, inclusive pass rate 0.1--0.9. At this group size the
+observable rates are multiples of 1/8, so this retains 1/8--7/8 and removes only
+unanimous initial-policy groups. The measurement is fixed before training;
+neither sync nor async passes an online dynamic filter.
+
+```bash
+# First validate servers, parquet loading, retrieval, reward, and output schema.
+sbatch -A coreai_horizon_dilations --export=ALL,LIMIT=64 \
+  experiments/src/difficulty_filter/run_measure_search_r1.sbatch
+
+# Then resume/complete the whole 169,615-row source and materialize p10-90.
+sbatch -A coreai_horizon_dilations \
+  experiments/src/difficulty_filter/run_measure_search_r1.sbatch
+```
+
+The default artifacts are:
+
+- `/data/difficulty/searchr1-nq-hotpotqa.Qwen3-4B-Instruct-2507.passrate.jsonl`
+- the adjacent `.meta.json` sampling/retrieval provenance
+- `/data/searchr1-nq-hotpotqa/searchr1-nq-hotpotqa-p10-90.jsonl`
+
+The pass-rate log is append/resume safe. A limited smoke writes under
+`/data/difficulty/smoke/` and deliberately does not write the production
+filtered set; only a complete measurement triggers `apply_filter.py`. Log-prob
+collection is disabled for this inference-only job,
+because pass-rate filtering uses the final response/reward and not TIS. Changing
+the policy, n, temperature, action budget, max turns, retriever/corpus, top-k, or
+reward semantics invalidates the cached difficulty coordinate and requires a
+new dataset tag.

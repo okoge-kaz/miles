@@ -85,6 +85,18 @@ def _env_float(name, default):
     return value
 
 
+def _env_bool(name, default):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean, got {raw!r}")
+
+
 SEARCH_R1_CONFIGS["max_turns"] = _env_int("SEARCH_R1_MAX_TURNS", SEARCH_R1_CONFIGS["max_turns"])
 SEARCH_R1_CONFIGS["topk"] = _env_int("SEARCH_R1_TOPK", SEARCH_R1_CONFIGS["topk"])
 SEARCH_R1_CONFIGS["search_concurrency"] = _env_int(
@@ -95,6 +107,7 @@ SEARCH_R1_CONFIGS["search_max_attempts"] = _env_int(
     "SEARCH_R1_SEARCH_MAX_ATTEMPTS", SEARCH_R1_CONFIGS["search_max_attempts"]
 )
 SEARCH_R1_CONFIGS["format_score"] = _env_float("SEARCH_R1_FORMAT_SCORE", SEARCH_R1_CONFIGS["format_score"])
+SEARCH_R1_CONFIGS["return_logprob"] = _env_bool("SEARCH_R1_RETURN_LOGPROB", SEARCH_R1_CONFIGS["return_logprob"])
 if os.environ.get("SEARCH_R1_SEARCH_URL"):
     SEARCH_R1_CONFIGS["local"]["search_url"] = os.environ["SEARCH_R1_SEARCH_URL"]
 
@@ -179,9 +192,7 @@ def postprocess_responses(resp: str) -> str:
     return (
         resp.split("</search>")[0] + "</search>"
         if "</search>" in resp
-        else resp.split("</answer>")[0] + "</answer>"
-        if "</answer>" in resp
-        else resp
+        else resp.split("</answer>")[0] + "</answer>" if "</answer>" in resp else resp
     )
 
 
@@ -339,9 +350,9 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         # Add log probs if enabled
         if SEARCH_R1_CONFIGS["return_logprob"]:
             rollout_log_probs += cur_response_log_probs
-            assert len(response_token_ids) == len(rollout_log_probs), (
-                f"Token/logp length mismatch: {len(response_token_ids)} tokens vs {len(rollout_log_probs)} logps"
-            )
+            assert len(response_token_ids) == len(
+                rollout_log_probs
+            ), f"Token/logp length mismatch: {len(response_token_ids)} tokens vs {len(rollout_log_probs)} logps"
 
         if finish_type == "length":
             break
@@ -379,9 +390,9 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             rollout_log_probs += [0.0] * len(obs_tokens_ids)
 
             # Verify alignment when collecting log probs
-            assert len(response_token_ids) == len(rollout_log_probs), (
-                f"Token/logp length mismatch: {len(response_token_ids)} tokens vs {len(rollout_log_probs)} logps"
-            )
+            assert len(response_token_ids) == len(
+                rollout_log_probs
+            ), f"Token/logp length mismatch: {len(response_token_ids)} tokens vs {len(rollout_log_probs)} logps"
 
     _populate_sample(
         sample,

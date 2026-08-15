@@ -152,6 +152,7 @@ def dataset_fingerprint(args, data_source) -> str:
         "global_batch_size": getattr(args, "global_batch_size", None),
         "num_steps_per_rollout": getattr(args, "num_steps_per_rollout", None),
         "rm_type": getattr(args, "rm_type", None),
+        "search_r1_format_score": getattr(args, "search_r1_format_score", None),
         "rm_url": getattr(args, "rm_url", None),
         "custom_rm_path": getattr(args, "custom_rm_path", None),
         "group_rm": getattr(args, "group_rm", None),

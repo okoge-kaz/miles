@@ -14,6 +14,7 @@ from .gpqa import compute_gpqa_reward
 from .math_dapo_utils import compute_score as compute_score_dapo
 from .math_utils import extract_answer as extract_boxed_answer
 from .math_utils import grade_answer_verl
+from .search_r1 import compute_search_r1_reward
 
 
 async def remote_rm(args, sample: Sample):
@@ -68,6 +69,13 @@ async def async_rm(args, sample: Sample, **kwargs):
         return 1 if grade_answer_verl(response, label) else 0
     elif rm_type == "f1":
         return f1_score(response, label)[0]
+    elif rm_type == "search_r1":
+        return compute_search_r1_reward(
+            prompt=sample.prompt,
+            response=response,
+            label=label,
+            format_score=getattr(args, "search_r1_format_score", 0.0),
+        )
     elif rm_type == "gpqa":
         return compute_gpqa_reward(response, label, metadata=metadata)
     elif rm_type == "ifbench":

@@ -170,7 +170,8 @@ The genre with genuinely different rollout shape: an observation is appended wit
 
 | Role | Path | Size | Verifier | Status |
 |---|---|---|---|---|
-| train | `/data/searchr1-nq-hotpotqa/train.parquet` | 340 MB | `generate_with_search.reward_func` | ⛔ |
+| source train | `/data/searchr1-nq-hotpotqa/train.parquet` | 169,615 rows / 340 MB | `--rm-type search_r1` | ✅ staged; unfiltered bring-up smoke only |
+| fixed train | `/data/searchr1-nq-hotpotqa/searchr1-nq-hotpotqa-p10-90.jsonl` | determined by offline Qwen3-4B-Instruct-2507 n=8 pass-rate measurement | same | ⏳ measurement required before controlled sync/async runs |
 | eval | `/data/flashrag-datasets/{nq,triviaqa,popqa}/test.jsonl` | 3,610 / 11,313 / 14,267 | same | ⛔ |
 | eval | `/data/flashrag-datasets/{hotpotqa,2wikimultihopqa,musique}/dev.jsonl` | 7,405 / 12,576 / 2,417 | same | ⛔ |
 | eval | `/data/flashrag-datasets/bamboogle/test.jsonl` | 125 | same | ⛔ |
@@ -181,10 +182,18 @@ The genre with genuinely different rollout shape: an observation is appended wit
 Eval config: `configs/eval_search_r1.yaml` (the seven FlashRAG sets Search-R1
 reports, sliced to 500 with the `path@[0:500]` syntax so the numbers stay
 comparable to published ones).
-Recipes: `search_r1/nq-hotpotqa/qwen3-4b-instruct-2507/`, `tau_bench/tau1/qwen3-4b-instruct-2507/`.
+Recipes: `search_r1_sync/nq-hotpotqa-p10-90/qwen3-4b-instruct-2507/`,
+`search_r1_async/nq-hotpotqa-p10-90/qwen3-4b-instruct-2507/`, and
+`tau_bench/tau1/qwen3-4b-instruct-2507/`.
 
-⛔ **because neither has completed a rollout yet**, not because anything is
-missing. The assets are staged:
+The colocated Search-R1 path completed an unfiltered one-rollout/one-update GPU
+bring-up smoke (job 15729407) with a checkpoint; it is not evidence for the
+final fixed-dataset design. The old dynamic-filter async smoke (job 15789560)
+was cancelled before allocation. The fully-async recipe, fused actor-logprob
+path, and replay sidecar pass unit/static validation; its final GPU smoke waits
+for the fixed p10-90 artifact. Difficulty-pipeline smoke outputs are isolated
+under `/data/difficulty/smoke/` and are never training inputs. The assets are
+staged:
 
 - `/data/search-r1/e5_Flat.index` — 64 GB, reassembled from `part_aa`+`part_ab`
 - `/data/search-r1/wiki-18.jsonl` — 14 GB corpus
@@ -196,9 +205,9 @@ framing and the retriever dies on a stray `0x80`. `prepare_search_r1.sbatch` ask
 sits at offset 257 and a short fragment does not see it reliably.
 
 The retriever (`src/search_r1/retrieval_server.py`) mmaps the index and refuses to
-start if the corpus and index counts disagree. That check matters:
-`generate_with_search` treats a failed search as an empty observation, so a dead
-retriever does not crash the run — it silently trains on unanswerable prompts.
+start if the corpus and index counts disagree. The worker probes the real
+`/retrieve` endpoint before rollout; later request failures abort and filter the
+affected trajectory rather than training on an empty observation.
 
 **tau-bench needs an external LLM** for its user simulator: `TAU_USER_MODEL` and
 `NVIDIA_INFERENCE_API_KEY` in `.env`, no default (see `.env.example`). Its recipe

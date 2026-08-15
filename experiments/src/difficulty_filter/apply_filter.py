@@ -39,6 +39,13 @@ import argparse
 import json
 import os
 import sys
+from dataclasses import fields
+from pathlib import Path
+
+try:
+    import pyarrow.parquet as pq
+except ImportError:
+    pq = None
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..")))
 
@@ -55,7 +62,11 @@ DIFFICULTY_KEY = "difficulty"
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--prompt-data", required=True, help="the jsonl that was measured (may already be annotated)")
+    p.add_argument(
+        "--prompt-data",
+        required=True,
+        help="the JSONL or parquet that was measured (JSONL may already be annotated)",
+    )
     # Optional: an annotated file already carries difficulty[policy].pass_rate,
     # so re-cutting a window from it needs no measurement file at all.
     p.add_argument("--pass-rates", default=None, help="measure_pass_rate.py output; omit to read existing tags")
@@ -98,12 +109,18 @@ def load_meta(pass_rates_path):
 
 def load_records(path):
     records = {}
+    record_fields = {field.name for field in fields(PassRateRecord)}
     with open(path) as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
-            r = PassRateRecord(**json.loads(line))
+            payload = json.loads(line)
+            # Search-R1 measurements also retain agentic-cost fields (search
+            # calls, observation length, statuses). Filtering needs only the
+            # common pass-rate record, so preserve those in the measurement
+            # artifact and ignore them here.
+            r = PassRateRecord(**{key: value for key, value in payload.items() if key in record_fields})
             records[r.index] = r
     return records
 
@@ -117,10 +134,38 @@ def build_tag(record, meta):
     }
     # Only the parameters that change what a pass rate *means* are copied in;
     # the sidecar keeps the full record.
-    for key in ("rm_type", "temperature", "max_new_tokens"):
+    for key in (
+        "rm_type",
+        "temperature",
+        "top_p",
+        "top_k",
+        "max_new_tokens",
+        "max_new_tokens_per_turn",
+        "max_turns",
+        "search_topk",
+        "format_score",
+    ):
         if key in meta:
             tag[key] = meta[key]
     return tag
+
+
+def iter_prompt_rows(path):
+    suffix = Path(path).suffix
+    if suffix == ".jsonl":
+        with open(path) as source:
+            for line in source:
+                if line.strip():
+                    yield json.loads(line)
+        return
+    if suffix == ".parquet":
+        if pq is None:
+            raise SystemExit("pyarrow is required to read parquet prompt data")
+        parquet_file = pq.ParquetFile(path)
+        for batch in parquet_file.iter_batches():
+            yield from batch.to_pylist()
+        return
+    raise SystemExit(f"unsupported prompt data {path!r}; expected .jsonl or .parquet")
 
 
 def main():
@@ -151,44 +196,38 @@ def main():
     filtered = open(args.output, "w") if args.output else None
     n_annotated = n_kept = n_unmeasured = 0
     try:
-        with open(args.prompt_data) as fin:
-            for i, line in enumerate(fin):
-                line = line.strip()
-                if not line:
+        for i, row in enumerate(iter_prompt_rows(args.prompt_data)):
+            if records is not None:
+                record = records.get(i)
+                if record is None:
+                    n_unmeasured += 1
+                    if not args.drop_unmeasured:
+                        raise SystemExit(
+                            f"prompt index {i} has no measurement; finish the sweep or pass --drop-unmeasured"
+                        )
                     continue
-                row = json.loads(line)
+                # Merge rather than assign: re-running for another policy must
+                # not discard the tags already on the row.
+                row.setdefault(DIFFICULTY_KEY, {})[policy] = build_tag(record, meta)
+                pass_rate = record.pass_rate
+            else:
+                tag = row.get(DIFFICULTY_KEY, {}).get(policy)
+                if tag is None:
+                    n_unmeasured += 1
+                    if not args.drop_unmeasured:
+                        raise SystemExit(
+                            f"prompt index {i} has no {DIFFICULTY_KEY}[{policy}] tag; "
+                            f"pass --pass-rates to measure it in, or --drop-unmeasured"
+                        )
+                    continue
+                pass_rate = tag["pass_rate"]
 
-                if records is not None:
-                    record = records.get(i)
-                    if record is None:
-                        n_unmeasured += 1
-                        if not args.drop_unmeasured:
-                            raise SystemExit(
-                                f"prompt index {i} has no measurement; finish the sweep or pass --drop-unmeasured"
-                            )
-                        continue
-                    # Merge rather than assign: re-running for another policy must
-                    # not discard the tags already on the row.
-                    row.setdefault(DIFFICULTY_KEY, {})[policy] = build_tag(record, meta)
-                    pass_rate = record.pass_rate
-                else:
-                    tag = row.get(DIFFICULTY_KEY, {}).get(policy)
-                    if tag is None:
-                        n_unmeasured += 1
-                        if not args.drop_unmeasured:
-                            raise SystemExit(
-                                f"prompt index {i} has no {DIFFICULTY_KEY}[{policy}] tag; "
-                                f"pass --pass-rates to measure it in, or --drop-unmeasured"
-                            )
-                        continue
-                    pass_rate = tag["pass_rate"]
-
-                if annotated:
-                    annotated.write(json.dumps(row) + "\n")
-                    n_annotated += 1
-                if filtered and pass_rate_in_window(pass_rate, args.pass_rate_min, args.pass_rate_max):
-                    filtered.write(json.dumps(row) + "\n")
-                    n_kept += 1
+            if annotated:
+                annotated.write(json.dumps(row) + "\n")
+                n_annotated += 1
+            if filtered and pass_rate_in_window(pass_rate, args.pass_rate_min, args.pass_rate_max):
+                filtered.write(json.dumps(row) + "\n")
+                n_kept += 1
     finally:
         for f in (annotated, filtered):
             if f:

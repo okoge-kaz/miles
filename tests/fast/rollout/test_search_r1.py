@@ -6,7 +6,6 @@ from types import SimpleNamespace
 
 import pytest
 
-
 if "numpy" not in sys.modules:
     try:
         __import__("numpy")
@@ -296,6 +295,29 @@ async def test_generate_aborts_instead_of_training_on_retriever_failure(monkeypa
     assert result.metadata["search_r1_search_calls"] == 1
     assert result.metadata["search_r1_error"] == "retriever unavailable"
     assert result.reward is None
+    result.validate()
+
+
+async def test_generate_can_skip_logprobs_for_inference_only_measurement(monkeypatch):
+    output = _output("<answer>beta</answer>", [41, 42], version=8)
+    del output["meta_info"]["output_token_logprobs"]
+
+    async def fake_post(url, payload):
+        assert "return_logprob" not in payload
+        return output
+
+    monkeypatch.setitem(search_r1.SEARCH_R1_CONFIGS, "return_logprob", False)
+    monkeypatch.setattr(search_r1, "GenerateState", _GenerateState)
+    monkeypatch.setattr(search_r1, "post", fake_post)
+
+    sample = Sample(prompt="prompt", label={"ground_truth": {"target": ["beta"]}})
+    result = await search_r1.generate(_args(), sample, _sampling_params())
+
+    expected_response_tokens = _Tokenizer()(result.response)["input_ids"]
+    assert result.status == Sample.Status.COMPLETED
+    assert result.response == "<answer>beta</answer>"
+    assert result.rollout_log_probs is None
+    assert result.loss_mask == [1] * len(expected_response_tokens)
     result.validate()
 
 
