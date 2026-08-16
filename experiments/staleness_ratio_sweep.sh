@@ -11,6 +11,8 @@
 #         --staleness 1 --ratio 2:6 --append-after 12345678
 #     experiments/staleness_ratio_sweep.sh --staleness 2    # one row of the grid
 #     experiments/staleness_ratio_sweep.sh --ratio 1:7,2:6  # one pair of columns
+#     experiments/staleness_ratio_sweep.sh --point 2:2:6 --point 4:2:6
+#     RUN_NAMESPACE=sidecar-v1 experiments/staleness_ratio_sweep.sh --point 2:2:6
 #     experiments/staleness_ratio_sweep.sh --include-colocated  # add one s=0 on-policy arm
 #     experiments/staleness_ratio_sweep.sh --colocated-only     # select only that s=0 arm
 #     experiments/staleness_ratio_sweep.sh --check
@@ -47,6 +49,7 @@ STALENESS_REFERENCE=prefill
 : "${LOG_PROBS_CHUNK_SIZE:=-1}"
 : "${OBSERVE_TRAINING_ENTROPY:=0}"
 : "${WANDB_PROJECT:=async-rl-dapo-math-node-ratio}"
+: "${RUN_NAMESPACE:=}"             # optional CONFIG_TAG/RUN_NAME suffix
 : "${PARTITION:=batch}"             # 8 nodes: batch_short caps at 4
 : "${WALL:=04:00:00}"
 : "${CHAIN_JOBS:=10}"               # 300 rollouts need ~7 measured 4 h segments
@@ -75,13 +78,23 @@ CP=$(read_default CONTEXT_PARALLEL_SIZE)
 GPN=$(read_default ACTOR_GPUS_PER_NODE)
 NUM_ROLLOUT="${NUM_ROLLOUT:-$(read_default NUM_ROLLOUT)}"
 
-STALENESS_FILTER=""; RATIO_FILTER=""; INCLUDE_COLOCATED=0; COLOCATED_ONLY=0
+STALENESS_FILTER=""; RATIO_FILTER=""; POINT_FILTER=""
+INCLUDE_COLOCATED=0; COLOCATED_ONLY=0
 APPEND_AFTER=""
 SUBMIT=0; RESUME=0; CLEAN_CHECKPOINTS=0; CHECK=0
 while (( $# )); do
     case "$1" in
         --staleness) STALENESS_FILTER="$2"; shift 2 ;;   # comma-separated, e.g. 1,2
         --ratio)     RATIO_FILTER="$2"; shift 2 ;;       # comma-separated, e.g. 1:7,2:6
+        --point)
+            point_arg="${2:-}"
+            [[ "${point_arg}" =~ ^[0-9]+:[1-9][0-9]*:[1-9][0-9]*$ ]] || {
+                echo "--point must be STALENESS:TRAIN_NODES:ROLLOUT_NODES, got '${point_arg}'" >&2
+                exit 1
+            }
+            POINT_FILTER="${POINT_FILTER:+${POINT_FILTER} }${point_arg}"
+            shift 2
+            ;;
         --submit)    SUBMIT=1; shift ;;
         --resume)    RESUME=1; shift ;;
         --append-after) APPEND_AFTER="$2"; shift 2 ;;
@@ -97,6 +110,15 @@ if (( SUBMIT == 1 && RESUME == 1 )); then
     echo "--submit and --resume are mutually exclusive" >&2
     exit 1
 fi
+if [[ -n "${POINT_FILTER}" && ( -n "${STALENESS_FILTER}" || -n "${RATIO_FILTER}" \
+      || "${INCLUDE_COLOCATED}" == 1 ) ]]; then
+    echo "--point cannot be combined with --staleness, --ratio, or a colocated selector" >&2
+    exit 1
+fi
+[[ -z "${RUN_NAMESPACE}" || "${RUN_NAMESPACE}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || {
+    echo "RUN_NAMESPACE must contain only letters, digits, dot, underscore, or dash" >&2
+    exit 1
+}
 if (( CLEAN_CHECKPOINTS == 1 && SUBMIT == 0 )); then
     echo "--clean-checkpoints requires --submit and cannot be used with --resume" >&2
     exit 1
@@ -125,6 +147,15 @@ in_list() {  # value comma-separated-list -> 0 when the list is empty or contain
     return 1
 }
 
+point_selected() {  # staleness train_nodes rollout_nodes
+    [[ -z "${POINT_FILTER}" ]] && return 0
+    local selected candidate="$1:$2:$3"
+    for selected in ${POINT_FILTER}; do
+        [[ "${selected}" == "${candidate}" ]] && return 0
+    done
+    return 1
+}
+
 # dp is the trainer's alone under --fully-async: the rollout GPUs do not train.
 # A shape megatron would reject is dropped here, at submission, with the reason.
 points() {  # staleness T R dp
@@ -135,6 +166,7 @@ points() {  # staleness T R dp
         for pair in ${RATIOS}; do
             in_list "${pair}" "${RATIO_FILTER}" || continue
             t="${pair%%:*}"; r="${pair##*:}"
+            point_selected "${s}" "${t}" "${r}" || continue
             (( t + r == TOTAL_NODES )) || { echo "skip ${pair}: not ${TOTAL_NODES} nodes" >&2; continue; }
             (( (t * GPN) % (TP * CP) == 0 )) || { echo "skip ${pair}: tp${TP}*cp${CP} does not divide $(( t * GPN )) train GPUs" >&2; continue; }
             dp=$(( t * GPN / (TP * CP) ))
@@ -144,8 +176,12 @@ points() {  # staleness T R dp
     done
 }
 
-name_of() { echo "s$1-t$2r$3"; }
-colo_name_of() { echo "s0-colocated"; }
+name_of() {
+    echo "s$1-t$2r$3${RUN_NAMESPACE:+-${RUN_NAMESPACE}}"
+}
+colo_name_of() {
+    echo "s0-colocated${RUN_NAMESPACE:+-${RUN_NAMESPACE}}"
+}
 
 # CKPT_PATH is derived by common/run_identity.sh, so asking it is the only way to
 # be sure the guard checks the directory the job will actually write to.
@@ -243,7 +279,7 @@ if (( CHECK == 1 )); then
     # if they were two configurations. Highest job id wins.
     declare -A newest_jid newest_log
     skipped=0; empty=0
-    for f in "${LOG_DIR}"/s*-t*r*-*.log; do
+    for f in "${LOG_DIR}"/s*-t*r*"${RUN_NAMESPACE:+-${RUN_NAMESPACE}}"-*.log; do
         if ! grep -q "fully_async/queue_size" "${f}"; then
             empty=$(( empty + 1 ))
             continue
@@ -362,6 +398,10 @@ fi
 
 n_jobs=$(points | wc -l)
 n_jobs=$(( n_jobs + INCLUDE_COLOCATED ))
+(( n_jobs > 0 )) || {
+    echo "no valid experiment points selected" >&2
+    exit 1
+}
 if [[ -n "${APPEND_AFTER}" ]] && (( n_jobs != 1 )); then
     echo "--append-after requires exactly one selected arm; narrow with" \
          "--staleness/--ratio or --colocated-only" >&2
@@ -371,6 +411,9 @@ fi
 printf 'lr %s, %s, %d nodes per job, %s wall, rseed %s\n' \
     "${LR}" "${IS_CORRECTION}" "${TOTAL_NODES}" "${WALL}" "${ROLLOUT_SEED}"
 printf 'wandb project %s\n' "${WANDB_PROJECT}"
+if [[ -n "${RUN_NAMESPACE}" ]]; then
+    printf 'run namespace %s (fresh CONFIG_TAG/RUN_NAME suffix)\n' "${RUN_NAMESPACE}"
+fi
 printf '%s rollouts, %s dependent %s jobs per arm; gbs %s, tp %s, cp %s.\n' \
     "${NUM_ROLLOUT}" "${CHAIN_JOBS}" "${WALL}" "${GBS}" "${TP}" "${CP}"
 if [[ -n "${APPEND_AFTER}" ]]; then
@@ -613,8 +656,10 @@ if (( INCLUDE_COLOCATED == 1 )); then
 fi
 
 echo
+check_prefix=""
+[[ -z "${RUN_NAMESPACE}" ]] || check_prefix="RUN_NAMESPACE=${RUN_NAMESPACE} "
 if (( INCLUDE_COLOCATED == 1 )); then
-    echo "check with:  experiments/staleness_ratio_sweep.sh --check --include-colocated"
+    echo "check with:  ${check_prefix}experiments/staleness_ratio_sweep.sh --check --include-colocated"
 else
-    echo "check with:  experiments/staleness_ratio_sweep.sh --check"
+    echo "check with:  ${check_prefix}experiments/staleness_ratio_sweep.sh --check"
 fi
