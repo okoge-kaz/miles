@@ -38,7 +38,6 @@ LIFECYCLE_EXACT_KEY = "fully_async_lifecycle_exact"
 
 ATTEMPT_WALL_SECONDS_KEY = "fully_async_attempt_wall_seconds"
 REWARD_SECONDS_KEY = "fully_async_reward_seconds"
-SELECTION_METRICS_KEY = "selection_metrics"
 
 GENERATED_TOKENS_KEY = "rollout/fully_async/useful_rollout/generated_tokens"
 ADMITTED_TOKENS_KEY = "rollout/fully_async/useful_rollout/admitted_tokens"
@@ -492,15 +491,6 @@ def add_selection_population(
         _append_population_value(population, "reward_seconds", sample.metadata.get(REWARD_SECONDS_KEY))
         _append_population_value(population, "difficulty", difficulty)
         _append_population_value(population, "prompt_pass_rate", prompt_pass_rate)
-        selection_metrics = sample.metadata.get(SELECTION_METRICS_KEY, {})
-        if not isinstance(selection_metrics, dict):
-            raise RuntimeError(
-                f"{SELECTION_METRICS_KEY} metadata must be a mapping, got {type(selection_metrics).__name__}"
-            )
-        for metric_name, value in selection_metrics.items():
-            if not isinstance(metric_name, str) or not metric_name:
-                raise RuntimeError(f"Invalid selection metric name: {metric_name!r}")
-            _append_population_value(population, metric_name, value)
         for name, start_key, end_key in (
             ("pre_queue_active", TRAJECTORY_START_VERSION_KEY, SAMPLE_GENERATION_COMPLETE_VERSION_KEY),
             ("pre_queue_group_wait", SAMPLE_GENERATION_COMPLETE_VERSION_KEY, GROUP_GENERATION_COMPLETE_VERSION_KEY),

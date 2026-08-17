@@ -14,7 +14,6 @@ from miles.rollout.recycle_compute_metrics import (
     LIFECYCLE_EXACT_KEY,
     QUEUE_PUT_TIME_KEY,
     REWARD_SECONDS_KEY,
-    SELECTION_METRICS_KEY,
     SAMPLE_GENERATION_COMPLETE_TIME_KEY,
     SAMPLE_GENERATION_COMPLETE_VERSION_KEY,
     SAMPLE_REFERENCE_VERSION_KEY,
@@ -184,25 +183,6 @@ def test_queue_telemetry_owns_response_length_until_final_consumption() -> None:
     assert metrics["selection_bias/generated/samples"] == 1
     assert "selection_bias/generated/response_length/mean" not in metrics
     assert metrics["selection_bias/consumed/response_length/mean"] == 7
-
-
-def test_custom_selection_metrics_are_aggregated_for_each_population() -> None:
-    samples = [_sample(1, 7, [1] * 7), _sample(2, 7, [1] * 7)]
-    samples[0].metadata[SELECTION_METRICS_KEY] = {
-        "strict_math/multiple_answer_markers": 0.0,
-        "strict_math/reward_disagreement": 0.0,
-    }
-    samples[1].metadata[SELECTION_METRICS_KEY] = {
-        "strict_math/multiple_answer_markers": 1.0,
-        "strict_math/reward_disagreement": 1.0,
-    }
-    populations: dict[str, dict[str, list[float]]] = {}
-
-    add_selection_population(populations, population_name="generated", samples=samples)
-    metrics = selection_population_metrics(populations)
-
-    assert metrics["selection_bias/generated/strict_math/multiple_answer_markers/mean"] == 0.5
-    assert metrics["selection_bias/generated/strict_math/reward_disagreement/mean"] == 0.5
 
 
 def test_consumed_debug_rows_are_idempotent_for_prepared_batch_replay() -> None:

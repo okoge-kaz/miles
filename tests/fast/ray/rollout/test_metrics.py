@@ -9,7 +9,6 @@ from miles.ray.rollout.metrics import (
     _compute_zero_std_metrics,
     log_rollout_batch_consumption,
 )
-from miles.rollout.recycle_compute_metrics import SELECTION_METRICS_KEY
 
 
 class TestComputeZeroStdMetrics:
@@ -126,24 +125,6 @@ class TestTitoMismatchMetrics:
             s.metadata = {"tito_session_mismatch": []}
         out = _compute_metrics_from_samples(args, samples)
         assert out["tito_session_mismatch_rate/assistant_text"] > 0
-
-
-def test_selection_metadata_metrics_are_logged_for_standard_rollouts():
-    args = make_args(advantage_estimator="ppo", ci_test=False, log_passrate=False)
-    samples = make_samples_grouped(1, 2)
-    samples[0].metadata[SELECTION_METRICS_KEY] = {
-        "strict_math/multiple_answer_markers": 0.0,
-        "strict_math/reward_disagreement": 0.0,
-    }
-    samples[1].metadata[SELECTION_METRICS_KEY] = {
-        "strict_math/multiple_answer_markers": 1.0,
-        "strict_math/reward_disagreement": 1.0,
-    }
-
-    metrics = _compute_metrics_from_samples(args, samples)
-
-    assert metrics["strict_math/multiple_answer_markers"] == 0.5
-    assert metrics["strict_math/reward_disagreement"] == 0.5
 
 
 class TestComputePassrateFromSamples:

@@ -74,24 +74,10 @@ prepared/admitted groups retain the decision already made before the snapshot.
 
 The implementation supports `queue-recycle`, `queue-max`, and `queue-drop`. It
 intentionally requires dense, critic-free Megatron GRPO, the standard FIFO
-global data source, built-in data conversion, `--update-weights-interval 1`, and
-a non-`disk-delta` weight transport. It also rejects debug rollout injection and
-any postprocessing that trims part of a prepared batch. These are fail-fast
-guards, not silent fallbacks.
-
-Arbitrary `--custom-rm-path` functions are rejected because a sidecar preserves
-the rewards and reward metadata of materialized trajectories instead of
-re-running unknown user code. A custom reward may be used only when its exact
-import path is registered in
-`miles.rollout.fully_async_checkpoint.CHECKPOINT_SAFE_CUSTOM_RM_VERSIONS` as a
-reviewed deterministic contract. The contract version and path are included in
-the dataset/config fingerprint, so changing either makes an old sidecar
-incompatible instead of silently mixing reward semantics. The strict terminal
-math reward is registered as `strict-terminal-answer-v2`; its current path is:
-
-```text
-experiments.src.staleness_ratio.strict_math_reward.strict_math_reward
-```
+global data source and built-in reward/data conversion,
+`--update-weights-interval 1`, and a non-`disk-delta` weight transport. It also
+rejects debug rollout injection and any postprocessing that trims part of a
+prepared batch. These are fail-fast guards, not silent fallbacks.
 
 ## Storage and observability
 

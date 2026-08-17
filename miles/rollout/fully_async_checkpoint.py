@@ -40,16 +40,6 @@ REQUIRED_STATE_KEYS = {
     "regeneration_group_ids",
 }
 
-# Custom reward functions are rejected by default because replay sidecars keep
-# materialized rewards instead of re-running arbitrary user code. Entries here
-# are reviewed deterministic contracts; bump the version whenever reward or
-# serialized-metadata semantics change so incompatible sidecars fail the
-# dataset/config fingerprint check.
-CHECKPOINT_SAFE_CUSTOM_RM_VERSIONS = {
-    "experiments.src.staleness_ratio.strict_math_reward.strict_math_reward": "strict-terminal-answer-v2",
-}
-
-
 def encode_sample(sample: Sample) -> dict[str, Any]:
     """Return a detached, serialization-safe representation of one sample."""
     return copy.deepcopy(sample.to_dict())
@@ -118,7 +108,6 @@ def dataset_fingerprint(args, data_source) -> str:
     file_digest = _hash_prompt_file(prompt_path) if prompt_path else None
     chat_template_path = getattr(args, "chat_template_path", None)
     dataset = getattr(data_source, "dataset", None)
-    custom_rm_path = getattr(args, "custom_rm_path", None)
     config = {
         "prompt_sha256": file_digest,
         "prompt_slice": _prompt_slice(prompt_path),
@@ -164,8 +153,7 @@ def dataset_fingerprint(args, data_source) -> str:
         "rm_type": getattr(args, "rm_type", None),
         "search_r1_format_score": getattr(args, "search_r1_format_score", None),
         "rm_url": getattr(args, "rm_url", None),
-        "custom_rm_path": custom_rm_path,
-        "custom_rm_checkpoint_version": CHECKPOINT_SAFE_CUSTOM_RM_VERSIONS.get(custom_rm_path),
+        "custom_rm_path": getattr(args, "custom_rm_path", None),
         "group_rm": getattr(args, "group_rm", None),
         "reward_key": getattr(args, "reward_key", None),
         "custom_reward_post_process_path": getattr(args, "custom_reward_post_process_path", None),

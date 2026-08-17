@@ -980,17 +980,6 @@ def test_dataset_fingerprint_includes_model_tokenizer_and_chat_template(tmp_path
     assert dataset_fingerprint(args, source) != initial
 
 
-def test_dataset_fingerprint_includes_checkpoint_safe_custom_rm_version(monkeypatch):
-    path = "experiments.src.staleness_ratio.strict_math_reward.strict_math_reward"
-    source = Namespace(dataset=[object()])
-    args = Namespace(custom_rm_path=path)
-    initial = dataset_fingerprint(args, source)
-
-    monkeypatch.setitem(checkpoint_module.CHECKPOINT_SAFE_CUSTOM_RM_VERSIONS, path, "strict-terminal-answer-v3")
-
-    assert dataset_fingerprint(args, source) != initial
-
-
 def test_checkpoint_retention_counts_existing_sparse_sidecars(tmp_path: Path):
     state = {
         "dataset_fingerprint": "dataset-a",

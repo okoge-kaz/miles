@@ -77,7 +77,7 @@ def _fully_async_checkpoint_args(**overrides) -> SimpleNamespace:
         ({"data_source_path": "custom.Source"}, "RolloutDataSourceWithBuffer"),
         ({"advantage_estimator": "gspo"}, "advantage-estimator grpo"),
         ({"use_critic": True}, "critic-free GRPO"),
-        ({"custom_rm_path": "custom.rm"}, "registered checkpoint-safe reward-model"),
+        ({"custom_rm_path": "custom.rm"}, "built-in reward-model"),
         ({"custom_reward_post_process_path": "custom.reward"}, "built-in reward"),
         ({"custom_convert_samples_to_train_data_path": "custom.convert"}, "built-in train-data"),
         ({"rollout_data_postprocess_path": "custom.postprocess"}, "built-in rollout data post-processing"),
@@ -120,17 +120,6 @@ def test_fully_async_rollout_checkpoint_accepts_supported_grpo_configuration(mon
     monkeypatch.setattr("miles.utils.arguments.enable_experimental_rollout_refactor", lambda: True)
     args = _fully_async_checkpoint_args(**queue_config)
     _resolve_rollout_functions(args)
-    assert args.rollout_function_path == "miles.rollout.fully_async_rollout.FullyAsyncRolloutFn"
-
-
-def test_fully_async_rollout_checkpoint_accepts_registered_strict_math_reward(monkeypatch):
-    monkeypatch.setattr("miles.utils.arguments.enable_experimental_rollout_refactor", lambda: True)
-    args = _fully_async_checkpoint_args(
-        custom_rm_path="experiments.src.staleness_ratio.strict_math_reward.strict_math_reward"
-    )
-
-    _resolve_rollout_functions(args)
-
     assert args.rollout_function_path == "miles.rollout.fully_async_rollout.FullyAsyncRolloutFn"
 
 

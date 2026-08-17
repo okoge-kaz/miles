@@ -51,9 +51,6 @@ ROLLOUT_ARGS=(
    --staleness-reference "${STALENESS_REFERENCE}"
    --pause-generation-mode "${PAUSE_GENERATION_MODE}"
 )
-if [[ -n "${CUSTOM_RM_PATH:-}" ]]; then
-   ROLLOUT_ARGS+=(--custom-rm-path "${CUSTOM_RM_PATH}")
-fi
 if [[ "${QUEUE_POLICY}" == queue-drop ]]; then
    ROLLOUT_ARGS+=(--fully-async-queue-factor "${QUEUE_FACTOR}")
 else
