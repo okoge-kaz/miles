@@ -34,6 +34,7 @@
 #                    `deepscaler` returns 0 unless the response contains
 #                    `</think>`, so it zeroes every non-thinking model.
 #   CONCURRENCY      prompts in flight                     (96)
+#   TOP_P / TOP_K    sampling cutoffs                      (1.0 / -1)
 #   MAX_RUNNING_REQUESTS  sequences admitted per replica    (96)
 #   SGLANG_LOG_LEVEL sglang verbosity                      (info)
 #                    Keep at info: the Decode-batch lines carry token usage,
@@ -72,6 +73,8 @@ CONCURRENCY="${CONCURRENCY:-96}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-96}"
 RM_TYPE="${RM_TYPE:-math}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
+TOP_P="${TOP_P:-1.0}"
+TOP_K="${TOP_K:--1}"
 SERVER_PORT="${SERVER_PORT:-30000}"
 LIMIT_ARG=""
 [[ -n "${LIMIT:-}" ]] && LIMIT_ARG="--limit ${LIMIT}"
@@ -152,6 +155,8 @@ python3 experiments/src/difficulty_filter/measure_pass_rate.py \
     ${LABEL_KEY:+--label-key ${LABEL_KEY}} \
     --n-samples ${N_SAMPLES} \
     --temperature ${TEMPERATURE} \
+    --top-p ${TOP_P} \
+    --top-k ${TOP_K} \
     --max-new-tokens ${MAX_NEW_TOKENS} \
     --concurrency ${CONCURRENCY} \
     ${LIMIT_ARG} ${DUMP_ARG}

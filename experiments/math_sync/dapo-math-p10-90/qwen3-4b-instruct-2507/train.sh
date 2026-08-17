@@ -46,6 +46,9 @@ ROLLOUT_ARGS=(
    --num-steps-per-rollout "${NUM_STEPS_PER_ROLLOUT}"
    --balance-data
 )
+if [[ -n "${CUSTOM_RM_PATH:-}" ]]; then
+   ROLLOUT_ARGS+=(--custom-rm-path "${CUSTOM_RM_PATH}")
+fi
 
 TELEMETRY_ARGS=(
    --dump-details "${CKPT_PATH}/dump"

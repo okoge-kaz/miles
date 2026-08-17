@@ -71,6 +71,7 @@ def parse_args():
     p.add_argument("--n-samples", type=int, default=8)
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--top-p", type=float, default=1.0)
+    p.add_argument("--top-k", type=int, default=-1)
     # Must equal the training recipe's --rollout-max-response-len. A truncated
     # sample scores 0 under every rule-based verifier, so measuring with a
     # smaller budget does not add noise -- it adds a *directional* bias that
@@ -150,6 +151,7 @@ def write_meta(args):
         "n_samples": args.n_samples,
         "temperature": args.temperature,
         "top_p": args.top_p,
+        "top_k": args.top_k,
         "max_new_tokens": args.max_new_tokens,
         "correct_threshold": args.correct_threshold,
     }
@@ -240,9 +242,14 @@ def scalar_reward(reward, reward_key=None) -> float:
     return float(reward)
 
 
-async def score_responses(args, prompt, label, responses, metadata=None):
+async def score_responses(args, prompt, label, responses, metadata=None, statuses=None):
     rm_args = SimpleNamespace(rm_type=args.rm_type, custom_rm_path=args.custom_rm_path)
     samples = [Sample(prompt=prompt, response=r, label=label, metadata=dict(metadata or {})) for r in responses]
+    if statuses is not None:
+        if len(statuses) != len(samples):
+            raise ValueError(f"got {len(statuses)} statuses for {len(samples)} responses")
+        for sample, status in zip(samples, statuses, strict=True):
+            sample.status = status
     rewards = await batched_async_rm(rm_args, samples)
     return [scalar_reward(r, args.reward_key) for r in rewards]
 
@@ -389,7 +396,17 @@ async def measure_one(session, args, tokenizer, row, sampling_params, sem, out_f
                      else m.get("finish_reason") == "length"
                      for m in metas]
 
-        rewards = await score_responses(args, row["prompt"], row["label"], responses, row.get("metadata"))
+        statuses = [
+            Sample.Status.TRUNCATED if is_truncated else Sample.Status.COMPLETED for is_truncated in truncated
+        ]
+        rewards = await score_responses(
+            args,
+            row["prompt"],
+            row["label"],
+            responses,
+            row.get("metadata"),
+            statuses,
+        )
 
         record = PassRateRecord(
             index=row["index"],
