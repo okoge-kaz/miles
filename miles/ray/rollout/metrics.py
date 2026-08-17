@@ -3,6 +3,7 @@ from typing import Any
 
 import numpy as np
 
+from miles.rollout.recycle_compute_metrics import SELECTION_METRICS_KEY
 from miles.utils.iter_utils import group_by
 from miles.utils.metric_utils import (
     compute_pass_rate,
@@ -140,6 +141,7 @@ def _compute_metrics_from_samples(args, samples):
     log_dict |= _compute_spec_metrics(args, samples)
     log_dict |= _compute_prefix_cache_metrics(args, samples)
     log_dict |= _compute_reward_cat_metrics(args, samples)
+    log_dict |= _compute_selection_metadata_metrics(samples)
     log_dict["repetition_frac"] = np.mean([int(has_repetition(s.response)) for s in samples]).item()
     log_dict["truncated_ratio"] = np.mean([int(s.status == Sample.Status.TRUNCATED) for s in samples]).item()
 
@@ -183,6 +185,24 @@ def _compute_metrics_from_samples(args, samples):
             # from the pretokenized prefix and may differ from canonical tokenization.
 
     return log_dict
+
+
+def _compute_selection_metadata_metrics(samples: list[Sample]) -> dict[str, float]:
+    """Average fixed-cardinality numeric diagnostics attached by rollout hooks."""
+    values_by_name: dict[str, list[float]] = {}
+    for sample in samples:
+        selection_metrics = sample.metadata.get(SELECTION_METRICS_KEY, {})
+        if not isinstance(selection_metrics, dict):
+            raise RuntimeError(
+                f"{SELECTION_METRICS_KEY} metadata must be a mapping, "
+                f"got {type(selection_metrics).__name__}"
+            )
+        for metric_name, value in selection_metrics.items():
+            if not isinstance(metric_name, str) or not metric_name:
+                raise RuntimeError(f"Invalid selection metric name: {metric_name!r}")
+            if isinstance(value, (int, float, np.integer, np.floating)):
+                values_by_name.setdefault(metric_name, []).append(float(value))
+    return {metric_name: float(np.mean(values)) for metric_name, values in values_by_name.items()}
 
 
 def _compute_perf_metrics_from_samples(args, samples, rollout_time):

@@ -40,7 +40,7 @@ PROMPT_DATA=/data/dapo-math-p10-90/dapo-math-p10-90.jsonl
 
 # training hyperparameters
 : "${LR:=1e-6}"
-: "${MAX_RESPONSE_LEN:=32768}"
+: "${MAX_RESPONSE_LEN:=16384}"
 : "${NUM_ROLLOUT:=300}"
 : "${TRAIN_SEED:=1234}"
 : "${ROLLOUT_SEED:=42}"
@@ -74,7 +74,7 @@ PROMPT_DATA=/data/dapo-math-p10-90/dapo-math-p10-90.jsonl
 # evaluation during training; the reported numbers come from src/offline_eval
 : "${EVAL_INTERVAL:=0}"       # 0 disables in-run eval; score HF exports offline
 : "${N_SAMPLES_PER_EVAL_PROMPT:=8}"
-: "${EVAL_MAX_RESPONSE_LEN:=32768}"
+: "${EVAL_MAX_RESPONSE_LEN:=16384}"
 : "${SKIP_EVAL_BEFORE_TRAIN:=0}"
 
 # checkpointing: torch_dist for resume, hf for offline eval, on separate cadences

@@ -48,8 +48,9 @@ STALENESS_REFERENCE=prefill
 : "${FUSE_ONE_STEP_ACTOR_LOGPROBS:=1}"
 : "${LOG_PROBS_CHUNK_SIZE:=-1}"
 : "${OBSERVE_TRAINING_ENTROPY:=0}"
+: "${CUSTOM_RM_PATH:=experiments.src.staleness_ratio.strict_math_reward.strict_math_reward}"
+: "${FULLY_ASYNC_ROLLOUT_CHECKPOINT:=1}"
 : "${WANDB_PROJECT:=async-rl-dapo-math-node-ratio}"
-: "${RUN_NAMESPACE:=}"             # optional CONFIG_TAG/RUN_NAME suffix
 : "${PARTITION:=batch}"             # 8 nodes: batch_short caps at 4
 : "${WALL:=04:00:00}"
 : "${CHAIN_JOBS:=10}"               # 300 rollouts need ~7 measured 4 h segments
@@ -67,7 +68,7 @@ STALENESS_REFERENCE=prefill
 # https://nvidia.atlassian.net/wiki/spaces/HWINFCSSUP/pages/2441648885
 # Must go on the sbatch line, not in a #SBATCH directive: the directive form
 # strips the double quotes and the reaper then sees invalid JSON.
-IDLE_EXEMPTION='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"60","reason":"data_loading","description":"Async RL: the training node is idle while the rollout engines generate its next batch; one 192x16 batch at 32k response length exceeds the default threshold"}}'
+IDLE_EXEMPTION='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"60","reason":"data_loading","description":"Async RL: the training node is idle while the rollout engines generate its next batch; one 192x16 batch at 16k response length exceeds the default threshold"}}'
 
 read_default() {  # read a recipe default so the grid cannot drift from the recipe
     sed -n "s/^: \"\${$1:=\([^}]*\)}\".*/\1/p" "${REPO_ROOT}/${ASYNC_RECIPE}" | head -1
@@ -77,6 +78,8 @@ TP=$(read_default TENSOR_PARALLEL_SIZE)
 CP=$(read_default CONTEXT_PARALLEL_SIZE)
 GPN=$(read_default ACTOR_GPUS_PER_NODE)
 NUM_ROLLOUT="${NUM_ROLLOUT:-$(read_default NUM_ROLLOUT)}"
+MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-$(read_default MAX_RESPONSE_LEN)}"
+: "${RUN_NAMESPACE:=strict-math-v2-$(( MAX_RESPONSE_LEN / 1024 ))k-sidecar-v1}"
 
 STALENESS_FILTER=""; RATIO_FILTER=""; POINT_FILTER=""
 INCLUDE_COLOCATED=0; COLOCATED_ONLY=0
@@ -136,6 +139,10 @@ fi
 [[ "${SAVE_RETAIN_INTERVAL}" =~ ^[1-9][0-9]*$ ]] ||
     { echo "SAVE_RETAIN_INTERVAL must be a positive integer" >&2; exit 1; }
 [[ "${SAVE_HF}" =~ ^[01]$ ]] || { echo "SAVE_HF must be 0 or 1" >&2; exit 1; }
+[[ "${FULLY_ASYNC_ROLLOUT_CHECKPOINT}" =~ ^[01]$ ]] || {
+    echo "FULLY_ASYNC_ROLLOUT_CHECKPOINT must be 0 or 1" >&2
+    exit 1
+}
 [[ "${HF_SAVE_INTERVAL}" =~ ^[1-9][0-9]*$ ]] ||
     { echo "HF_SAVE_INTERVAL must be a positive integer" >&2; exit 1; }
 (( SAVE_RETAIN_INTERVAL % SAVE_INTERVAL == 0 )) ||
@@ -194,7 +201,7 @@ ckpt_path_of() {  # staleness config_tag
         IS_CORRECTION="${IS_CORRECTION}" TIS_CLIP="${TIS_CLIP}" TIS_CLIP_LOW="${TIS_CLIP_LOW}"
         MIS_PROFILE= USE_OPSM=0 OPSM_DELTA=1e-4
         ROLLOUT_BATCH_SIZE=192 N_SAMPLES_PER_PROMPT=16 GLOBAL_BATCH_SIZE="${GBS}"
-        NUM_STEPS_PER_ROLLOUT=1 MAX_RESPONSE_LEN=32768 LR="${LR}"
+        NUM_STEPS_PER_ROLLOUT=1 MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN}" LR="${LR}"
         MAX_WEIGHT_STALENESS=$1 PAUSE_GENERATION_MODE=in_place
         STALENESS_REFERENCE="${STALENESS_REFERENCE}"
         TRAIN_SEED=1234 ROLLOUT_SEED="${ROLLOUT_SEED}" RUN_NAME=$2 CONFIG_TAG=$2
@@ -212,7 +219,7 @@ colo_ckpt_path_of() {  # config_tag
         IS_CORRECTION="${IS_CORRECTION}" TIS_CLIP="${TIS_CLIP}" TIS_CLIP_LOW="${TIS_CLIP_LOW}"
         MIS_PROFILE= USE_OPSM=0 OPSM_DELTA=1e-4
         ROLLOUT_BATCH_SIZE=192 N_SAMPLES_PER_PROMPT=16 GLOBAL_BATCH_SIZE="${GBS}"
-        NUM_STEPS_PER_ROLLOUT=1 MAX_RESPONSE_LEN=32768 LR="${LR}"
+        NUM_STEPS_PER_ROLLOUT=1 MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN}" LR="${LR}"
         MAX_WEIGHT_STALENESS=0 PAUSE_GENERATION_MODE=none STALENESS_REFERENCE=completion
         TRAIN_SEED=1234 ROLLOUT_SEED="${ROLLOUT_SEED}" RUN_NAME=$1 CONFIG_TAG=$1
         source "${REPO_ROOT}/experiments/common/run_identity.sh" >/dev/null
@@ -416,6 +423,9 @@ if [[ -n "${RUN_NAMESPACE}" ]]; then
 fi
 printf '%s rollouts, %s dependent %s jobs per arm; gbs %s, tp %s, cp %s.\n' \
     "${NUM_ROLLOUT}" "${CHAIN_JOBS}" "${WALL}" "${GBS}" "${TP}" "${CP}"
+printf 'max response length %s; custom reward %s.\n' \
+    "${MAX_RESPONSE_LEN}" "${CUSTOM_RM_PATH:-none}"
+printf 'fully-async rollout sidecar %s.\n' "${FULLY_ASYNC_ROLLOUT_CHECKPOINT}"
 if [[ -n "${APPEND_AFTER}" ]]; then
     printf 'The new chain will append after Slurm job %s.\n' "${APPEND_AFTER}"
 fi
@@ -600,7 +610,7 @@ submit_async_chain() {  # staleness train_nodes rollout_nodes dp
             --job-name="${name}" \
             --nodes="${TOTAL_NODES}" --time="${WALL}" \
             --output="${LOG_DIR}/${name}-%j.log" \
-            --export="ALL,WANDB_PROJECT=${WANDB_PROJECT},RUN_NAME=${name},CONFIG_TAG=${name},NUM_ROLLOUT=${NUM_ROLLOUT},SAVE_INTERVAL=${SAVE_INTERVAL},SAVE_RETAIN_INTERVAL=${SAVE_RETAIN_INTERVAL},SAVE_HF=${SAVE_HF},HF_SAVE_INTERVAL=${HF_SAVE_INTERVAL},EVAL_INTERVAL=0,SKIP_EVAL_BEFORE_TRAIN=1,LR=${LR},MAX_WEIGHT_STALENESS=${s},STALENESS_REFERENCE=prefill,PAUSE_GENERATION_MODE=in_place,ACTOR_NUM_NODES=${t},ROLLOUT_NUM_GPUS=$(( r * GPN )),ROLLOUT_SEED=${ROLLOUT_SEED},IS_CORRECTION=${IS_CORRECTION},TIS_CLIP=${TIS_CLIP},TIS_CLIP_LOW=${TIS_CLIP_LOW},RATIO_DENOMINATOR=${RATIO_DENOMINATOR},FUSE_ONE_STEP_ACTOR_LOGPROBS=${FUSE_ONE_STEP_ACTOR_LOGPROBS},VERIFY_FUSED_ONE_STEP_ACTOR_LOGPROBS=0" \
+            --export="ALL,WANDB_PROJECT=${WANDB_PROJECT},RUN_NAME=${name},CONFIG_TAG=${name},NUM_ROLLOUT=${NUM_ROLLOUT},MAX_RESPONSE_LEN=${MAX_RESPONSE_LEN},CUSTOM_RM_PATH=${CUSTOM_RM_PATH},FULLY_ASYNC_ROLLOUT_CHECKPOINT=${FULLY_ASYNC_ROLLOUT_CHECKPOINT},SAVE_INTERVAL=${SAVE_INTERVAL},SAVE_RETAIN_INTERVAL=${SAVE_RETAIN_INTERVAL},SAVE_HF=${SAVE_HF},HF_SAVE_INTERVAL=${HF_SAVE_INTERVAL},EVAL_INTERVAL=0,SKIP_EVAL_BEFORE_TRAIN=1,LR=${LR},MAX_WEIGHT_STALENESS=${s},STALENESS_REFERENCE=prefill,PAUSE_GENERATION_MODE=in_place,ACTOR_NUM_NODES=${t},ROLLOUT_NUM_GPUS=$(( r * GPN )),ROLLOUT_SEED=${ROLLOUT_SEED},IS_CORRECTION=${IS_CORRECTION},TIS_CLIP=${TIS_CLIP},TIS_CLIP_LOW=${TIS_CLIP_LOW},RATIO_DENOMINATOR=${RATIO_DENOMINATOR},FUSE_ONE_STEP_ACTOR_LOGPROBS=${FUSE_ONE_STEP_ACTOR_LOGPROBS},VERIFY_FUSED_ONE_STEP_ACTOR_LOGPROBS=0" \
             "${REPO_ROOT}/${ASYNC_RECIPE}")
         jid=${raw_jid%%;*}
         dependency_label=""
@@ -633,7 +643,7 @@ submit_colocated_chain() {
             --job-name="${name}" \
             --nodes="${TOTAL_NODES}" --time="${WALL}" \
             --output="${LOG_DIR}/${name}-%j.log" \
-            --export="ALL,WANDB_PROJECT=${WANDB_PROJECT},RUN_NAME=${name},CONFIG_TAG=${name},NUM_ROLLOUT=${NUM_ROLLOUT},SAVE_INTERVAL=${SAVE_INTERVAL},SAVE_RETAIN_INTERVAL=${SAVE_RETAIN_INTERVAL},SAVE_HF=${SAVE_HF},HF_SAVE_INTERVAL=${HF_SAVE_INTERVAL},EVAL_INTERVAL=0,SKIP_EVAL_BEFORE_TRAIN=1,LR=${LR},MAX_WEIGHT_STALENESS=0,STALENESS_REFERENCE=completion,PAUSE_GENERATION_MODE=none,ACTOR_NUM_NODES=${TOTAL_NODES},ROLLOUT_NUM_GPUS=0,ROLLOUT_SEED=${ROLLOUT_SEED},IS_CORRECTION=${IS_CORRECTION},TIS_CLIP=${TIS_CLIP},TIS_CLIP_LOW=${TIS_CLIP_LOW},RATIO_DENOMINATOR=${RATIO_DENOMINATOR},LOG_PROBS_CHUNK_SIZE=${LOG_PROBS_CHUNK_SIZE},OBSERVE_TRAINING_ENTROPY=${OBSERVE_TRAINING_ENTROPY}" \
+            --export="ALL,WANDB_PROJECT=${WANDB_PROJECT},RUN_NAME=${name},CONFIG_TAG=${name},NUM_ROLLOUT=${NUM_ROLLOUT},MAX_RESPONSE_LEN=${MAX_RESPONSE_LEN},CUSTOM_RM_PATH=${CUSTOM_RM_PATH},FULLY_ASYNC_ROLLOUT_CHECKPOINT=0,SAVE_INTERVAL=${SAVE_INTERVAL},SAVE_RETAIN_INTERVAL=${SAVE_RETAIN_INTERVAL},SAVE_HF=${SAVE_HF},HF_SAVE_INTERVAL=${HF_SAVE_INTERVAL},EVAL_INTERVAL=0,SKIP_EVAL_BEFORE_TRAIN=1,LR=${LR},MAX_WEIGHT_STALENESS=0,STALENESS_REFERENCE=completion,PAUSE_GENERATION_MODE=none,ACTOR_NUM_NODES=${TOTAL_NODES},ROLLOUT_NUM_GPUS=0,ROLLOUT_SEED=${ROLLOUT_SEED},IS_CORRECTION=${IS_CORRECTION},TIS_CLIP=${TIS_CLIP},TIS_CLIP_LOW=${TIS_CLIP_LOW},RATIO_DENOMINATOR=${RATIO_DENOMINATOR},LOG_PROBS_CHUNK_SIZE=${LOG_PROBS_CHUNK_SIZE},OBSERVE_TRAINING_ENTROPY=${OBSERVE_TRAINING_ENTROPY}" \
             "${REPO_ROOT}/${COLO_RECIPE}")
         jid=${raw_jid%%;*}
         dependency_label=""

@@ -11,6 +11,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from miles.rollout.rm_hub.math_utils import grade_answer_verl
+from miles.rollout.recycle_compute_metrics import SELECTION_METRICS_KEY
 
 
 _ANSWER_LINE = re.compile(r"^[ \t]*Answer[ \t]*:[ \t]*", re.IGNORECASE | re.MULTILINE)
@@ -27,6 +28,7 @@ _TOKENIZER_CONFIG_FILES = (
     "config.json",
     "special_tokens_map.json",
 )
+_STRICT_METRIC_PREFIX = "strict_math/"
 
 
 def _as_list(value):
@@ -205,12 +207,38 @@ def _status_value(sample) -> str | None:
 
 
 def score_strict_math_sample(sample, eos_tokens=()) -> float:
-    """Score one single-turn sample, rejecting incomplete generations."""
-    if _status_value(sample) in _REJECTED_STATUSES:
-        return 0.0
-    if not has_strict_terminal_answer(sample.response, eos_tokens):
-        return 0.0
-    return float(bool(grade_answer_verl(sample.response, sample.label)))
+    """Score one sample and attach fixed-cardinality math/format diagnostics."""
+    response = str(sample.response or "")
+    status_rejected = _status_value(sample) in _REJECTED_STATUSES
+    format_error = strict_terminal_answer_error(response, eos_tokens)
+    math_reward = float(bool(grade_answer_verl(response, sample.label)))
+    format_valid = not status_rejected and format_error is None
+    strict_reward = float(format_valid and bool(math_reward))
+
+    metadata = getattr(sample, "metadata", None)
+    if metadata is None:
+        metadata = {}
+        sample.metadata = metadata
+    if not isinstance(metadata, dict):
+        raise RuntimeError(f"Sample metadata must be a mapping, got {type(metadata).__name__}")
+    selection_metrics = metadata.setdefault(SELECTION_METRICS_KEY, {})
+    if not isinstance(selection_metrics, dict):
+        raise RuntimeError(
+            f"{SELECTION_METRICS_KEY} metadata must be a mapping, "
+            f"got {type(selection_metrics).__name__}"
+        )
+    selection_metrics.update(
+        {
+            f"{_STRICT_METRIC_PREFIX}math_reward": math_reward,
+            f"{_STRICT_METRIC_PREFIX}strict_reward": strict_reward,
+            f"{_STRICT_METRIC_PREFIX}format_valid": float(format_valid),
+            f"{_STRICT_METRIC_PREFIX}multiple_answer_markers": float(
+                format_error == "multiple_answer_markers"
+            ),
+            f"{_STRICT_METRIC_PREFIX}reward_disagreement": float(math_reward != strict_reward),
+        }
+    )
+    return strict_reward
 
 
 async def strict_math_reward(args, sample_or_samples, **kwargs):

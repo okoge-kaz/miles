@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from miles.rollout.rm_hub import batched_async_rm
+from miles.rollout.recycle_compute_metrics import SELECTION_METRICS_KEY
 from miles.utils.types import Sample
 
 from experiments.src.staleness_ratio.strict_math_reward import (
@@ -116,6 +117,28 @@ def test_scores_format_and_correctness_together():
         score_strict_math_sample(_sample("Work: \\boxed{40}.\nAnswer: \\boxed{42}"))
         == 1.0
     )
+
+
+def test_records_math_reward_and_format_diagnostics():
+    repeated = _sample("Answer: \\boxed{42}\nAnswer: \\boxed{42}")
+
+    assert score_strict_math_sample(repeated) == 0.0
+    assert repeated.metadata[SELECTION_METRICS_KEY] == {
+        "strict_math/math_reward": 1.0,
+        "strict_math/strict_reward": 0.0,
+        "strict_math/format_valid": 0.0,
+        "strict_math/multiple_answer_markers": 1.0,
+        "strict_math/reward_disagreement": 1.0,
+    }
+
+
+def test_truncated_math_correct_response_is_logged_but_not_rewarded():
+    sample = _sample(r"Answer: \boxed{42}", status="truncated")
+
+    assert score_strict_math_sample(sample) == 0.0
+    assert sample.metadata[SELECTION_METRICS_KEY]["strict_math/math_reward"] == 1.0
+    assert sample.metadata[SELECTION_METRICS_KEY]["strict_math/format_valid"] == 0.0
+    assert sample.metadata[SELECTION_METRICS_KEY]["strict_math/reward_disagreement"] == 1.0
 
 
 @pytest.mark.parametrize("status", ["truncated", "aborted", "failed"])

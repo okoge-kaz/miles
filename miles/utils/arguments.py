@@ -51,6 +51,12 @@ def _validate_fully_async_rollout_checkpoint(args) -> None:
     if not checkpoint_enabled:
         return
 
+    from miles.rollout.fully_async_checkpoint import CHECKPOINT_SAFE_CUSTOM_RM_VERSIONS
+
+    custom_rm_is_checkpoint_safe = (
+        args.custom_rm_path is None or args.custom_rm_path in CHECKPOINT_SAFE_CUSTOM_RM_VERSIONS
+    )
+
     checks = (
         (args.train_backend == "megatron", "the Megatron training backend"),
         (args.rollout_global_dataset, "the global rollout dataset"),
@@ -60,7 +66,10 @@ def _validate_fully_async_rollout_checkpoint(args) -> None:
         ),
         (args.advantage_estimator == "grpo", "--advantage-estimator grpo"),
         (not args.use_critic, "a critic-free GRPO run"),
-        (args.custom_rm_path is None, "the built-in reward-model function"),
+        (
+            custom_rm_is_checkpoint_safe,
+            "the built-in or a registered checkpoint-safe reward-model function",
+        ),
         (args.custom_reward_post_process_path is None, "the built-in reward post-processing path"),
         (args.custom_convert_samples_to_train_data_path is None, "the built-in train-data conversion path"),
         (args.rollout_data_postprocess_path is None, "the built-in rollout data post-processing path"),
