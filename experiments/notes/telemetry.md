@@ -40,12 +40,25 @@ exist alongside it.
 
     train/train_rollout_kl, train/train_rollout_logprob_abs_diff, train/ppo_kl
     train/tis, train/tis_abs, train/tis_clipfrac
-    train/ess_ratio, train/rollout_ess_ratio, train/ois
+    train/ess_ratio, train/rollout_token_level_ess,
+    train/rollout_sequence_level_ess, train/ois
+    train/policy_rollout_abs_diff, train/policy_rollout_kl,
+    train/policy_rollout_token_ess, train/policy_rollout_sequence_ess
 
 `train_rollout_logprob_abs_diff` is the direct numerical-mismatch probe --
 non-zero even at zero staleness, because it also picks up the Megatron/SGLang
 kernel difference. Separating that floor from the staleness-induced part is what
 makes the `--true-on-policy-mode` parity run worth having as a baseline.
+
+The historical token-level ESS is Kish's ratio over tokens *within each
+response*, averaged with the training reducer. It remains for compatibility but
+is not the population ESS normally meant by an off-policy sequence diagnostic.
+`rollout_sequence_level_ess` is the standard
+`(sum_i w_i)^2 / (B sum_i w_i^2)` over response weights. The `policy_rollout_*`
+family always uses the current actor forward, independently of the PPO ratio
+denominator; use it when `--use-rollout-logprobs` would otherwise make the
+historical family identically zero/one. Both ESS families reuse tensors already
+computed by the loss and require no additional model forward.
 
 **Waste accounting**, which is how the pause modes get compared:
 
@@ -57,8 +70,11 @@ makes the `--true-on-policy-mode` parity run worth having as a baseline.
 `abort` discards tokens, `retract` recomputes KV, `in_place` reuses it. The first
 shows up in `aborted_tokens`, the second only in wall clock. Both are visible.
 
-**Dynamic sampling**: `rollout/dynamic_filter/drop_zero_std_*`,
-`rollout/zero_std/{all_zero,all_one}_percentage`. The all-zero percentage is the
+**Dynamic sampling**: `rollout/dynamic_filter/drop_zero_std_*`, historical
+`rollout/zero_std/count_{0.0,1.0}`, and normalized
+`rollout/zero_std/{all_zero,all_one}_percentage`. With binary math reward these
+are respectively all-wrong and all-correct group counts; mixed groups are the
+total prompt-group count minus the two. The all-zero percentage is the
 livelock indicator -- when a too-short generation budget made every group
 unanimously wrong, this went to 1.0 and the drain never filled.
 
@@ -91,17 +107,35 @@ no step is missing from the export.
 
 **Wall clock does not survive a resume.** Every chained job is a new wandb run
 with its own `_runtime` starting at zero. `--wandb-group` puts them in one group
-and `train/step` continues correctly across the boundary, so the step-axis curves
-concatenate; the time axis does not. Since the plan's primary x-axis is wall
-clock, reconstruct it by cumulating `perf/step_time` rather than reading
-`_runtime`. That is also the more honest number -- it excludes the requeue gap,
-which is a property of the queue and not of the method.
+and normally continues `train/step`, but a restart from an older published
+checkpoint can replay step numbers that were already logged. Therefore the
+step-axis curves must not be blindly concatenated either. In the audited
+2026-08-15 extension, 35 overlapping run/step rows across 11 runs changed 807
+values across the selected major metrics when the latest checkpoint lineage
+was selected. Reparse the
+complete timestamp-ordered lineage, keep the latest valid incarnation of a
+replayed step, and record the replacements; appending only new step numbers
+mixes abandoned and current attempts. Since the plan's primary x-axis is wall
+clock, reconstruct it by cumulating `perf/step_time` on that selected lineage
+rather than reading `_runtime`. That is also the more honest number -- it
+excludes the requeue gap, which is a property of the scheduler and not of the
+method. Future sidecars should persist a run-incarnation ID, global update ID,
+logging cursor, and resume-source checkpoint ID so this selection is explicit.
 
 **GPU memory is host-level only.** wandb's system metrics come from the node
 running the wandb process, which is the Ray head, which is a training node. In
 the async layout train and rollout are on different nodes, so host-level HBM is
 attributable to training without further work -- which is the side the TP-sizing
 question is about. In the colocated layout it is not separable.
+
+**Checkpoint presence is not checkpoint access.** A visible index, nonzero
+shard size, and complete weight map do not prove that the analysis identity can
+read the shard. Later checkpoints in this study reverted to mode 600: 50/175
+structurally complete checkpoint sets were unreadable, including all 18 added
+after the later training cutoff. Every artifact manifest must separately record
+`checkpoint_complete` and `checkpoint_readable`, with the latter verified by an
+actual one-byte open before a weight job is submitted. A permission failure is
+missing parameter evidence, never a zero displacement.
 
 ## Not yet observed
 
@@ -789,6 +823,51 @@ For each lag bin, the log contains:
 - mean absolute policy/rollout and PPO-objective (`current/old_actor`) log-ratios;
 - current/rollout token and sequence ESS;
 - non-zero contribution fraction.
+
+The pre-loss-token masses are also the sufficient statistics for the age seen
+by the loss.  When the overflow bin is empty,
+
+```
+K_loss_token = sum_k(k * pre_loss_tokens_k) / sum_k(pre_loss_tokens_k)
+```
+
+is exact; the corresponding first and second moments recover its mean,
+variance, and tail mass without retaining token ids.  The historical 2026-08-14
+sample dumps show why this measure should not be replaced by group mean age:
+over 957 resume-eligible updates, loss-token age is 0.159 update older on
+average, with a 0.064--0.337 update shift across the common configuration
+window.  Response length and age are positively associated in every common
+configuration.
+
+For future runs that do not enable all fixed bins, retain the equivalent compact
+per-update moments alongside the ordinary group histogram:
+
+- `sum(loss_tokens)`, `sum(K * loss_tokens)`, and
+  `sum(K^2 * loss_tokens)`;
+- loss-token counts above each configured age threshold;
+- the same first moments weighted by absolute advantage or reward contrast
+  when those values are already present during batch construction.
+
+These are detached scalar reductions over values already needed by training;
+they require neither response text nor an additional model evaluation.  The
+absolute-advantage/reward moments remain exposure proxies, not exact parameter
+influence, because clipping, importance ratios, parameter Jacobians, and signed
+cancellation act later.
+
+The fixed age bins support a stronger time-aligned diagnostic than
+`mean(K) * current_grad`.  With per-update scale
+`q_j = lr_j * min(grad_norm_j, clip_norm)`, reconstruct
+
+```
+D_t = sum_h q_(t-h) * P_loss_token(K >= h)
+```
+
+which is algebraically identical to averaging `sum(q_(t-K), ..., q_(t-1))`
+over the loss-token age distribution.  This needs the tail counts already in
+the fixed bins and the historical LR/gradient scalars, but no token ids and no
+additional training compute.  It is an SGD-style path-scale proxy, not an Adam
+parameter displacement: exact displacement additionally requires the applied
+preconditioned update norm and direction/cosine.
 
 This path consists of detached `torch.bincount` reductions over tensors already
 resident on the training GPU, followed by the existing distributed metric
