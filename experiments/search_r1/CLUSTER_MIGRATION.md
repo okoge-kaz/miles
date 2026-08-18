@@ -141,8 +141,8 @@ comparison.
 7. **End to end:** run one fixed-dataset sync update and confirm reward,
    checkpoint, HF export, valid-action/search metrics, and W&B project
    `async-search-r1`.
-8. **Async resume:** run one async update, confirm the replay sidecar exists,
-   stop cleanly, resume the same run identity, and verify that sidecar/FIFO state
+8. **Async resume:** run one async update, confirm the replay buffer exists,
+   stop cleanly, resume the same run identity, and verify that replay-buffer/FIFO state
    restores without a full queue refill.
 
 Functional qualification comes before B300 tuning. The 4B model is not

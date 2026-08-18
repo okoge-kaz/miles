@@ -119,7 +119,7 @@ mixes abandoned and current attempts. Since the plan's primary x-axis is wall
 clock, reconstruct it by cumulating `perf/step_time` on that selected lineage
 rather than reading `_runtime`. That is also the more honest number -- it
 excludes the requeue gap, which is a property of the scheduler and not of the
-method. Future sidecars should persist a run-incarnation ID, global update ID,
+method. Future replay-buffer schemas should persist a run-incarnation ID, global update ID,
 logging cursor, and resume-source checkpoint ID so this selection is explicit.
 
 **GPU memory is host-level only.** wandb's system metrics come from the node
@@ -601,8 +601,8 @@ staleness with the closed form, but it cannot establish a seed-general
 downstream-task significance claim.
 
 The submission-side version is TTL-cached at 1 s; engine-reported prefill
-provenance is not. Full rollout checkpointing supports all three queue policies.
-The sidecar records policy plus effective capacity and rejects a cross-policy or
+provenance is not. Replay-buffer persistence supports all three queue policies.
+The replay buffer records policy plus effective capacity and rejects a cross-policy or
 cross-capacity restore. For `queue-drop`, snapshot-time completed-task promotion
 applies oldest-first overflow eviction before serialization, including the same
 length, reward-lifecycle, token, and group accounting as live eviction.

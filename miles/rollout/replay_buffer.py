@@ -1,4 +1,4 @@
-"""Durable state helpers for fully-asynchronous rollout replay.
+"""Durable replay-buffer storage for fully asynchronous rollout.
 
 The model checkpoint tracker remains the commit record.  A rollout state with a
 newer id is harmless when model saving fails; a model checkpoint without the
@@ -18,12 +18,14 @@ from typing import Any
 
 import torch
 
-from miles.rollout.fully_async_checkpoint_codec import SAMPLE_CODEC_VERSION, materialize_checkpoint_state
+from miles.rollout.replay_buffer_codec import SAMPLE_CODEC_VERSION, materialize_replay_buffer_state
 from miles.utils.types import Sample
 
-SCHEMA_VERSION = 3
-SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, SCHEMA_VERSION})
-STATE_PREFIX = "fully_async_state_"
+SCHEMA_VERSION = 4
+SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3, SCHEMA_VERSION})
+EXTERNAL_TENSOR_SCHEMA_VERSIONS = frozenset({3, SCHEMA_VERSION})
+STATE_PREFIX = "replay_buffer_"
+LEGACY_STATE_PREFIX = "fully_async_state_"
 STATE_SUFFIX = ".pt"
 CHECKSUM_SUFFIX = ".sha256.json"
 PARTS_MARKER = ".parts-"
@@ -39,6 +41,11 @@ REQUIRED_STATE_KEYS = {
     "prepared_batches",
     "regeneration_group_ids",
 }
+SCHEMA_4_REQUIRED_STATE_KEYS = {"rollout_id", "replay_buffer_type", "inflight_items"}
+REPLAY_BUFFER_ROLLOUT = "rollout"
+REPLAY_BUFFER_INFLIGHT = "inflight"
+REPLAY_BUFFER_TYPES = (REPLAY_BUFFER_ROLLOUT, REPLAY_BUFFER_INFLIGHT)
+
 
 def encode_sample(sample: Sample) -> dict[str, Any]:
     """Return a detached, serialization-safe representation of one sample."""
@@ -163,28 +170,52 @@ def dataset_fingerprint(args, data_source) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def checkpoint_path(root: str | os.PathLike[str], rollout_id: int) -> Path:
+def replay_buffer_path(root: str | os.PathLike[str], rollout_id: int) -> Path:
     return Path(root) / "rollout" / f"{STATE_PREFIX}{rollout_id}{STATE_SUFFIX}"
 
 
-def ensure_no_full_replay_sidecar(root: str | os.PathLike[str] | None, rollout_id: int | None) -> None:
+def _legacy_replay_buffer_path(root: str | os.PathLike[str], rollout_id: int) -> Path:
+    return Path(root) / "rollout" / f"{LEGACY_STATE_PREFIX}{rollout_id}{STATE_SUFFIX}"
+
+
+def _existing_replay_buffer_path(root: str | os.PathLike[str], rollout_id: int) -> Path:
+    current = replay_buffer_path(root, rollout_id)
+    if current.is_file() or Path(f"{current}{CHECKSUM_SUFFIX}").is_file():
+        return current
+    legacy = _legacy_replay_buffer_path(root, rollout_id)
+    if legacy.is_file() or Path(f"{legacy}{CHECKSUM_SUFFIX}").is_file():
+        return legacy
+    return current
+
+
+def ensure_no_replay_buffer(root: str | os.PathLike[str] | None, rollout_id: int | None) -> None:
     """Reject a mode downgrade that would silently discard pending prompt state."""
     if root is None or rollout_id is None or rollout_id < 0:
         return
-    path = checkpoint_path(root, rollout_id)
-    checksum_path = Path(f"{path}{CHECKSUM_SUFFIX}")
-    if path.is_file() or checksum_path.is_file():
-        raise RuntimeError(
-            f"Model checkpoint {rollout_id} has a fully-async replay sidecar; resume with "
-            "--fully-async-rollout-checkpoint instead of silently discarding its pending prompt ledger"
-        )
+    for path in (replay_buffer_path(root, rollout_id), _legacy_replay_buffer_path(root, rollout_id)):
+        checksum_path = Path(f"{path}{CHECKSUM_SUFFIX}")
+        if path.is_file() or checksum_path.is_file():
+            raise RuntimeError(
+                f"Model checkpoint {rollout_id} has a replay buffer; resume with "
+                "--use-replay-buffer instead of silently discarding its pending prompt ledger"
+            )
 
 
-def save_checkpoint(root: str | os.PathLike[str], rollout_id: int, state: dict[str, Any]) -> tuple[Path, int]:
+def save_replay_buffer(root: str | os.PathLike[str], rollout_id: int, state: dict[str, Any]) -> tuple[Path, int]:
     """Atomically publish state and checksum-verified tensor shards."""
-    path = checkpoint_path(root, rollout_id)
+    replay_buffer_type = state.get("replay_buffer_type", REPLAY_BUFFER_ROLLOUT)
+    inflight_items = state.get("inflight_items", [])
+    _validate_replay_buffer_payload(replay_buffer_type, inflight_items)
+    path = replay_buffer_path(root, rollout_id)
     path.parent.mkdir(parents=True, exist_ok=True)
-    state = {**state, "schema_version": SCHEMA_VERSION, "checkpoint_rollout_id": rollout_id}
+    state = {
+        **state,
+        "replay_buffer_type": replay_buffer_type,
+        "inflight_items": inflight_items,
+        "schema_version": SCHEMA_VERSION,
+        "rollout_id": rollout_id,
+    }
+    state.pop("checkpoint_rollout_id", None)
 
     data_tmp = _temporary_path(path.parent, path.name)
     checksum_path = Path(f"{path}{CHECKSUM_SUFFIX}")
@@ -235,73 +266,91 @@ def save_checkpoint(root: str | os.PathLike[str], rollout_id: int, state: dict[s
     return path, total_size
 
 
-def load_checkpoint(
+def load_replay_buffer(
     root: str | os.PathLike[str],
     rollout_id: int,
     *,
     expected_fingerprint: str,
 ) -> dict[str, Any]:
-    path = checkpoint_path(root, rollout_id)
+    path = _existing_replay_buffer_path(root, rollout_id)
     checksum_path = Path(f"{path}{CHECKSUM_SUFFIX}")
     if not path.is_file() or not checksum_path.is_file():
         raise FileNotFoundError(
-            f"Model checkpoint {rollout_id} requires fully-async rollout state {path} and {checksum_path}"
+            f"Model checkpoint {rollout_id} requires replay-buffer state {path} and {checksum_path}"
         )
 
     try:
         manifest = json.loads(checksum_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
-        raise RuntimeError(f"Cannot read fully-async rollout checkpoint manifest: {checksum_path}") from error
+        raise RuntimeError(f"Cannot read replay-buffer manifest: {checksum_path}") from error
     if not isinstance(manifest, dict) or manifest.get("schema_version") not in SUPPORTED_SCHEMA_VERSIONS:
-        raise RuntimeError(f"Unsupported fully-async rollout checkpoint manifest: {checksum_path}")
+        raise RuntimeError(f"Unsupported replay-buffer manifest: {checksum_path}")
     digest, main_size = _file_digest(path)
     expected_main_size = manifest.get("main_size", manifest.get("size"))
     if expected_main_size != main_size or manifest.get("sha256") != digest:
-        raise RuntimeError(f"Fully-async rollout checkpoint checksum mismatch: {path}")
-    if manifest.get("schema_version") == SCHEMA_VERSION:
+        raise RuntimeError(f"Replay-buffer checksum mismatch: {path}")
+    if manifest.get("schema_version") in EXTERNAL_TENSOR_SCHEMA_VERSIONS:
         parts = manifest.get("parts")
         if not isinstance(parts, list) or any(not isinstance(part, dict) for part in parts):
-            raise RuntimeError(f"Malformed fully-async rollout checkpoint tensor manifest: {checksum_path}")
+            raise RuntimeError(f"Malformed replay-buffer tensor manifest: {checksum_path}")
         part_sizes = [part.get("size") for part in parts]
         if any(type(size) is not int or size < 0 for size in part_sizes):
-            raise RuntimeError(f"Malformed fully-async rollout checkpoint tensor sizes: {checksum_path}")
+            raise RuntimeError(f"Malformed replay-buffer tensor sizes: {checksum_path}")
         if manifest.get("size") != main_size + sum(part_sizes):
-            raise RuntimeError(f"Fully-async rollout checkpoint size mismatch: {path}")
+            raise RuntimeError(f"Replay-buffer size mismatch: {path}")
 
     try:
         state = torch.load(path, map_location="cpu", weights_only=False)
     except Exception as error:
-        raise RuntimeError(f"Cannot deserialize fully-async rollout checkpoint: {path}") from error
+        raise RuntimeError(f"Cannot deserialize replay buffer: {path}") from error
     if not isinstance(state, dict):
-        raise RuntimeError(f"Fully-async rollout checkpoint is not a mapping: {path}")
+        raise RuntimeError(f"Replay buffer is not a mapping: {path}")
     if state.get("schema_version") not in SUPPORTED_SCHEMA_VERSIONS:
         raise RuntimeError(
-            f"Unsupported fully-async rollout checkpoint schema {state.get('schema_version')}; "
+            f"Unsupported replay-buffer schema {state.get('schema_version')}; "
             f"expected one of {sorted(SUPPORTED_SCHEMA_VERSIONS)}"
         )
     if state.get("schema_version") != manifest.get("schema_version"):
         raise RuntimeError(
-            "Fully-async rollout checkpoint schema does not match its manifest: "
+            "Replay-buffer schema does not match its manifest: "
             f"state={state.get('schema_version')}, manifest={manifest.get('schema_version')}"
         )
-    if state.get("schema_version") == SCHEMA_VERSION:
+    if state.get("schema_version") in EXTERNAL_TENSOR_SCHEMA_VERSIONS:
         state = _load_external_tensor_arrays(path, state, manifest)
-    if state.get("checkpoint_rollout_id") != rollout_id:
+    rollout_id_key = "rollout_id" if state["schema_version"] == SCHEMA_VERSION else "checkpoint_rollout_id"
+    if state.get(rollout_id_key) != rollout_id:
         raise RuntimeError(
-            f"Rollout checkpoint id mismatch: requested={rollout_id}, " f"stored={state.get('checkpoint_rollout_id')}"
+            f"Replay-buffer rollout id mismatch: requested={rollout_id}, stored={state.get(rollout_id_key)}"
         )
     if state.get("dataset_fingerprint") != expected_fingerprint:
         raise RuntimeError(
-            "Fully-async rollout checkpoint dataset/config fingerprint does not match this run: "
+            "Replay-buffer dataset/config fingerprint does not match this run: "
             f"stored={state.get('dataset_fingerprint')}, current={expected_fingerprint}"
         )
     missing_keys = REQUIRED_STATE_KEYS - state.keys()
+    if state.get("schema_version") == SCHEMA_VERSION:
+        missing_keys |= SCHEMA_4_REQUIRED_STATE_KEYS - state.keys()
     if missing_keys:
-        raise RuntimeError(f"Fully-async rollout checkpoint is missing fields: {sorted(missing_keys)}")
-    return materialize_checkpoint_state(state)
+        raise RuntimeError(f"Replay buffer is missing fields: {sorted(missing_keys)}")
+    if state["schema_version"] < SCHEMA_VERSION:
+        # The legacy schemas predate inflight continuation. Do not let
+        # unversioned extra keys opt an old payload into schema-4 semantics.
+        state["replay_buffer_type"] = REPLAY_BUFFER_ROLLOUT
+        state["inflight_items"] = []
+    _validate_replay_buffer_payload(state["replay_buffer_type"], state["inflight_items"])
+    return materialize_replay_buffer_state(state)
 
 
-def prune_checkpoints(
+def _validate_replay_buffer_payload(replay_buffer_type: Any, inflight_items: Any) -> None:
+    if replay_buffer_type not in REPLAY_BUFFER_TYPES:
+        raise RuntimeError(f"Unsupported replay-buffer type: {replay_buffer_type!r}")
+    if not isinstance(inflight_items, list):
+        raise RuntimeError("Replay-buffer inflight_items must be a list")
+    if replay_buffer_type == REPLAY_BUFFER_ROLLOUT and inflight_items:
+        raise RuntimeError("A rollout replay buffer cannot contain inflight items")
+
+
+def prune_replay_buffers(
     root: str | os.PathLike[str],
     *,
     current_rollout_id: int,
@@ -312,13 +361,15 @@ def prune_checkpoints(
     rollout_dir = Path(root) / "rollout"
     if not rollout_dir.is_dir():
         return
-    checkpoints = sorted(
+    buffers = sorted(
         (rollout_id, path)
-        for path in rollout_dir.glob(f"{STATE_PREFIX}*{STATE_SUFFIX}")
+        for prefix in (STATE_PREFIX, LEGACY_STATE_PREFIX)
+        for path in rollout_dir.glob(f"{prefix}*{STATE_SUFFIX}")
         if (rollout_id := _rollout_id_from_path(path)) is not None and rollout_id <= current_rollout_id
     )
-    recent_ids = {rollout_id for rollout_id, _ in checkpoints[-max(keep_last, 1) :]}
-    for rollout_id, path in checkpoints:
+    all_ids = sorted({rollout_id for rollout_id, _ in buffers})
+    recent_ids = set(all_ids[-max(keep_last, 1) :])
+    for rollout_id, path in buffers:
         if rollout_id in recent_ids:
             continue
         if archive_interval is not None and archive_interval > 0 and (rollout_id + 1) % archive_interval == 0:
@@ -338,9 +389,9 @@ def _externalize_tensor_arrays(
     arrays = codec.get("arrays")
     array_checksums = codec.get("array_checksums")
     if not isinstance(arrays, dict) or not isinstance(array_checksums, dict):
-        raise RuntimeError("Malformed fully-async Sample codec arrays")
+        raise RuntimeError("Malformed replay-buffer Sample codec arrays")
     if arrays.keys() != array_checksums.keys():
-        raise RuntimeError("Fully-async Sample codec arrays and checksums do not match")
+        raise RuntimeError("Replay-buffer Sample codec arrays and checksums do not match")
 
     tensor_parts = []
     external_arrays = {}
@@ -358,14 +409,14 @@ def _externalize_tensor_arrays(
 
     for field, shards in arrays.items():
         if not isinstance(shards, list):
-            raise RuntimeError(f"Malformed fully-async Sample codec shards for {field}")
+            raise RuntimeError(f"Malformed replay-buffer Sample codec shards for {field}")
         checksums = array_checksums[field]
         if not isinstance(checksums, list) or len(checksums) != len(shards):
-            raise RuntimeError(f"Malformed fully-async Sample codec checksums for {field}")
+            raise RuntimeError(f"Malformed replay-buffer Sample codec checksums for {field}")
         references = []
         for shard_index, tensor in enumerate(shards):
             if not isinstance(tensor, torch.Tensor) or tensor.device.type != "cpu" or tensor.ndim != 1:
-                raise RuntimeError(f"Fully-async Sample codec shard {field}[{shard_index}] is invalid")
+                raise RuntimeError(f"Replay-buffer Sample codec shard {field}[{shard_index}] is invalid")
             padding = -part_bytes % tensor.element_size()
             if part_tensors and part_bytes + padding + tensor.nbytes > TENSOR_PART_BYTES:
                 flush_part()
@@ -413,56 +464,56 @@ def _write_tensor_parts(
 
 
 def _load_external_tensor_arrays(
-    checkpoint: Path,
+    replay_path: Path,
     state: dict[str, Any],
     manifest: dict[str, Any],
 ) -> dict[str, Any]:
     codec = state.get("sample_codec")
     if not isinstance(codec, dict) or not codec.get("arrays_external"):
         if manifest.get("parts"):
-            raise RuntimeError(f"Fully-async rollout checkpoint has unreferenced tensor parts: {checkpoint}")
+            raise RuntimeError(f"Replay buffer has unreferenced tensor parts: {replay_path}")
         return state
 
     parts_directory = codec.get("parts_directory")
     manifest_directory = manifest.get("parts_directory")
     if parts_directory != manifest_directory:
-        raise RuntimeError(f"Fully-async rollout checkpoint tensor-part directory mismatch: {checkpoint}")
-    if parts_directory is not None and not _is_safe_part_directory(checkpoint, parts_directory):
-        raise RuntimeError(f"Unsafe fully-async rollout checkpoint tensor-part directory: {parts_directory!r}")
+        raise RuntimeError(f"Replay-buffer tensor-part directory mismatch: {replay_path}")
+    if parts_directory is not None and not _is_safe_part_directory(replay_path, parts_directory):
+        raise RuntimeError(f"Unsafe replay-buffer tensor-part directory: {parts_directory!r}")
 
     part_manifests = manifest.get("parts")
     if not isinstance(part_manifests, list):
-        raise RuntimeError(f"Malformed fully-async rollout checkpoint tensor manifest: {checkpoint}")
+        raise RuntimeError(f"Malformed replay-buffer tensor manifest: {replay_path}")
     manifest_by_name = {}
     for part in part_manifests:
         if not isinstance(part, dict) or not _is_safe_part_filename(part.get("file")):
-            raise RuntimeError(f"Malformed fully-async rollout checkpoint tensor part: {checkpoint}")
+            raise RuntimeError(f"Malformed replay-buffer tensor part: {replay_path}")
         filename = part["file"]
         if filename in manifest_by_name:
-            raise RuntimeError(f"Duplicate fully-async rollout checkpoint tensor part {filename}")
+            raise RuntimeError(f"Duplicate replay-buffer tensor part {filename}")
         manifest_by_name[filename] = part
 
     arrays = codec.get("arrays")
     if not isinstance(arrays, dict):
-        raise RuntimeError(f"Malformed fully-async rollout checkpoint external arrays: {checkpoint}")
+        raise RuntimeError(f"Malformed replay-buffer external arrays: {replay_path}")
     if any(not isinstance(field_refs, list) for field_refs in arrays.values()):
-        raise RuntimeError(f"Malformed fully-async rollout checkpoint external array references: {checkpoint}")
+        raise RuntimeError(f"Malformed replay-buffer external array references: {replay_path}")
     references = [reference for field_refs in arrays.values() for reference in field_refs]
     referenced_names = []
     referenced_tensors = []
     for reference in references:
         if not isinstance(reference, dict) or not _is_safe_part_filename(reference.get("file")):
-            raise RuntimeError(f"Malformed fully-async rollout checkpoint tensor reference: {checkpoint}")
+            raise RuntimeError(f"Malformed replay-buffer tensor reference: {replay_path}")
         if type(reference.get("offset")) is not int or reference["offset"] < 0:
-            raise RuntimeError(f"Malformed fully-async rollout checkpoint tensor offset: {checkpoint}")
+            raise RuntimeError(f"Malformed replay-buffer tensor offset: {replay_path}")
         referenced_names.append(reference["file"])
         referenced_tensors.append((reference["file"], reference.get("offset")))
     if len(referenced_tensors) != len(set(referenced_tensors)) or set(referenced_names) != set(manifest_by_name):
-        raise RuntimeError(f"Fully-async rollout checkpoint tensor references do not match its manifest: {checkpoint}")
+        raise RuntimeError(f"Replay-buffer tensor references do not match its manifest: {replay_path}")
 
     if referenced_names and parts_directory is None:
-        raise RuntimeError(f"Fully-async rollout checkpoint tensor parts have no directory: {checkpoint}")
-    parts_path = checkpoint.parent / parts_directory if parts_directory is not None else None
+        raise RuntimeError(f"Replay-buffer tensor parts have no directory: {replay_path}")
+    parts_path = replay_path.parent / parts_directory if parts_directory is not None else None
 
     def load_part(filename: str) -> tuple[str, torch.Tensor]:
         part = manifest_by_name[filename]
@@ -470,9 +521,9 @@ def _load_external_tensor_arrays(
         try:
             size = part_path.stat().st_size
         except OSError as error:
-            raise RuntimeError(f"Cannot read fully-async rollout checkpoint tensor: {part_path}") from error
+            raise RuntimeError(f"Cannot read replay-buffer tensor: {part_path}") from error
         if part.get("size") != size:
-            raise RuntimeError(f"Fully-async rollout checkpoint checksum mismatch: {part_path}")
+            raise RuntimeError(f"Replay-buffer checksum mismatch: {part_path}")
         return filename, torch.from_file(str(part_path), shared=False, size=size, dtype=torch.uint8)
 
     loaded = {}
@@ -498,14 +549,10 @@ def _load_external_tensor_arrays(
                 or offset + numel * dtype.itemsize > storage.numel()
                 or offset % dtype.itemsize != 0
             ):
-                raise RuntimeError(
-                    f"Fully-async rollout checkpoint tensor offset mismatch: " f"{parts_path / reference['file']}"
-                )
+                raise RuntimeError(f"Replay-buffer tensor offset mismatch: {parts_path / reference['file']}")
             tensor = storage[offset : offset + numel * dtype.itemsize].view(dtype)
             if _tensor_digest(tensor) != reference.get("sha256"):
-                raise RuntimeError(
-                    f"Fully-async rollout checkpoint checksum mismatch: " f"{parts_path / reference['file']}"
-                )
+                raise RuntimeError(f"Replay-buffer checksum mismatch: {parts_path / reference['file']}")
             hydrated_arrays[field].append(tensor)
 
     hydrated_codec = dict(codec)
@@ -519,9 +566,9 @@ def _is_safe_part_filename(value: Any) -> bool:
     return isinstance(value, str) and value == Path(value).name and value.endswith(".bin")
 
 
-def _is_safe_part_directory(checkpoint: Path, value: Any) -> bool:
+def _is_safe_part_directory(replay_path: Path, value: Any) -> bool:
     return (
-        isinstance(value, str) and value == Path(value).name and value.startswith(f"{checkpoint.name}{PARTS_MARKER}")
+        isinstance(value, str) and value == Path(value).name and value.startswith(f"{replay_path.name}{PARTS_MARKER}")
     )
 
 
@@ -530,7 +577,7 @@ def _cleanup_part_directories(path: Path, *, keep: str | None) -> None:
         if candidate.name != keep and candidate.is_dir():
             # The newly published manifest no longer references these paths.
             # Cleanup failure is a space leak, not a reason to report an
-            # otherwise durable checkpoint as failed.
+            # otherwise durable replay buffer as failed.
             shutil.rmtree(candidate, ignore_errors=True)
 
 
@@ -558,7 +605,7 @@ def _write_raw_tensor_file(
             if padding:
                 buffers.append(memoryview(bytes(padding)))
             if not tensor.is_contiguous():
-                raise RuntimeError("Fully-async checkpoint tensor shards must be contiguous")
+                raise RuntimeError("Replay-buffer tensor shards must be contiguous")
             buffers.append(memoryview(tensor.numpy()).cast("B"))
         for value in buffers:
             size += len(value)
@@ -580,7 +627,7 @@ def _writev_all(descriptor: int, buffers: list[memoryview]) -> None:
             batch[0] = batch[0][offset:]
         written = os.writev(descriptor, batch)
         if written <= 0:
-            raise OSError("Short write while saving fully-async checkpoint tensor shards")
+            raise OSError("Short write while saving replay-buffer tensor shards")
         while index < len(buffers):
             remaining = len(buffers[index]) - offset
             if written < remaining:
@@ -599,7 +646,7 @@ def _torch_dtype(value: Any) -> torch.dtype:
         str(torch.uint8): torch.uint8,
     }
     if value not in dtypes:
-        raise RuntimeError(f"Unsupported fully-async checkpoint tensor dtype: {value!r}")
+        raise RuntimeError(f"Unsupported replay-buffer tensor dtype: {value!r}")
     return dtypes[value]
 
 
@@ -657,7 +704,7 @@ class _HashingWriter:
     def write(self, value) -> int:
         written = self._handle.write(value)
         if written != len(value):
-            raise OSError(f"Short write while saving fully-async checkpoint: {written} of {len(value)} bytes")
+            raise OSError(f"Short write while saving replay buffer: {written} of {len(value)} bytes")
         self._digest.update(value)
         self._size += written
         return written
@@ -692,7 +739,13 @@ def _fsync_directory(path: Path) -> None:
 
 
 def _rollout_id_from_path(path: Path) -> int | None:
-    stem = path.name.removeprefix(STATE_PREFIX).removesuffix(STATE_SUFFIX)
+    stem = path.name.removesuffix(STATE_SUFFIX)
+    for prefix in (STATE_PREFIX, LEGACY_STATE_PREFIX):
+        if stem.startswith(prefix):
+            stem = stem.removeprefix(prefix)
+            break
+    else:
+        return None
     try:
         return int(stem)
     except ValueError:

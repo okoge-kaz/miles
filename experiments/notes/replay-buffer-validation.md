@@ -1,15 +1,17 @@
-# Fully-async rollout checkpoint validation
+# Replay-buffer validation
 
 This note records the correctness, resume-latency, batching-efficiency, and
-short-horizon convergence checks for the opt-in fully-async rollout checkpoint
-sidecar. It is intended to make the measurements reproducible after the Slurm
-logs have aged out.
+short-horizon convergence checks for the opt-in replay buffer. These historical
+runs cover what is now `--replay-buffer-type rollout`; the newer `inflight`
+token-prefix mode is covered by its implementation tests and is not part of the
+measurements below. The record is retained so the results remain reproducible
+after the Slurm logs have aged out.
 
 ## Scope and revisions
 
 - MILES branch: `experiments/cw-dfw-math-rl`
 - Integrated revision: `7917d9db`
-- Sidecar lifecycle checkpoint: `3874266d`
+- Replay buffer lifecycle checkpoint: `3874266d`
 - Packed replay serialization: `5134ce9e`
 - Streaming tensor parts and incremental checksums: `d0adc6c6`
 - Trainer batching metrics: `5a0d2775`
@@ -18,15 +20,15 @@ logs have aged out.
 - Dataset: real `dapo-math-p10-90` prompts
 - Model: `Qwen3-4B-Instruct-2507`
 
-The feature is opt-in through `--fully-async-rollout-checkpoint`. A checkpoint
-created without the option has no matching replay sidecar, so enabling it in
+The feature is opt-in through `--use-replay-buffer --replay-buffer-type
+rollout`. A checkpoint created without the option has no matching replay buffer, so enabling it in
 the middle of an existing experimental arm does not retroactively restore the
 rollout pipeline. Matched comparisons therefore start at a new experiment
 boundary.
 
 ## What is preserved
 
-The sidecar preserves the fully-async prompt lifecycle at a trainer checkpoint:
+The replay buffer preserves the fully-async prompt lifecycle at a trainer checkpoint:
 
 - pending prompt groups;
 - ready groups;
@@ -61,9 +63,9 @@ The new per-optimizer-step metrics are:
 Only a small fixed-size statistic is gathered across data-parallel ranks; no
 per-token payload is introduced by this telemetry.
 
-## Sidecar serialization benchmark
+## Replay buffer serialization benchmark
 
-CPU job 15669530 replayed a real schema-one sidecar captured by the 4-node
+CPU job 15669530 replayed a real schema-one replay buffer captured by the 4-node
 `full-replay-4n-feature-batch-20260812` run. The input was 97,416,265 bytes and
 the packed representation contained 7,040 sample records. Three repetitions
 gave the following medians:
@@ -75,7 +77,7 @@ gave the following medians:
 
 The total capture-and-save path improved by 7.47x and the durable save portion
 by 12.0x. The benchmark materialized the packed state and loaded the published
-sidecar through the production reader; both comparisons were bit-exact,
+replay buffer through the production reader; both comparisons were bit-exact,
 including array dtype, shape, and bytes. A second single-repeat run (job
 15669990) reproduced the result at 1.043 s versus 7.220 s.
 
@@ -91,35 +93,35 @@ same container and model checkpoint.
 
 | Case | Fresh job | Resume job | Result |
 |---|---:|---:|---|
-| Sidecar enabled | 15710027 | 15710033 | Passed |
-| Sidecar disabled | 15710428 | 15710458 | Passed |
+| Replay buffer enabled | 15710027 | 15710033 | Passed |
+| Replay buffer disabled | 15710428 | 15710458 | Passed |
 
 The enabled resume restored 60 pending groups, 48 ready groups, 8 active groups
 for regeneration, and one prepared batch. The trainer logged
-`resume/fully_async/warm_prepared_batch_hit=1` and immediately reused the
+`resume/replay_buffer/warm_prepared_batch_hit=1` and immediately reused the
 prepared batch.
 
 Resume-side first rollout wait:
 
 | Mode | `perf/rollout_time` |
 |---|---:|
-| Sidecar enabled | 0.092381 s |
-| Sidecar disabled | 2.753768 s |
+| Replay buffer enabled | 0.092381 s |
+| Replay buffer disabled | 2.753768 s |
 
 This is a 29.8x reduction, or 2.661 s saved in the deliberately small smoke
 configuration. Whole Slurm elapsed time was 3:51 versus 4:10 on resume, a
 19-second (7.6%) reduction despite model, Ray, and SGLang initialization being
 unchanged.
 
-### Three-policy sidecar extension
+### Three-policy replay buffer extension
 
 The queue-policy extension was validated on 2026-08-13 after merging remote
 revision `b20c5962`. Each case used one node (8 H100 GPUs), split into four
 trainer GPUs and four rollout GPUs, with real DAPO prompts, two prompt groups x
 two responses per trainer batch, a 256-token response cap, and
-`--fully-async-rollout-checkpoint`. The fresh job trained rollout 0 and
-published its model plus sidecar; a separate dependent job loaded both and
-trained rollout 1.
+`--use-replay-buffer --replay-buffer-type rollout`. The fresh job trained
+rollout 0 and published its model plus replay buffer; a separate dependent job
+loaded both and trained rollout 1.
 
 | Policy | Fresh job | Resume job | Restored pending / ready / regenerated / prepared | First resumed rollout |
 |---|---:|---:|---:|---:|
@@ -139,9 +141,9 @@ matched the intended contracts:
 - `queue-drop` restored exactly its two-group capacity plus four active prompt
   leases for regeneration. Its first resumed metrics recovered 30 prior queue
   evictions, 15,360 evicted response tokens, and 60 aligned sample lengths from
-  the sidecar. No evicted prompt was regenerated.
+  the replay buffer. No evicted prompt was regenerated.
 
-The first fresh sidecar publication for each policy measured:
+The first fresh replay buffer publication for each policy measured:
 
 | Policy | Ready / active / prepared groups | Capture | Durable write | Total | Stored bytes |
 |---|---:|---:|---:|---:|---:|
@@ -159,8 +161,8 @@ statistics, and optional reward-lifecycle records.
 
 The containerized regression suite passed 234 tests (job 15720283), including
 policy storage reconstruction, queue-max staleness rechecks, queue-drop
-snapshot overflow, telemetry persistence, old-sidecar compatibility, and
-cross-policy/capacity rejection. A real-Ray GPU test also passed (job
+snapshot overflow, telemetry persistence, legacy replay-buffer compatibility,
+and cross-policy/capacity rejection. A real-Ray GPU test also passed (job
 15720353).
 
 ## Real-data 20-step restart check
@@ -170,8 +172,8 @@ batch size 32, and a forced restart after step 9.
 
 | Mode | Steps 0--9 | Steps 10--19 |
 |---|---:|---:|
-| Sidecar enabled | 15711550 | 15711552 |
-| Sidecar disabled | 15711554 | 15711562 |
+| Replay buffer enabled | 15711550 | 15711552 |
+| Replay buffer disabled | 15711554 | 15711562 |
 
 The enabled resume restored 24 pending groups, regenerated 16 active groups,
 and reused one prepared batch. Eleven of 20 enabled steps and fourteen of 20
@@ -183,13 +185,13 @@ real optimizer updates; the run is too short to establish convergence.
 The definitive short-horizon comparison uses the same initial checkpoint,
 training seed 1234, rollout seed 42, data, model, container, batch shape, and
 hyperparameters. The only treatment difference is
-`FULLY_ASYNC_ROLLOUT_CHECKPOINT=1` versus `0`. Each arm is forcibly restarted at
+`USE_REPLAY_BUFFER=1` versus `0`. Each arm is forcibly restarted at
 50 steps and continues to 100 steps.
 
 | Mode | Steps 0--49 | Steps 50--99 | Final AIME24 eval |
 |---|---:|---:|---:|
-| Sidecar enabled | 15712624 | 15712640 | 15718112 |
-| Sidecar disabled | 15712642 | 15712648 | 15718134 |
+| Replay buffer enabled | 15712624 | 15712640 | 15718112 |
+| Replay buffer disabled | 15712642 | 15712648 | 15718134 |
 
 Configuration:
 
@@ -212,7 +214,7 @@ HF_SAVE_INTERVAL=100
 ### Enabled-arm results
 
 Both 50-step segments completed successfully in 9:01 and 9:13. The resume
-restored the sidecar and reused a prepared batch. Its first
+restored the replay buffer and reused a prepared batch. Its first
 `perf/rollout_time` was 0.146476 s.
 
 | Metric | Steps 0--49 | Steps 50--99 |
@@ -234,7 +236,7 @@ paired-sample estimator.
 ### Disabled-arm results and restart latency
 
 Both disabled segments completed successfully in 8:55 and 9:11. As expected,
-the resume found no replay sidecar and could not reuse a prepared batch. Its
+the resume found no replay buffer and could not reuse a prepared batch. Its
 first `perf/rollout_time` was 10.527783 s.
 
 | Metric | Steps 0--49 | Steps 50--99 |
@@ -249,7 +251,7 @@ first `perf/rollout_time` was 10.527783 s.
 | Mean in-queue staleness | 0.058824 | 0.065000 |
 | Mean mixed-version fraction | 0.911765 | 0.905000 |
 
-At the forced restart boundary, the sidecar reduced the first trainer rollout
+At the forced restart boundary, the replay buffer reduced the first trainer rollout
 wait from 10.527783 s to 0.146476 s: 10.381307 s saved, or 71.9x lower. The
 initial segments had nearly identical cold-start waits (10.639241 s enabled and
 10.611810 s disabled), which confirms that the restart difference came from
@@ -279,14 +281,14 @@ The final step-99 checkpoints were evaluated on all 30 AIME24 prompts with
 eight samples per prompt, a 4096-token response cap, and no generation
 failures. The first submissions (15712674 and 15712682) exposed a common HF
 export issue: the config declared vocabulary size 151,936 while the padded
-embedding tensor had 152,064 rows. This was independent of the sidecar. The
+embedding tensor had 152,064 rows. This was independent of the replay buffer. The
 official `experiments/src/offline_eval/unpad_vocab.py` utility removed only the
 128 padded rows in eval-only checkpoint copies. CPU jobs 15718013 and 15718020
 verified every retained tensor value against the original before jobs 15718112
 and 15718134 performed the successful evaluations. The original training
 checkpoints were not modified.
 
-| Metric | Sidecar enabled | Sidecar disabled | Enabled - disabled |
+| Metric | Replay buffer enabled | Replay buffer disabled | Enabled - disabled |
 |---|---:|---:|---:|
 | Correct samples | 83/240 | 75/240 | 8/240 |
 | Mean prompt pass rate | 0.345833 | 0.312500 | +0.033333 |
@@ -321,18 +323,18 @@ export WANDB_MODE=offline
 export WANDB_API_KEY=offline
 
 sbatch -A "${SLURM_ACCOUNT_NAME}" -p interactive -N 2 -t 02:00:00 \
-  --export=ALL,CONFIG_TAG=<unique-tag>,NUM_ROLLOUT=100,DEBUG_EXIT_AFTER_ROLLOUT=50,SAVE_INTERVAL=50,SAVE_RETAIN_INTERVAL=100,SAVE_HF=1,HF_SAVE_INTERVAL=100,FULLY_ASYNC_ROLLOUT_CHECKPOINT=1,MAX_RESPONSE_LEN=2048,ROLLOUT_BATCH_SIZE=8,N_SAMPLES_PER_PROMPT=4,GLOBAL_BATCH_SIZE=32,MAX_TOKENS_PER_GPU=8192,ASYNC_MAX_CONCURRENT_SAMPLES=64,SGLANG_MAX_RUNNING_REQUESTS=64,EVAL_INTERVAL=0,DUMP_TRAIN_DATA=0,FUSE_ONE_STEP_ACTOR_LOGPROBS=1 \
+  --export=ALL,CONFIG_TAG=<unique-tag>,NUM_ROLLOUT=100,DEBUG_EXIT_AFTER_ROLLOUT=50,SAVE_INTERVAL=50,SAVE_RETAIN_INTERVAL=100,SAVE_HF=1,HF_SAVE_INTERVAL=100,USE_REPLAY_BUFFER=1,REPLAY_BUFFER_TYPE=rollout,MAX_RESPONSE_LEN=2048,ROLLOUT_BATCH_SIZE=8,N_SAMPLES_PER_PROMPT=4,GLOBAL_BATCH_SIZE=32,MAX_TOKENS_PER_GPU=8192,ASYNC_MAX_CONCURRENT_SAMPLES=64,SGLANG_MAX_RUNNING_REQUESTS=64,EVAL_INTERVAL=0,DUMP_TRAIN_DATA=0,FUSE_ONE_STEP_ACTOR_LOGPROBS=1 \
   experiments/math_async/dapo-math-p10-90/qwen3-4b-instruct-2507/run.sbatch
 ```
 
 Submit the second invocation with the same `CONFIG_TAG` and
 `--dependency=afterok:<first-job-id>` so it resumes from the step-49
 checkpoint. For the control, change only
-`FULLY_ASYNC_ROLLOUT_CHECKPOINT=0` and use a distinct `CONFIG_TAG`.
+`USE_REPLAY_BUFFER=0` and use a distinct `CONFIG_TAG`.
 
 ## Interpretation constraints
 
-- Sidecar ON and OFF do not consume exactly the same post-restart trajectories:
+- Replay buffer ON and OFF do not consume exactly the same post-restart trajectories:
   preserving queued work is the treatment itself. Fixed-batch unit tests cover
   serialization equivalence, while live runs measure system behavior.
 - A 100-step run is a short-horizon non-regression check, not a full convergence

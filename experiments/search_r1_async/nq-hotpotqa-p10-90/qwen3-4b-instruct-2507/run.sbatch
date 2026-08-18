@@ -15,7 +15,7 @@
 #
 # Requires prepare_search_r1.sbatch followed by
 # difficulty_filter/run_measure_search_r1.sbatch. The prompt population is fixed
-# before training; the replay sidecar is intentionally mandatory so a resumed
+# before training; the replay buffer is intentionally mandatory so a resumed
 # allocation restores its in-flight/FIFO rollout state instead of refilling.
 
 set -euo pipefail
@@ -98,9 +98,14 @@ fi
 : "${STALENESS_REFERENCE:=prefill}"
 : "${PAUSE_GENERATION_MODE:=in_place}"
 : "${ASYNC_MAX_CONCURRENT_SAMPLES:=}"
-: "${FULLY_ASYNC_ROLLOUT_CHECKPOINT:=1}"
-[[ "${FULLY_ASYNC_ROLLOUT_CHECKPOINT}" == "1" ]] || {
-    echo "Search-R1 async requires FULLY_ASYNC_ROLLOUT_CHECKPOINT=1; use a different recipe for a no-sidecar ablation" >&2
+: "${USE_REPLAY_BUFFER:=1}"
+: "${REPLAY_BUFFER_TYPE:=rollout}"
+[[ "${USE_REPLAY_BUFFER}" == "1" ]] || {
+    echo "Search-R1 async requires USE_REPLAY_BUFFER=1; use a different recipe for a no-buffer ablation" >&2
+    exit 1
+}
+[[ "${REPLAY_BUFFER_TYPE}" == "rollout" ]] || {
+    echo "Search-R1 uses a custom generator and requires REPLAY_BUFFER_TYPE=rollout" >&2
     exit 1
 }
 
@@ -158,7 +163,7 @@ export TIS_CLIP TIS_CLIP_LOW MIS_PROFILE M2PO_BUDGET USE_OPSM OPSM_DELTA
 export LR TRAIN_SEED ROLLOUT_SEED MAX_RESPONSE_LEN ROLLOUT_MAX_CONTEXT_LEN NUM_STEPS_PER_ROLLOUT
 export ROLLOUT_BATCH_SIZE N_SAMPLES_PER_PROMPT GLOBAL_BATCH_SIZE NUM_ROLLOUT
 export QUEUE_POLICY QUEUE_FACTOR MAX_WEIGHT_STALENESS STALENESS_REFERENCE PAUSE_GENERATION_MODE
-export ASYNC_MAX_CONCURRENT_SAMPLES FULLY_ASYNC_ROLLOUT_CHECKPOINT
+export ASYNC_MAX_CONCURRENT_SAMPLES USE_REPLAY_BUFFER REPLAY_BUFFER_TYPE
 export SEARCH_MAX_TURNS SEARCH_TOPK SEARCH_CONCURRENCY SEARCH_TIMEOUT SEARCH_MAX_ATTEMPTS SEARCH_FORMAT_SCORE RETRIEVER_PORT
 export RETRIEVER_BATCH_MAX_REQUESTS RETRIEVER_BATCH_WAIT_MS RETRIEVER_FAISS_THREADS
 export ACTOR_NUM_NODES ACTOR_GPUS_PER_NODE ROLLOUT_NUM_GPUS

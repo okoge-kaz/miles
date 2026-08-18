@@ -190,7 +190,7 @@ The colocated Search-R1 path completed an unfiltered one-rollout/one-update GPU
 bring-up smoke (job 15729407) with a checkpoint; it is not evidence for the
 final fixed-dataset design. The old dynamic-filter async smoke (job 15789560)
 was cancelled before allocation. The fully-async recipe, fused actor-logprob
-path, and replay sidecar pass unit/static validation; its final GPU smoke waits
+path, and replay buffer pass unit/static validation; its final GPU smoke waits
 for the fixed p10-90 artifact. Difficulty-pipeline smoke outputs are isolated
 under `/data/difficulty/smoke/` and are never training inputs. The assets are
 staged:

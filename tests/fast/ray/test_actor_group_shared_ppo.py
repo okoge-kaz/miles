@@ -79,7 +79,7 @@ async def test_train_rejects_wrong_number_of_rank_payloads():
         await group.train(5, {"data_ref": "rollout"}, external_data=[{"values": []}])
 
 
-async def test_full_replay_aligns_v1_weight_version_before_push():
+async def test_replay_buffer_aligns_v1_weight_version_before_push():
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
 
@@ -89,7 +89,7 @@ async def test_full_replay_aligns_v1_weight_version_before_push():
     group.args = SimpleNamespace(
         debug_train_only=False,
         debug_rollout_only=False,
-        fully_async_rollout_checkpoint=True,
+        use_replay_buffer=True,
         use_fault_tolerance=False,
     )
     group.rollout_manager = _RolloutManager(version=7)

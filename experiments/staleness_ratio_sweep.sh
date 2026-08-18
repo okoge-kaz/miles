@@ -12,7 +12,7 @@
 #     experiments/staleness_ratio_sweep.sh --staleness 2    # one row of the grid
 #     experiments/staleness_ratio_sweep.sh --ratio 1:7,2:6  # one pair of columns
 #     experiments/staleness_ratio_sweep.sh --point 2:2:6 --point 4:2:6
-#     RUN_NAMESPACE=sidecar-v1 experiments/staleness_ratio_sweep.sh --point 2:2:6
+#     RUN_NAMESPACE=replay-buffer-v1 experiments/staleness_ratio_sweep.sh --point 2:2:6
 #     experiments/staleness_ratio_sweep.sh --include-colocated  # add one s=0 on-policy arm
 #     experiments/staleness_ratio_sweep.sh --colocated-only     # select only that s=0 arm
 #     experiments/staleness_ratio_sweep.sh --check
@@ -48,7 +48,8 @@ STALENESS_REFERENCE=prefill
 : "${FUSE_ONE_STEP_ACTOR_LOGPROBS:=1}"
 : "${LOG_PROBS_CHUNK_SIZE:=-1}"
 : "${OBSERVE_TRAINING_ENTROPY:=0}"
-: "${FULLY_ASYNC_ROLLOUT_CHECKPOINT:=1}"
+: "${USE_REPLAY_BUFFER:=1}"
+: "${REPLAY_BUFFER_TYPE:=rollout}"
 : "${WANDB_PROJECT:=async-rl-dapo-math-node-ratio}"
 : "${PARTITION:=batch}"             # 8 nodes: batch_short caps at 4
 : "${WALL:=04:00:00}"
@@ -78,7 +79,7 @@ CP=$(read_default CONTEXT_PARALLEL_SIZE)
 GPN=$(read_default ACTOR_GPUS_PER_NODE)
 NUM_ROLLOUT="${NUM_ROLLOUT:-$(read_default NUM_ROLLOUT)}"
 MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-$(read_default MAX_RESPONSE_LEN)}"
-: "${RUN_NAMESPACE:=math-$(( MAX_RESPONSE_LEN / 1024 ))k-sidecar-v1}"
+: "${RUN_NAMESPACE:=math-$(( MAX_RESPONSE_LEN / 1024 ))k-replay-buffer-v1}"
 
 STALENESS_FILTER=""; RATIO_FILTER=""; POINT_FILTER=""
 INCLUDE_COLOCATED=0; COLOCATED_ONLY=0
@@ -138,8 +139,12 @@ fi
 [[ "${SAVE_RETAIN_INTERVAL}" =~ ^[1-9][0-9]*$ ]] ||
     { echo "SAVE_RETAIN_INTERVAL must be a positive integer" >&2; exit 1; }
 [[ "${SAVE_HF}" =~ ^[01]$ ]] || { echo "SAVE_HF must be 0 or 1" >&2; exit 1; }
-[[ "${FULLY_ASYNC_ROLLOUT_CHECKPOINT}" =~ ^[01]$ ]] || {
-    echo "FULLY_ASYNC_ROLLOUT_CHECKPOINT must be 0 or 1" >&2
+[[ "${USE_REPLAY_BUFFER}" =~ ^[01]$ ]] || {
+    echo "USE_REPLAY_BUFFER must be 0 or 1" >&2
+    exit 1
+}
+[[ "${REPLAY_BUFFER_TYPE}" =~ ^(rollout|inflight)$ ]] || {
+    echo "REPLAY_BUFFER_TYPE must be rollout or inflight" >&2
     exit 1
 }
 [[ "${HF_SAVE_INTERVAL}" =~ ^[1-9][0-9]*$ ]] ||
@@ -423,7 +428,7 @@ fi
 printf '%s rollouts, %s dependent %s jobs per arm; gbs %s, tp %s, cp %s.\n' \
     "${NUM_ROLLOUT}" "${CHAIN_JOBS}" "${WALL}" "${GBS}" "${TP}" "${CP}"
 printf 'max response length %s; reward math.\n' "${MAX_RESPONSE_LEN}"
-printf 'fully-async rollout sidecar %s.\n' "${FULLY_ASYNC_ROLLOUT_CHECKPOINT}"
+printf 'replay buffer %s (type %s).\n' "${USE_REPLAY_BUFFER}" "${REPLAY_BUFFER_TYPE}"
 if [[ -n "${APPEND_AFTER}" ]]; then
     printf 'The new chain will append after Slurm job %s.\n' "${APPEND_AFTER}"
 fi
@@ -608,7 +613,7 @@ submit_async_chain() {  # staleness train_nodes rollout_nodes dp
             --job-name="${name}" \
             --nodes="${TOTAL_NODES}" --time="${WALL}" \
             --output="${LOG_DIR}/${name}-%j.log" \
-            --export="ALL,WANDB_PROJECT=${WANDB_PROJECT},RUN_NAME=${name},CONFIG_TAG=${name},NUM_ROLLOUT=${NUM_ROLLOUT},MAX_RESPONSE_LEN=${MAX_RESPONSE_LEN},FULLY_ASYNC_ROLLOUT_CHECKPOINT=${FULLY_ASYNC_ROLLOUT_CHECKPOINT},SAVE_INTERVAL=${SAVE_INTERVAL},SAVE_RETAIN_INTERVAL=${SAVE_RETAIN_INTERVAL},SAVE_HF=${SAVE_HF},HF_SAVE_INTERVAL=${HF_SAVE_INTERVAL},EVAL_INTERVAL=0,SKIP_EVAL_BEFORE_TRAIN=1,LR=${LR},MAX_WEIGHT_STALENESS=${s},STALENESS_REFERENCE=prefill,PAUSE_GENERATION_MODE=in_place,ACTOR_NUM_NODES=${t},ROLLOUT_NUM_GPUS=$(( r * GPN )),ROLLOUT_SEED=${ROLLOUT_SEED},IS_CORRECTION=${IS_CORRECTION},TIS_CLIP=${TIS_CLIP},TIS_CLIP_LOW=${TIS_CLIP_LOW},RATIO_DENOMINATOR=${RATIO_DENOMINATOR},FUSE_ONE_STEP_ACTOR_LOGPROBS=${FUSE_ONE_STEP_ACTOR_LOGPROBS},VERIFY_FUSED_ONE_STEP_ACTOR_LOGPROBS=0" \
+            --export="ALL,WANDB_PROJECT=${WANDB_PROJECT},RUN_NAME=${name},CONFIG_TAG=${name},NUM_ROLLOUT=${NUM_ROLLOUT},MAX_RESPONSE_LEN=${MAX_RESPONSE_LEN},USE_REPLAY_BUFFER=${USE_REPLAY_BUFFER},REPLAY_BUFFER_TYPE=${REPLAY_BUFFER_TYPE},SAVE_INTERVAL=${SAVE_INTERVAL},SAVE_RETAIN_INTERVAL=${SAVE_RETAIN_INTERVAL},SAVE_HF=${SAVE_HF},HF_SAVE_INTERVAL=${HF_SAVE_INTERVAL},EVAL_INTERVAL=0,SKIP_EVAL_BEFORE_TRAIN=1,LR=${LR},MAX_WEIGHT_STALENESS=${s},STALENESS_REFERENCE=prefill,PAUSE_GENERATION_MODE=in_place,ACTOR_NUM_NODES=${t},ROLLOUT_NUM_GPUS=$(( r * GPN )),ROLLOUT_SEED=${ROLLOUT_SEED},IS_CORRECTION=${IS_CORRECTION},TIS_CLIP=${TIS_CLIP},TIS_CLIP_LOW=${TIS_CLIP_LOW},RATIO_DENOMINATOR=${RATIO_DENOMINATOR},FUSE_ONE_STEP_ACTOR_LOGPROBS=${FUSE_ONE_STEP_ACTOR_LOGPROBS},VERIFY_FUSED_ONE_STEP_ACTOR_LOGPROBS=0" \
             "${REPO_ROOT}/${ASYNC_RECIPE}")
         jid=${raw_jid%%;*}
         dependency_label=""
@@ -641,7 +646,7 @@ submit_colocated_chain() {
             --job-name="${name}" \
             --nodes="${TOTAL_NODES}" --time="${WALL}" \
             --output="${LOG_DIR}/${name}-%j.log" \
-            --export="ALL,WANDB_PROJECT=${WANDB_PROJECT},RUN_NAME=${name},CONFIG_TAG=${name},NUM_ROLLOUT=${NUM_ROLLOUT},MAX_RESPONSE_LEN=${MAX_RESPONSE_LEN},FULLY_ASYNC_ROLLOUT_CHECKPOINT=0,SAVE_INTERVAL=${SAVE_INTERVAL},SAVE_RETAIN_INTERVAL=${SAVE_RETAIN_INTERVAL},SAVE_HF=${SAVE_HF},HF_SAVE_INTERVAL=${HF_SAVE_INTERVAL},EVAL_INTERVAL=0,SKIP_EVAL_BEFORE_TRAIN=1,LR=${LR},MAX_WEIGHT_STALENESS=0,STALENESS_REFERENCE=completion,PAUSE_GENERATION_MODE=none,ACTOR_NUM_NODES=${TOTAL_NODES},ROLLOUT_NUM_GPUS=0,ROLLOUT_SEED=${ROLLOUT_SEED},IS_CORRECTION=${IS_CORRECTION},TIS_CLIP=${TIS_CLIP},TIS_CLIP_LOW=${TIS_CLIP_LOW},RATIO_DENOMINATOR=${RATIO_DENOMINATOR},LOG_PROBS_CHUNK_SIZE=${LOG_PROBS_CHUNK_SIZE},OBSERVE_TRAINING_ENTROPY=${OBSERVE_TRAINING_ENTROPY}" \
+            --export="ALL,WANDB_PROJECT=${WANDB_PROJECT},RUN_NAME=${name},CONFIG_TAG=${name},NUM_ROLLOUT=${NUM_ROLLOUT},MAX_RESPONSE_LEN=${MAX_RESPONSE_LEN},USE_REPLAY_BUFFER=0,REPLAY_BUFFER_TYPE=rollout,SAVE_INTERVAL=${SAVE_INTERVAL},SAVE_RETAIN_INTERVAL=${SAVE_RETAIN_INTERVAL},SAVE_HF=${SAVE_HF},HF_SAVE_INTERVAL=${HF_SAVE_INTERVAL},EVAL_INTERVAL=0,SKIP_EVAL_BEFORE_TRAIN=1,LR=${LR},MAX_WEIGHT_STALENESS=0,STALENESS_REFERENCE=completion,PAUSE_GENERATION_MODE=none,ACTOR_NUM_NODES=${TOTAL_NODES},ROLLOUT_NUM_GPUS=0,ROLLOUT_SEED=${ROLLOUT_SEED},IS_CORRECTION=${IS_CORRECTION},TIS_CLIP=${TIS_CLIP},TIS_CLIP_LOW=${TIS_CLIP_LOW},RATIO_DENOMINATOR=${RATIO_DENOMINATOR},LOG_PROBS_CHUNK_SIZE=${LOG_PROBS_CHUNK_SIZE},OBSERVE_TRAINING_ENTROPY=${OBSERVE_TRAINING_ENTROPY}" \
             "${REPO_ROOT}/${COLO_RECIPE}")
         jid=${raw_jid%%;*}
         dependency_label=""

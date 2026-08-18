@@ -66,7 +66,16 @@ fi
 : "${STALENESS_REFERENCE:=prefill}"   # completion | submission | prefill
 : "${PAUSE_GENERATION_MODE:=in_place}"
 : "${ASYNC_MAX_CONCURRENT_SAMPLES:=}"
-: "${FULLY_ASYNC_ROLLOUT_CHECKPOINT:=0}"  # opt-in; older checkpoints have no replay sidecar
+: "${USE_REPLAY_BUFFER:=0}"        # opt-in; older checkpoints may have no replay buffer
+: "${REPLAY_BUFFER_TYPE:=rollout}" # rollout | inflight
+[[ "${USE_REPLAY_BUFFER}" =~ ^[01]$ ]] || {
+   echo "USE_REPLAY_BUFFER must be 0 or 1" >&2
+   exit 1
+}
+[[ "${REPLAY_BUFFER_TYPE}" =~ ^(rollout|inflight)$ ]] || {
+   echo "REPLAY_BUFFER_TYPE must be rollout or inflight" >&2
+   exit 1
+}
 
 # distributed setting
 : "${ACTOR_NUM_NODES:=1}"
@@ -115,7 +124,7 @@ export LR MAX_RESPONSE_LEN NUM_ROLLOUT TRAIN_SEED ROLLOUT_SEED
 export ROLLOUT_BATCH_SIZE N_SAMPLES_PER_PROMPT GLOBAL_BATCH_SIZE NUM_STEPS_PER_ROLLOUT
 export QUEUE_POLICY QUEUE_FACTOR MAX_WEIGHT_STALENESS STALENESS_REFERENCE
 export PAUSE_GENERATION_MODE ASYNC_MAX_CONCURRENT_SAMPLES
-export FULLY_ASYNC_ROLLOUT_CHECKPOINT
+export USE_REPLAY_BUFFER REPLAY_BUFFER_TYPE
 export ACTOR_NUM_NODES ACTOR_GPUS_PER_NODE ROLLOUT_NUM_GPUS
 export TENSOR_PARALLEL_SIZE CONTEXT_PARALLEL_SIZE EXPERT_PARALLEL_SIZE
 export MAX_TOKENS_PER_GPU RECOMPUTE_GRANULARITY OVERLAP_COMM

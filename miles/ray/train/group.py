@@ -259,7 +259,7 @@ class RayTrainGroup:
     async def update_weights(self, rollout_id: int | None = None):
         """Broadcast weights to rollout engines."""
         log_structured(logger.info, op="update_weights", phase="start", rollout=rollout_id)
-        if getattr(self.args, "fully_async_rollout_checkpoint", False):
+        if getattr(self.args, "use_replay_buffer", False):
             current_version = await self._rollout_manager.get_current_applied_weight_version.remote()
             await self.restore_weight_version(current_version)
         # TODO: allow using all cells to update weights (instead of first alive cell)

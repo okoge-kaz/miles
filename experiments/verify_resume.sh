@@ -66,7 +66,7 @@ if [[ "${1:-}" == "--check" ]]; then
         echo "  NO TRACKER: nothing was saved"
     fi
     echo "  dist  : $(ls -d "${CKPT_DIR}"/iter_* 2>/dev/null | xargs -rn1 basename | tr '\n' ' ')"
-    echo "  replay: $(ls "${CKPT_DIR}"/rollout/fully_async_state_*.pt 2>/dev/null | xargs -rn1 basename | tr '\n' ' ')"
+    echo "  replay: $(ls "${CKPT_DIR}"/rollout/replay_buffer_*.pt 2>/dev/null | xargs -rn1 basename | tr '\n' ' ')"
     echo "  hf    : $(ls "${CKPT_DIR}/hf" 2>/dev/null | tr '\n' ' ')"
     echo "  du    : $(du -sh "${CKPT_DIR}" 2>/dev/null | cut -f1) total,"\
          "$(du -sh "${CKPT_DIR}/hf" 2>/dev/null | cut -f1) of it hf"
@@ -86,7 +86,7 @@ if [[ "${1:-}" == "--check" ]]; then
         echo
         grep -oE "successfully saved checkpoint from iteration +[0-9]+" "${log}" | sed 's/^/  /'
         grep -oE "(skipping )?deleting checkpoint from iteration +[0-9]+" "${log}" | sed 's/^/  /'
-        grep -E "(Captured|Restored) fully-async rollout state|Reusing prepared fully-async rollout batch" \
+        grep -E "(Captured|Restored|Published) replay buffer|Reusing prepared fully-async rollout batch" \
             "${log}" | head -10 | sed 's/^/  /'
     done
     exit 0
@@ -104,7 +104,7 @@ fi
 # --num-rollout fixed across its chained jobs. It is still worth knowing that
 # --num-rollout is frozen for the lifetime of a run: a run cannot be extended
 # later by raising it.
-COMMON="CONFIG_TAG=${CONFIG_TAG},NUM_ROLLOUT=30,SAVE_INTERVAL=2,SAVE_RETAIN_INTERVAL=4,SKIP_EVAL_BEFORE_TRAIN=1,EVAL_INTERVAL=1000,FULLY_ASYNC_ROLLOUT_CHECKPOINT=1"
+COMMON="CONFIG_TAG=${CONFIG_TAG},NUM_ROLLOUT=30,SAVE_INTERVAL=2,SAVE_RETAIN_INTERVAL=4,SKIP_EVAL_BEFORE_TRAIN=1,EVAL_INTERVAL=1000,USE_REPLAY_BUFFER=1,REPLAY_BUFFER_TYPE=rollout"
 
 if [[ "${1:-}" != "--submit" ]]; then
     echo "would submit, 3 nodes each:"

@@ -22,15 +22,16 @@ PATH_ARGS = ["--rollout-function-path", "--custom-generate-function-path"]
 REQUIRED_ARGS = ["--rollout-batch-size", "64"]
 
 
-def _fully_async_checkpoint_args(**overrides) -> SimpleNamespace:
+def _replay_buffer_args(**overrides) -> SimpleNamespace:
     values = {
         "fully_async": True,
         "fully_async_queue_policy": "queue-recycle",
         "fully_async_queue_factor": 1,
         "max_weight_staleness": None,
         "staleness_reference": "completion",
-        "fully_async_rollout_checkpoint": True,
-        "fully_async_rollout_checkpoint_keep_last": 2,
+        "use_replay_buffer": True,
+        "replay_buffer_type": "rollout",
+        "replay_buffer_keep_last": 2,
         "multi_lora": False,
         "rollout_function_path": None,
         "eval_function_path": None,
@@ -44,6 +45,7 @@ def _fully_async_checkpoint_args(**overrides) -> SimpleNamespace:
         "advantage_estimator": "grpo",
         "use_critic": False,
         "custom_rm_path": None,
+        "custom_generate_function_path": None,
         "custom_reward_post_process_path": None,
         "custom_convert_samples_to_train_data_path": None,
         "rollout_data_postprocess_path": None,
@@ -95,15 +97,15 @@ def _fully_async_checkpoint_args(**overrides) -> SimpleNamespace:
         ({"use_rollout_indexer_replay": True}, "no routing/indexer replay"),
         ({"update_weight_transfer_mode": "disk-delta"}, "non-delta weight transfer"),
         ({"update_weights_interval": 2}, "update-weights-interval 1"),
-        ({"save": None}, "--save for durable replay"),
-        ({"save_interval": None}, "positive --save-interval for durable replay"),
-        ({"save_interval": 0}, "positive --save-interval for durable replay"),
-        ({"fully_async_rollout_checkpoint_keep_last": 0}, "positive checkpoint retention"),
+        ({"save": None}, "--save for the durable replay buffer"),
+        ({"save_interval": None}, "positive --save-interval for the durable replay buffer"),
+        ({"save_interval": 0}, "positive --save-interval for the durable replay buffer"),
+        ({"replay_buffer_keep_last": 0}, "positive replay-buffer retention"),
     ],
 )
-def test_fully_async_rollout_checkpoint_guards(monkeypatch, override, message):
+def test_use_replay_buffer_guards(monkeypatch, override, message):
     monkeypatch.setattr("miles.utils.arguments.enable_experimental_rollout_refactor", lambda: True)
-    args = _fully_async_checkpoint_args(**override)
+    args = _replay_buffer_args(**override)
     with pytest.raises((AssertionError, ValueError), match=message):
         _resolve_rollout_functions(args)
 
@@ -116,11 +118,55 @@ def test_fully_async_rollout_checkpoint_guards(monkeypatch, override, message):
         {"fully_async_queue_policy": "queue-drop", "fully_async_queue_factor": 2},
     ],
 )
-def test_fully_async_rollout_checkpoint_accepts_supported_grpo_configuration(monkeypatch, queue_config):
+def test_use_replay_buffer_accepts_supported_grpo_configuration(monkeypatch, queue_config):
     monkeypatch.setattr("miles.utils.arguments.enable_experimental_rollout_refactor", lambda: True)
-    args = _fully_async_checkpoint_args(**queue_config)
+    args = _replay_buffer_args(**queue_config)
     _resolve_rollout_functions(args)
     assert args.rollout_function_path == "miles.rollout.fully_async_rollout.FullyAsyncRolloutFn"
+
+
+def test_inflight_replay_buffer_rejects_custom_generate_function(monkeypatch):
+    monkeypatch.setattr("miles.utils.arguments.enable_experimental_rollout_refactor", lambda: True)
+    args = _replay_buffer_args(
+        replay_buffer_type="inflight",
+        custom_generate_function_path="custom.generate",
+    )
+    with pytest.raises(ValueError, match="built-in single-turn"):
+        _resolve_rollout_functions(args)
+
+
+def test_inflight_replay_buffer_requires_opt_in(monkeypatch):
+    monkeypatch.setattr("miles.utils.arguments.enable_experimental_rollout_refactor", lambda: True)
+    args = _replay_buffer_args(
+        use_replay_buffer=False,
+        replay_buffer_type="inflight",
+    )
+    with pytest.raises(ValueError, match="requires --use-replay-buffer"):
+        _resolve_rollout_functions(args)
+
+
+def test_replay_buffer_rejects_unknown_type_from_config(monkeypatch):
+    monkeypatch.setattr("miles.utils.arguments.enable_experimental_rollout_refactor", lambda: True)
+    args = _replay_buffer_args(replay_buffer_type="unknown")
+    with pytest.raises(ValueError, match="must be one of"):
+        _resolve_rollout_functions(args)
+
+
+def test_replay_buffer_cli_is_opt_in_with_rollout_as_the_default_type():
+    parser = argparse.ArgumentParser()
+    get_miles_extra_args_provider()(parser)
+
+    defaults = parser.parse_args(REQUIRED_ARGS)
+    assert not defaults.use_replay_buffer
+    assert defaults.replay_buffer_type == "rollout"
+
+    rollout = parser.parse_args(["--use-replay-buffer"] + REQUIRED_ARGS)
+    assert rollout.use_replay_buffer
+    assert rollout.replay_buffer_type == "rollout"
+
+    inflight = parser.parse_args(["--use-replay-buffer", "--replay-buffer-type", "inflight"] + REQUIRED_ARGS)
+    assert inflight.use_replay_buffer
+    assert inflight.replay_buffer_type == "inflight"
 
 
 def make_class_with_add_arguments():

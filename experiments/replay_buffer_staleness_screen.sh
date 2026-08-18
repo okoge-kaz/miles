@@ -1,5 +1,5 @@
 #!/bin/bash
-# Sidecar-restored screening cohort for the three selected async DAPO-MATH arms:
+# Replay-buffer screening cohort for the three selected async DAPO-MATH arms:
 #
 #   s2-t2r6  stable async anchor
 #   s2-t3r5  phase-boundary arm
@@ -7,17 +7,17 @@
 #
 # The run namespace is part of CONFIG_TAG, RUN_NAME, Slurm job name, log name,
 # and checkpoint path. These runs therefore cannot silently resume the legacy
-# s*-t*r* checkpoints, which have no replay sidecar.
+# s*-t*r* checkpoints, which have no replay buffer.
 #
 # Usage:
-#   experiments/sidecar_staleness_screen.sh             # dry-run / preflight
-#   experiments/sidecar_staleness_screen.sh --submit    # fresh 3-arm chains
-#   experiments/sidecar_staleness_screen.sh --check     # newest segment summary
-#   experiments/sidecar_staleness_screen.sh --resume    # extend completed chains
+#   experiments/replay_buffer_staleness_screen.sh             # dry-run / preflight
+#   experiments/replay_buffer_staleness_screen.sh --submit    # fresh 3-arm chains
+#   experiments/replay_buffer_staleness_screen.sh --check     # newest segment summary
+#   experiments/replay_buffer_staleness_screen.sh --resume    # extend completed chains
 #
 # Override a new cohort name instead of deleting or reusing an existing cohort:
-#   SIDECAR_SCREEN_NAMESPACE=sidecar-v2 \
-#       experiments/sidecar_staleness_screen.sh --submit
+#   REPLAY_BUFFER_SCREEN_NAMESPACE=replay-buffer-v2 \
+#       experiments/replay_buffer_staleness_screen.sh --submit
 
 set -euo pipefail
 
@@ -41,9 +41,9 @@ esac
 }
 
 # A dated semantic cohort name prevents legacy checkpoint or W&B-group reuse.
-# Change the override for a genuinely new cohort; never toggle sidecar within it.
-: "${SIDECAR_SCREEN_NAMESPACE:=sidecar-v1-20260815}"
-: "${WANDB_PROJECT:=async-rl-dapo-math-sidecar-screen}"
+# Change the override for a genuinely new cohort; never toggle the replay buffer within it.
+: "${REPLAY_BUFFER_SCREEN_NAMESPACE:=replay-buffer-v1-20260815}"
+: "${WANDB_PROJECT:=async-rl-dapo-math-replay-buffer-screen}"
 : "${NUM_ROLLOUT:=300}"
 : "${CHAIN_JOBS:=10}"
 : "${WALL:=04:00:00}"
@@ -51,13 +51,13 @@ esac
 : "${SAVE_RETAIN_INTERVAL:=10}"
 : "${HF_SAVE_INTERVAL:=10}"
 
-RUN_NAMESPACE="${SIDECAR_SCREEN_NAMESPACE}"
+RUN_NAMESPACE="${REPLAY_BUFFER_SCREEN_NAMESPACE}"
 TOTAL_NODES=8
 RATIOS="1:7 2:6 3:5 4:4"
 STALENESS_LEVELS="1 2 4 8"
 
 # Pin the legacy sweep's training conditions. The only semantic interventions
-# in this cohort are replay-sidecar resume and the added diagnostics below.
+# in this cohort are replay-buffer resume and the added diagnostics below.
 ADVANTAGE_ESTIMATOR=grpo
 ENTROPY_COEF=0.00
 KL_LOSS_COEF=0.00
@@ -79,7 +79,8 @@ GLOBAL_BATCH_SIZE=3072
 NUM_STEPS_PER_ROLLOUT=1
 QUEUE_POLICY=queue-recycle
 QUEUE_FACTOR=1
-FULLY_ASYNC_ROLLOUT_CHECKPOINT=1
+USE_REPLAY_BUFFER=1
+REPLAY_BUFFER_TYPE=rollout
 ACTOR_GPUS_PER_NODE=8
 TENSOR_PARALLEL_SIZE=2
 CONTEXT_PARALLEL_SIZE=1
@@ -113,7 +114,7 @@ export ADVANTAGE_ESTIMATOR ENTROPY_COEF KL_LOSS_COEF EPS_CLIP EPS_CLIP_HIGH EPS_
 export RATIO_DENOMINATOR IS_CORRECTION TIS_CLIP TIS_CLIP_LOW USE_OPSM
 export LR MAX_RESPONSE_LEN TRAIN_SEED ROLLOUT_SEED
 export ROLLOUT_BATCH_SIZE N_SAMPLES_PER_PROMPT GLOBAL_BATCH_SIZE NUM_STEPS_PER_ROLLOUT
-export QUEUE_POLICY QUEUE_FACTOR FULLY_ASYNC_ROLLOUT_CHECKPOINT
+export QUEUE_POLICY QUEUE_FACTOR USE_REPLAY_BUFFER REPLAY_BUFFER_TYPE
 export ACTOR_GPUS_PER_NODE TENSOR_PARALLEL_SIZE CONTEXT_PARALLEL_SIZE EXPERT_PARALLEL_SIZE
 export MAX_TOKENS_PER_GPU RECOMPUTE_GRANULARITY OVERLAP_COMM
 export ROLLOUT_NUM_GPUS_PER_ENGINE SGLANG_MEM_FRACTION RM_TYPE
@@ -123,9 +124,9 @@ export LOG_STALENESS_GRADIENT_METRICS LOG_STALENESS_GRADIENT_RATIO_HISTOGRAM
 export SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS
 export DUMP_POLICY_LOSS_DEBUG DUMP_TRAIN_DATA
 
-printf 'Sidecar screening cohort: %s\n' "${RUN_NAMESPACE}"
+printf 'Replay-buffer screening cohort: %s\n' "${RUN_NAMESPACE}"
 printf 'Selected arms: s2-t2r6, s2-t3r5, s4-t2r6 (no colocated rerun)\n'
-printf 'Natural Slurm resume timing is retained; every resume uses replay sidecars.\n'
+printf 'Natural Slurm resume timing is retained; every resume uses the replay buffer.\n'
 printf 'Telemetry: staleness-gradient bins+histograms, standard ESS families, '
 printf 'response weight-version segments, disposition/trajectory dumps.\n\n'
 

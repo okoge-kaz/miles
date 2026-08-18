@@ -141,7 +141,7 @@ if [[ "${TASK_FAMILY}" == search_r1 ]]; then
     : "${SEARCH_TOPK:?}"
     : "${SEARCH_FORMAT_SCORE:?}"
     # These change generated trajectories or rewards. In particular, never
-    # restore a fully-async replay sidecar under different search semantics.
+    # restore a replay buffer under different search semantics.
     # The offline difficulty window is part of DATASET_TAG, not a run-time knob.
     CONFIG_TAG="${CONFIG_TAG}-action${MAX_RESPONSE_LEN}-turns${SEARCH_MAX_TURNS}-topk${SEARCH_TOPK}-fmt${SEARCH_FORMAT_SCORE}"
 fi

@@ -119,7 +119,7 @@ class RayTrainGroup:
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
 
-        if getattr(self.args, "fully_async_rollout_checkpoint", False):
+        if getattr(self.args, "use_replay_buffer", False):
             current_version = await self.rollout_manager.get_current_applied_weight_version.remote()
             await self.restore_weight_version(current_version)
 

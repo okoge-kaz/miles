@@ -10,7 +10,7 @@ recipes:
 - `search_r1_sync/nq-hotpotqa-p10-90/qwen3-4b-instruct-2507`: one-node colocated
   generation and training.
 - `search_r1_async/nq-hotpotqa-p10-90/qwen3-4b-instruct-2507`: one 8-GPU actor node
-  plus one 8-GPU rollout node, with TIS and replay-sidecar resume enabled.
+  plus one 8-GPU rollout node, with TIS and replay-buffer resume enabled.
 
 Both log to the W&B project `async-search-r1` and use the same prompt data,
 retriever, sampling settings, reward, optimizer, and TIS correction defaults.
@@ -38,7 +38,7 @@ experiments/submit_training.sh \
 | Sync placement | One 8-GPU colocated node |
 | Async placement | One 8-GPU trainer plus one 8-GPU rollout node, TIS enabled |
 | Async log-probs | Fused actor denominator; no reference forward at KL 0; behavior log-probs retained for TIS/alignment |
-| Async resume | Replay sidecar is mandatory |
+| Async resume | Replay buffer (type `rollout`) is mandatory |
 | Protocol | Existing think/search/information/answer text tags; no tokenizer resize |
 | B300 | CUDA 13 image is a compatibility candidate; target-cluster `sm_103` smoke still required |
 
@@ -222,7 +222,7 @@ only when imports are missing.
 An arbitrary non-Slurm or non-Pyxis cluster is not turnkey yet. It needs a
 launcher adapter that preserves `/root/miles`, `/data`, and `/ckpt` mounts, Ray
 head/worker discovery, the retriever port, one-node sync vs. two-node async GPU
-placement, and durable shared storage for the replay sidecar. Before a long run,
+placement, and durable shared storage for the replay buffer. Before a long run,
 perform a one-update smoke and verify the retriever's real `/retrieve` probe,
 valid tagged actions, non-empty search observations, W&B project, checkpoint,
-and sidecar restore.
+and replay-buffer restore.

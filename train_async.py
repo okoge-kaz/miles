@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 # The framework supports other asynchronous approaches such as fully async (see miles/rollout/fully_async_rollout.py).
 async def train(args):
     assert not args.colocate, "Colocation is not supported for async training."
-    fully_async_checkpoint = getattr(args, "fully_async_rollout_checkpoint", False)
+    use_replay_buffer = getattr(args, "use_replay_buffer", False)
     validate_async_off_policy_correction(args)
     configure_logger(args, source=MainProcessIdentity())
     maybe_start_periodic_pyspy_dump()
@@ -107,10 +107,10 @@ async def train(args):
                 rollout_id,
                 actor_trained=actor_trained,
             )
-        if fully_async_checkpoint:
+        if use_replay_buffer:
             await rollout_manager.acknowledge_trained_batch.remote(
                 rollout_id,
-                rollout_data_curr_ref.get("fully_async_batch_token"),
+                rollout_data_curr_ref.get("replay_buffer_batch_token"),
             )
         remove_rollout_data_refs(args, rollout_data_curr_ref)
 
@@ -124,7 +124,7 @@ async def train(args):
             external_save=external_save,
         )
         if write_dist or write_hf:
-            if write_dist and fully_async_checkpoint and rollout_data_next_future is not None:
+            if write_dist and use_replay_buffer and rollout_data_next_future is not None:
                 # Failure-free execution finishes this prefetched batch before
                 # the weight push below. Finish it before the snapshot as well,
                 # so resume restores one complete, already-admitted batch rather
@@ -133,14 +133,14 @@ async def train(args):
             force_sync = (
                 external_save
                 or rollout_id == args.num_rollout - 1
-                # The model tracker is the full-replay commit record. Megatron's
-                # async save can return before publishing it; pruning sidecars at
+                # The model tracker is the replay-buffer commit record. Megatron's
+                # async save can return before publishing it; pruning replay buffers at
                 # that point could remove the state named by the old tracker.
-                or (write_dist and fully_async_checkpoint)
+                or (write_dist and use_replay_buffer)
             )
-            # The model tracker is the commit record. Publish the matching rollout
-            # sidecar first so a visible model checkpoint can never lack replay state.
-            if write_dist and fully_async_checkpoint:
+            # The model tracker is the commit record. Publish the matching replay
+            # buffer first so a visible model checkpoint can never lack replay state.
+            if write_dist and use_replay_buffer:
                 await rollout_manager.save.remote(rollout_id)
             await save_training_model(actor_model, rollout_id, force_sync, write_dist=write_dist, write_hf=write_hf)
             if args.use_critic:
@@ -148,8 +148,8 @@ async def train(args):
                     critic_model, rollout_id, force_sync, write_dist=write_dist, write_hf=write_hf
                 )
             if write_dist:
-                if fully_async_checkpoint:
-                    await rollout_manager.mark_checkpoint_published.remote(rollout_id)
+                if use_replay_buffer:
+                    await rollout_manager.mark_replay_buffer_committed.remote(rollout_id)
                 else:
                     # Preserve the legacy cursor-only checkpoint order.
                     await rollout_manager.save.remote(rollout_id)

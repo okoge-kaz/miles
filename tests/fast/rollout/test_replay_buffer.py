@@ -16,24 +16,24 @@ import numpy as np
 import pytest
 import torch
 
-import miles.rollout.fully_async_checkpoint as checkpoint_module
-import miles.rollout.fully_async_checkpoint_codec as codec_module
 import miles.rollout.fully_async_rollout as fully_async
+import miles.rollout.replay_buffer as replay_buffer_module
+import miles.rollout.replay_buffer_codec as codec_module
 from miles.rollout.base_types import RolloutFnConstructorInput, RolloutFnTrainInput
-from miles.rollout.fully_async_checkpoint import (
-    checkpoint_path,
+from miles.rollout.replay_buffer import (
     dataset_fingerprint,
     decode_group,
-    ensure_no_full_replay_sidecar,
-    load_checkpoint,
-    prune_checkpoints,
-    save_checkpoint,
+    ensure_no_replay_buffer,
+    load_replay_buffer,
+    prune_replay_buffers,
+    replay_buffer_path,
+    save_replay_buffer,
 )
-from miles.rollout.fully_async_checkpoint_codec import (
+from miles.rollout.replay_buffer_codec import (
     SAMPLE_CODEC_STATE_KEY,
-    CheckpointPackedFieldCache,
-    CheckpointSampleEncoder,
-    materialize_checkpoint_state,
+    ReplayBufferPackedFieldCache,
+    ReplayBufferSampleEncoder,
+    materialize_replay_buffer_state,
 )
 from miles.utils.types import Sample
 
@@ -42,6 +42,10 @@ class _GenerateState:
     def __init__(self, args):
         self.args = args
         self.sampling_params = {}
+        self.aborted = False
+
+    def reset(self) -> None:
+        self.aborted = False
 
 
 class _DataSource:
@@ -96,7 +100,8 @@ def _args(**overrides) -> Namespace:
         "sglang_router_ip": "127.0.0.1",
         "sglang_router_port": 30000,
         "staleness_reference": "completion",
-        "fully_async_rollout_checkpoint": True,
+        "use_replay_buffer": True,
+        "replay_buffer_type": "rollout",
         "prompt_data": None,
         "data_source_path": "miles.rollout.data_source.RolloutDataSourceWithBuffer",
     }
@@ -160,6 +165,18 @@ def _ready_item(group_id: int, version: int = 5) -> tuple[list[Sample], list[Sam
     return prompt_group, _complete(copy.deepcopy(prompt_group), version)
 
 
+def _partial_item(group_id: int) -> fully_async._InflightReplayItem:
+    prompt_group = _prompt_group(group_id)
+    generation_group = copy.deepcopy(prompt_group)
+    for sample in generation_group:
+        sample.tokens = [100, sample.index]
+        sample.response = "partial"
+        sample.response_length = 1
+        sample.rollout_log_probs = [-0.25]
+        sample.status = Sample.Status.ABORTED
+    return fully_async._InflightReplayItem(prompt_group, generation_group)
+
+
 @pytest.mark.parametrize("policy", ["queue-recycle", "queue-max", "queue-drop"])
 async def test_ready_queue_restores_in_policy_storage(monkeypatch, policy):
     args = _queue_args(policy, rollout_batch_size=1, fully_async_queue_factor=2 if policy == "queue-drop" else 1)
@@ -175,9 +192,9 @@ async def test_ready_queue_restores_in_policy_storage(monkeypatch, policy):
         original._policy_output_ready = asyncio.Event()
         original._policy_output_ready.set()
 
-    state = await original.checkpoint_state(0)
+    state = await original.replay_buffer_state(0)
     restored = _make_fn(monkeypatch, args, _DataSource(), lambda *args, **kwargs: None)
-    await restored.restore_checkpoint_state(state)
+    await restored.restore_replay_buffer_state(state)
 
     if policy == "queue-recycle":
         restored_items = list(restored._output._queue)
@@ -187,21 +204,21 @@ async def test_ready_queue_restores_in_policy_storage(monkeypatch, policy):
         assert restored._output is None
         assert restored._policy_output_ready.is_set()
     assert [item[0][0].group_index for item in restored_items] == [1, 2]
-    assert restored._resume_metrics["resume/fully_async/ready_groups_restored"] == 2
+    assert restored._resume_metrics["resume/replay_buffer/ready_groups_restored"] == 2
 
 
-async def test_checkpoint_rejects_cross_policy_and_capacity_restore(monkeypatch):
+async def test_replay_buffer_rejects_cross_policy_and_capacity_restore(monkeypatch):
     recycle = _make_fn(
         monkeypatch,
         _queue_args("queue-recycle"),
         _DataSource(),
         lambda *args, **kwargs: None,
     )
-    recycle_state = await recycle.checkpoint_state(0)
+    recycle_state = await recycle.replay_buffer_state(0)
 
     queue_max = _make_fn(monkeypatch, _queue_args("queue-max"), _DataSource(), lambda *args, **kwargs: None)
     with pytest.raises(RuntimeError, match="queue configuration"):
-        await queue_max.restore_checkpoint_state(recycle_state)
+        await queue_max.restore_replay_buffer_state(recycle_state)
 
     legacy_state = copy.deepcopy(recycle_state)
     del legacy_state["queue_config"]
@@ -211,7 +228,7 @@ async def test_checkpoint_rejects_cross_policy_and_capacity_restore(monkeypatch)
         _DataSource(),
         lambda *args, **kwargs: None,
     )
-    await restored_recycle.restore_checkpoint_state(legacy_state)
+    await restored_recycle.restore_replay_buffer_state(legacy_state)
 
     queue_drop = _make_fn(
         monkeypatch,
@@ -219,7 +236,7 @@ async def test_checkpoint_rejects_cross_policy_and_capacity_restore(monkeypatch)
         _DataSource(),
         lambda *args, **kwargs: None,
     )
-    drop_state = await queue_drop.checkpoint_state(0)
+    drop_state = await queue_drop.replay_buffer_state(0)
     different_capacity = _make_fn(
         monkeypatch,
         _queue_args("queue-drop", fully_async_queue_factor=2),
@@ -227,7 +244,7 @@ async def test_checkpoint_rejects_cross_policy_and_capacity_restore(monkeypatch)
         lambda *args, **kwargs: None,
     )
     with pytest.raises(RuntimeError, match="queue configuration"):
-        await different_capacity.restore_checkpoint_state(drop_state)
+        await different_capacity.restore_replay_buffer_state(drop_state)
 
 
 async def test_queue_drop_snapshot_applies_waiting_completion_evictions(monkeypatch):
@@ -263,8 +280,8 @@ async def test_queue_drop_snapshot_applies_waiting_completion_evictions(monkeypa
                 depth_after=depth_before + 1,
             )
 
-    state = await original.checkpoint_state(0)
-    materialized = materialize_checkpoint_state(state)
+    state = await original.replay_buffer_state(0)
+    materialized = materialize_replay_buffer_state(state)
     ready_items = [fully_async._decode_ready_item(item) for item in materialized["ready_items"]]
     pending_ids = [fully_async.prompt_group_id(decode_group(group)) for group in materialized["pending_prompts"]]
     telemetry = state["queue_telemetry"]
@@ -280,7 +297,7 @@ async def test_queue_drop_snapshot_applies_waiting_completion_evictions(monkeypa
     assert {record["group_index"] for record in telemetry["lifecycle"]["live_records"].values()} == {3, 4}
 
     restored = _make_fn(monkeypatch, args, _DataSource(), lambda *args, **kwargs: None)
-    await restored.restore_checkpoint_state(state)
+    await restored.restore_replay_buffer_state(state)
     assert [item[0][0].group_index for item in restored._policy_output] == [3, 4]
     assert set(restored._pending_prompts) == {3, 4}
     assert restored._queue_evicted_groups == 2
@@ -317,23 +334,23 @@ async def test_prepared_batch_is_a_warm_resume_hit_and_active_prompt_is_regenera
     original = _make_fn(monkeypatch, args, source, generate)
     output = await original(RolloutFnTrainInput(rollout_id=0))
     await _wait_until(lambda: any(group_id == 2 for group_id in original._pending_prompts))
-    state = await original.checkpoint_state(0)
+    state = await original.replay_buffer_state(0)
     await _stop(original)
 
     invalid = _make_fn(monkeypatch, args, _DataSource(), generate)
     invalid_state = copy.deepcopy(state)
     invalid_state["prepared_batches"][0]["group_ids"] = [999]
     with pytest.raises(RuntimeError, match="does not match stored group"):
-        await invalid.restore_checkpoint_state(invalid_state)
+        await invalid.restore_replay_buffer_state(invalid_state)
 
     restored_source = _DataSource()
     restored = _make_fn(monkeypatch, args, restored_source, generate)
-    await restored.restore_checkpoint_state(state)
+    await restored.restore_replay_buffer_state(state)
 
     warm_output = await restored(RolloutFnTrainInput(rollout_id=0))
     assert warm_output.samples[0][0].index == output.samples[0][0].index
     assert warm_output.debug_metadata == output.debug_metadata
-    assert warm_output.metrics["resume/fully_async/warm_prepared_batch_hit"] == 1
+    assert warm_output.metrics["resume/replay_buffer/warm_prepared_batch_hit"] == 1
     assert restored._worker is None
     assert [group[0].group_index for group in restored_source.buffer] == [2]
 
@@ -347,6 +364,258 @@ async def test_prepared_batch_is_a_warm_resume_hit_and_active_prompt_is_regenera
         await restored.acknowledge_trained_batch(0, "wrong-after-commit")
     assert 1 not in restored._pending_prompts
     assert 2 in restored._pending_prompts
+
+
+async def test_inflight_buffer_restores_partial_tokens_and_continues_generation(monkeypatch, tmp_path):
+    interrupted = asyncio.Event()
+    first_generation_started = asyncio.Event()
+
+    async def abort_requests(_args):
+        interrupted.set()
+
+    async def generate(state, group, sampling_params, evaluation=False):
+        if any(sample.response_length > 0 for sample in group):
+            for sample in group:
+                if sample.status == Sample.Status.COMPLETED:
+                    continue
+                assert sample.tokens == [100, sample.index]
+                assert sample.response == "partial"
+                assert sample.rollout_log_probs == [-0.25]
+                sample.tokens.append(200 + sample.index)
+                sample.response += "-done"
+                sample.response_length += 1
+                sample.rollout_log_probs.append(-0.5)
+                sample.reward = 1.0
+                sample.status = Sample.Status.COMPLETED
+            return group
+
+        first_generation_started.set()
+        await interrupted.wait()
+        for sample in group:
+            sample.tokens = [100, sample.index]
+            sample.response = "partial"
+            sample.response_length = 1
+            sample.rollout_log_probs = [-0.25]
+            sample.status = Sample.Status.ABORTED
+        return group
+
+    monkeypatch.setattr(fully_async, "_abort_inflight_requests", abort_requests)
+    args = _args(replay_buffer_type="inflight")
+    original = _make_fn(monkeypatch, args, _DataSource([_prompt_group(1)]), generate)
+    original._ensure_worker()
+    await first_generation_started.wait()
+
+    state = await original.replay_buffer_state(0)
+    path, _ = save_replay_buffer(tmp_path, 0, state)
+    assert path.name == "replay_buffer_0.pt"
+    state = load_replay_buffer(
+        tmp_path,
+        0,
+        expected_fingerprint=original.replay_buffer_dataset_fingerprint(),
+    )
+    materialized = materialize_replay_buffer_state(state)
+    [inflight] = materialized["inflight_items"]
+    assert [sample["tokens"] for sample in inflight["generation_group"]] == [[100, 10], [100, 11]]
+    assert [sample["response"] for sample in inflight["generation_group"]] == ["partial", "partial"]
+    assert materialized["snapshot_counts"]["inflight_groups"] == 1
+    assert materialized["snapshot_counts"]["inflight_response_tokens"] == 2
+    assert all("kv_cache" not in str(key) for key in materialized)
+    await _stop(original)
+
+    restored_source = _DataSource()
+    restored = _make_fn(monkeypatch, args, restored_source, generate)
+    await restored.restore_replay_buffer_state(state)
+    restored._weight_version = _Version(9)
+    restored.commit_applied_weight_version(9)
+    output = await restored(RolloutFnTrainInput(rollout_id=0))
+
+    samples = output.samples[0]
+    assert [sample.tokens for sample in samples] == [[100, 10, 210], [100, 11, 211]]
+    assert [sample.response for sample in samples] == ["partial-done", "partial-done"]
+    assert [sample.rollout_log_probs for sample in samples] == [[-0.25, -0.5], [-0.25, -0.5]]
+    assert restored_source.buffer == []
+    assert {sample.metadata[fully_async.SUBMISSION_VERSION_KEY] for sample in samples} == {5}
+    assert {sample.metadata[fully_async.TRAJECTORY_START_VERSION_KEY] for sample in samples} == {5}
+    assert output.metrics["resume/replay_buffer/inflight_groups_restored"] == 1
+    assert output.metrics["resume/replay_buffer/inflight_tokens_restored"] == 2
+    await _stop(restored)
+
+
+async def test_inflight_capture_treats_unstarted_pending_group_as_unfinished(monkeypatch):
+    interrupted = asyncio.Event()
+    generation_started = asyncio.Event()
+
+    async def abort_requests(_args):
+        interrupted.set()
+
+    async def generate(state, group, sampling_params, evaluation=False):
+        generation_started.set()
+        await interrupted.wait()
+        return group
+
+    monkeypatch.setattr(fully_async, "_abort_inflight_requests", abort_requests)
+    fn = _make_fn(
+        monkeypatch,
+        _args(replay_buffer_type="inflight"),
+        _DataSource([_prompt_group(1)]),
+        generate,
+    )
+    fn._ensure_worker()
+    await generation_started.wait()
+
+    state = materialize_replay_buffer_state(await fn.replay_buffer_state(0))
+
+    [inflight] = state["inflight_items"]
+    assert {sample["status"] for sample in inflight["generation_group"]} == {"pending"}
+    assert state["snapshot_counts"]["inflight_groups"] == 1
+    await _stop(fn)
+
+
+async def test_inflight_recapture_keeps_original_prompt_lease_order(monkeypatch):
+    fn = _make_fn(
+        monkeypatch,
+        _args(replay_buffer_type="inflight"),
+        _DataSource(),
+        lambda *args, **kwargs: None,
+    )
+    first = _partial_item(1)
+    second = _partial_item(2)
+    fn._pending_prompts = {1: first.prompt_group, 2: second.prompt_group}
+    fn._inflight_replay = deque([second])
+
+    async def completed_first():
+        return first.prompt_group, first.generation_group
+
+    task = asyncio.create_task(completed_first())
+    await task
+    fn._active.add(task)
+
+    await fn._materialize_active_inflight_requests()
+
+    assert [fully_async.prompt_group_id(item.prompt_group) for item in fn._inflight_replay] == [1, 2]
+
+
+async def test_inflight_capture_preserves_terminal_group_awaiting_reward(monkeypatch):
+    fn = _make_fn(
+        monkeypatch,
+        _args(replay_buffer_type="inflight"),
+        _DataSource(),
+        lambda *args, **kwargs: None,
+    )
+    prompt_group = _prompt_group(1)
+    generation_group = copy.deepcopy(prompt_group)
+    for sample in generation_group:
+        sample.response = "complete response"
+        sample.response_length = 1
+        sample.status = Sample.Status.COMPLETED
+        sample.reward = None
+    fn._pending_prompts = {1: prompt_group}
+
+    async def completed_without_group_reward():
+        return prompt_group, generation_group
+
+    task = asyncio.create_task(completed_without_group_reward())
+    await task
+    fn._active.add(task)
+
+    await fn._materialize_active_inflight_requests()
+
+    [item] = fn._inflight_replay
+    assert fully_async.prompt_group_id(item.prompt_group) == 1
+    assert all(sample.status == Sample.Status.COMPLETED for sample in item.generation_group)
+    assert all(sample.reward is None for sample in item.generation_group)
+
+
+def test_inflight_continuation_preserves_completed_sibling_timing():
+    completed, partial = _prompt_group(1)
+    completed.status = Sample.Status.COMPLETED
+    completed.reward = 1.0
+    completed.response_length = 1
+    completed.metadata = {
+        fully_async.SUBMISSION_VERSION_KEY: 3,
+        fully_async.TRAJECTORY_START_VERSION_KEY: 3,
+        fully_async.TRAJECTORY_START_TIME_KEY: 10.0,
+        fully_async.SAMPLE_GENERATION_COMPLETE_VERSION_KEY: 4,
+        fully_async.SAMPLE_GENERATION_COMPLETE_TIME_KEY: 12.0,
+        fully_async.ATTEMPT_WALL_SECONDS_KEY: 2.0,
+        fully_async.REWARD_SECONDS_KEY: 0.25,
+    }
+    partial.status = Sample.Status.ABORTED
+    partial.response_length = 1
+    partial.metadata = {
+        fully_async.SUBMISSION_VERSION_KEY: 3,
+        fully_async.TRAJECTORY_START_VERSION_KEY: 3,
+        fully_async.TRAJECTORY_START_TIME_KEY: 10.0,
+    }
+
+    preserved = fully_async._prepare_generation_attempt(
+        [completed, partial],
+        continuation=True,
+    )
+    fully_async.stamp_attempt_wall_seconds([completed, partial], 5.0)
+    fully_async._restore_continuation_metadata([completed, partial], preserved)
+
+    assert completed.metadata[fully_async.ATTEMPT_WALL_SECONDS_KEY] == 2.0
+    assert completed.metadata[fully_async.REWARD_SECONDS_KEY] == 0.25
+    assert partial.metadata[fully_async.ATTEMPT_WALL_SECONDS_KEY] == 5.0
+
+
+async def test_failed_inflight_capture_restarts_the_worker(monkeypatch):
+    generation_started = asyncio.Event()
+    release_generation = asyncio.Event()
+
+    async def generate(state, group, sampling_params, evaluation=False):
+        generation_started.set()
+        await release_generation.wait()
+        return _complete(group, 5)
+
+    async def fail_abort(_args):
+        raise RuntimeError("abort failed")
+
+    monkeypatch.setattr(fully_async, "_abort_inflight_requests", fail_abort)
+    fn = _make_fn(
+        monkeypatch,
+        _args(replay_buffer_type="inflight"),
+        _DataSource([_prompt_group(1)]),
+        generate,
+    )
+    fn._ensure_worker()
+    await generation_started.wait()
+
+    with pytest.raises(RuntimeError, match="abort failed"):
+        await fn.replay_buffer_state(0)
+
+    assert fn._worker is not None
+    assert not fn.state.aborted
+    release_generation.set()
+    await _wait_until(lambda: fn._queue_size() == 1)
+    await _stop(fn)
+
+
+async def test_restore_rejects_a_different_replay_buffer_type(monkeypatch):
+    rollout = _make_fn(monkeypatch, _args(), _DataSource(), lambda *args, **kwargs: None)
+    state = await rollout.replay_buffer_state(0)
+    inflight = _make_fn(
+        monkeypatch,
+        _args(replay_buffer_type="inflight"),
+        _DataSource(),
+        lambda *args, **kwargs: None,
+    )
+
+    with pytest.raises(RuntimeError, match="type does not match"):
+        await inflight.restore_replay_buffer_state(state)
+
+
+async def test_replay_buffer_state_requires_opt_in(monkeypatch):
+    fn = _make_fn(
+        monkeypatch,
+        _args(use_replay_buffer=False),
+        _DataSource(),
+        lambda *args, **kwargs: None,
+    )
+
+    with pytest.raises(RuntimeError, match="disabled"):
+        await fn.replay_buffer_state(0)
 
 
 async def test_regenerated_prompt_does_not_alias_pending_lease(monkeypatch):
@@ -367,14 +636,14 @@ async def test_regenerated_prompt_does_not_alias_pending_lease(monkeypatch):
     original = _make_fn(monkeypatch, args, source, generate)
     original._ensure_worker()
     await mutated.wait()
-    state = await original.checkpoint_state(0)
+    state = await original.replay_buffer_state(0)
     await _stop(original)
     mutated.clear()
     generated_groups.clear()
 
     restored_source = _DataSource()
     restored = _make_fn(monkeypatch, args, restored_source, generate)
-    await restored.restore_checkpoint_state(state)
+    await restored.restore_replay_buffer_state(state)
     restored._ensure_worker()
     await mutated.wait()
 
@@ -447,7 +716,7 @@ async def test_ready_group_rechecks_staleness_after_resume(monkeypatch):
     original = _make_fn(monkeypatch, args, _DataSource([_prompt_group(1), _prompt_group(2)]), first_generate)
     original._ensure_worker()
     await _wait_until(lambda: original._output.qsize() == 1 and len(original._active) == 1)
-    state = await original.checkpoint_state(0)
+    state = await original.replay_buffer_state(0)
     await _stop(original)
 
     async def resumed_generate(state, group, sampling_params, evaluation=False):
@@ -457,14 +726,14 @@ async def test_ready_group_rechecks_staleness_after_resume(monkeypatch):
 
     restored_source = _DataSource()
     restored = _make_fn(monkeypatch, args, restored_source, resumed_generate)
-    await restored.restore_checkpoint_state(state)
+    await restored.restore_replay_buffer_state(state)
     restored._weight_version = _Version(6)
     restored.commit_applied_weight_version(6)
 
     output = await restored(RolloutFnTrainInput(rollout_id=0))
     assert output.samples[0][0].group_index != 1
     assert output.metrics["rollout/fully_async/stale_groups_recycled"] == 1
-    assert output.metrics["resume/fully_async/ready_groups_restored"] == 1
+    assert output.metrics["resume/replay_buffer/ready_groups_restored"] == 1
     await _stop(restored)
 
 
@@ -486,7 +755,7 @@ async def test_queue_max_ready_group_rechecks_prefill_staleness_after_resume(mon
     original = _make_fn(monkeypatch, args, _DataSource([_prompt_group(1), _prompt_group(2)]), first_generate)
     original._ensure_worker()
     await _wait_until(lambda: len(original._policy_output) == 1 and len(original._active) == 1)
-    state = await original.checkpoint_state(0)
+    state = await original.replay_buffer_state(0)
     await _stop(original)
 
     async def resumed_generate(state, group, sampling_params, evaluation=False):
@@ -499,7 +768,7 @@ async def test_queue_max_ready_group_rechecks_prefill_staleness_after_resume(mon
         return result
 
     restored = _make_fn(monkeypatch, args, _DataSource(), resumed_generate)
-    await restored.restore_checkpoint_state(state)
+    await restored.restore_replay_buffer_state(state)
     restored._weight_version = _Version(6)
     restored.commit_applied_weight_version(6)
 
@@ -507,7 +776,7 @@ async def test_queue_max_ready_group_rechecks_prefill_staleness_after_resume(mon
     assert output.samples[0][0].group_index == 2
     assert output.metrics["rollout/fully_async/stale_groups_dropped"] == 1
     assert output.metrics["rollout/fully_async/stale_groups_recycled"] == 0
-    assert output.metrics["resume/fully_async/ready_groups_restored"] == 1
+    assert output.metrics["resume/replay_buffer/ready_groups_restored"] == 1
     await _stop(restored)
 
 
@@ -523,7 +792,7 @@ async def test_partial_drain_keeps_already_admitted_group_after_resume(monkeypat
     original = _make_fn(monkeypatch, args, _DataSource([_prompt_group(1), _prompt_group(2)]), first_generate)
     drain = asyncio.create_task(original(RolloutFnTrainInput(rollout_id=0)))
     await _wait_until(lambda: len(original._drain_progress.get(0, fully_async._DrainProgress(0)).data) == 1)
-    state = await original.checkpoint_state(0)
+    state = await original.replay_buffer_state(0)
     drain.cancel()
     await asyncio.gather(drain, return_exceptions=True)
     await _stop(original)
@@ -535,14 +804,14 @@ async def test_partial_drain_keeps_already_admitted_group_after_resume(monkeypat
 
     restored_source = _DataSource()
     restored = _make_fn(monkeypatch, args, restored_source, resumed_generate)
-    await restored.restore_checkpoint_state(state)
+    await restored.restore_replay_buffer_state(state)
     restored._weight_version = _Version(6)
     restored.commit_applied_weight_version(6)
 
     output = await restored(RolloutFnTrainInput(rollout_id=0))
     assert {group[0].group_index for group in output.samples} == {1, 2}
     assert output.metrics["rollout/fully_async/stale_groups_recycled"] == 0
-    assert output.metrics["resume/fully_async/partial_drains_restored"] == 1
+    assert output.metrics["resume/replay_buffer/partial_drains_restored"] == 1
     await _stop(restored)
 
 
@@ -568,11 +837,11 @@ async def test_queue_handoff_and_finished_active_task_are_not_downgraded_to_prom
     await finished
     fn._active.add(finished)
 
-    state = await fn.checkpoint_state(0)
+    state = await fn.replay_buffer_state(0)
     assert len(state["ready_items"]) == 2
     assert state["snapshot_counts"]["claimed_groups"] == 1
     assert state["snapshot_counts"]["finished_active_groups"] == 1
-    for ready_state in materialize_checkpoint_state(state)["ready_items"]:
+    for ready_state in materialize_replay_buffer_state(state)["ready_items"]:
         _, result = fully_async._decode_ready_item(ready_state)
         assert fully_async.group_lifecycle_weight_version(result, fully_async.QUEUE_PUT_VERSION_KEY) == 5
 
@@ -596,10 +865,10 @@ def test_packed_sample_codec_is_lossless_and_restores_independent_samples():
     sample.dynamic_attribute = {"preserved": True}
     sample.validate()
 
-    encoder = CheckpointSampleEncoder()
+    encoder = ReplayBufferSampleEncoder()
     group_state = encoder.encode_group([sample, [sample]])
     state = _codec_state(group_state, encoder.finish())
-    materialized = materialize_checkpoint_state(state)
+    materialized = materialize_replay_buffer_state(state)
     flat_state, nested_states = materialized["pending_prompts"][0]
 
     assert len(state[SAMPLE_CODEC_STATE_KEY]["records"]) == 1
@@ -626,9 +895,9 @@ def test_packed_sample_codec_is_lossless_and_restores_independent_samples():
 
 def test_packed_sample_codec_falls_back_without_changing_unsupported_element_types():
     sample = Sample(tokens=[2**40], loss_mask=[True], rollout_log_probs=[np.float32(1.5)])
-    encoder = CheckpointSampleEncoder()
+    encoder = ReplayBufferSampleEncoder()
     group_state = encoder.encode_group([sample])
-    materialized = materialize_checkpoint_state(_codec_state(group_state, encoder.finish()))
+    materialized = materialize_replay_buffer_state(_codec_state(group_state, encoder.finish()))
     [sample_state] = materialized["pending_prompts"][0]
 
     assert sample_state["tokens"] == [2**40]
@@ -640,12 +909,12 @@ def test_packed_sample_codec_falls_back_without_changing_unsupported_element_typ
 
 def test_packed_sample_codec_applies_queue_overlay_without_mutating_or_aliasing_source():
     sample = Sample(group_index=1, index=2, metadata={"source": 1})
-    encoder = CheckpointSampleEncoder()
+    encoder = ReplayBufferSampleEncoder()
     prompt_state = encoder.encode_group([sample])
     result_state = encoder.encode_group([sample], metadata_updates={fully_async.QUEUE_PUT_VERSION_KEY: 9})
     state = _codec_state(prompt_state, encoder.finish())
     state["ready_items"] = [{"prompt_group": prompt_state, "result": result_state}]
-    materialized = materialize_checkpoint_state(state)
+    materialized = materialize_replay_buffer_state(state)
     [prompt] = materialized["ready_items"][0]["prompt_group"]
     [result] = materialized["ready_items"][0]["result"]
 
@@ -663,16 +932,16 @@ def test_prepacked_sample_cache_is_lossless_and_reassigned_fields_fall_back():
         loss_mask=[1, 0, 1],
         rollout_log_probs=[-0.0, -1.25, float("nan")],
     )
-    cache = CheckpointPackedFieldCache()
+    cache = ReplayBufferPackedFieldCache()
     cache.cache_group([sample])
     assert cache.stats()["live_packed_bytes"] == 3 * (4 + 1 + 8) + len(sample.response.encode("utf-8"))
 
     sample.tokens = [4, 5, 6, 7]
     sample.loss_mask = []
     sample.teacher_log_probs = (-2.0, -3.0)
-    encoder = CheckpointSampleEncoder(cache)
+    encoder = ReplayBufferSampleEncoder(cache)
     group_state = encoder.encode_group([sample], use_packed_cache=True)
-    materialized = materialize_checkpoint_state(_codec_state(group_state, encoder.finish()))
+    materialized = materialize_replay_buffer_state(_codec_state(group_state, encoder.finish()))
     [sample_state] = materialized["pending_prompts"][0]
 
     assert sample_state["tokens"] == sample.tokens
@@ -690,17 +959,17 @@ def test_prepacked_group_uses_one_tensor_and_current_lifecycle_metadata():
         Sample(tokens=[1, 2], rollout_log_probs=[-1.0, -2.0], metadata={"version": 1}),
         Sample(tokens=[3, 4, 5], rollout_log_probs=[-3.0, -4.0, -5.0], metadata={"version": 1}),
     ]
-    cache = CheckpointPackedFieldCache()
+    cache = ReplayBufferPackedFieldCache()
     cache.cache_group(samples)
     samples[0].metadata["version"] = 2
 
-    encoder = CheckpointSampleEncoder(cache)
+    encoder = ReplayBufferSampleEncoder(cache)
     group_state = encoder.encode_group(samples, use_packed_cache=True)
     codec = encoder.finish()
 
     assert len(codec["arrays"]["tokens"]) == 1
     assert codec["arrays"]["tokens"][0].tolist() == [1, 2, 3, 4, 5]
-    materialized = materialize_checkpoint_state(_codec_state(group_state, codec))
+    materialized = materialize_replay_buffer_state(_codec_state(group_state, codec))
     first, second = materialized["pending_prompts"][0]
     assert first["tokens"] == samples[0].tokens
     assert second["tokens"] == samples[1].tokens
@@ -708,30 +977,30 @@ def test_prepacked_group_uses_one_tensor_and_current_lifecycle_metadata():
     assert second["metadata"] == {"version": 1}
 
 
-async def test_checkpoint_capture_restores_gc_after_failure(monkeypatch):
+async def test_replay_buffer_capture_restores_gc_after_failure(monkeypatch):
     fn = _make_fn(monkeypatch, _args(), _DataSource(), lambda *args, **kwargs: None)
 
     def fail(_rollout_id):
         assert not gc.isenabled()
         raise RuntimeError("capture failed")
 
-    monkeypatch.setattr(fn, "_capture_checkpoint_state", fail)
+    monkeypatch.setattr(fn, "_capture_replay_buffer_state", fail)
     was_enabled = gc.isenabled()
     with pytest.raises(RuntimeError, match="capture failed"):
-        await fn.checkpoint_state(1)
+        await fn.replay_buffer_state(1)
     assert gc.isenabled() == was_enabled
 
 
 def test_packed_sample_codec_spans_multiple_tensor_shards(monkeypatch):
     monkeypatch.setattr(codec_module, "ARRAY_SHARD_BYTES", 16)
     sample = Sample(tokens=list(range(11)), rollout_log_probs=[-float(index) for index in range(11)])
-    encoder = CheckpointSampleEncoder()
+    encoder = ReplayBufferSampleEncoder()
     group_state = encoder.encode_group([sample])
     codec = encoder.finish()
 
     assert [tensor.numel() for tensor in codec["arrays"]["tokens"]] == [4, 4, 3]
     assert [tensor.numel() for tensor in codec["arrays"]["rollout_log_probs"]] == [2, 2, 2, 2, 2, 1]
-    materialized = materialize_checkpoint_state(_codec_state(group_state, codec))
+    materialized = materialize_replay_buffer_state(_codec_state(group_state, codec))
     [sample_state] = materialized["pending_prompts"][0]
     assert sample_state["tokens"] == sample.tokens
     assert sample_state["rollout_log_probs"] == sample.rollout_log_probs
@@ -751,7 +1020,7 @@ def _codec_state(group_state, codec):
     }
 
 
-def test_checkpoint_checksum_fingerprint_and_retention(tmp_path: Path):
+def test_replay_buffer_checksum_fingerprint_and_retention(tmp_path: Path):
     state = {
         "dataset_fingerprint": "dataset-a",
         "data_source": {},
@@ -763,49 +1032,70 @@ def test_checkpoint_checksum_fingerprint_and_retention(tmp_path: Path):
         "regeneration_group_ids": [],
         "value": [1, 2, 3],
     }
-    with pytest.raises(FileNotFoundError, match="requires fully-async rollout state"):
-        load_checkpoint(tmp_path, 3, expected_fingerprint="dataset-a")
+    with pytest.raises(FileNotFoundError, match="requires replay-buffer state"):
+        load_replay_buffer(tmp_path, 3, expected_fingerprint="dataset-a")
 
-    path, size = save_checkpoint(tmp_path, 4, state)
+    path, size = save_replay_buffer(tmp_path, 4, state)
     assert path.stat().st_size == size
     assert path.stat().st_mode & 0o777 == 0o644
     assert Path(f"{path}.sha256.json").stat().st_mode & 0o777 == 0o644
     manifest = json.loads(Path(f"{path}.sha256.json").read_text(encoding="utf-8"))
     assert manifest["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
-    assert load_checkpoint(tmp_path, 4, expected_fingerprint="dataset-a")["value"] == [1, 2, 3]
-    with pytest.raises(RuntimeError, match="resume with --fully-async-rollout-checkpoint"):
-        ensure_no_full_replay_sidecar(tmp_path, 4)
+    loaded = load_replay_buffer(tmp_path, 4, expected_fingerprint="dataset-a")
+    assert loaded["value"] == [1, 2, 3]
+    assert loaded["rollout_id"] == 4
+    assert "checkpoint_rollout_id" not in loaded
+    with pytest.raises(RuntimeError, match="resume with --use-replay-buffer"):
+        ensure_no_replay_buffer(tmp_path, 4)
 
     with pytest.raises(RuntimeError, match="fingerprint"):
-        load_checkpoint(tmp_path, 4, expected_fingerprint="dataset-b")
+        load_replay_buffer(tmp_path, 4, expected_fingerprint="dataset-b")
 
     path.write_bytes(path.read_bytes() + b"corruption")
     with pytest.raises(RuntimeError, match="checksum mismatch"):
-        load_checkpoint(tmp_path, 4, expected_fingerprint="dataset-a")
+        load_replay_buffer(tmp_path, 4, expected_fingerprint="dataset-a")
 
     for rollout_id in range(5, 9):
-        save_checkpoint(tmp_path, rollout_id, {**state, "value": rollout_id})
-    prune_checkpoints(tmp_path, current_rollout_id=8, keep_last=2, archive_interval=5)
-    assert (tmp_path / "rollout" / "fully_async_state_4.pt").is_file()
-    assert not (tmp_path / "rollout" / "fully_async_state_5.pt").exists()
-    assert not (tmp_path / "rollout" / "fully_async_state_6.pt").exists()
-    assert (tmp_path / "rollout" / "fully_async_state_7.pt").is_file()
-    assert (tmp_path / "rollout" / "fully_async_state_8.pt").is_file()
+        save_replay_buffer(tmp_path, rollout_id, {**state, "value": rollout_id})
+    prune_replay_buffers(tmp_path, current_rollout_id=8, keep_last=2, archive_interval=5)
+    assert (tmp_path / "rollout" / "replay_buffer_4.pt").is_file()
+    assert not (tmp_path / "rollout" / "replay_buffer_5.pt").exists()
+    assert not (tmp_path / "rollout" / "replay_buffer_6.pt").exists()
+    assert (tmp_path / "rollout" / "replay_buffer_7.pt").is_file()
+    assert (tmp_path / "rollout" / "replay_buffer_8.pt").is_file()
 
 
-def test_checkpoint_external_tensor_shards_are_verified_and_pruned(tmp_path: Path, monkeypatch):
+def test_rollout_replay_buffer_rejects_inflight_payload(tmp_path: Path):
+    state = {
+        "dataset_fingerprint": "dataset-a",
+        "data_source": {},
+        "applied_weight_version": 0,
+        "pending_prompts": [],
+        "ready_items": [],
+        "drain_progress": [],
+        "prepared_batches": [],
+        "regeneration_group_ids": [],
+        "replay_buffer_type": "rollout",
+        "inflight_items": [{}],
+    }
+
+    with pytest.raises(RuntimeError, match="cannot contain inflight"):
+        save_replay_buffer(tmp_path, 0, state)
+
+
+def test_replay_buffer_external_tensor_shards_are_verified_and_pruned(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(codec_module, "ARRAY_SHARD_BYTES", 16)
-    monkeypatch.setattr(checkpoint_module, "TENSOR_PART_BYTES", 16)
+    monkeypatch.setattr(replay_buffer_module, "TENSOR_PART_BYTES", 16)
     sample = Sample(
         tokens=list(range(20)),
         response="external response 雪🙂" * 20,
         rollout_log_probs=[-float(index) for index in range(20)],
     )
-    encoder = CheckpointSampleEncoder()
+    encoder = ReplayBufferSampleEncoder()
     group_state = encoder.encode_group([sample])
     state = _codec_state(group_state, encoder.finish())
 
-    path, size = save_checkpoint(tmp_path, 12, state)
+    path, size = save_replay_buffer(tmp_path, 12, state)
     checksum_path = Path(f"{path}.sha256.json")
     manifest = json.loads(checksum_path.read_text(encoding="utf-8"))
     parts_path = path.parent / manifest["parts_directory"]
@@ -816,7 +1106,7 @@ def test_checkpoint_external_tensor_shards_are_verified_and_pruned(tmp_path: Pat
         part_path = parts_path / part["file"]
         assert part_path.stat().st_mode & 0o777 == 0o644
 
-    loaded = load_checkpoint(tmp_path, 12, expected_fingerprint="dataset-a")
+    loaded = load_replay_buffer(tmp_path, 12, expected_fingerprint="dataset-a")
     [sample_state] = loaded["pending_prompts"][0]
     assert sample_state["tokens"] == sample.tokens
     assert sample_state["response"] == sample.response
@@ -825,24 +1115,24 @@ def test_checkpoint_external_tensor_shards_are_verified_and_pruned(tmp_path: Pat
     first_part = parts_path / manifest["parts"][0]["file"]
     first_part.write_bytes(first_part.read_bytes() + b"corruption")
     with pytest.raises(RuntimeError, match="checksum mismatch"):
-        load_checkpoint(tmp_path, 12, expected_fingerprint="dataset-a")
+        load_replay_buffer(tmp_path, 12, expected_fingerprint="dataset-a")
 
-    prune_checkpoints(tmp_path, current_rollout_id=12, keep_last=1, archive_interval=None)
-    save_checkpoint(tmp_path, 13, state)
-    prune_checkpoints(tmp_path, current_rollout_id=13, keep_last=1, archive_interval=None)
+    prune_replay_buffers(tmp_path, current_rollout_id=12, keep_last=1, archive_interval=None)
+    save_replay_buffer(tmp_path, 13, state)
+    prune_replay_buffers(tmp_path, current_rollout_id=13, keep_last=1, archive_interval=None)
     assert not path.exists()
     assert not checksum_path.exists()
     assert not parts_path.exists()
 
 
-def test_checkpoint_preserves_empty_packable_lists(tmp_path: Path):
+def test_replay_buffer_preserves_empty_packable_lists(tmp_path: Path):
     sample = Sample(tokens=[], loss_mask=[], rollout_log_probs=[])
-    encoder = CheckpointSampleEncoder()
+    encoder = ReplayBufferSampleEncoder()
     group_state = encoder.encode_group([sample])
     state = _codec_state(group_state, encoder.finish())
 
-    save_checkpoint(tmp_path, 13, state)
-    loaded = load_checkpoint(tmp_path, 13, expected_fingerprint="dataset-a")
+    save_replay_buffer(tmp_path, 13, state)
+    loaded = load_replay_buffer(tmp_path, 13, expected_fingerprint="dataset-a")
     [sample_state] = loaded["pending_prompts"][0]
 
     assert sample_state["tokens"] == []
@@ -850,59 +1140,63 @@ def test_checkpoint_preserves_empty_packable_lists(tmp_path: Path):
     assert sample_state["rollout_log_probs"] == []
 
 
-def test_checkpoint_tensor_write_failure_publishes_nothing(tmp_path: Path, monkeypatch):
+def test_replay_buffer_tensor_write_failure_publishes_nothing(tmp_path: Path, monkeypatch):
     sample = Sample(tokens=[1, 2, 3], rollout_log_probs=[-1.0, -2.0, -3.0])
-    encoder = CheckpointSampleEncoder()
+    encoder = ReplayBufferSampleEncoder()
     group_state = encoder.encode_group([sample])
     state = _codec_state(group_state, encoder.finish())
 
     def fail(*_args, **_kwargs):
         raise OSError("injected part failure")
 
-    monkeypatch.setattr(checkpoint_module, "_write_tensor_parts", fail)
+    monkeypatch.setattr(replay_buffer_module, "_write_tensor_parts", fail)
     with pytest.raises(OSError, match="injected part failure"):
-        save_checkpoint(tmp_path, 14, state)
+        save_replay_buffer(tmp_path, 14, state)
 
     rollout_dir = tmp_path / "rollout"
     assert list(rollout_dir.iterdir()) == []
 
 
-def test_checkpoint_manifest_write_failure_removes_published_tensor_parts(tmp_path: Path, monkeypatch):
+def test_replay_buffer_manifest_write_failure_removes_published_tensor_parts(tmp_path: Path, monkeypatch):
     sample = Sample(tokens=[1, 2, 3], response="answer", rollout_log_probs=[-1.0, -2.0, -3.0])
-    encoder = CheckpointSampleEncoder()
+    encoder = ReplayBufferSampleEncoder()
     group_state = encoder.encode_group([sample])
     state = _codec_state(group_state, encoder.finish())
 
     def fail(*_args, **_kwargs):
         raise OSError("injected manifest failure")
 
-    monkeypatch.setattr(checkpoint_module, "_write_torch_file", fail)
+    monkeypatch.setattr(replay_buffer_module, "_write_torch_file", fail)
     with pytest.raises(OSError, match="injected manifest failure"):
-        save_checkpoint(tmp_path, 15, state)
+        save_replay_buffer(tmp_path, 15, state)
 
     assert list((tmp_path / "rollout").iterdir()) == []
 
 
-def test_save_checkpoint_does_not_reread_payload_for_checksum(tmp_path: Path, monkeypatch):
-    state = _codec_state([], CheckpointSampleEncoder().finish())
+def test_save_replay_buffer_does_not_reread_payload_for_checksum(tmp_path: Path, monkeypatch):
+    state = _codec_state([], ReplayBufferSampleEncoder().finish())
 
     def fail_if_called(path):
         raise AssertionError(f"save reread payload at {path}")
 
-    monkeypatch.setattr(checkpoint_module, "_file_digest", fail_if_called)
-    path, size = save_checkpoint(tmp_path, 2, state)
+    monkeypatch.setattr(replay_buffer_module, "_file_digest", fail_if_called)
+    path, size = save_replay_buffer(tmp_path, 2, state)
     assert path.stat().st_size == size
 
 
-def test_load_checkpoint_accepts_legacy_schema_one(tmp_path: Path):
+def test_load_replay_buffer_accepts_legacy_schema_one(tmp_path: Path):
     state = {
-        **_codec_state([], CheckpointSampleEncoder().finish()),
+        **_codec_state([], ReplayBufferSampleEncoder().finish()),
         "schema_version": 1,
         "checkpoint_rollout_id": 7,
         "value": "legacy",
+        # Legacy schemas are always rollout buffers, even if a producer wrote
+        # unknown extra fields before schema 4 assigned them semantics.
+        "replay_buffer_type": "inflight",
+        "inflight_items": [{}],
     }
     state.pop(SAMPLE_CODEC_STATE_KEY)
-    path = checkpoint_path(tmp_path, 7)
+    path = tmp_path / "rollout" / "fully_async_state_7.pt"
     path.parent.mkdir(parents=True)
     torch.save(state, path)
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -911,13 +1205,17 @@ def test_load_checkpoint_accepts_legacy_schema_one(tmp_path: Path):
         encoding="utf-8",
     )
 
-    loaded = load_checkpoint(tmp_path, 7, expected_fingerprint="dataset-a")
+    loaded = load_replay_buffer(tmp_path, 7, expected_fingerprint="dataset-a")
     assert loaded["value"] == "legacy"
+    assert loaded["replay_buffer_type"] == "rollout"
+    assert loaded["inflight_items"] == []
+    with pytest.raises(RuntimeError, match="resume with --use-replay-buffer"):
+        ensure_no_replay_buffer(tmp_path, 7)
 
 
-def test_load_checkpoint_accepts_legacy_schema_two_with_monolithic_arrays(tmp_path: Path):
+def test_load_replay_buffer_accepts_legacy_schema_two_with_monolithic_arrays(tmp_path: Path):
     sample = Sample(tokens=[1, 2, 3], rollout_log_probs=[-1.0, -2.0, -3.0])
-    encoder = CheckpointSampleEncoder()
+    encoder = ReplayBufferSampleEncoder()
     group_state = encoder.encode_group([sample])
     codec = encoder.finish()
     codec["version"] = 1
@@ -930,7 +1228,7 @@ def test_load_checkpoint_accepts_legacy_schema_two_with_monolithic_arrays(tmp_pa
         "schema_version": 2,
         "checkpoint_rollout_id": 8,
     }
-    path = checkpoint_path(tmp_path, 8)
+    path = replay_buffer_path(tmp_path, 8)
     path.parent.mkdir(parents=True)
     torch.save(state, path)
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -939,7 +1237,7 @@ def test_load_checkpoint_accepts_legacy_schema_two_with_monolithic_arrays(tmp_pa
         encoding="utf-8",
     )
 
-    loaded = load_checkpoint(tmp_path, 8, expected_fingerprint="dataset-a")
+    loaded = load_replay_buffer(tmp_path, 8, expected_fingerprint="dataset-a")
     [sample_state] = loaded["pending_prompts"][0]
     assert sample_state["tokens"] == sample.tokens
     assert sample_state["rollout_log_probs"] == sample.rollout_log_probs
@@ -980,7 +1278,7 @@ def test_dataset_fingerprint_includes_model_tokenizer_and_chat_template(tmp_path
     assert dataset_fingerprint(args, source) != initial
 
 
-def test_checkpoint_retention_counts_existing_sparse_sidecars(tmp_path: Path):
+def test_replay_buffer_retention_counts_existing_sparse_buffers(tmp_path: Path):
     state = {
         "dataset_fingerprint": "dataset-a",
         "data_source": {},
@@ -992,10 +1290,10 @@ def test_checkpoint_retention_counts_existing_sparse_sidecars(tmp_path: Path):
         "regeneration_group_ids": [],
     }
     for rollout_id in (9, 19, 29):
-        save_checkpoint(tmp_path, rollout_id, state)
+        save_replay_buffer(tmp_path, rollout_id, state)
 
-    prune_checkpoints(tmp_path, current_rollout_id=29, keep_last=2, archive_interval=100)
+    prune_replay_buffers(tmp_path, current_rollout_id=29, keep_last=2, archive_interval=100)
 
-    assert not (tmp_path / "rollout" / "fully_async_state_9.pt").exists()
-    assert (tmp_path / "rollout" / "fully_async_state_19.pt").is_file()
-    assert (tmp_path / "rollout" / "fully_async_state_29.pt").is_file()
+    assert not (tmp_path / "rollout" / "replay_buffer_9.pt").exists()
+    assert (tmp_path / "rollout" / "replay_buffer_19.pt").is_file()
+    assert (tmp_path / "rollout" / "replay_buffer_29.pt").is_file()

@@ -44,7 +44,7 @@ class _RolloutManager:
         self.record_batch_trained = _RemoteMethod(self._record_batch_trained)
         self.acknowledge_trained_batch = _RemoteMethod(self._acknowledge)
         self.save = _RemoteMethod(self._save)
-        self.mark_checkpoint_published = _RemoteMethod(self._mark_published)
+        self.mark_replay_buffer_committed = _RemoteMethod(self._mark_committed)
         self.eval = _RemoteMethod(lambda rollout_id: None)
         self.dispose = _RemoteMethod(self._dispose)
 
@@ -54,7 +54,7 @@ class _RolloutManager:
         return {
             "sample_indices": [rollout_id],
             "data_ref": object(),
-            "fully_async_batch_token": f"token-{rollout_id}",
+            "replay_buffer_batch_token": f"token-{rollout_id}",
         }
 
     async def _record_batch_consumption(self, rollout_id):
@@ -69,9 +69,9 @@ class _RolloutManager:
         self.events.append(("ack", rollout_id, token))
 
     def _save(self, rollout_id):
-        self.events.append(("sidecar", rollout_id))
+        self.events.append(("rollout_save", rollout_id))
 
-    def _mark_published(self, rollout_id):
+    def _mark_committed(self, rollout_id):
         self.events.append(("prune", rollout_id))
 
     def _dispose(self):
@@ -100,7 +100,7 @@ def _args(**overrides):
         "colocate": False,
         "fully_async": False,
         "fully_async_queue_policy": "queue-recycle",
-        "fully_async_rollout_checkpoint": True,
+        "use_replay_buffer": True,
         "control_server_port": None,
         "ft_components": [],
         "use_critic": False,
@@ -143,7 +143,7 @@ def _patch_runtime(monkeypatch, manager, actor):
     monkeypatch.setattr(train_async, "should_run_periodic_action", lambda *args, **kwargs: False)
 
 
-async def test_full_replay_checkpoint_commit_order(monkeypatch):
+async def test_replay_buffer_commit_order(monkeypatch):
     events = []
     manager = _RolloutManager(events)
     actor = _ActorModel(events)
@@ -152,12 +152,12 @@ async def test_full_replay_checkpoint_commit_order(monkeypatch):
     await train_async.train(_args())
 
     assert events.index(("train", 0)) < events.index(("ack", 0, "token-0"))
-    assert events.index(("generate", 1)) < events.index(("sidecar", 0))
-    assert events.index(("sidecar", 0)) < events.index(("model", 0, True, True, False))
+    assert events.index(("generate", 1)) < events.index(("rollout_save", 0))
+    assert events.index(("rollout_save", 0)) < events.index(("model", 0, True, True, False))
     assert events.index(("model", 0, True, True, False)) < events.index(("prune", 0))
 
 
-async def test_full_replay_does_not_ack_failed_training(monkeypatch):
+async def test_replay_buffer_does_not_ack_failed_training(monkeypatch):
     events = []
     manager = _RolloutManager(events)
     actor = _ActorModel(events, fail_train=True)
@@ -167,7 +167,7 @@ async def test_full_replay_does_not_ack_failed_training(monkeypatch):
         await train_async.train(_args(num_rollout=1))
 
     assert not any(event[0] == "ack" for event in events)
-    assert not any(event[0] == "sidecar" for event in events)
+    assert not any(event[0] == "rollout_save" for event in events)
 
 
 async def test_legacy_checkpoint_order_and_async_save_semantics_are_unchanged(monkeypatch):
@@ -178,7 +178,7 @@ async def test_legacy_checkpoint_order_and_async_save_semantics_are_unchanged(mo
 
     await train_async.train(
         _args(
-            fully_async_rollout_checkpoint=False,
+            use_replay_buffer=False,
             debug_exit_after_rollout=1,
         )
     )
@@ -186,7 +186,7 @@ async def test_legacy_checkpoint_order_and_async_save_semantics_are_unchanged(mo
     assert not any(event[0] == "ack" for event in events)
     model_event = ("model", 0, False, True, False)
     assert model_event in events
-    assert events.index(model_event) < events.index(("sidecar", 0))
+    assert events.index(model_event) < events.index(("rollout_save", 0))
 
 
 async def test_queue_recycle_starts_legacy_prefetch_before_consumption(monkeypatch):
@@ -198,7 +198,7 @@ async def test_queue_recycle_starts_legacy_prefetch_before_consumption(monkeypat
     await train_async.train(
         _args(
             fully_async=True,
-            fully_async_rollout_checkpoint=False,
+            use_replay_buffer=False,
             debug_exit_after_rollout=1,
         )
     )
@@ -219,7 +219,7 @@ async def test_selection_policies_defer_next_batch_until_after_weight_update(mon
         _args(
             fully_async=True,
             fully_async_queue_policy=policy,
-            fully_async_rollout_checkpoint=False,
+            use_replay_buffer=False,
         )
     )
 

@@ -236,17 +236,9 @@ async def test_stale_group_recycled(monkeypatch):
     # Tokens counted before reset_for_retry cleared them.
     stale_response_tokens = 4
     assert output.metrics["rollout/fully_async/stale_tokens"] == stale_response_tokens
+    assert output.metrics["rollout/fully_async/recycle_reason/stale_during_reward_finalize/groups"] == 1
     assert (
-        output.metrics[
-            "rollout/fully_async/recycle_reason/stale_during_reward_finalize/groups"
-        ]
-        == 1
-    )
-    assert (
-        output.metrics[
-            "rollout/fully_async/waste/stale_during_reward_finalize/decode_tokens"
-        ]
-        == stale_response_tokens
+        output.metrics["rollout/fully_async/waste/stale_during_reward_finalize/decode_tokens"] == stale_response_tokens
     )
     assert output.metrics["selection_bias/generated/samples"] >= 2 * N_SAMPLES_PER_PROMPT
     assert output.metrics["selection_bias/recycled/samples"] == N_SAMPLES_PER_PROMPT

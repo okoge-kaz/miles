@@ -32,15 +32,6 @@ from miles.rollout.base_types import (
     RolloutFnTrainInput,
     call_rollout_fn,
 )
-from miles.rollout.fully_async_checkpoint import (
-    ensure_no_full_replay_sidecar,
-)
-from miles.rollout.fully_async_checkpoint import load_checkpoint as load_fully_async_checkpoint
-from miles.rollout.fully_async_checkpoint import prune_checkpoints as prune_fully_async_checkpoints
-from miles.rollout.fully_async_checkpoint import (
-    rollout_batch_token,
-)
-from miles.rollout.fully_async_checkpoint import save_checkpoint as save_fully_async_checkpoint
 from miles.rollout.inference_rollout.compatibility import call_rollout_function, load_rollout_function
 from miles.rollout.recycle_compute_metrics import (
     GENERATED_TOKENS_KEY,
@@ -49,6 +40,13 @@ from miles.rollout.recycle_compute_metrics import (
     build_batch_consumption_snapshot,
     finalize_useful_rollout_metrics,
     pipeline_throughput_metrics,
+)
+from miles.rollout.replay_buffer import (
+    ensure_no_replay_buffer,
+    load_replay_buffer,
+    prune_replay_buffers,
+    rollout_batch_token,
+    save_replay_buffer,
 )
 from miles.utils import object_store
 from miles.utils.async_utils import run
@@ -286,15 +284,15 @@ class RolloutManager:
         else:
             data_ref = split_train_data_by_dp(self.args, data, self.train_parallel_config["dp_size"])
         result = dict(sample_indices=sample_indices, data_ref=data_ref)
-        if getattr(self.args, "fully_async_rollout_checkpoint", False):
-            result["fully_async_batch_token"] = batch_token
+        if getattr(self.args, "use_replay_buffer", False):
+            result["replay_buffer_batch_token"] = batch_token
         return result
 
     async def acknowledge_trained_batch(self, rollout_id: int, token: str | None) -> None:
-        if not getattr(self.args, "fully_async_rollout_checkpoint", False):
+        if not getattr(self.args, "use_replay_buffer", False):
             return
         if token is None:
-            raise RuntimeError(f"Missing fully-async batch token for trained rollout {rollout_id}")
+            raise RuntimeError(f"Missing replay-buffer batch token for trained rollout {rollout_id}")
         await asyncio.to_thread(run, self.generate_rollout.acknowledge_trained_batch(rollout_id, token))
 
     async def eval(self, rollout_id):
@@ -325,7 +323,7 @@ class RolloutManager:
 
     async def _get_rollout_data(self, rollout_id):
         batch_token = None
-        checkpoint_sample_indices = None
+        replay_buffer_sample_indices = None
         if self.args.load_debug_rollout_data:
             data, metadata = load_debug_rollout_data(self.args, rollout_id=rollout_id)
             metadata = dict(metadata)
@@ -343,9 +341,11 @@ class RolloutManager:
             metrics = data.metrics
             debug_metadata = data.debug_metadata
             data = data.samples
-            if getattr(self.args, "fully_async_rollout_checkpoint", False):
+            if getattr(self.args, "use_replay_buffer", False):
                 batch_token = rollout_batch_token(data)
-                checkpoint_sample_indices = [sample.index for group in data for sample in _iter_group_samples(group)]
+                replay_buffer_sample_indices = [
+                    sample.index for group in data for sample in _iter_group_samples(group)
+                ]
             data, metadata = postprocess_rollout_data(
                 self.args, data, train_parallel_config=self.train_parallel_config
             )
@@ -361,12 +361,12 @@ class RolloutManager:
                 bound=getattr(self.args, "max_weight_staleness", None),
                 training_step=rollout_id,
             )
-            if checkpoint_sample_indices is not None:
+            if replay_buffer_sample_indices is not None:
                 postprocessed_indices = [sample.index for sample in data]
-                if postprocessed_indices != checkpoint_sample_indices:
+                if postprocessed_indices != replay_buffer_sample_indices:
                     raise RuntimeError(
-                        "Fully-async rollout checkpointing cannot acknowledge a partially consumed prepared batch: "
-                        f"prepared_indices={checkpoint_sample_indices}, trained_indices={postprocessed_indices}. "
+                        "The replay buffer cannot acknowledge a partially consumed prepared batch: "
+                        f"prepared_indices={replay_buffer_sample_indices}, trained_indices={postprocessed_indices}. "
                         "Use a batch shape that does not trim generated samples."
                     )
             if RolloutDataInjectionUtil.should_inject(self.args, rollout_id):
@@ -381,67 +381,67 @@ class RolloutManager:
 
         return data, metadata, metrics, debug_metadata, batch_token
 
-    # -------------------------- checkpointing -----------------------------
+    # -------------------------- rollout persistence -----------------------
 
     async def save(self, rollout_id):
-        if getattr(self.args, "fully_async_rollout_checkpoint", False):
-            checkpoint_start = time.monotonic()
-            state = await asyncio.to_thread(run, self.generate_rollout.checkpoint_state(rollout_id))
-            capture_seconds = time.monotonic() - checkpoint_start
+        if getattr(self.args, "use_replay_buffer", False):
+            replay_buffer_start = time.monotonic()
+            state = await asyncio.to_thread(run, self.generate_rollout.replay_buffer_state(rollout_id))
+            capture_seconds = time.monotonic() - replay_buffer_start
             write_start = time.monotonic()
             path, size = await asyncio.to_thread(
-                save_fully_async_checkpoint,
+                save_replay_buffer,
                 self.args.save,
                 rollout_id,
                 state,
             )
             write_seconds = time.monotonic() - write_start
             logger.info(
-                "Published fully-async rollout checkpoint %s "
+                "Published replay buffer %s "
                 "(%d bytes, capture %.3f seconds, write %.3f seconds, total %.3f seconds)",
                 path,
                 size,
                 capture_seconds,
                 write_seconds,
-                time.monotonic() - checkpoint_start,
+                time.monotonic() - replay_buffer_start,
             )
         elif self.args.rollout_global_dataset:
             self.data_source.save(rollout_id)
-        if not getattr(self.args, "fully_async_rollout_checkpoint", False):
+        if not getattr(self.args, "use_replay_buffer", False):
             event_logger_checkpoint.snapshot(self.args, rollout_id)
 
     async def load(self, rollout_id=None):
-        if not getattr(self.args, "fully_async_rollout_checkpoint", False):
-            ensure_no_full_replay_sidecar(self.args.load, rollout_id)
+        if not getattr(self.args, "use_replay_buffer", False):
+            ensure_no_replay_buffer(self.args.load, rollout_id)
             self.data_source.load(rollout_id)
             return
         if self.args.load is None or rollout_id is None or rollout_id < 0:
             return
-        fingerprint = self.generate_rollout.checkpoint_dataset_fingerprint()
+        fingerprint = self.generate_rollout.replay_buffer_dataset_fingerprint()
         state = await asyncio.to_thread(
-            load_fully_async_checkpoint,
+            load_replay_buffer,
             self.args.load,
             rollout_id,
             expected_fingerprint=fingerprint,
         )
-        await asyncio.to_thread(run, self.generate_rollout.restore_checkpoint_state(state))
+        await asyncio.to_thread(run, self.generate_rollout.restore_replay_buffer_state(state))
 
     async def get_restored_applied_weight_version(self) -> int | None:
-        if not getattr(self.args, "fully_async_rollout_checkpoint", False) or self.args.load is None:
+        if not getattr(self.args, "use_replay_buffer", False) or self.args.load is None:
             return None
         return await asyncio.to_thread(run, self.generate_rollout.current_applied_weight_version())
 
-    async def mark_checkpoint_published(self, rollout_id: int) -> None:
-        if not getattr(self.args, "fully_async_rollout_checkpoint", False):
+    async def mark_replay_buffer_committed(self, rollout_id: int) -> None:
+        if not getattr(self.args, "use_replay_buffer", False):
             return
         # This snapshot lives inside iter_N, so write it only after the model
         # saver has durably published that directory and its tracker.
         event_logger_checkpoint.snapshot(self.args, rollout_id)
         await asyncio.to_thread(
-            prune_fully_async_checkpoints,
+            prune_replay_buffers,
             self.args.save,
             current_rollout_id=rollout_id,
-            keep_last=self.args.fully_async_rollout_checkpoint_keep_last,
+            keep_last=self.args.replay_buffer_keep_last,
             archive_interval=self.args.save_retain_interval,
         )
 

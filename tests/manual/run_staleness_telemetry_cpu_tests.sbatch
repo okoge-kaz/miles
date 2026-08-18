@@ -29,13 +29,13 @@ python -m pytest -q \
     tests/fast/rollout/test_recycle_compute_metrics.py \
     tests/fast/ray/rollout/test_metrics.py \
     tests/fast/ray/rollout/test_train_data_conversion.py \
-    tests/fast/rollout/test_fully_async_checkpoint.py \
+    tests/fast/rollout/test_replay_buffer.py \
     tests/fast/rollout/session/test_samples_codec.py \
     tests/fast/rollout/test_queue_policy.py \
     tests/fast/rollout/test_queue_telemetry.py \
     tests/fast/utils/test_types.py \
     tests/fast/rollout/test_fully_async_rollout.py \
-    tests/fast/test_train_async_checkpoint.py
+    tests/fast/test_train_async_replay_buffer.py
 
 python_files=(
     experiments/src/offpolicy_acceleration/analyze_staleness_telemetry.py
@@ -53,6 +53,8 @@ python_files=(
     miles/ray/rollout/rollout_manager.py
     miles/ray/rollout/train_data_conversion.py
     miles/rollout/base_types.py
+    miles/rollout/replay_buffer.py
+    miles/rollout/replay_buffer_codec.py
     miles/rollout/fully_async_rollout.py
     miles/rollout/fully_async_telemetry.py
     miles/rollout/generate_utils/sample_utils.py
@@ -66,12 +68,12 @@ python_files=(
     tests/fast/backends/training_utils/test_debug_dump.py
     tests/fast/ray/rollout/real_ray/test_rollout_manager.py
     tests/fast/ray/rollout/test_train_data_conversion.py
-    tests/fast/rollout/test_fully_async_checkpoint.py
+    tests/fast/rollout/test_replay_buffer.py
     tests/fast/rollout/session/test_samples_codec.py
     tests/fast/rollout/test_recycle_compute_metrics.py
     tests/fast/test_analyze_staleness_telemetry.py
     tests/fast/test_offpolicy_log_source.py
-    tests/fast/test_train_async_checkpoint.py
+    tests/fast/test_train_async_replay_buffer.py
     tests/fast/utils/test_types.py
     tests/manual/analyze_staleness_telemetry_gpu_validation.py
     tests/manual/benchmark_sglang_forward_version_stamp.py

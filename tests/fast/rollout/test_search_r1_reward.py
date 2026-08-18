@@ -40,7 +40,7 @@ def test_search_r1_reward_penalizes_correct_answer_with_invalid_format():
     assert compute_search_r1_reward(prompt=PROMPT, response=response, label=LABEL, format_score=0.2) == 0.8
 
 
-async def test_search_r1_is_a_builtin_reward_for_fully_async_checkpointing():
+async def test_search_r1_is_a_builtin_reward_for_replay_buffer():
     args = SimpleNamespace(
         custom_rm_path=None,
         rm_type="search_r1",

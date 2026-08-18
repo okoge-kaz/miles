@@ -15,6 +15,7 @@ from miles.rollout.queue_policy import (
     FULLY_ASYNC_QUEUE_POLICIES,
     validate_fully_async_queue_args,
 )
+from miles.rollout.replay_buffer import REPLAY_BUFFER_INFLIGHT, REPLAY_BUFFER_ROLLOUT, REPLAY_BUFFER_TYPES
 from miles.utils.chat_template_utils.tito_tokenizer import TITOTokenizerType
 from miles.utils.environ import enable_experimental_ft_trainer, enable_experimental_rollout_refactor
 from miles.utils.eval_config import EvalDatasetConfig, build_eval_dataset_configs, ensure_dataset_list
@@ -44,11 +45,16 @@ def resolve_rollout_function_paths(args) -> tuple[str, str]:
     return rollout_path, eval_path
 
 
-def _validate_fully_async_rollout_checkpoint(args) -> None:
-    checkpoint_enabled = getattr(args, "fully_async_rollout_checkpoint", False)
-    if checkpoint_enabled and not args.fully_async:
-        raise ValueError("--fully-async-rollout-checkpoint requires --fully-async")
-    if not checkpoint_enabled:
+def _validate_replay_buffer(args) -> None:
+    replay_buffer_enabled = getattr(args, "use_replay_buffer", False)
+    replay_buffer_type = getattr(args, "replay_buffer_type", REPLAY_BUFFER_ROLLOUT)
+    if replay_buffer_type not in REPLAY_BUFFER_TYPES:
+        raise ValueError(f"--replay-buffer-type must be one of {REPLAY_BUFFER_TYPES}, got {replay_buffer_type!r}")
+    if replay_buffer_enabled and not args.fully_async:
+        raise ValueError("--use-replay-buffer requires --fully-async")
+    if not replay_buffer_enabled:
+        if replay_buffer_type != REPLAY_BUFFER_ROLLOUT:
+            raise ValueError("--replay-buffer-type inflight requires --use-replay-buffer")
         return
 
     checks = (
@@ -86,21 +92,27 @@ def _validate_fully_async_rollout_checkpoint(args) -> None:
         ),
         (args.update_weight_transfer_mode != "disk-delta", "a non-delta weight transfer mode"),
         (args.update_weights_interval == 1, "--update-weights-interval 1"),
-        (args.save is not None, "--save for durable replay sidecars"),
+        (args.save is not None, "--save for the durable replay buffer"),
         (
             args.save_interval is not None and args.save_interval > 0,
-            "a positive --save-interval for durable replay sidecars",
+            "a positive --save-interval for the durable replay buffer",
         ),
-        (args.fully_async_rollout_checkpoint_keep_last >= 1, "a positive checkpoint retention count"),
+        (args.replay_buffer_keep_last >= 1, "a positive replay-buffer retention count"),
     )
     for valid, requirement in checks:
         if not valid:
-            raise ValueError(f"--fully-async-rollout-checkpoint requires {requirement}")
+            raise ValueError(f"--use-replay-buffer requires {requirement}")
+
+    if (
+        replay_buffer_type == REPLAY_BUFFER_INFLIGHT
+        and getattr(args, "custom_generate_function_path", None) is not None
+    ):
+        raise ValueError("--replay-buffer-type inflight currently requires the built-in single-turn generate function")
 
 
 def _resolve_rollout_functions(args) -> None:
     validate_fully_async_queue_args(args)
-    _validate_fully_async_rollout_checkpoint(args)
+    _validate_replay_buffer(args)
     if args.fully_async:
         assert enable_experimental_rollout_refactor(), (
             "--fully-async needs the class-based rollout API: set MILES_EXPERIMENTAL_ROLLOUT_REFACTOR=1 "
@@ -526,22 +538,31 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
-                "--fully-async-rollout-checkpoint",
+                "--use-replay-buffer",
                 action="store_true",
                 default=False,
                 help=(
-                    "Checkpoint fully-async prompt leases, completed ready groups, partial drains, and the "
-                    "prepared next trainer batch. Resume can train a restored prepared batch immediately; "
-                    "generation that was active at the snapshot is regenerated from its original prompt."
+                    "Persist fully-async rollout state next to distributed model checkpoints and restore it "
+                    "into the training replay buffer on resume."
                 ),
             )
             parser.add_argument(
-                "--fully-async-rollout-checkpoint-keep-last",
+                "--replay-buffer-type",
+                choices=REPLAY_BUFFER_TYPES,
+                default=REPLAY_BUFFER_ROLLOUT,
+                help=(
+                    "Replay-buffer payload. 'rollout' stores completed rollouts and regenerates active requests "
+                    "from their original prompts. 'inflight' additionally stores partial token prefixes and "
+                    "continues them after a full prefill; KV cache is never persisted."
+                ),
+            )
+            parser.add_argument(
+                "--replay-buffer-keep-last",
                 type=int,
                 default=2,
                 help=(
-                    "Number of recent fully-async rollout sidecars to retain. Checkpoints selected by "
-                    "--save-retain-interval are retained in addition to these recent sidecars."
+                    "Number of recent replay buffers to retain. Checkpoints selected by "
+                    "--save-retain-interval are retained in addition to these recent buffers."
                 ),
             )
             parser.add_argument(
@@ -3467,7 +3488,7 @@ def miles_validate_args(args):
     # Custom config is applied after rollout-path resolution, so repeat the
     # safety validation here to prevent YAML overrides from bypassing guards.
     validate_fully_async_queue_args(args)
-    _validate_fully_async_rollout_checkpoint(args)
+    _validate_replay_buffer(args)
 
     validate_fused_one_step_actor_logprobs(args)
 

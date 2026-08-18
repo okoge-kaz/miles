@@ -1,4 +1,4 @@
-"""Lossless packed Sample storage for fully-async rollout checkpoints."""
+"""Lossless packed ``Sample`` storage for the durable replay buffer."""
 
 import copy
 import hashlib
@@ -64,10 +64,10 @@ class _PackedTensorChunk:
     owner_sha256: str
 
 
-class CheckpointPackedFieldCache:
+class ReplayBufferPackedFieldCache:
     """Prepack immutable completed-sample fields while generation is active.
 
-    Fully-async checkpoint mode rejects custom sample filters, and Miles only
+    Replay-buffer mode rejects custom sample filters, and Miles only
     changes lifecycle metadata after generation completes. The source-list
     identity check still makes reassignment safe: a replaced field falls back to
     the ordinary lossless conversion at snapshot time.
@@ -198,10 +198,10 @@ class CheckpointPackedFieldCache:
         }
 
 
-class CheckpointSampleEncoder:
+class ReplayBufferSampleEncoder:
     """Build one identity-deduplicated Sample table for a coherent snapshot."""
 
-    def __init__(self, packed_cache: CheckpointPackedFieldCache | None = None) -> None:
+    def __init__(self, packed_cache: ReplayBufferPackedFieldCache | None = None) -> None:
         self._packed_cache = packed_cache
         self._record_ids: dict[tuple[int, tuple[tuple[str, int], ...]], int] = {}
         self._records: list[dict[str, Any]] = []
@@ -252,7 +252,7 @@ class CheckpointSampleEncoder:
     ) -> int:
         """Return an identity reference, optionally overlaying serialized metadata."""
         if self._finished:
-            raise RuntimeError("Cannot add Samples after the checkpoint codec is finalized")
+            raise RuntimeError("Cannot add Samples after the replay-buffer codec is finalized")
         update_key = tuple(sorted((metadata_updates or {}).items()))
         identity = (id(sample), update_key)
         if identity in self._record_ids:
@@ -317,7 +317,7 @@ class CheckpointSampleEncoder:
         self._source_samples.append(sample)
         # A cached static state is already a private deep copy. Only lifecycle
         # metadata and fallback packed fields were copied above, so another full
-        # deepcopy would add checkpoint-boundary CPU without increasing isolation.
+        # deepcopy would add replay-buffer capture CPU without increasing isolation.
         record_state = sample_state if cached_state is not None else copy.deepcopy(sample_state)
         self._records.append({"state": record_state, "slices": slices})
         return record_id
@@ -325,7 +325,7 @@ class CheckpointSampleEncoder:
     def finish(self) -> dict[str, Any]:
         """Detach packed values into contiguous CPU tensors."""
         if self._finished:
-            raise RuntimeError("Checkpoint Sample codec was already finalized")
+            raise RuntimeError("Replay-buffer Sample codec was already finalized")
         self._finished = True
         packed = {
             field: _detach_chunks_into_shards(self._chunks[field], spec) for field, spec in _PACKED_ARRAY_SPECS.items()
@@ -343,17 +343,17 @@ class CheckpointSampleEncoder:
         }
 
 
-class _CheckpointSampleDecoder:
+class _ReplayBufferSampleDecoder:
     def __init__(self, codec: dict[str, Any]) -> None:
         version = codec.get("version") if isinstance(codec, dict) else None
         if version not in SUPPORTED_SAMPLE_CODEC_VERSIONS:
-            raise RuntimeError(f"Unsupported fully-async Sample codec: {version!r}")
+            raise RuntimeError(f"Unsupported replay-buffer Sample codec: {version!r}")
         self._version = version
         self._records = codec.get("records")
         self._arrays = codec.get("arrays")
         self._array_specs = _PACKED_FIELDS if version < 3 else _PACKED_ARRAY_SPECS
         if not isinstance(self._records, list) or not isinstance(self._arrays, dict):
-            raise RuntimeError("Malformed fully-async Sample codec table")
+            raise RuntimeError("Malformed replay-buffer Sample codec table")
         self._validate_arrays()
 
     def decode_group(self, group: list[int | list[int]]) -> list[dict[str, Any] | list[dict[str, Any]]]:
@@ -367,13 +367,13 @@ class _CheckpointSampleDecoder:
 
     def decode_sample(self, reference: int) -> dict[str, Any]:
         if type(reference) is not int or reference < 0 or reference >= len(self._records):
-            raise RuntimeError(f"Invalid fully-async Sample table reference: {reference!r}")
+            raise RuntimeError(f"Invalid replay-buffer Sample table reference: {reference!r}")
         record = self._records[reference]
         if not isinstance(record, dict) or not isinstance(record.get("state"), dict):
-            raise RuntimeError(f"Malformed fully-async Sample table record {reference}")
+            raise RuntimeError(f"Malformed replay-buffer Sample table record {reference}")
         slices = record.get("slices")
         if not isinstance(slices, dict) or slices.keys() - self._array_specs.keys():
-            raise RuntimeError(f"Malformed packed fields in fully-async Sample table record {reference}")
+            raise RuntimeError(f"Malformed packed fields in replay-buffer Sample table record {reference}")
 
         sample_state = copy.deepcopy(record["state"])
         for field, location in slices.items():
@@ -383,10 +383,10 @@ class _CheckpointSampleDecoder:
                 or type(location[0]) is not int
                 or type(location[1]) is not int
             ):
-                raise RuntimeError(f"Malformed {field} slice in fully-async Sample table record {reference}")
+                raise RuntimeError(f"Malformed {field} slice in replay-buffer Sample table record {reference}")
             start, length = location
             if start < 0 or length < 0 or start + length > self._array_lengths[field]:
-                raise RuntimeError(f"Out-of-bounds {field} slice in fully-async Sample table record {reference}")
+                raise RuntimeError(f"Out-of-bounds {field} slice in replay-buffer Sample table record {reference}")
             if field == _PACKED_RESPONSE_FIELD:
                 sample_state[field] = self._slice_to_response(start, length)
             else:
@@ -395,19 +395,19 @@ class _CheckpointSampleDecoder:
 
     def _validate_arrays(self) -> None:
         if self._arrays.keys() != self._array_specs.keys():
-            raise RuntimeError("Fully-async Sample codec has an unexpected packed-array set")
+            raise RuntimeError("Replay-buffer Sample codec has an unexpected packed-array set")
         self._array_lengths = {}
         for field, spec in self._array_specs.items():
             value = self._arrays[field]
             arrays = [value] if self._version == 1 else value
             if not isinstance(arrays, list):
-                raise RuntimeError(f"Fully-async Sample codec {field} shards must be a list")
+                raise RuntimeError(f"Replay-buffer Sample codec {field} shards must be a list")
             for array in arrays:
                 if not isinstance(array, torch.Tensor) or array.device.type != "cpu":
-                    raise RuntimeError(f"Fully-async Sample codec {field} array must be a CPU tensor")
+                    raise RuntimeError(f"Replay-buffer Sample codec {field} array must be a CPU tensor")
                 if array.dtype != spec.torch_dtype or array.ndim != 1:
                     raise RuntimeError(
-                        f"Fully-async Sample codec {field} array must be rank-one {spec.torch_dtype}, "
+                        f"Replay-buffer Sample codec {field} array must be rank-one {spec.torch_dtype}, "
                         f"got {array.dtype} rank {array.ndim}"
                     )
             self._arrays[field] = arrays
@@ -446,12 +446,12 @@ class _CheckpointSampleDecoder:
         return values.decode("utf-8", errors="surrogatepass")
 
 
-def materialize_checkpoint_state(state: dict[str, Any]) -> dict[str, Any]:
-    """Expand a packed checkpoint into the legacy detached-dictionary contract."""
+def materialize_replay_buffer_state(state: dict[str, Any]) -> dict[str, Any]:
+    """Expand packed replay-buffer samples into detached dictionaries."""
     codec = state.get(SAMPLE_CODEC_STATE_KEY)
     if codec is None:
         return state
-    decoder = _CheckpointSampleDecoder(codec)
+    decoder = _ReplayBufferSampleDecoder(codec)
     materialized = {key: value for key, value in state.items() if key != SAMPLE_CODEC_STATE_KEY}
     materialized["pending_prompts"] = [decoder.decode_group(group) for group in state["pending_prompts"]]
     materialized["ready_items"] = [
@@ -469,6 +469,14 @@ def materialize_checkpoint_state(state: dict[str, Any]) -> dict[str, Any]:
     materialized["prepared_batches"] = [
         {**prepared, "samples": [decoder.decode_group(group) for group in prepared["samples"]]}
         for prepared in state["prepared_batches"]
+    ]
+    materialized["inflight_items"] = [
+        {
+            **item,
+            "prompt_group": decoder.decode_group(item["prompt_group"]),
+            "generation_group": decoder.decode_group(item["generation_group"]),
+        }
+        for item in state.get("inflight_items", [])
     ]
     return materialized
 
