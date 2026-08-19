@@ -418,13 +418,26 @@ class RolloutManager:
         if self.args.load is None or rollout_id is None or rollout_id < 0:
             return
         fingerprint = self.generate_rollout.replay_buffer_dataset_fingerprint()
+        load_start = time.monotonic()
         state = await asyncio.to_thread(
             load_replay_buffer,
             self.args.load,
             rollout_id,
             expected_fingerprint=fingerprint,
         )
+        read_seconds = time.monotonic() - load_start
+        restore_start = time.monotonic()
         await asyncio.to_thread(run, self.generate_rollout.restore_replay_buffer_state(state))
+        restore_seconds = time.monotonic() - restore_start
+        logger.info(
+            "Loaded replay buffer from %s at rollout %d "
+            "(read %.3f seconds, restore %.3f seconds, total %.3f seconds)",
+            self.args.load,
+            rollout_id,
+            read_seconds,
+            restore_seconds,
+            time.monotonic() - load_start,
+        )
 
     async def get_restored_applied_weight_version(self) -> int | None:
         if not getattr(self.args, "use_replay_buffer", False) or self.args.load is None:

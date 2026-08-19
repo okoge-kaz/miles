@@ -51,9 +51,9 @@ set -euo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." &>/dev/null && pwd)"
 source "${REPO_ROOT}/experiments/env.sh"
 
-ASYNC_RECIPE=experiments/math_async/dapo-math-p10-90/qwen3-4b-instruct-2507/run.sbatch
-COLO_RECIPE=experiments/math_sync/dapo-math-p10-90/qwen3-4b-instruct-2507/run.sbatch
-LOG_DIR="${OUTPUT_DIR}/training/math/dapo-math-p10-90/qwen3-4b-instruct-2507"
+ASYNC_RECIPE=experiments/math_async/dapo-math-p10-90/qwen3-4b/run.sbatch
+COLO_RECIPE=experiments/math_sync/dapo-math-p10-90/qwen3-4b/run.sbatch
+LOG_DIR="${OUTPUT_DIR}/training/math/dapo-math-p10-90/qwen3-4b"
 
 : "${TRAIN_NODES:=1}"           # one train node; override to sweep the other axis too
 : "${MAX_TOTAL_NODES:=8}"

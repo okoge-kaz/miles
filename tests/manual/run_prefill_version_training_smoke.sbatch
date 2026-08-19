@@ -64,4 +64,4 @@ export WANDB_PROJECT="miles-prefill-version-smoke"
 test -f "${SQSH_IMAGE}"
 test -f "/lustre/fs1/portfolios/coreai/projects/coreai_horizon_dilations/users/kfujii/datasets/dapo-math-p10-90/dapo-math-p10-90.jsonl"
 
-bash "${REPO_ROOT}/experiments/math_async/dapo-math-p10-90/qwen3-4b-instruct-2507/run.sbatch"
+bash "${REPO_ROOT}/experiments/math_async/dapo-math-p10-90/qwen3-4b/run.sbatch"

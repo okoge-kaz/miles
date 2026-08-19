@@ -64,21 +64,40 @@ def parse_args():
     # mismatch rather than producing an all-zero pass-rate file.
     p.add_argument("--rm-type", default="math", help="must match the training recipe's --rm-type")
     p.add_argument("--custom-rm-path", default=None)
+    p.add_argument(
+        "--zero-reward-on-truncated",
+        action="store_true",
+        help="assign reward 0 on finish_reason=length instead of grading the partial response",
+    )
     p.add_argument("--reward-key", default=None, help="for rm types returning a dict, e.g. 'score' for --rm-type dapo")
     # Defaults mirror experiments/math_sync: n_samples_per_prompt 8, temperature 1.
     # The measured pass rate is then the same statistic the trainer will see per
     # group, so the window maps onto training batches without rescaling.
     p.add_argument("--n-samples", type=int, default=8)
+    p.add_argument(
+        "--samples-per-request",
+        type=int,
+        default=None,
+        help="split a group across requests of at most this size; default sends the whole group together",
+    )
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--top-p", type=float, default=1.0)
     p.add_argument("--top-k", type=int, default=-1)
-    # Must equal the training recipe's --rollout-max-response-len. A truncated
-    # sample scores 0 under every rule-based verifier, so measuring with a
-    # smaller budget does not add noise -- it adds a *directional* bias that
-    # mislabels long-solution problems as too hard and drops exactly the
-    # prompts a math curriculum most wants to keep.
+    # Must equal the training recipe's --rollout-max-response-len. With
+    # --zero-reward-on-truncated, a smaller measurement budget introduces a
+    # directional bias toward zero. Without it, the verifier grades a different
+    # partial response than training would see. Either way, the budgets must
+    # match for the pass rate to describe the training distribution.
     p.add_argument("--max-new-tokens", type=int, default=24576)
+    p.add_argument(
+        "--max-context-length",
+        type=int,
+        default=None,
+        help="cap max_new_tokens to this total prompt+response length, matching rollout-max-context-len",
+    )
     p.add_argument("--concurrency", type=int, default=64, help="prompts in flight; each expands to --n-samples")
+    p.add_argument("--start-index", type=int, default=0, help="first source prompt index to measure (inclusive)")
+    p.add_argument("--end-index", type=int, default=None, help="last source prompt index to measure (exclusive)")
     p.add_argument("--limit", type=int, default=None, help="stop after this many prompts (smoke runs)")
     p.add_argument("--correct-threshold", type=float, default=DEFAULT_CORRECT_THRESHOLD)
     p.add_argument("--pass-rate-min", type=float, default=DEFAULT_PASS_RATE_MIN, help="reporting only")
@@ -97,7 +116,18 @@ def parse_args():
     # would refuse every such sweep. `warn` keeps the diagnostic without the
     # veto; `off` skips the probes entirely.
     p.add_argument("--preflight", choices=("strict", "warn", "off"), default="strict")
-    return p.parse_args()
+    args = p.parse_args()
+    if args.n_samples < 1:
+        p.error("--n-samples must be at least 1")
+    if args.samples_per_request is not None and args.samples_per_request < 1:
+        p.error("--samples-per-request must be at least 1")
+    if args.max_context_length is not None and args.max_context_length < 1:
+        p.error("--max-context-length must be at least 1")
+    if args.start_index < 0:
+        p.error("--start-index must be non-negative")
+    if args.end_index is not None and args.end_index <= args.start_index:
+        p.error("--end-index must be greater than --start-index")
+    return args
 
 
 def finalize_output(path):
@@ -148,23 +178,47 @@ def write_meta(args):
         "prompt_data": args.prompt_data,
         "rm_type": args.rm_type,
         "custom_rm_path": args.custom_rm_path,
+        "zero_reward_on_truncated": args.zero_reward_on_truncated,
         "n_samples": args.n_samples,
+        "samples_per_request": args.samples_per_request or args.n_samples,
         "temperature": args.temperature,
         "top_p": args.top_p,
         "top_k": args.top_k,
         "max_new_tokens": args.max_new_tokens,
+        "max_context_length": args.max_context_length,
         "correct_threshold": args.correct_threshold,
+        "start_index": args.start_index,
+        "end_index": args.end_index,
     }
-    with open(meta_path(args.output), "w") as f:
+    path = meta_path(args.output)
+    if os.path.exists(path):
+        with open(path) as f:
+            existing = json.load(f)
+        # Files produced before request sharding was added used one request for
+        # the whole group, which is the explicit value recorded now.
+        existing.setdefault("samples_per_request", existing.get("n_samples"))
+        existing.setdefault("start_index", 0)
+        existing.setdefault("end_index", None)
+        if existing != meta:
+            changed = sorted(key for key in set(existing) | set(meta) if existing.get(key) != meta.get(key))
+            raise SystemExit(
+                f"refusing to resume {args.output} with different measurement metadata; "
+                f"changed fields: {changed}"
+            )
+    with open(path, "w") as f:
         json.dump(meta, f, indent=2)
-    print(f"meta -> {meta_path(args.output)}: {json.dumps(meta)}", flush=True)
+    print(f"meta -> {path}: {json.dumps(meta)}", flush=True)
     return meta
 
 
-def load_prompts(path, input_key, label_key, limit=None, tool_key="tools"):
+def load_prompts(path, input_key, label_key, limit=None, tool_key="tools", start_index=0, end_index=None):
     rows = []
     with open(path) as f:
         for i, line in enumerate(f):
+            if i < start_index:
+                continue
+            if end_index is not None and i >= end_index:
+                break
             line = line.strip()
             if not line:
                 continue
@@ -211,6 +265,37 @@ def load_done_indices(path):
     return done
 
 
+def repair_trailing_record(path):
+    """Make an interrupted append log safe for the next append.
+
+    A normal record is written with its newline in one call and flushed, but a
+    hard Slurm time-limit can still interrupt the final filesystem write. If a
+    later process appends directly to that partial byte sequence, its first
+    complete record is concatenated to the fragment and both become unreadable.
+    Preserve a valid final JSON record by adding its newline; otherwise truncate
+    only the malformed tail after the last complete line.
+    """
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return None
+
+    with open(path, "r+b") as output:
+        output.seek(-1, os.SEEK_END)
+        if output.read(1) == b"\n":
+            return None
+        output.seek(0)
+        contents = output.read()
+        tail_start = contents.rfind(b"\n") + 1
+        tail = contents[tail_start:]
+        try:
+            json.loads(tail.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            output.truncate(tail_start)
+            return "truncated malformed tail"
+        output.seek(0, os.SEEK_END)
+        output.write(b"\n")
+        return "added missing newline"
+
+
 def build_prompt_text(tokenizer, prompt, tools=None):
     """Mirror miles' own prompt construction (generate_endpoint_utils.py:29-34):
     a chat-formatted prompt goes through the template, a plain string does not.
@@ -243,7 +328,11 @@ def scalar_reward(reward, reward_key=None) -> float:
 
 
 async def score_responses(args, prompt, label, responses, metadata=None, statuses=None):
-    rm_args = SimpleNamespace(rm_type=args.rm_type, custom_rm_path=args.custom_rm_path)
+    rm_args = SimpleNamespace(
+        rm_type=args.rm_type,
+        custom_rm_path=args.custom_rm_path,
+        zero_reward_on_truncated=args.zero_reward_on_truncated,
+    )
     samples = [Sample(prompt=prompt, response=r, label=label, metadata=dict(metadata or {})) for r in responses]
     if statuses is not None:
         if len(statuses) != len(samples):
@@ -368,8 +457,9 @@ async def verifier_preflight(args, label, metadata=None):
     )
 
 
-async def generate_group(session, url, text, sampling_params, timeout):
-    payload = {"text": text, "sampling_params": sampling_params}
+async def _generate_request(session, url, text, sampling_params, n_samples, timeout):
+    request_params = {**sampling_params, "n": n_samples}
+    payload = {"text": text, "sampling_params": request_params}
     async with session.post(f"{url}/generate", json=payload, timeout=timeout) as resp:
         resp.raise_for_status()
         out = await resp.json()
@@ -377,11 +467,66 @@ async def generate_group(session, url, text, sampling_params, timeout):
     return out if isinstance(out, list) else [out]
 
 
+def sample_request_sizes(n_samples, samples_per_request=None):
+    """Partition one pass-rate group without changing its total sample count."""
+    shard_size = samples_per_request or n_samples
+    full_shards, remainder = divmod(n_samples, shard_size)
+    return [shard_size] * full_shards + ([remainder] if remainder else [])
+
+
+def cap_max_new_tokens(max_new_tokens, max_context_length, prompt_tokens):
+    """Apply the same total-context cap as rollout request construction."""
+    if max_context_length is None:
+        return max_new_tokens
+    return min(max_new_tokens, max_context_length - prompt_tokens)
+
+
+async def generate_group(session, url, text, sampling_params, n_samples, samples_per_request, timeout):
+    """Generate one group, optionally spreading it over multiple DP requests.
+
+    SGLang dispatches at HTTP-request granularity. Splitting n=16 into two n=8
+    requests lets the two halves land on different data-parallel replicas while
+    retaining exactly the same pass-rate group for scoring.
+    """
+    shard_sizes = sample_request_sizes(n_samples, samples_per_request)
+    shards = await asyncio.gather(
+        *(
+            _generate_request(session, url, text, sampling_params, shard_size, timeout)
+            for shard_size in shard_sizes
+        )
+    )
+    return [output for shard in shards for output in shard]
+
+
 async def measure_one(session, args, tokenizer, row, sampling_params, sem, out_file, lock, counters):
     async with sem:
         text = build_prompt_text(tokenizer, row["prompt"], (row.get("metadata") or {}).get("tools"))
+        prompt_tokens = len(tokenizer.encode(text, add_special_tokens=False))
+        prompt_max_new_tokens = cap_max_new_tokens(
+            args.max_new_tokens,
+            args.max_context_length,
+            prompt_tokens,
+        )
+        request_sampling_params = {**sampling_params, "max_new_tokens": prompt_max_new_tokens}
         try:
-            outputs = await generate_group(session, args.server_url, text, sampling_params, args.request_timeout)
+            if prompt_max_new_tokens <= 0:
+                outputs = [
+                    {
+                        "text": "",
+                        "meta_info": {"completion_tokens": 0, "finish_reason": {"type": "length"}},
+                    }
+                    for _ in range(args.n_samples)
+                ]
+            else:
+                outputs = await generate_group(
+                    session,
+                    args.server_url,
+                    text,
+                    request_sampling_params,
+                    args.n_samples,
+                    args.samples_per_request,
+                    args.request_timeout,
+                )
         except Exception as exc:  # noqa: BLE001 - one bad prompt must not kill a 17k-prompt sweep
             async with lock:
                 counters["failed"] += 1
@@ -459,20 +604,29 @@ async def main_async(args):
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
 
-    rows = load_prompts(args.prompt_data, args.input_key, args.label_key, args.limit, args.tool_key)
+    rows = load_prompts(
+        args.prompt_data,
+        args.input_key,
+        args.label_key,
+        args.limit,
+        args.tool_key,
+        args.start_index,
+        args.end_index,
+    )
     await verifier_preflight(args, rows[0]["label"] if rows else None, rows[0].get("metadata") if rows else None)
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
     write_meta(args)
 
+    if repair_action := repair_trailing_record(args.output):
+        print(f"resume repair: {repair_action} in {args.output}", flush=True)
     done = load_done_indices(args.output)
     todo = [r for r in rows if r["index"] not in done]
     print(f"prompts={len(rows)} already_measured={len(done)} todo={len(todo)}", flush=True)
 
     sampling_params = {
-        "n": args.n_samples,
         "temperature": args.temperature,
         "top_p": args.top_p,
-        "max_new_tokens": args.max_new_tokens,
+        "top_k": args.top_k,
     }
 
     counters = {"done": 0, "failed": 0, "dumped": 0, "dump_file": None, "total": len(todo), "t0": time.time()}
@@ -480,7 +634,8 @@ async def main_async(args):
         sem = asyncio.Semaphore(args.concurrency)
         lock = asyncio.Lock()
         timeout = aiohttp.ClientTimeout(total=None)
-        connector = aiohttp.TCPConnector(limit=args.concurrency * 2)
+        requests_per_group = len(sample_request_sizes(args.n_samples, args.samples_per_request))
+        connector = aiohttp.TCPConnector(limit=args.concurrency * requests_per_group)
         dump_ctx = open(args.dump_responses, "w") if args.dump_responses else None
         try:
             counters["dump_file"] = dump_ctx
@@ -512,6 +667,8 @@ async def main_async(args):
     for k, c in enumerate(hist):
         bar = "#" * int(60 * c / max(1, max(hist)))
         print(f"    {k}/{args.n_samples}  {c:6d}  {bar}", flush=True)
+    if counters["failed"]:
+        raise SystemExit(f"{counters['failed']} prompt groups failed generation; rerun to fill the gaps")
 
 
 def main():

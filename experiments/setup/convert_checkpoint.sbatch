@@ -12,7 +12,7 @@
 #
 #   sbatch -A coreai_horizon_dilations experiments/setup/convert_checkpoint.sbatch
 #
-#   $HF_CKPT_DIR/Qwen3-4B  ->  $MEGATRON_CKPT_DIR/Qwen3-4B_torch_dist
+#   $HF_CKPT_DIR/$HF_MODEL_NAME  ->  $MEGATRON_CKPT_DIR/${MODEL_NAME}_torch_dist
 #
 # The HF directory is kept: SGLang still serves from it (--hf-checkpoint), only
 # the trainer reads torch_dist (--ref-load / --load).
@@ -26,6 +26,7 @@ REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.."
 source "${REPO_ROOT}/experiments/env.sh"
 
 MODEL_NAME="${MODEL_NAME:-Qwen3-4B}"
+HF_MODEL_NAME="${HF_MODEL_NAME:-${MODEL_NAME}}"
 MEGATRON_MODEL_TYPE="${MEGATRON_MODEL_TYPE:-qwen3-4B}"   # scripts/models/<type>.sh
 # Per-model overrides from models.txt, e.g. parallelism for large MoE or a
 # fusion flag a given architecture cannot use.
@@ -33,7 +34,12 @@ CONVERT_EXTRA_ARGS="${CONVERT_EXTRA_ARGS:-}"
 NODES="${SLURM_JOB_NUM_NODES:-1}"
 MASTER_NODE=$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | head -1)
 MASTER_PORT="${MASTER_PORT:-29517}"
-echo "converting ${MODEL_NAME} (${MEGATRON_MODEL_TYPE}) on ${NODES} node(s); extra: ${CONVERT_EXTRA_ARGS:-none}"
+echo "converting ${HF_MODEL_NAME} -> ${MODEL_NAME}_torch_dist (${MEGATRON_MODEL_TYPE}) on ${NODES} node(s); extra: ${CONVERT_EXTRA_ARGS:-none}"
+
+[[ -f "${HF_CKPT_DIR}/${HF_MODEL_NAME}/config.json" ]] || {
+    echo "missing HF checkpoint: ${HF_CKPT_DIR}/${HF_MODEL_NAME}/config.json" >&2
+    exit 1
+}
 
 TRACKER="${MEGATRON_CKPT_DIR}/${MODEL_NAME}_torch_dist/latest_checkpointed_iteration.txt"
 if [[ -f "${TRACKER}" && "$(cat "${TRACKER}")" == "release" ]]; then
@@ -64,7 +70,7 @@ PYTHONPATH=/root/Megatron-LM:/root/miles torchrun \
     --nproc-per-node ${GPUS_PER_NODE} \
     tools/convert_hf_to_torch_dist.py \
     \${MODEL_ARGS[@]} \
-    --hf-checkpoint /ckpt/hf/${MODEL_NAME} \
+    --hf-checkpoint /ckpt/hf/${HF_MODEL_NAME} \
     --save /ckpt/megatron/${MODEL_NAME}_torch_dist \
     ${CONVERT_EXTRA_ARGS}
 

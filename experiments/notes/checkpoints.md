@@ -108,13 +108,11 @@ so it biases `S` in the direction of the effect being measured -- roughly 1% on 
 `--save-interval` stays at 20. It is sized by preemption, not by analysis: 4h of
 wall-clock is about 98 rollouts, so 20 caps redone work at ~50 min.
 
-**The recipe does not carry these numbers.** `math_async/.../run.sbatch` defaults
-to `SAVE_INTERVAL=10`, `SAVE_RETAIN_INTERVAL=100`, `HF_SAVE_INTERVAL=5`, and that
-is what every convergence-sweep job ran at (verified on job 15319206's command
-line). The table above is the sizing argument; the recipe is what executed. Do
-not quote the table as a description of the runs, and reconcile the two before
-the next sweep — at h=5 the synchronous export cost on step time is double what
-the argument above accepted. Before this
+The current `math_async/.../run.sbatch` defaults to `SAVE_INTERVAL=10`,
+`SAVE_RETAIN_INTERVAL=100`, and `HF_SAVE_INTERVAL=10`, matching the sizing
+argument above. Historical convergence-sweep jobs used `HF_SAVE_INTERVAL=5`
+(verified on job 15319206's command line), so do not reinterpret those runs as
+h=10. Before this
 flag, getting HF every 10 would have meant `--save-interval 10` and 40 torch_dist
 writes -- 2,160 GB/run against 1,080 GB now, or ~311 TB across the 288-run grid.
 

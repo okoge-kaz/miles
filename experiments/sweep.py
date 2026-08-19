@@ -2,7 +2,7 @@
 """Submit a grid of training jobs for one or more recipes.
 
     experiments/sweep.py --sweep experiments/sweeps/<name>.txt \\
-        --recipe math_async/dapo-math-p10-90/qwen3-4b-instruct-2507 [--recipe ...] \\
+        --recipe math_async/dapo-math-p10-90/qwen3-4b [--recipe ...] \\
         [-- <extra sbatch args>]
 
 Prints the grid and exits. Add --submit to actually submit.

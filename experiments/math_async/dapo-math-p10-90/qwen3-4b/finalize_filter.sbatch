@@ -1,0 +1,70 @@
+#!/bin/bash
+#SBATCH --job-name=merge-pr-qwen3-4b-step4000
+#SBATCH --partition=cpu_interactive
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=32G
+#SBATCH --time=01:00:00
+#SBATCH --output=experiments/outputs/difficulty/%x-%j.log
+
+set -euo pipefail
+
+REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../.." &>/dev/null && pwd)}"
+source "${REPO_ROOT}/experiments/env.sh"
+
+MODEL_NAME=Qwen3-4B-Base-LR2e-5-Step4000
+DATASET_NAME=dapo-math-p10-90-qwen3-4b-base-lr2e-5-step4000
+PROMPT_DATA=/data/dapo-math-17k/dapo-math-17k.jsonl
+PASS_RATE_BASE="/data/difficulty/dapo-math-17k.${MODEL_NAME}.n16-len16384-zero-trunc.passrate"
+SHARD_0="${PASS_RATE_BASE}.shard-0-of-2.jsonl"
+SHARD_1="${PASS_RATE_BASE}.shard-1-of-2.jsonl"
+MERGED_OUTPUT="${PASS_RATE_BASE}.jsonl"
+FILTERED_OUTPUT="/data/${DATASET_NAME}/${DATASET_NAME}.jsonl"
+
+for shard in "${SHARD_0}" "${SHARD_1}"; do
+    host_path="${DATASET_DIR}/${shard#/data/}"
+    [[ -f "${host_path}.complete" ]] || {
+        echo "incomplete shard: ${host_path}" >&2
+        exit 1
+    }
+done
+unset shard host_path
+
+srun \
+    --cpus-per-task="${SLURM_JOB_CPUS_PER_NODE:-8}" \
+    --mem=0 \
+    --container-image="${SQSH_IMAGE}" \
+    --container-mounts="${CONTAINER_MOUNTS}" \
+    --container-writable \
+    --no-container-mount-home \
+    --export=ALL \
+    bash -lc "
+set -euo pipefail
+cd /root/miles
+export PYTHONPATH=/root/Megatron-LM:/root/miles
+
+python3 -m experiments.src.difficulty_filter.merge_pass_rate_shards \
+    --inputs ${SHARD_0} ${SHARD_1} \
+    --output ${MERGED_OUTPUT} \
+    --prompt-data ${PROMPT_DATA}
+
+python3 -m experiments.src.difficulty_filter.apply_filter \
+    --prompt-data ${PROMPT_DATA} \
+    --pass-rates ${MERGED_OUTPUT} \
+    --output ${FILTERED_OUTPUT} \
+    --pass-rate-min 0.1 \
+    --pass-rate-max 0.9
+
+touch ${MERGED_OUTPUT}.measured ${MERGED_OUTPUT}.complete
+"
+
+if [[ "${SUBMIT_REPLAY_BUFFER_VALIDATION:-1}" != "0" ]]; then
+    [[ -n "${SLURM_JOB_ID:-}" ]] || {
+        echo "SUBMIT_REPLAY_BUFFER_VALIDATION requires a Slurm job" >&2
+        exit 1
+    }
+    "${REPO_ROOT}/experiments/math_async/dapo-math-p10-90/qwen3-4b/submit_replay_buffer_validation.sh" \
+        --submit \
+        --afterok "${SLURM_JOB_ID}"
+fi

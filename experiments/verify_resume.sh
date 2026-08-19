@@ -42,9 +42,9 @@ set -euo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." &>/dev/null && pwd)"
 source "${REPO_ROOT}/experiments/env.sh"
 
-RECIPE=experiments/math_async/dapo-math-p10-90/qwen3-4b-instruct-2507/run.sbatch
+RECIPE=experiments/math_async/dapo-math-p10-90/qwen3-4b/run.sbatch
 CONFIG_TAG=resume-test
-LOG_DIR="${OUTPUT_DIR}/training/math/dapo-math-p10-90/qwen3-4b-instruct-2507"
+LOG_DIR="${OUTPUT_DIR}/training/math/dapo-math-p10-90/qwen3-4b"
 
 # CKPT_PATH now has RL_ALGORITHM / PLACEMENT / POLICY_REGIME / staleness levels
 # above CONFIG_TAG, so derive it the way the recipe does instead of spelling it

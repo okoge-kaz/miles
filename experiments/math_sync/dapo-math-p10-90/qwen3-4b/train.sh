@@ -4,18 +4,17 @@ set -ex
 
 export PYTHONBUFFERED=16
 export HF_HOME=/root/.cache/huggingface
-export MILES_EXPERIMENTAL_ROLLOUT_REFACTOR=1
 
 NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
 HAS_NVLINK=$([ "$NVLINK_COUNT" -gt 0 ] && echo 1 || echo 0)
 
 cd /root/miles
-source /root/miles/scripts/models/qwen3-4B-Instruct-2507.sh
+source /root/miles/scripts/models/qwen3-4B.sh
 source /root/miles/experiments/common/ray_cluster.sh
 
 CKPT_ARGS=(
-   --hf-checkpoint /ckpt/hf/Qwen3-4B-Instruct-2507
-   --ref-load      /ckpt/megatron/Qwen3-4B-Instruct-2507_torch_dist
+   --hf-checkpoint "/ckpt/hf/${HF_MODEL_NAME}"
+   --ref-load      "/ckpt/megatron/${MODEL_NAME}_torch_dist"
    --load          "${CKPT_PATH}"
    --save          "${CKPT_PATH}"
    --save-interval "${SAVE_INTERVAL}"
@@ -29,8 +28,6 @@ if [[ "${SAVE_HF}" != "0" ]]; then
 fi
 
 ROLLOUT_ARGS=(
-   --fully-async
-   --fully-async-queue-policy "${QUEUE_POLICY}"
    --prompt-data "${PROMPT_DATA}"
    --input-key prompt
    --label-key label
@@ -48,49 +45,23 @@ ROLLOUT_ARGS=(
    --global-batch-size "${GLOBAL_BATCH_SIZE}"
    --num-steps-per-rollout "${NUM_STEPS_PER_ROLLOUT}"
    --balance-data
-   --staleness-reference "${STALENESS_REFERENCE}"
-   --pause-generation-mode "${PAUSE_GENERATION_MODE}"
 )
-if [[ "${QUEUE_POLICY}" == queue-drop ]]; then
-   ROLLOUT_ARGS+=(--fully-async-queue-factor "${QUEUE_FACTOR}")
-else
-   ROLLOUT_ARGS+=(--max-weight-staleness "${MAX_WEIGHT_STALENESS}")
-fi
-if [[ "${USE_REPLAY_BUFFER:-0}" != "0" ]]; then
-   ROLLOUT_ARGS+=(--use-replay-buffer --replay-buffer-type "${REPLAY_BUFFER_TYPE:-rollout}")
-fi
-if [[ -n "${ASYNC_MAX_CONCURRENT_SAMPLES:-}" ]]; then
-
-   ROLLOUT_ARGS+=(--async-max-concurrent-samples "${ASYNC_MAX_CONCURRENT_SAMPLES}")
-fi
-if [[ -n "${DEBUG_EXIT_AFTER_ROLLOUT:-}" ]]; then
-   ROLLOUT_ARGS+=(--debug-exit-after-rollout "${DEBUG_EXIT_AFTER_ROLLOUT}")
+if [[ "${ZERO_REWARD_ON_TRUNCATED}" != "0" ]]; then
+   ROLLOUT_ARGS+=(--zero-reward-on-truncated)
 fi
 
 TELEMETRY_ARGS=(
    --dump-details "${CKPT_PATH}/dump"
    --use-miles-dashboard
-   --observe-training-entropy
+   --no-dump-policy-loss-debug
 )
-if [[ "${DUMP_POLICY_LOSS_DEBUG:-0}" != "0" ]]; then
-   TELEMETRY_ARGS+=(--dump-policy-loss-debug)
-else
-   TELEMETRY_ARGS+=(--no-dump-policy-loss-debug)
+if [[ "${OBSERVE_TRAINING_ENTROPY}" != "0" ]]; then
+   TELEMETRY_ARGS+=(--observe-training-entropy)
 fi
 if [[ "${DUMP_TRAIN_DATA}" == "0" ]]; then
    TELEMETRY_ARGS+=(--no-dump-train-data)
 else
    TELEMETRY_ARGS+=(--use-rollout-entropy)
-fi
-if [[ "${LOG_STALENESS_GRADIENT_METRICS:-0}" != "0" ]]; then
-   TELEMETRY_ARGS+=(--log-staleness-gradient-metrics)
-fi
-if [[ "${LOG_STALENESS_GRADIENT_RATIO_HISTOGRAM:-0}" != "0" ]]; then
-   if [[ "${LOG_STALENESS_GRADIENT_METRICS:-0}" == "0" ]]; then
-      echo "LOG_STALENESS_GRADIENT_RATIO_HISTOGRAM requires LOG_STALENESS_GRADIENT_METRICS=1" >&2
-      exit 1
-   fi
-   TELEMETRY_ARGS+=(--log-staleness-gradient-ratio-histogram)
 fi
 
 # EVAL_INTERVAL=0 passes no --eval-interval at all, which is what leaves
@@ -123,9 +94,7 @@ PERF_ARGS=(
 
    --use-dynamic-batch-size
    --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
-
-   # trainer only: the sglang engines keep the default allocator
-   --train-env-vars '{"PYTORCH_CUDA_ALLOC_CONF":"expandable_segments:True"}'
+   --log-probs-chunk-size "${LOG_PROBS_CHUNK_SIZE}"
 )
 if [[ "${RECOMPUTE_GRANULARITY}" == "full" ]]; then
    PERF_ARGS+=(--recompute-method uniform --recompute-num-layers 1)
@@ -146,16 +115,6 @@ GRPO_ARGS=(
    --eps-clip-high "${EPS_CLIP_HIGH}"
    --calculate-per-token-loss
 )
-if [[ "${FUSE_ONE_STEP_ACTOR_LOGPROBS}" != "0" ]]; then
-   GRPO_ARGS+=(--fuse-one-step-actor-logprobs)
-fi
-if [[ "${VERIFY_FUSED_ONE_STEP_ACTOR_LOGPROBS}" != "0" ]]; then
-   if [[ "${FUSE_ONE_STEP_ACTOR_LOGPROBS}" == "0" ]]; then
-      echo "VERIFY_FUSED_ONE_STEP_ACTOR_LOGPROBS requires FUSE_ONE_STEP_ACTOR_LOGPROBS=1" >&2
-      exit 1
-   fi
-   GRPO_ARGS+=(--verify-fused-one-step-actor-logprobs)
-fi
 TIS_BOUNDS=(--tis-clip "${TIS_CLIP}" --tis-clip-low "${TIS_CLIP_LOW}")
 case "${IS_CORRECTION}" in
    none)   ;;
@@ -203,9 +162,6 @@ fi
 if [[ -n "${SGLANG_CUDA_GRAPH_MAX_BS:-}" ]]; then
    SGLANG_ARGS+=(--sglang-cuda-graph-max-bs "${SGLANG_CUDA_GRAPH_MAX_BS}")
 fi
-if [[ "${SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS:-0}" != "0" ]]; then
-   SGLANG_ARGS+=(--sglang-enable-response-weight-version-segments)
-fi
 
 MISC_ARGS=(
    --attention-dropout 0.0
@@ -215,19 +171,17 @@ MISC_ARGS=(
    --attention-backend flash
 )
 
-# WANDB_API_KEY is inherited through --export=ALL. Never put it in this argv:
-# both shell xtrace and Ray's "Running entrypoint" line are persisted in job logs.
 WANDB_ARGS=(
    --use-wandb
    --wandb-project "${WANDB_PROJECT:-off-policy-${DATASET_TAG}}"
    --wandb-group "${RUN_NAME}"
+   --wandb-key "${WANDB_API_KEY}"
 )
 
 RUNTIME_ENV_JSON=$(cat <<JSON
 {
   "env_vars": {
     "PYTHONPATH": "/root/Megatron-LM/:/root/miles",
-    "MILES_EXPERIMENTAL_ROLLOUT_REFACTOR": "1",
     "CUDA_DEVICE_MAX_CONNECTIONS": "1",
     "NCCL_NVLS_ENABLE": "${HAS_NVLINK}",
     "no_proxy": "127.0.0.1"
@@ -238,10 +192,10 @@ JSON
 
 ray job submit --address="http://127.0.0.1:8265" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
-   -- python3 train_async.py \
+   -- python3 train.py \
    --actor-num-nodes "${ACTOR_NUM_NODES}" \
    --actor-num-gpus-per-node "${ACTOR_GPUS_PER_NODE}" \
-   --rollout-num-gpus "${ROLLOUT_NUM_GPUS}" \
+   --colocate \
    ${MODEL_ARGS[@]} \
    "${CKPT_ARGS[@]}" \
    "${ROLLOUT_ARGS[@]}" \

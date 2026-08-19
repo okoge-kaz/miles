@@ -89,7 +89,9 @@ def check_recipe(recipe_dir: Path) -> None:
     # 3. placement, at the node count the recipe declares for itself
     nodes = int(re.search(r"#SBATCH --nodes=(\d+)", run_text).group(1))
     defaults = "\n".join(
-        line for line in run_text.splitlines() if re.match(r'^: "\$\{[A-Z_0-9]+:=', line)
+        line.lstrip()
+        for line in run_text.splitlines()
+        if re.match(r'^\s*: "\$\{[A-Z_0-9]+:=', line)
     )
     r = sh(
         f"set -e; SLURM_JOB_NUM_NODES={nodes}; GPUS_PER_NODE={GPUS_PER_NODE}\n"
@@ -106,11 +108,34 @@ def check_recipe(recipe_dir: Path) -> None:
     identity_env = "\n".join(
         line
         for line in run_text.splitlines()
-        if re.match(r'^: "\$\{[A-Z_0-9]+:=', line) or re.match(r"^[A-Z_0-9]+=\S*$", line)
+        if re.match(r'^\s*: "\$\{[A-Z_0-9]+:=', line) or re.match(r"^[A-Z_0-9]+=\S*$", line)
     )
     r = sh(f"set -e\n{identity_env}\nsource experiments/common/run_identity.sh >/dev/null\n")
     if r.returncode:
         fail(rel, f"run_identity.sh rejected the defaults: {(r.stderr or r.stdout).strip()}")
+
+    # Recipes that make replay persistence part of their default must keep the
+    # two incompatible on-disk formats in distinct checkpoint namespaces.
+    if "REPLAY_BUFFER_IDENTITY_TAG:=1" in run_text:
+        if knob(run_text, "USE_REPLAY_BUFFER") != 1:
+            fail(rel, "replay-buffer identity tagging is enabled but USE_REPLAY_BUFFER does not default to 1")
+        if "--use-replay-buffer" not in train_text or "--replay-buffer-type" not in train_text:
+            fail(rel, "replay-buffer default is not carried to train_async.py")
+        paths = {}
+        for buffer_type in ("rollout", "inflight"):
+            derived = sh(
+                f"set -e\n{identity_env}\nREPLAY_BUFFER_TYPE={buffer_type}\n"
+                "source experiments/common/run_identity.sh >/dev/null\nprintf '%s' \"${CKPT_PATH}\"\n"
+            )
+            if derived.returncode:
+                fail(rel, f"cannot derive {buffer_type} replay-buffer identity: {derived.stderr.strip()}")
+            else:
+                paths[buffer_type] = derived.stdout
+        if len(set(paths.values())) != len(paths):
+            fail(rel, f"rollout and inflight replay buffers share CKPT_PATH: {paths}")
+        for buffer_type, path in paths.items():
+            if f"-rb-{buffer_type}" not in path:
+                fail(rel, f"{buffer_type} CKPT_PATH does not identify its replay-buffer type: {path}")
 
     # 4/5. batch shape and the token budget
     tp = knob(run_text, "TENSOR_PARALLEL_SIZE")
@@ -157,7 +182,7 @@ def check_recipe(recipe_dir: Path) -> None:
     # notes/parallelism.md.
     if not is_async and "expandable_segments" in train_text:
         fail(rel, "colocated recipe cannot set expandable_segments: torch_memory_saver rejects it")
-    if "qwen3-4b-instruct-2507" in rel:
+    if rel.endswith("/qwen3-4b"):
         has_logprob_chunk_flag = "--log-probs-chunk-size" in train_text
         if is_async and has_logprob_chunk_flag:
             fail(rel, "async Qwen3-4B recipe must not enable colocated-only log-prob chunking")

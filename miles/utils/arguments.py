@@ -2349,6 +2349,16 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="Type of the reward model",
             )
             parser.add_argument(
+                "--zero-reward-on-truncated",
+                action="store_true",
+                default=False,
+                help=(
+                    "Assign scalar reward 0 to responses that hit the generation/context limit, "
+                    "without invoking the configured reward model. Off by default to preserve "
+                    "the existing behavior of grading the truncated response text."
+                ),
+            )
+            parser.add_argument(
                 "--search-r1-format-score",
                 type=float,
                 default=0.0,

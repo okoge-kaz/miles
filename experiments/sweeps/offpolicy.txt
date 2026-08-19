@@ -2,7 +2,7 @@
 # sample may be. The two axes math_async exists to measure.
 #
 #   experiments/sweep.py --sweep experiments/sweeps/offpolicy.txt \
-#       --recipe math_async/dapo-math-p10-90/qwen3-4b-instruct-2507 \
+#       --recipe math_async/dapo-math-p10-90/qwen3-4b \
 #       -- -N 2 -p batch_short --time=02:00:00
 #
 # 6 points. GLOBAL_BATCH_SIZE is derived per point, so the four-knob invariant

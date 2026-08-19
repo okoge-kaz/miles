@@ -114,11 +114,12 @@ Two more ways to get a filter that lies to you:
    the recipe's own `--rm-type`, rather than reimplementing the check. That
    keeps the `boxed_` prefix handling and the `</think>` split inside the
    deepscaler reward identical on both sides.
-2. **Measuring with a shorter generation budget than training.** A truncated
-   sample scores 0 under every rule-based verifier, so a short
-   `--max-new-tokens` does not add noise — it adds a *directional* bias that
-   marks long-solution problems as too hard and drops exactly the prompts a math
-   curriculum most wants to keep. Averaging cannot recover from a bias.
+2. **Measuring with a shorter generation budget than training.** Historically,
+   miles grades the partial text of a truncated response. With the opt-in
+   `--zero-reward-on-truncated` rule, a short `--max-new-tokens` instead adds a
+   *directional* bias toward reward 0. In either mode the measurement and
+   training budgets must match: otherwise they grade different responses and
+   the pass-rate window no longer describes the training distribution.
 
    `--max-new-tokens` therefore defaults to **24576**, matching
    `--rollout-max-response-len` in `experiments/math_sync`. Measured on

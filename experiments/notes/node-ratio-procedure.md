@@ -276,7 +276,7 @@ run, which split does that bound want?
   forever (`notes/cluster.md`).
 - **Checkpoints are written on the recipe's cadence**, the same one the
   convergence sweep runs at: `--save-interval 10`, `--save-retain-interval 100`,
-  HF export every 5. A point that turns out to be the right balance is then a
+  HF export every 10. A point that turns out to be the right balance is then a
   run that can be continued rather than repeated.
 - dp is the trainer's alone under `--fully-async`, so 3:5 is legal: 24 train GPUs
   at tp2 is dp12, and 3072/12 = 256. The script derives this from the recipe,

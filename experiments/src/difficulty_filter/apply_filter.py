@@ -140,10 +140,12 @@ def build_tag(record, meta):
         "top_p",
         "top_k",
         "max_new_tokens",
+        "max_context_length",
         "max_new_tokens_per_turn",
         "max_turns",
         "search_topk",
         "format_score",
+        "zero_reward_on_truncated",
     ):
         if key in meta:
             tag[key] = meta[key]

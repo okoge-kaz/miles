@@ -32,9 +32,9 @@ set -euo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." &>/dev/null && pwd)"
 source "${REPO_ROOT}/experiments/env.sh"
 
-ASYNC_RECIPE=experiments/math_async/dapo-math-p10-90/qwen3-4b-instruct-2507/run.sbatch
-COLO_RECIPE=experiments/math_sync/dapo-math-p10-90/qwen3-4b-instruct-2507/run.sbatch
-LOG_DIR="${OUTPUT_DIR}/training/math/dapo-math-p10-90/qwen3-4b-instruct-2507"
+ASYNC_RECIPE=experiments/math_async/dapo-math-p10-90/qwen3-4b/run.sbatch
+COLO_RECIPE=experiments/math_sync/dapo-math-p10-90/qwen3-4b/run.sbatch
+LOG_DIR="${OUTPUT_DIR}/training/math/dapo-math-p10-90/qwen3-4b"
 
 : "${TOTAL_NODES:=8}"
 : "${RATIOS:=1:7 2:6 3:5 4:4}"      # train:rollout, in nodes
@@ -79,7 +79,7 @@ CP=$(read_default CONTEXT_PARALLEL_SIZE)
 GPN=$(read_default ACTOR_GPUS_PER_NODE)
 NUM_ROLLOUT="${NUM_ROLLOUT:-$(read_default NUM_ROLLOUT)}"
 MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-$(read_default MAX_RESPONSE_LEN)}"
-: "${RUN_NAMESPACE:=math-$(( MAX_RESPONSE_LEN / 1024 ))k-replay-buffer-v1}"
+: "${RUN_NAMESPACE:=deepscaler-$(( MAX_RESPONSE_LEN / 1024 ))k-replay-buffer-v1}"
 
 STALENESS_FILTER=""; RATIO_FILTER=""; POINT_FILTER=""
 INCLUDE_COLOCATED=0; COLOCATED_ONLY=0
@@ -199,7 +199,7 @@ colo_name_of() {
 ckpt_path_of() {  # staleness config_tag
     (
         set -euo pipefail
-        MODEL_NAME=Qwen3-4B-Instruct-2507 DATASET_TAG=dapo-math-p10-90 PLACEMENT=async
+        MODEL_NAME=Qwen3-4B DATASET_TAG=dapo-math-p10-90 PLACEMENT=async
         ADVANTAGE_ESTIMATOR=grpo ENTROPY_COEF=0.00 KL_LOSS_COEF=0.00
         EPS_CLIP=0.2 EPS_CLIP_HIGH=0.28 EPS_CLIP_C= RATIO_DENOMINATOR="${RATIO_DENOMINATOR}"
         IS_CORRECTION="${IS_CORRECTION}" TIS_CLIP="${TIS_CLIP}" TIS_CLIP_LOW="${TIS_CLIP_LOW}"
@@ -217,7 +217,7 @@ ckpt_path_of() {  # staleness config_tag
 colo_ckpt_path_of() {  # config_tag
     (
         set -euo pipefail
-        MODEL_NAME=Qwen3-4B-Instruct-2507 DATASET_TAG=dapo-math-p10-90 PLACEMENT=colocated
+        MODEL_NAME=Qwen3-4B DATASET_TAG=dapo-math-p10-90 PLACEMENT=colocated
         ADVANTAGE_ESTIMATOR=grpo ENTROPY_COEF=0.00 KL_LOSS_COEF=0.00
         EPS_CLIP=0.2 EPS_CLIP_HIGH=0.28 EPS_CLIP_C= RATIO_DENOMINATOR="${RATIO_DENOMINATOR}"
         IS_CORRECTION="${IS_CORRECTION}" TIS_CLIP="${TIS_CLIP}" TIS_CLIP_LOW="${TIS_CLIP_LOW}"
@@ -427,7 +427,7 @@ if [[ -n "${RUN_NAMESPACE}" ]]; then
 fi
 printf '%s rollouts, %s dependent %s jobs per arm; gbs %s, tp %s, cp %s.\n' \
     "${NUM_ROLLOUT}" "${CHAIN_JOBS}" "${WALL}" "${GBS}" "${TP}" "${CP}"
-printf 'max response length %s; reward math.\n' "${MAX_RESPONSE_LEN}"
+printf 'max response length %s; reward deepscaler.\n' "${MAX_RESPONSE_LEN}"
 printf 'replay buffer %s (type %s).\n' "${USE_REPLAY_BUFFER}" "${REPLAY_BUFFER_TYPE}"
 if [[ -n "${APPEND_AFTER}" ]]; then
     printf 'The new chain will append after Slurm job %s.\n' "${APPEND_AFTER}"

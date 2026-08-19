@@ -1,8 +1,9 @@
 # math_async / dapo-math-p10-90
 
-DAPO-Math-17K を難易度フィルタした 5865 問の上での fully-async GRPO。
-**dynamic sampling は行わない**（§4.0）。学習中の評価は AIME-2025 のみ、
-報告値は保存済み checkpoint に対するオフライン評価から作る（§2）。
+DAPO-Math-17K を step-4000 Qwen3-4B policy で難易度フィルタした 10,778 問の
+上での fully-async GRPO。**dynamic sampling は行わない**（§4.0）。学習中の
+評価は既定で無効にし、報告値は 10 rollout step ごとの HF checkpoint に対する
+オフライン評価から作る（§2）。
 
 フィルタなしの `dapo-math` レシピは削除済み — 全実験をこのデータセットで行う。
 
@@ -181,10 +182,10 @@ M2PO は *Stale-k RL training* を導入し、**k 回の model update 分だけ�
 
 | | 学習中 eval | オフライン eval（報告値） |
 |---|---|---|
-| 目的 | run が学習しているかの監視、崩壊検出 | `Q(t)`、`τ_m(δ)`、`S_m(p)` |
-| ベンチマーク | **AIME-2025 のみ**（30 問） | **AIME-2023 / 24 / 25 / 26**（各 30 問） |
-| n / prompt | 8 | 16 |
-| 生成長 | 24576（学習と同じ） | 32768 |
+| 目的 | opt-in の監視、崩壊検出（既定では無効） | `Q(t)`、`τ_m(δ)`、`S_m(p)` |
+| ベンチマーク | opt-in 時は **AIME-2025**（30 問） | **AIME-2023 / 24 / 25 / 26**（各 30 問） |
+| n / prompt | 8（opt-in 時） | 16 |
+| 生成長 | 16384（opt-in 時、学習と同じ） | 32768 |
 | sampling | T=1.0 / top_p=1.0 | 比較に必要な設定（既定は学習と同じ 1.0 / 1.0） |
 | 実行 | `train.sh` の `--eval-prompt-data` | [`src/offline_eval/run_eval.sbatch`](../../src/offline_eval/run_eval.sbatch) |
 | コスト | 学習の critical path 上 | **別ジョブ。学習の wall-clock に一切入らない** |
@@ -194,25 +195,24 @@ M2PO は *Stale-k RL training* を導入し、**k 回の model update 分だけ�
 * **検出力。** 30 問 × 8 では bootstrap 半値幅が δ より大きく、
   offpolicy_acceleration の `analyze.py` は `UNDERPOWERED` を出す。4 年 × 30 問
   × n=16 なら 120 問で標準誤差 ≈ 4.5 点、5 年なら 150 問。
-* **打ち切りバイアス。** 学習中の 24576 では AIME-2024 の 13.75% が打ち切られ、
-  打ち切りサンプルは全 rule-based verifier で 0 点になる。学習中の数字は
-  「モデルが悪い」ではなく「予算が短い」で押し下げられている。オフライン側は
-  32768 なのでこの分が乗らない。
-* **overhead。** 学習中の eval を 1 ベンチ × n=8 に抑えることで、arm 間の
-  wall-clock 差が eval 予算の差で汚染されない。
+* **打ち切りバイアス。** 現在のレシピは 16,384 token で打ち切られた応答を
+  opt-in 設定により 0 点にする。オフライン側の予算を変える場合は、学習時と
+  異なる評価量になることを明示する。
+* **overhead。** 学習中の eval を既定で無効にすることで、arm 間の wall-clock
+  差が eval 予算の差で汚染されない。
 
-### 時間分解能は 20 rollout step
+### 時間分解能は 10 rollout step
 
 オフライン eval は `--save-hf` が書く HF snapshot を読む。retention 設計
 （コミット `82b86040`）により:
 
 ```
-torch_dist  100 step ごと + latest   7 × 53 GB = 371 GB   (resume 用)
-HF           20 step ごと           31 ×  8 GB = 248 GB   (offline eval 用)
+torch_dist  10 step ごとに書き、100 step ごとの milestone + latest を保持
+HF          10 step ごとに書き、offline eval 用に保持
 ```
 
 HF は `--save` の外に落ちるので `--save-retain-interval` の刈り込み対象外。
-したがって **`Q(t)` の時間解像度は `SAVE_INTERVAL` = 20 rollout step**。
+したがって **`Q(t)` の時間解像度は `HF_SAVE_INTERVAL` = 10 rollout step**。
 `τ_m(δ)` の分解能はこれで決まるので、`SAVE_INTERVAL` は eval 設定の一部として
 全 arm で共通に固定する（§6.1）。
 
@@ -302,10 +302,11 @@ step 時間が学習内容と無関係な要因で揺れるのは許容できな
 | 項目 | 値 |
 |---|---|
 | 元データ | DAPO-Math-17K, 17398 問 |
-| 残った問題数 | **5865 問（33.7%）** |
+| dataset | `dapo-math-p10-90-qwen3-4b-base-lr2e-5-step4000` |
+| 残った問題数 | **10,778 問（61.9%）** |
 | window | pass rate **0.1–0.9** |
-| 測定ポリシー | **Qwen3-4B-Instruct-2507** |
-| 測定条件 | n=8, T=1.0, max_new_tokens=24576, `rm_type=math` |
+| 測定ポリシー | **Qwen3-4B-Base-LR2e-5-Step4000** |
+| 測定条件 | n=16, T=1.0, max_new_tokens=16384, max_context_length=32768, `rm_type=deepscaler`, truncation reward 0 |
 
 生成手順は [`src/difficulty_filter`](../../src/difficulty_filter/README.md)。
 測定（GPU 1 ジョブ）と window 選択（CPU 数秒）が分離されているので、window を
@@ -314,8 +315,9 @@ step 時間が学習内容と無関係な要因で揺れるのは許容できな
 ### 4.2 フィルタはポリシーに紐づく — モデルを変えたら測り直す
 
 difficulty は *(prompt, policy, sampling-params)* の三つ組の性質であって、
-プロンプト単体の性質ではない。**`dapo-math-p10-90` は Qwen3-4B-Instruct-2507 に
-とっての 0.1–0.8 であり、他のモデルにとってはそうではない。**
+プロンプト単体の性質ではない。**現在の policy-specific dataset は
+Qwen3-4B-Base-LR2e-5-Step4000 にとっての 0.1–0.9 であり、他のモデルに
+とってはそうではない。**
 
 これは §8 のモデル拡張計画に直接効く制約:
 
@@ -378,7 +380,7 @@ IS 重みの項数がその倍率で効くので、「アルゴリズムが検�
 **6,880 token**（中央値 6,701）。4096 上限では **8 割近くが打ち切られる**。打ち切り
 サンプルは全 rule-based verifier で 0 点なので reward が潰れ、group が全滅
 （zero variance）して **advantage が恒等的に 0 = 勾配が立たない**。プロンプト集合が
-`max_new_tokens=24576` で pass rate 0.1–0.8 に絞ってある（§4.1）ことも、4k では
+`max_new_tokens=16384` で pass rate 0.1–0.9 に絞ってある（§4.1）ことも、4k では
 window が意味を失う方向に効く。grid の 1/4 を投じる前に 1 本で確認する
 （`truncated_ratio`, `zero_std_group_frac`, `rollout/raw_reward`）。
 
@@ -408,7 +410,7 @@ grid の軸ではない。主軸を回す前に決め、以降全 arm で共通�
 | knob | 決め方 | 現状 |
 |---|---|---|
 | `N_SAMPLES_PER_PROMPT` | **Nemotron3 の値を踏襲**。8 か 16 になる見込み | 先行研究調査中。**コストが線形に効く**（§5.4） |
-| `N_SAMPLES_PER_PROMPT` | **8** | Nemotron 3 Super は 16 だがコストが線形に効くので 8 を採る。**難易度フィルタが n=8 で測られている**（§4.1）ので、0.1–0.8 の window が訓練時の group をそのまま記述するという一貫性の利点もある。代償は degenerate group 率で、window 上で一様なら **n=8 で 8.4% / n=16 で 1.6%**、pass rate 0.1 付近に集中する（p=0.1 で 43%）|
+| `N_SAMPLES_PER_PROMPT` | **16** | Nemotron 3 Super と同じ値で、難易度フィルタも n=16 で測定済み（§4.1）。window が訓練時の group をそのまま記述し、n=8 より degenerate group を減らす。|
 | `ROLLOUT_BATCH_SIZE` / `GLOBAL_BATCH_SIZE` | **64 prompt / 512 サンプル**（`NUM_STEPS_PER_ROLLOUT=1`）| **バッチ形状はコストを変えないが、主軸である実現 lag を変える**（下記）。64 なら 10 epoch = 619 step で、刻み 20 でも 31 評価点。degenerate 8.4% を引いて実効 59 group |
 
 **バッチ形状は主軸と結合している — これが選択理由。** 実現 lag は
@@ -441,7 +443,7 @@ lag を作る他の手段は `ASYNC_MAX_CONCURRENT_SAMPLES`（生成の並列度
 | KL coefficient | **使わない。** reference model を持たないため | `KL_LOSS_COEF=0.00` |
 | dynamic sampling | **off。** 難易度フィルタで置換（§4.0） | フィルタ済みプロンプト集合 |
 | `--rollout-temperature` | 1.0 固定。フィルタが T=1.0 で測られている | 1.0 |
-| 難易度フィルタの測定条件 | `max_new_tokens=24576` で測ってある | **2k / 8k の水準では window が意味を失う**（§5.1）。フィルタを測り直すかは 2k の pilot 結果を見て決める |
+| 難易度フィルタの測定条件 | `max_new_tokens=16384`, total context 32768, n=16 で測定済み | **2k / 8k の水準では window が意味を失う**（§5.1）。フィルタを測り直すかは 2k の pilot 結果を見て決める |
 | deterministic kernel | **sweep 軸にしない**（§5.5） | 未使用 |
 
 ### 5.3 スループット専用 — モデルごとに 1 回調整して凍結
@@ -730,7 +732,7 @@ Stage 3 が Stage 4 より前にあるのは、**run 間分散が未測定のう
 
 | 順 | モデル | 位置づけ | 前提作業 |
 |---|---|---|---|
-| 1 | **Qwen3-4B-Instruct-2507** | 主対象。全 grid をここで回す | 済（`dapo-math-p10-90`） |
+| 1 | **Qwen3-4B** | 主対象。全 grid をここで回す | policy-specific filter 測定済み（n=16, 16k） |
 | 2 | Qwen3-1.7B-Base + SFT | パラメータ規模の下端 | 難易度再測定、verifier 確認 |
 | 3 | Qwen3-8B-Base + SFT | 同上端（dense） | 同上 |
 | 4 | Qwen3-30B-A3B-Base + SFT | MoE。R3 が常時 on | 同上 |
@@ -758,9 +760,9 @@ Stage 3 が Stage 4 より前にあるのは、**run 間分散が未測定のう
 ## 9. ハイパラではないもの
 
 `RM_TYPE` は探索対象ではなく正しさの設定。`deepscaler` は応答に `</think>`
-区切りが無いと 0 を返すので、非 thinking checkpoint には `math` が必要。
-`qwen3-4b-instruct-2507` のレシピは既に `math` を既定にしている。SFT 済み Base
-モデルは SFT のフォーマット次第なので、毎回 preflight で確認する。
+区切りが無いと 0 を返す。現在の `qwen3-4b` レシピは hybrid-thinking checkpoint
+を使うため `deepscaler` を既定にしている。SFT 済み Base モデルは SFT の
+フォーマット次第なので、毎回 preflight で確認する。
 
 ## 10. 未決事項
 
@@ -770,7 +772,7 @@ Stage 3 が Stage 4 より前にあるのは、**run 間分散が未測定のう
    README が要る。本ファイルから async 固有の節を落とした版になる。
 2. **`S_m(p)` の報告形式。** AReaL の 2.77× はスループット比なので、
    「スループット比は N× 、`S_m` は M×」と両方出す形にするか。
-3. **フィルタ window (0.1–0.8) を grid に含めるか。** 現状は固定扱いだが、
+3. **フィルタ window (0.1–0.9) を grid に含めるか。** 現状は固定扱いだが、
    dynamic sampling を外した以上これが唯一の難易度制御であり、`ROLLOUT_BATCH_SIZE`
    と同じく「勾配に寄与する group の割合」を決めている。再測定は不要（window の
    切り直しは CPU 数秒）なので、含めるコストは低い。

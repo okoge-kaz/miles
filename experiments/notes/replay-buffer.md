@@ -134,7 +134,7 @@ For the math-async recipe:
 
 ```bash
 CONFIG_TAG=my-run-replay USE_REPLAY_BUFFER=1 REPLAY_BUFFER_TYPE=rollout sbatch \
-  experiments/math_async/dapo-math-p10-90/qwen3-4b-instruct-2507/run.sbatch
+  experiments/math_async/dapo-math-p10-90/qwen3-4b/run.sbatch
 ```
 
 Use `REPLAY_BUFFER_TYPE=inflight` for token-prefix continuation with the

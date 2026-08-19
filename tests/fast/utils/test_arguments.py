@@ -169,6 +169,17 @@ def test_replay_buffer_cli_is_opt_in_with_rollout_as_the_default_type():
     assert inflight.replay_buffer_type == "inflight"
 
 
+def test_zero_reward_on_truncated_cli_is_opt_in():
+    parser = argparse.ArgumentParser()
+    get_miles_extra_args_provider()(parser)
+
+    defaults = parser.parse_args(REQUIRED_ARGS)
+    assert not defaults.zero_reward_on_truncated
+
+    enabled = parser.parse_args(["--zero-reward-on-truncated"] + REQUIRED_ARGS)
+    assert enabled.zero_reward_on_truncated
+
+
 def make_class_with_add_arguments():
     class MyFn:
         @classmethod

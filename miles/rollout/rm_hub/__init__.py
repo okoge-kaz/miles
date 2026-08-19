@@ -42,6 +42,9 @@ def _resolve_reward_config(args, sample: Sample) -> tuple[str | None, str]:
 
 
 async def async_rm(args, sample: Sample, **kwargs):
+    if getattr(args, "zero_reward_on_truncated", False) is True and sample.status == Sample.Status.TRUNCATED:
+        return 0
+
     custom_rm_path, rm_type = _resolve_reward_config(args, sample)
 
     if custom_rm_path is not None:
@@ -111,7 +114,13 @@ async def batched_async_rm(
 
     if args.custom_rm_path is not None and not is_multi_lora_enabled(args):
         rm_function = load_function(args.custom_rm_path)
-        return await rm_function(args, samples, **kwargs)
+        rewards = await rm_function(args, samples, **kwargs)
+        if getattr(args, "zero_reward_on_truncated", False) is True:
+            rewards = [
+                0 if sample.status == Sample.Status.TRUNCATED else reward
+                for sample, reward in zip(samples, rewards, strict=True)
+            ]
+        return rewards
     tasks = [async_rm(args, sample, **kwargs) for sample in samples]
     rewards = await asyncio.gather(*tasks)
     return rewards

@@ -3,7 +3,7 @@
 # the pacer and any saving shows up in the step time.
 #
 #   experiments/sweep.py --sweep experiments/sweeps/trainer-memory.txt \
-#     --recipe math_async/dapo-math-p10-90/qwen3-4b-instruct-2507 \
+#     --recipe math_async/dapo-math-p10-90/qwen3-4b \
 #     -- -N 3 -p batch_short --time=00:40:00
 #
 # Read actor_train + log_probs, not just step_s: once the trainer gets fast

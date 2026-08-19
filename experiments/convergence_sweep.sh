@@ -21,9 +21,9 @@ set -euo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." &>/dev/null && pwd)"
 source "${REPO_ROOT}/experiments/env.sh"
 
-ASYNC_RECIPE=experiments/math_async/dapo-math-p10-90/qwen3-4b-instruct-2507/run.sbatch
-COLO_RECIPE=experiments/math_sync/dapo-math-p10-90/qwen3-4b-instruct-2507/run.sbatch
-LOG_DIR="${OUTPUT_DIR}/training/math/dapo-math-p10-90/qwen3-4b-instruct-2507"
+ASYNC_RECIPE=experiments/math_async/dapo-math-p10-90/qwen3-4b/run.sbatch
+COLO_RECIPE=experiments/math_sync/dapo-math-p10-90/qwen3-4b/run.sbatch
+LOG_DIR="${OUTPUT_DIR}/training/math/dapo-math-p10-90/qwen3-4b"
 
 : "${TOTAL_ROLLOUT:=300}"
 : "${N_JOBS:=10}"            # 300 x 335 s = 28 h against a 4 h wall, plus margin
@@ -165,7 +165,7 @@ arms_of_tier() {
 ckpt_path_of() {  # staleness is_correction ratio_denominator opsm_delta lr max_response_len
     (
         set -euo pipefail
-        MODEL_NAME=Qwen3-4B-Instruct-2507 DATASET_TAG=dapo-math-p10-90
+        MODEL_NAME=Qwen3-4B DATASET_TAG=dapo-math-p10-90
         ADVANTAGE_ESTIMATOR=grpo ENTROPY_COEF=0.00 KL_LOSS_COEF=0.00
         EPS_CLIP=0.2 EPS_CLIP_HIGH=0.28 EPS_CLIP_C= RATIO_DENOMINATOR=$3
         read -r TIS_CLIP_LOW TIS_CLIP < <(bounds_of "$2")

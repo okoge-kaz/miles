@@ -136,6 +136,20 @@ if awk "BEGIN{exit !(${KL_LOSS_COEF} != 0)}"; then
 fi
 
 CONFIG_TAG="${CONFIG_TAG:-rollout-length-$(( MAX_RESPONSE_LEN / 1024 ))k-lr${LR}-rbs${ROLLOUT_BATCH_SIZE}-gbs${GLOBAL_BATCH_SIZE}-n${N_SAMPLES_PER_PROMPT}-tseed${TRAIN_SEED}-rseed${ROLLOUT_SEED}}"
+if [[ "${ZERO_REWARD_ON_TRUNCATED:-0}" != "0" ]]; then
+    CONFIG_TAG="${CONFIG_TAG}-zero-trunc"
+fi
+# Replay-buffer formats have different resume semantics and reject one another
+# at load time. Recipes that opt into this identity axis therefore cannot
+# accidentally share a checkpoint directory when only the buffer type changes.
+if [[ "${REPLAY_BUFFER_IDENTITY_TAG:-0}" != "0" ]]; then
+    if [[ "${USE_REPLAY_BUFFER:-0}" != "0" ]]; then
+        : "${REPLAY_BUFFER_TYPE:?USE_REPLAY_BUFFER needs REPLAY_BUFFER_TYPE}"
+        CONFIG_TAG="${CONFIG_TAG}-rb-${REPLAY_BUFFER_TYPE}"
+    else
+        CONFIG_TAG="${CONFIG_TAG}-no-rb"
+    fi
+fi
 if [[ "${TASK_FAMILY}" == search_r1 ]]; then
     : "${SEARCH_MAX_TURNS:?}"
     : "${SEARCH_TOPK:?}"

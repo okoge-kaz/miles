@@ -31,7 +31,7 @@ experiments/
   outputs/                      job logs (git-ignored)
 ```
 
-A recipe is `<task>/<dataset>/<model>/`, e.g. `math_sync/dapo-math-p10-90/qwen3-4b-instruct-2507/`.
+A recipe is `<task>/<dataset>/<model>/`, e.g. `math_sync/dapo-math-p10-90/qwen3-4b/`.
 The task directory fixes the RL setup (rollout mode, reward, generate function),
 the dataset directory fixes the prompt file and the eval benchmarks, and the
 model directory fixes the weights, the parallelism and the batch shape.
@@ -91,7 +91,7 @@ Re-add one by copying the surviving pair and measuring it.
 
 | model | sync (16 GPU colocated) | async (8 train + 8 rollout) | verifier |
 |---|---|---|---|
-| `qwen3-4b-instruct-2507` | TP2 CP4, 9216 tok/GPU | TP2 CP1, 32768 | **`math`** |
+| `qwen3-4b` | TP2 CP1, 32768 tok/GPU | TP2 CP1, 32768 | **`deepscaler`** |
 
 Two rules the row encodes:
 
@@ -99,10 +99,9 @@ Two rules the row encodes:
   sample has to fit in that budget
   (`miles/backends/training_utils/data.py:473`). With the shared 32768 context
   the row clears it.
-* **`qwen3-4b-instruct-2507` defaults to `--rm-type math`, not `deepscaler`.**
-  deepscaler returns 0 unless the response contains a `</think>` delimiter
-  (`rm_hub/deepscaler.py:36-44`), and this checkpoint is non-thinking, so under
-  deepscaler the entire run would score reward 0 without erroring anywhere.
+* **`qwen3-4b` defaults to `--rm-type deepscaler`.** The hybrid-thinking
+  checkpoint emits the `</think>` delimiter required by that verifier
+  (`rm_hub/deepscaler.py:36-44`).
 
 ### Off-policy control
 
@@ -121,10 +120,15 @@ uncontrolled variance in the metric being reported. Measured, it also tripled
 rollout time (253 s → 761 s). `--over-sampling-batch-size` is likewise not
 passed, so the rollout loop submits exactly what it needs.
 
-The offline filter is keyed to a *policy*: `dapo-math-p10-90` is the 0.1–0.9 pass
-rate window measured with Qwen3-4B-Instruct-2507. Another model needs its own
-measurement and its own dataset directory — and with the online filter gone there
-is no safety net when the window is stale.
+The offline filter is keyed to a *policy*. The current recipes use
+`dapo-math-p10-90-qwen3-4b-base-lr2e-5-step4000`: 10,778 of 17,398 prompts in
+the inclusive 0.1–0.9 pass-rate window measured with the step-4000 policy at
+n=16, a 16,384-token response cap, a 32,768-token total-context cap,
+`deepscaler`, and zero reward on truncation. Another model needs its own
+measurement and its own dataset directory — and with the online filter gone
+there is no safety net when the window is stale. The recipe directory retains
+the shorter historical `dapo-math-p10-90` name; `PROMPT_DATA` identifies the
+policy-specific dataset actually used.
 
 `--partial-rollout` is on in `math_sync`, to carry over generation still in flight
 when a rollout batch closes. It does not exist in `math_async` —
@@ -149,7 +153,7 @@ any of it on the command line — the `:=` form means an exported value wins:
 ```bash
 sbatch -A $ACC -N 4 \
   --export=ALL,ACTOR_NUM_NODES=2,ACTOR_GPUS_PER_NODE=8,ROLLOUT_NUM_GPUS=16 \
-  experiments/math_async/dapo-math-p10-90/qwen3-4b-instruct-2507/run.sbatch
+  experiments/math_async/dapo-math-p10-90/qwen3-4b/run.sbatch
 ```
 
 Nothing is inferred from the allocation. `-N 4` allocates four nodes;
@@ -296,7 +300,7 @@ where you think — and leave it off for the long ones.
 
 ```bash
 experiments/sweep.py --sweep experiments/sweeps/offpolicy.txt \
-  --recipe math_async/dapo-math-p10-90/qwen3-4b-instruct-2507 \
+  --recipe math_async/dapo-math-p10-90/qwen3-4b \
   -- -N 2 -p batch_short --time=02:00:00
 ```
 
@@ -412,10 +416,10 @@ Then the training recipes:
 
 ```bash
 # 4a. Math RL, colocated.
-sbatch -A $ACC experiments/math_sync/dapo-math-p10-90/qwen3-4b-instruct-2507/run.sbatch
+sbatch -A $ACC experiments/math_sync/dapo-math-p10-90/qwen3-4b/run.sbatch
 
 # 4b. The same task on the fully-async rollout.
-sbatch -A $ACC experiments/math_async/dapo-math-p10-90/qwen3-4b-instruct-2507/run.sbatch
+sbatch -A $ACC experiments/math_async/dapo-math-p10-90/qwen3-4b/run.sbatch
 ```
 
 A fast smoke variant (a few rollouts, short responses), for checking a change
@@ -424,7 +428,7 @@ before spending a slot on a full run:
 ```bash
 sbatch -A $ACC -p interactive --time=01:00:00 \
   --export=ALL,NUM_ROLLOUT=3,ROLLOUT_BATCH_SIZE=8,N_SAMPLES_PER_PROMPT=8,GLOBAL_BATCH_SIZE=64,MAX_RESPONSE_LEN=1024 \
-  experiments/math_sync/dapo-math-p10-90/qwen3-4b-instruct-2507/run.sbatch
+  experiments/math_sync/dapo-math-p10-90/qwen3-4b/run.sbatch
 ```
 
 Keep the four-knob invariant when changing batch sizes:

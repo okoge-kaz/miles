@@ -16,8 +16,8 @@ export GPUS_PER_NODE="${GPUS_PER_NODE:-8}"           # pool0 default: H100 x8, 1
 # byte-identical prompt file. They are world-readable and stay put.
 export SHARED_WS="${SHARED_WS:-/lustre/fsw/portfolios/coreai/users/kfujii}"
 export DATASET_DIR="${SHARED_WS}/datasets"           # prompt files, eval benchmarks
-export HF_CKPT_DIR="${SHARED_WS}/checkpoints/hf"     # HuggingFace-format weights
-export MEGATRON_CKPT_DIR="${SHARED_WS}/checkpoints/megatron"  # torch_dist weights
+export HF_CKPT_DIR="${HF_CKPT_DIR:-${SHARED_WS}/checkpoints/hf}"  # HuggingFace-format weights
+export MEGATRON_CKPT_DIR="${MEGATRON_CKPT_DIR:-${SHARED_WS}/checkpoints/megatron}"  # torch_dist weights
 export CONTAINER_DIR="${SHARED_WS}/container"        # miles-latest.sqsh
 
 # Written directories are per-user. Sharing them would be worse than a

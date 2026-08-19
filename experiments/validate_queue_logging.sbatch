@@ -13,7 +13,7 @@ set -euo pipefail
 CANDIDATE_REPO="${CANDIDATE_REPO:-${SLURM_SUBMIT_DIR}}"
 BASELINE_REPO="${BASELINE_REPO:-${CANDIDATE_REPO}-baseline}"
 VALIDATION_DIR="${CANDIDATE_REPO}/experiments/outputs/queue_logging/${SLURM_JOB_ID}"
-RECIPE="experiments/math_async/dapo-math-p10-90/qwen3-4b-instruct-2507/run.sbatch"
+RECIPE="experiments/math_async/dapo-math-p10-90/qwen3-4b/run.sbatch"
 
 mkdir -p "${VALIDATION_DIR}"
 

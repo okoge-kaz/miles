@@ -3,11 +3,11 @@
 #
 #   experiments/submit_training.sh <task>/<dataset>/<model> <run-name> [sbatch args...]
 #
-#   recipe: <task>/<dataset>/<model>, e.g. math_sync/dapo-math-p10-90/qwen3-4b-instruct-2507
+#   recipe: <task>/<dataset>/<model>, e.g. math_sync/dapo-math-p10-90/qwen3-4b
 #   (an unknown recipe lists what actually exists on disk)
 #
 # Example — a real 24k-response colocated run, resumable across three 4 h jobs:
-#   experiments/submit_training.sh math_sync/dapo-math-p10-90/qwen3-4b-instruct-2507 real-math-24k \
+#   experiments/submit_training.sh math_sync/dapo-math-p10-90/qwen3-4b real-math-24k \
 #       -p batch --time=04:00:00 --export=ALL,MAX_RESPONSE_LEN=24576,SAVE_INTERVAL=5
 #
 # RUN_NAME is exported for the recipe (it names the checkpoint directory) and

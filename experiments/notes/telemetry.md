@@ -317,9 +317,10 @@ Two rules that go with it:
 
 ### The alternative worth taking for later tiers
 
-`HF_SAVE_INTERVAL=5` already exports an HF checkpoint every 5 rollouts, and
-`experiments/src/offline_eval/run_eval.sbatch` can score them off the training
-critical path. That removes the exclusion entirely and buys a better eval
+The runs analyzed in this section used `HF_SAVE_INTERVAL=5`; the current math
+recipes use `HF_SAVE_INTERVAL=10`. In either case,
+`experiments/src/offline_eval/run_eval.sbatch` can score the exports off the
+training critical path. That removes the exclusion entirely and buys a better eval
 (more samples, more benchmarks) than 30 prompts x 8 affords -- `eval/aime25` at
 n=8 on 30 prompts has se ~0.032, which is wider than the effects being chased.
 Do not switch tier 1 mid-run; switch a whole tier at once or not at all.
@@ -363,7 +364,7 @@ Consequences:
   `wasted_token_frac` as well as to wall-clock. Drop rollouts from the eval until
   `queue_size` returns to its steady value -- 5 rollouts in the case above.
 - Moving evaluation offline (`experiments/src/offline_eval/run_eval.sbatch`, over
-  the `HF_SAVE_INTERVAL=5` exports) removes the perturbation rather than
+  the then-current `HF_SAVE_INTERVAL=5` exports) removes the perturbation rather than
   correcting for it, and is the right configuration for tier 2 onward. It is
   still not something to change inside a running tier.
 
@@ -372,7 +373,8 @@ Consequences:
 `EVAL_INTERVAL` defaults to `0` in both recipes, and `train.sh` then passes no
 `--eval-interval` at all, which leaves `args.eval_interval` None and turns off
 both call sites (`train.py:98` before-train, `train.py:144` periodic). Quality is
-read by scoring the `HF_SAVE_INTERVAL=5` exports offline.
+read by scoring the current `HF_SAVE_INTERVAL=10` exports offline; the historical
+measurements above used an interval of 5.
 
 Three reasons, in order of how much they distort the measurement:
 

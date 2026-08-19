@@ -91,10 +91,10 @@ def resolve_pass_rate_window(args=None) -> tuple[float, float]:
 class PassRateRecord:
     """One prompt's measurement. Serialized one per line by `measure_pass_rate`.
 
-    `truncated_frac` is not decoration: a truncated sample scores 0 under every
-    rule-based verifier, so measuring with a shorter budget than training uses
-    makes prompts look harder than they are. Recording it keeps that bias
-    auditable instead of silent.
+    `truncated_frac` is not decoration: with the opt-in truncation rule it
+    determines how many samples were forced to reward 0; under the historical
+    rule those partial responses are still graded. Recording it keeps either
+    behavior auditable instead of silent.
     """
 
     index: int

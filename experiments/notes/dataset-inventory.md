@@ -22,7 +22,8 @@ neither 0.000 nor 1.000.
 | ⏳ | staged and converted; smoke queued, not yet run |
 | ⛔ | blocked, see the note |
 
-Counts are `wc -l` as of 2026-08-05.
+Counts are `wc -l` as of 2026-08-05, except the step-4000 Qwen3-4B row measured
+on 2026-08-19.
 
 ---
 
@@ -33,6 +34,7 @@ set in use.
 
 | Role | Path | Rows | Verifier | Status |
 |---|---|---|---|---|
+| train | `/data/dapo-math-p10-90-qwen3-4b-base-lr2e-5-step4000/dapo-math-p10-90-qwen3-4b-base-lr2e-5-step4000.jsonl` | 10,778 | `deepscaler` | ✅ |
 | train | `/data/dapo-math-p10-80/dapo-math-p10-80.jsonl` | 3,962 | `math` | ✅ |
 | train (source) | `/data/dapo-math-17k/dapo-math-17k.jsonl` | 17,398 | `math` | ✅ |
 | train | `/data/skywork-or1-rl/skywork-or1-math-miles-20k.jsonl` | 20,060 | `math` | ⏳ |
@@ -44,17 +46,20 @@ set in use.
 | eval (spare) | `/data/aime-2023/aime-2023.jsonl`, `/data/amc-2023/` | 30, parquet | `math` | not in a config |
 
 Eval config: `configs/eval_math.yaml` (aime24/25/26 + math500).
-Recipes: `math_sync/dapo-math-p10-90/qwen3-4b-instruct-2507/`, `math_async/dapo-math-p10-90/qwen3-4b-instruct-2507/` (the only surviving pair; the other four models were deleted unrun on 2026-08-05)
+Recipes: `math_sync/dapo-math-p10-90/qwen3-4b/`, `math_async/dapo-math-p10-90/qwen3-4b/` (the only surviving pair; the other four models were deleted unrun on 2026-08-05)
 for qwen3-1.7b / 4b / 4b-instruct-2507 / 8b / 30b-a3b.
 
-**`--rm-type math`, not `deepscaler`.** `deepscaler.py:36-44` gates on the
-response containing `</think>`, so it returns 0 for every non-thinking model —
-Qwen3-4B-Instruct-2507 answering `\boxed{37}` to the label `37` scored 0.
+The current recipes use **`--rm-type deepscaler`** with the hybrid-thinking
+step-4000 Qwen3-4B checkpoint. Its difficulty measurement used n=16,
+`max_new_tokens=16384`, `max_context_length=32768`, and zero reward on
+truncation. The complete 17,398-row measurement has mean pass rate 0.557; the
+inclusive 0.1–0.9 window retains 10,778 rows (61.9%). Both recipe families use
+this policy-specific dataset.
 
-**DAPO-Math is saturated for this policy**: mean pass rate 0.770, 56.4% of prompts
-solved 8/8. GRPO's advantage is proportional to the group std `sqrt(p(1-p))`, so
-those rows contribute no gradient. `dapo-math-p10-80` is the 3,962-row window that
-survives the cut, and is what both recipe families train on.
+The older Qwen3-4B-Instruct-2507 measurement used `math` and was substantially
+more saturated: mean pass rate 0.770 and 56.4% solved 8/8. Its
+`dapo-math-p10-80` 3,962-row window remains for historical reproduction, but is
+not the prompt file selected by the current recipes.
 
 ## 2. Knowledge / MCQA
 
