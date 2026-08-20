@@ -121,6 +121,8 @@ export RAY_DONE_FLAG="/root/miles/experiments/outputs/.ray/${RUN_NAME}-${SLURM_J
 mkdir -p "${OUTPUT_DIR}/.ray"
 rm -f "${OUTPUT_DIR}/.ray/${RUN_NAME}-${SLURM_JOB_ID}.done"
 
+source "${REPO_ROOT}/experiments/common/clean_checkpoint.sh"
+
 echo "run ${RUN_NAME}"
 echo "checkpoints ${CKPT_PATH}"
 

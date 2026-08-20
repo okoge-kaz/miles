@@ -73,7 +73,7 @@ fi
 : "${PAUSE_GENERATION_MODE:=in_place}"
 : "${ASYNC_MAX_CONCURRENT_SAMPLES:=}"
 : "${USE_REPLAY_BUFFER:=1}"
-: "${REPLAY_BUFFER_TYPE:=rollout}" # rollout | inflight
+: "${REPLAY_BUFFER_TYPE:=inflight}" # rollout | inflight
 : "${REPLAY_BUFFER_IDENTITY_TAG:=1}" # keep buffer types in separate checkpoint namespaces
 [[ "${USE_REPLAY_BUFFER}" =~ ^[01]$ ]] || {
    echo "USE_REPLAY_BUFFER must be 0 or 1" >&2
@@ -163,6 +163,8 @@ export RAY_HEAD_IP
 export RAY_DONE_FLAG="/root/miles/experiments/outputs/.ray/${RUN_NAME}-${SLURM_JOB_ID}.done"
 mkdir -p "${OUTPUT_DIR}/.ray"
 rm -f "${OUTPUT_DIR}/.ray/${RUN_NAME}-${SLURM_JOB_ID}.done"
+
+source "${REPO_ROOT}/experiments/common/clean_checkpoint.sh"
 
 echo "run ${RUN_NAME}"
 echo "checkpoints ${CKPT_PATH}"
