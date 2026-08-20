@@ -139,6 +139,7 @@ CONTEXT_PARALLEL="$(recipe_or_environment CONTEXT_PARALLEL_SIZE)"
 QUEUE_POLICY="$(recipe_or_environment QUEUE_TYPE)"
 STALENESS_REFERENCE_VALUE="$(recipe_or_environment STALENESS_REFERENCE)"
 NUM_ROLLOUT_VALUE="$(recipe_or_environment NUM_ROLLOUT)"
+NUM_STEPS_PER_ROLLOUT_VALUE="$(recipe_or_environment NUM_STEPS_PER_ROLLOUT)"
 MAX_RESPONSE_LEN_VALUE="$(recipe_or_environment MAX_RESPONSE_LEN)"
 ZERO_REWARD_ON_TRUNCATED_VALUE="$(recipe_or_environment ZERO_REWARD_ON_TRUNCATED)"
 USE_REPLAY_BUFFER_VALUE="$(recipe_or_environment USE_REPLAY_BUFFER)"
@@ -157,6 +158,7 @@ HF_SAVE_INTERVAL_VALUE="$(recipe_or_environment HF_SAVE_INTERVAL)"
     exit 1
 }
 require_setting NUM_ROLLOUT 300
+require_setting NUM_STEPS_PER_ROLLOUT 1
 require_setting MAX_RESPONSE_LEN 16384
 require_setting ZERO_REWARD_ON_TRUNCATED 1
 require_setting USE_REPLAY_BUFFER 1
@@ -165,6 +167,10 @@ require_setting FUSE_ONE_STEP_ACTOR_LOGPROBS 1
 require_setting SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS 1
 require_setting SAVE_HF 1
 require_setting HF_SAVE_INTERVAL 10
+[[ -z "${DEBUG_EXIT_AFTER_ROLLOUT:-}" ]] || {
+    echo "this sweep requires DEBUG_EXIT_AFTER_ROLLOUT to be empty" >&2
+    exit 1
+}
 
 declare -a RAW_POINTS=()
 if (( ${#REQUESTED_POINTS[@]} > 0 )); then
@@ -231,8 +237,9 @@ fi
 SETTING_COUNT=$(( ${#POINTS[@]} + INCLUDE_COLOCATED ))
 
 printf 'recipe: %s\n' "${RECIPE}"
-printf 'fixed by recipe: queue=%s, reference=%s, rollouts=%s, gbs=%s, tp=%s, cp=%s\n' \
+printf 'fixed by recipe: queue=%s, reference=%s, rollouts=%s, steps/rollout=%s, gbs=%s, tp=%s, cp=%s\n' \
     "${QUEUE_POLICY}" "${STALENESS_REFERENCE_VALUE}" "${NUM_ROLLOUT_VALUE}" \
+    "${NUM_STEPS_PER_ROLLOUT_VALUE}" \
     "${GLOBAL_BATCH}" "${TENSOR_PARALLEL}" "${CONTEXT_PARALLEL}"
 printf 'fixed safety: response=%s, zero-trunc=%s, replay=%s/%s, fused-logprobs=%s, exact-segments=%s\n' \
     "${MAX_RESPONSE_LEN_VALUE}" "${ZERO_REWARD_ON_TRUNCATED_VALUE}" \
@@ -280,6 +287,7 @@ submit_chain() {
         "ACTOR_NUM_NODES=${train_nodes}"
         "ROLLOUT_NUM_GPUS=$(( rollout_nodes * GPUS_PER_NODE ))"
         "NUM_ROLLOUT=${NUM_ROLLOUT_VALUE}"
+        "NUM_STEPS_PER_ROLLOUT=${NUM_STEPS_PER_ROLLOUT_VALUE}"
         "MAX_RESPONSE_LEN=${MAX_RESPONSE_LEN_VALUE}"
         "ZERO_REWARD_ON_TRUNCATED=${ZERO_REWARD_ON_TRUNCATED_VALUE}"
         "USE_REPLAY_BUFFER=${USE_REPLAY_BUFFER_VALUE}"
@@ -288,6 +296,7 @@ submit_chain() {
         "SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS=${SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS_VALUE}"
         "SAVE_HF=${SAVE_HF_VALUE}"
         "HF_SAVE_INTERVAL=${HF_SAVE_INTERVAL_VALUE}"
+        "DEBUG_EXIT_AFTER_ROLLOUT="
     )
     base_exports_csv="$(IFS=,; printf '%s' "${exports[*]}")"
 
@@ -325,6 +334,7 @@ submit_colocated_chain() {
         "ACTOR_NUM_NODES=${TOTAL_NODES}"
         "ROLLOUT_NUM_GPUS=0"
         "NUM_ROLLOUT=${NUM_ROLLOUT_VALUE}"
+        "NUM_STEPS_PER_ROLLOUT=${NUM_STEPS_PER_ROLLOUT_VALUE}"
         "MAX_RESPONSE_LEN=${MAX_RESPONSE_LEN_VALUE}"
         "ZERO_REWARD_ON_TRUNCATED=${ZERO_REWARD_ON_TRUNCATED_VALUE}"
         "SAVE_HF=${SAVE_HF_VALUE}"
@@ -339,6 +349,7 @@ submit_colocated_chain() {
         "REPLAY_BUFFER_IDENTITY_TAG=0"
         "FUSE_ONE_STEP_ACTOR_LOGPROBS=0"
         "SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS=0"
+        "DEBUG_EXIT_AFTER_ROLLOUT="
     )
     base_exports_csv="$(IFS=,; printf '%s' "${exports[*]}")"
 
