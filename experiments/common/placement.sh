@@ -39,12 +39,9 @@ if (( _engine_pool % ROLLOUT_NUM_GPUS_PER_ENGINE != 0 )); then
 fi
 
 if [[ "${PLACEMENT:-}" == async ]]; then
-    # Jobs submitted before queue policies were named do not export these
-    # variables. They source this helper at execution time, so preserve their
-    # legacy queue-recycle behavior when launching the container.
-    : "${QUEUE_POLICY:=queue-recycle}"
+    : "${QUEUE_TYPE:=queue-recycle}"
     : "${QUEUE_FACTOR:=1}"
-    export QUEUE_POLICY QUEUE_FACTOR
+    export QUEUE_TYPE QUEUE_FACTOR
 
     if [[ -n "${ASYNC_SQSH_IMAGE_OVERRIDE:-}" ]]; then
         [[ "${ASYNC_SQSH_IMAGE_OVERRIDE}" == /* ]] || {

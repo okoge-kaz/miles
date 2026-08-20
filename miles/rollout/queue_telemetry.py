@@ -180,7 +180,7 @@ class _QueueLifecycleRecorder:
     immediately, so rejected groups never remain reachable through diagnostics.
     """
 
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
 
     def __init__(self, enabled: bool) -> None:
         self.enabled = enabled
@@ -315,17 +315,29 @@ class _QueueLifecycleRecorder:
         decision_version: int,
         rollout_id: int | None,
         reference_version: int | None = None,
+        train_version: int | None = None,
         bound_staleness: int | None = None,
         detail: str | None = None,
     ) -> None:
-        if (record := self._records_by_group_key.pop(self._group_key(group), None)) is None:
+        group_key = self._group_key(group)
+        if (record := self._records_by_group_key.get(group_key)) is None:
             return
+        if bound_staleness is not None and (
+            train_version is None or reference_version is None or bound_staleness != train_version - reference_version
+        ):
+            raise ValueError(
+                "bound_staleness must equal train_version - reference_version: "
+                f"bound_staleness={bound_staleness}, train_version={train_version}, "
+                f"reference_version={reference_version}"
+            )
+        del self._records_by_group_key[group_key]
         record.update(
             disposition=disposition,
             decision_version=decision_version,
             decision_time_ns=self._now_ns(),
             rollout_id=rollout_id,
             reference_version=reference_version,
+            train_version=train_version,
             bound_staleness=bound_staleness,
         )
         if detail is not None:
@@ -370,5 +382,6 @@ class _QueueLifecycleRecorder:
             "policy": policy,
             "capacity_groups": capacity_groups,
             "decision_version_semantics": "queue_selection",
+            "bound_staleness_semantics": "scheduled_train_version_minus_reference",
             "records": records,
         }

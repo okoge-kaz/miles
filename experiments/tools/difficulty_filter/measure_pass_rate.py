@@ -35,7 +35,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
 from miles.rollout.rm_hub import batched_async_rm  # noqa: E402
 from miles.utils.types import Sample  # noqa: E402
 
-from experiments.src.difficulty_filter.pass_rate import (  # noqa: E402
+from experiments.tools.difficulty_filter.pass_rate import (  # noqa: E402
     DEFAULT_CORRECT_THRESHOLD,
     DEFAULT_PASS_RATE_MAX,
     DEFAULT_PASS_RATE_MIN,
@@ -70,7 +70,7 @@ def parse_args():
         help="assign reward 0 on finish_reason=length instead of grading the partial response",
     )
     p.add_argument("--reward-key", default=None, help="for rm types returning a dict, e.g. 'score' for --rm-type dapo")
-    # Defaults mirror experiments/math_sync: n_samples_per_prompt 8, temperature 1.
+    # Defaults mirror experiments/scripts/math/sync: n_samples_per_prompt 8, temperature 1.
     # The measured pass rate is then the same statistic the trainer will see per
     # group, so the window maps onto training batches without rescaling.
     p.add_argument("--n-samples", type=int, default=8)

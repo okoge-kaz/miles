@@ -36,10 +36,15 @@ isolates the mechanism instead of reporting that async is faster.
 
     x-axis   rollout GPUs: 8, 16, 24, 32, 48
     series   (a) colocated/sync
-             (b) fully-async, --max-weight-staleness 0
-             (c) fully-async, --max-weight-staleness 2
+             (b) fully-async queue-max, --max-weight-staleness 0
+             (c) fully-async queue-recycle, --max-weight-staleness 2
     y-axis   perf/rollout_time, steady state
     marker   a horizontal line at max_response_len / 203.6 = 120.7 s
+
+`queue-recycle` cannot represent the zero endpoint: its strict admission rule
+`D-F < M` admits no nonnegative gap at `M=0`. Series (b) therefore uses
+`queue-max`, whose dequeue rule accepts equality. This queue-type change must
+remain explicit in the legend.
 
 Prediction: (a) and (b) flatten onto the 120.7 s line and stay there while GPUs
 keep being added -- both forbid a sample from crossing a step boundary, so both

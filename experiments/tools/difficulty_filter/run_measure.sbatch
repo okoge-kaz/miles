@@ -13,7 +13,7 @@
 # Measure a policy's per-prompt pass rate over a whole prompt file.
 #
 #   sbatch -A coreai_horizon_dilations \
-#     experiments/src/difficulty_filter/run_measure.sbatch
+#     experiments/tools/difficulty_filter/run_measure.sbatch
 #
 # Knobs (all --export=ALL environment variables):
 #   MODEL_NAME       policy/artifact name                 (Qwen3-4B-Instruct-2507)
@@ -198,7 +198,7 @@ if [[ ${SKIP_MEASUREMENT} == 0 ]]; then
     done
     curl -sf http://127.0.0.1:${SERVER_PORT}/health >/dev/null || { echo 'sglang never became healthy'; exit 1; }
 
-    python3 experiments/src/difficulty_filter/measure_pass_rate.py \
+    python3 experiments/tools/difficulty_filter/measure_pass_rate.py \
         --prompt-data ${PROMPT_DATA} \
         --output ${OUTPUT} \
         --model-path /ckpt/hf/${HF_MODEL_NAME} \
@@ -229,7 +229,7 @@ if [[ ${SKIP_MEASUREMENT} == 0 ]]; then
 fi
 
 if [[ -n \"${FILTER_OUTPUT_ARGS}\" ]]; then
-    python3 -m experiments.src.difficulty_filter.apply_filter \
+    python3 -m experiments.tools.difficulty_filter.apply_filter \
         --prompt-data ${PROMPT_DATA} \
         --pass-rates ${OUTPUT} \
         ${FILTER_OUTPUT_ARGS} \

@@ -7,7 +7,11 @@ import psutil
 import torch
 import torch.distributed as dist
 
-from miles.backends.training_utils.loss_hub.staleness_metrics import finalize_staleness_gradient_metrics
+from miles.backends.training_utils.loss_hub.staleness_metrics import finalize_sample_staleness_metrics
+from miles.backends.training_utils.update_diagnostics import (
+    UPDATE_PART_PREFIX,
+    finalize_update_diagnostic_parts,
+)
 from miles.utils import train_metric_utils
 from miles.utils.flops_utils import calculate_fwd_flops
 from miles.utils.ft_utils.process_group_utils import MultiPGUtil
@@ -21,6 +25,8 @@ from .data import DataIterator
 from .parallel import get_parallel_state
 
 logger = logging.getLogger(__name__)
+
+_SAMPLE_STALENESS_PREFIX = "sample_staleness/"
 
 
 def gather_log_data(
@@ -429,8 +435,11 @@ def aggregate_train_losses(
     loss_reduced = {}
     values = values.tolist()
     num_samples_or_tokens = values[0]
+    metric_sums = dict(zip(keys, values[1:], strict=True))
 
-    for key, value in zip(keys, values[1:], strict=True):
+    for key, value in metric_sums.items():
+        if key.startswith(UPDATE_PART_PREFIX):
+            continue
         loss_reduced[key] = value * parallel_state.cp.size / num_samples_or_tokens
     if diagnostic_values is not None:
         for key, value in zip(diagnostic_keys, diagnostic_values.tolist(), strict=True):
@@ -449,9 +458,17 @@ def aggregate_train_losses(
         if a is not None and b is not None and c is not None and b > 0.0 and c > 0.0:
             loss_reduced[dst] = (a * a) / (b * c)
 
-    finalize_staleness_gradient_metrics(loss_reduced)
+    loss_reduced.update(finalize_update_diagnostic_parts(metric_sums))
+    finalize_sample_staleness_metrics(loss_reduced)
 
     return loss_reduced
+
+
+def _format_train_metric_key(key: str, role_tag: str) -> str:
+    """Keep actor sample-staleness diagnostics in their own root section."""
+    if not role_tag and key.startswith(_SAMPLE_STALENESS_PREFIX):
+        return key
+    return f"train/{role_tag}{key}"
 
 
 def log_train_step(
@@ -472,7 +489,7 @@ def log_train_step(
     Args:
         args: Configuration.
         loss_dict: Dictionary of loss metrics from aggregate_train_losses.
-        grad_norm: Gradient norm after clipping.
+        grad_norm: Gradient norm measured before clipping.
         rollout_id: Rollout ID.
         step_id: Step ID within the rollout.
         num_steps_per_rollout: Total number of steps per rollout.
@@ -487,14 +504,14 @@ def log_train_step(
     role_tag = "" if role == "actor" else f"{role}-"
 
     log_dict_out = {
-        f"train/{role_tag}{key}": val.mean().item() if isinstance(val, torch.Tensor) else val
+        _format_train_metric_key(key, role_tag): val.mean().item() if isinstance(val, torch.Tensor) else val
         for key, val in loss_dict.items()
     }
     log_dict_out[f"train/{role_tag}grad_norm"] = float(grad_norm)
 
     if extra_metrics:
         for key, val in extra_metrics.items():
-            log_dict_out[f"train/{role_tag}{key}"] = val
+            log_dict_out[_format_train_metric_key(key, role_tag)] = val
 
     log_dict_out["train/step"] = accumulated_step_id
 

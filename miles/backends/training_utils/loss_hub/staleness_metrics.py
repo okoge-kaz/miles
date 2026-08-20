@@ -1,4 +1,4 @@
-"""Feature-gated gradient-contribution diagnostics grouped by rollout lag."""
+"""Feature-gated trainer diagnostics grouped by sample staleness."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from miles.backends.training_utils.cp_utils import get_local_response_loss_masks
 from miles.backends.training_utils.parallel import get_parallel_state
 from miles.utils.types import RolloutBatch
 
-_PART_PREFIX = "_staleness_gradient_part/"
+_PART_PREFIX = "_sample_staleness_part/"
 _RATIO_HISTOGRAM_EDGES = (
     -1.0,
     -0.3,
@@ -246,7 +246,7 @@ def _histogram_parts(
     return {f"ratio_hist_{index}": counts[:, index] for index in range(num_ratio_bins)}
 
 
-def compute_staleness_gradient_parts(
+def compute_sample_staleness_parts(
     *,
     args: Namespace,
     batch: RolloutBatch,
@@ -260,12 +260,12 @@ def compute_staleness_gradient_parts(
 ) -> dict[str, torch.Tensor]:
     """Return detached additive parts; the global reducer forms all ratios."""
     sample_staleness = batch.get("sample_staleness")
-    if not getattr(args, "log_staleness_gradient_metrics", False) or sample_staleness is None:
+    if not getattr(args, "log_sample_staleness_metrics", False) or sample_staleness is None:
         return {}
     if len(sample_staleness) != len(original_local_masks):
         raise ValueError(f"sample_staleness has {len(sample_staleness)} rows for {len(original_local_masks)} samples")
 
-    max_staleness = int(getattr(args, "staleness_gradient_max_bin", 16))
+    max_staleness = int(getattr(args, "sample_staleness_max_bin", 16))
     num_bins = max_staleness + 2
     device = pg_loss_tokens.device
     final_local_mask_list = get_local_response_loss_masks(
@@ -329,7 +329,7 @@ def compute_staleness_gradient_parts(
             "sequence_ratio_sum_w2": seq_sum_w2,
             "sequence_count": seq_count,
         }
-        if getattr(args, "log_staleness_gradient_ratio_histogram", False):
+        if getattr(args, "log_sample_staleness_ratio_histogram", False):
             parts |= _histogram_parts(
                 token_bins=token_bins,
                 policy_log_ratio=policy_log_ratio,
@@ -378,7 +378,7 @@ def _approx_abs_p95(histogram: list[float]) -> float:
     return 1.0
 
 
-def finalize_staleness_gradient_metrics(
+def finalize_sample_staleness_metrics(
     metrics: dict[str, float],
     *,
     max_staleness: int | None = None,
@@ -416,18 +416,18 @@ def finalize_staleness_gradient_metrics(
     total_response_tokens = sum(parts["response_token_count"])
     total_pre_loss_tokens = sum(parts["token_count"])
     total_contribution = sum(parts["effective_contribution"])
-    metrics["staleness_gradient/mean_abs_pg_objective"] = _safe_ratio(
+    metrics["sample_staleness/mean_abs_pg_objective"] = _safe_ratio(
         total_contribution,
         total_samples,
     )
-    metrics["staleness_gradient/effective_contribution_available"] = float(total_contribution > 0.0)
+    metrics["sample_staleness/effective_contribution_available"] = float(total_contribution > 0.0)
     for index in range(num_bins):
         label = _bin_label(index, max_staleness)
         response_count = parts["response_token_count"][index]
         token_count = parts["token_count"][index]
         final_count = parts["final_token_count"][index]
         contribution = parts["effective_contribution"][index]
-        prefix = f"staleness_gradient/{label}"
+        prefix = f"sample_staleness/{label}"
         metrics[f"{prefix}/consumed_sequence_mass"] = _safe_ratio(parts["sample_count"][index], total_samples)
         metrics[f"{prefix}/consumed_response_token_mass"] = _safe_ratio(
             response_count,
@@ -477,11 +477,11 @@ def finalize_staleness_gradient_metrics(
         label = _bin_label(staleness_index, max_staleness)
         histogram = [values[staleness_index] for values in histograms]
         total = sum(histogram)
-        metrics[f"staleness_gradient/{label}/approx_p95_abs_policy_rollout_log_ratio_capped_1"] = _approx_abs_p95(
+        metrics[f"sample_staleness/{label}/approx_p95_abs_policy_rollout_log_ratio_capped_1"] = _approx_abs_p95(
             histogram
         )
         for ratio_label, count in zip(histogram_labels, histogram, strict=True):
-            metrics[f"staleness_gradient/{label}/policy_rollout_log_ratio_hist/{ratio_label}"] = _safe_ratio(
+            metrics[f"sample_staleness/{label}/policy_rollout_log_ratio_hist/{ratio_label}"] = _safe_ratio(
                 count,
                 total,
             )

@@ -35,6 +35,7 @@ python -m pytest -q \
     tests/fast/rollout/test_queue_telemetry.py \
     tests/fast/utils/test_types.py \
     tests/fast/rollout/test_fully_async_rollout.py \
+    miles/utils/test_wandb_utils.py \
     tests/fast/test_train_async_replay_buffer.py
 
 python_files=(
@@ -63,7 +64,9 @@ python_files=(
     miles/rollout/session/samples/codec.py
     miles/utils/arguments.py
     miles/utils/train_metric_utils.py
+    miles/utils/tracking_utils/wandb_utils.py
     miles/utils/types.py
+    miles/utils/test_wandb_utils.py
     tests/fast/backends/training_utils/loss/test_staleness_metrics.py
     tests/fast/backends/training_utils/test_debug_dump.py
     tests/fast/ray/rollout/real_ray/test_rollout_manager.py

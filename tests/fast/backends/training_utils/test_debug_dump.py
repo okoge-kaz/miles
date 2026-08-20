@@ -25,8 +25,8 @@ def test_logging_values_preserve_float64_additive_parts() -> None:
         1,
         {
             "legacy_metric": torch.tensor(0.25, dtype=torch.float32),
-            "_staleness_gradient_part/sequence_ess_sum_w/0": torch.tensor(1.0e100, dtype=torch.float64),
-            "_staleness_gradient_part/token_count/0": torch.tensor(3.0, dtype=torch.float32),
+            "_sample_staleness_part/sequence_ess_sum_w/0": torch.tensor(1.0e100, dtype=torch.float64),
+            "_sample_staleness_part/token_count/0": torch.tensor(3.0, dtype=torch.float32),
         },
         device=torch.device("cpu"),
     )
@@ -34,8 +34,8 @@ def test_logging_values_preserve_float64_additive_parts() -> None:
     assert packed["keys"] == ["legacy_metric"]
     assert packed["values"].dtype == torch.float32
     assert packed["diagnostic_keys"] == [
-        "_staleness_gradient_part/sequence_ess_sum_w/0",
-        "_staleness_gradient_part/token_count/0",
+        "_sample_staleness_part/sequence_ess_sum_w/0",
+        "_sample_staleness_part/token_count/0",
     ]
     assert packed["diagnostic_values"].dtype == torch.float64
     assert torch.isfinite(packed["diagnostic_values"]).all()
@@ -51,7 +51,7 @@ def test_float64_additive_parts_reduce_without_promoting_historical_metrics(monk
         2,
         {
             "legacy_metric": torch.tensor(4.0, dtype=torch.float32),
-            "_staleness_gradient_part/high_dynamic_range/0": torch.tensor(1.0e100, dtype=torch.float64),
+            "_sample_staleness_part/high_dynamic_range/0": torch.tensor(1.0e100, dtype=torch.float64),
         },
         device=torch.device("cpu"),
     )
@@ -59,7 +59,7 @@ def test_float64_additive_parts_reduce_without_promoting_historical_metrics(monk
     metrics = aggregate_train_losses([packed])
 
     assert metrics["legacy_metric"] == 2.0
-    assert metrics["_staleness_gradient_part/high_dynamic_range/0"] == pytest.approx(5.0e99)
+    assert metrics["_sample_staleness_part/high_dynamic_range/0"] == pytest.approx(5.0e99)
 
 
 def test_policy_loss_debug_records_joinable_final_sample_diagnostics(tmp_path, monkeypatch) -> None:

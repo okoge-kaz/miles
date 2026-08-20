@@ -45,7 +45,7 @@ submit_smoke() {
         -A "${ACCOUNT}" -p interactive --time=01:00:00 \
         --job-name=smoke-pr-qwen3-4b-base-step4000 \
         --export="$(filter_exports "${smoke_output}" "LIMIT=32,DUMP_RESPONSES=${smoke_audit},DUMP_LIMIT=8")" \
-        experiments/src/difficulty_filter/run_measure.sbatch
+        experiments/tools/difficulty_filter/run_measure.sbatch
 }
 
 submit_shard_round() {
@@ -63,7 +63,7 @@ submit_shard_round() {
         --job-name="pr${shard}-qwen3-4b-step4000" \
         "${dependency[@]}" \
         --export="$(filter_exports "${output}" "START_INDEX=${start_index},END_INDEX=${end_index},DUMP_RESPONSES=${audit},DUMP_LIMIT=8")" \
-        experiments/src/difficulty_filter/run_measure.sbatch
+        experiments/tools/difficulty_filter/run_measure.sbatch
 }
 
 submit_filter() {
@@ -74,7 +74,7 @@ submit_filter() {
         -A "${ACCOUNT}" \
         --dependency="afterany:${shard_0_job}:${shard_1_job}" \
         --export="ALL,FILTER_ROUND=1,FILTER_MAX_ROUNDS=${FILTER_MAX_ROUNDS:-8},HF_CKPT_DIR=${HF_CKPT_DIR}" \
-        experiments/math_async/dapo-math-p10-90/qwen3-4b/continue_filter.sbatch)"
+        experiments/tools/difficulty_filter/dapo-math/continue_filter.sbatch)"
     echo "round 1: shard0=${shard_0_job} shard1=${shard_1_job} continuation=${continuation_job}" >&2
 }
 

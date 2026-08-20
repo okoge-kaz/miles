@@ -1,6 +1,6 @@
 import json
 
-from experiments.src.difficulty_filter.measure_pass_rate import (
+from experiments.tools.difficulty_filter.measure_pass_rate import (
     cap_max_new_tokens,
     load_prompts,
     repair_trailing_record,

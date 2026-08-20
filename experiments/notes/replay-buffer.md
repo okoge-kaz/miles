@@ -88,16 +88,15 @@ update and usually preserve the ready queue instead.
 
 ## Compatibility
 
-New writes use replay-buffer schema 4 and the `replay_buffer_N.pt` name. The
-reader remains compatible with schema 1-3 files named
-`fully_async_state_N.pt`; those legacy files are interpreted as type `rollout`.
-The legacy CLI option and Python module names are intentionally not aliases:
-current configurations must use replay-buffer terminology, while compatibility
-code for the old disk format stays isolated in `miles.rollout.replay_buffer`.
+Replay-buffer resume accepts only schema 4 with the `replay_buffer_N.pt` name.
+Old schema 1-3 files and the `fully_async_state_N.pt` name are not searched or
+migrated. Current launch configurations must use replay-buffer terminology and
+must create a new state after an incompatible format change.
 
-The buffer records queue policy and effective group capacity. Resume rejects a
-different policy or capacity instead of interpreting one algorithm's queue as
-another. Older schemas without this field are treated as `queue-recycle`.
+The buffer records queue type and effective group capacity. Resume rejects a
+missing or different queue configuration instead of inferring `queue-recycle`
+or interpreting one algorithm's queue as another. There is no migration for a
+state written before `queue_config` became required.
 
 ## Storage and observability
 
@@ -134,7 +133,7 @@ For the math-async recipe:
 
 ```bash
 CONFIG_TAG=my-run-replay USE_REPLAY_BUFFER=1 REPLAY_BUFFER_TYPE=rollout sbatch \
-  experiments/math_async/dapo-math-p10-90/qwen3-4b/run.sbatch
+  experiments/scripts/math/async/dapo-math-p10-90/qwen3-4b/run.sbatch
 ```
 
 Use `REPLAY_BUFFER_TYPE=inflight` for token-prefix continuation with the

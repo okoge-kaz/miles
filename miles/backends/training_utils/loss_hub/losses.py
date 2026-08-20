@@ -20,8 +20,9 @@ from miles.backends.training_utils.loss_hub.math_utils import (
     compute_policy_loss,
     compute_sequence_level_ess_parts,
 )
-from miles.backends.training_utils.loss_hub.staleness_metrics import compute_staleness_gradient_parts
+from miles.backends.training_utils.loss_hub.staleness_metrics import compute_sample_staleness_parts
 from miles.backends.training_utils.parallel import get_parallel_state
+from miles.backends.training_utils.update_diagnostics import compute_update_diagnostic_parts
 from miles.utils.misc import load_function
 from miles.utils.types import RolloutBatch
 
@@ -55,9 +56,10 @@ class LossFunction(Protocol):
             `(loss, metrics)`:
               * `loss`: scalar tensor with grad, un-rescaled (the dispatcher
                 applies Megatron scaling on top).
-              * `metrics`: dict of detached 0-d scalars; surfaced under `train/`
-                in the training log / wandb. Keys per loss type are documented
-                on each implementation.
+              * `metrics`: dict of detached 0-d scalars. Ordinary keys are
+                surfaced under `train/`; `sample_staleness/` remains a
+                top-level namespace. Keys per loss type are documented on each
+                implementation.
         """
         ...
 
@@ -399,21 +401,20 @@ def policy_loss_function(
 
     policy_log_ratio = None
     if batch.get("rollout_log_probs") is not None and (
-        getattr(args, "log_staleness_gradient_metrics", False) or debug_base_pg_loss is not None
+        getattr(args, "log_sample_staleness_metrics", False) or debug_base_pg_loss is not None
     ):
         policy_log_ratio = log_probs.detach() - torch.cat(batch["rollout_log_probs"], dim=0).detach()
 
-    staleness_gradient_parts: dict[str, torch.Tensor] = {}
-    if getattr(args, "log_staleness_gradient_metrics", False):
+    sample_staleness_parts: dict[str, torch.Tensor] = {}
+    if getattr(args, "log_sample_staleness_metrics", False):
         assert batch.get("sample_staleness") is not None, (
-            "--log-staleness-gradient-metrics requires complete per-sample "
-            "reference/drain weight-version provenance"
+            "--log-sample-staleness-metrics requires complete per-sample " "reference/drain weight-version provenance"
         )
         assert (
             "rollout_log_probs" in batch
-        ), "staleness-gradient metrics require rollout_log_probs to measure the current/behavior ratio"
+        ), "sample-staleness metrics require rollout_log_probs to measure the current/behavior ratio"
         assert policy_log_ratio is not None
-        staleness_gradient_parts = compute_staleness_gradient_parts(
+        sample_staleness_parts = compute_sample_staleness_parts(
             args=args,
             batch=batch,
             original_local_masks=local_loss_mask_list,
@@ -613,7 +614,13 @@ def policy_loss_function(
         "ess_ratio": ess_ratio_sum.squeeze(),
     }
     reported_loss |= {name: value.clone().detach() for name, value in fused_metrics.items()}
-    reported_loss |= staleness_gradient_parts
+    reported_loss |= sample_staleness_parts
+    reported_loss |= compute_update_diagnostic_parts(
+        args,
+        batch,
+        advantages,
+        modified_response_masks,
+    )
 
     if train_rollout_logprob_abs_diff is not None:
         reported_loss["train_rollout_logprob_abs_diff"] = train_rollout_logprob_abs_diff.clone().detach()

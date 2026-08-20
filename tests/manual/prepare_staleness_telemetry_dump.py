@@ -11,8 +11,8 @@ import torch
 
 from miles.rollout.recycle_compute_metrics import (
     BOUND_REFERENCE_VERSION_KEY,
-    DRAIN_VERSION_KEY,
     SAMPLE_REFERENCE_VERSION_KEY,
+    TRAIN_VERSION_KEY,
 )
 
 
@@ -22,7 +22,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--group-size", type=int, required=True)
     parser.add_argument("--lags", type=int, nargs="+", default=(0, 1, 2, 4, 8, 17))
-    parser.add_argument("--drain-version", type=int, default=100)
+    parser.add_argument("--train-version", type=int, default=100)
     return parser.parse_args()
 
 
@@ -56,19 +56,19 @@ def main() -> None:
         if group_key not in lag_by_group:
             lag_by_group[group_key] = args.lags[len(lag_by_group) % len(args.lags)]
         lag = lag_by_group[group_key]
-        reference = args.drain_version - lag
+        reference = args.train_version - lag
         metadata = sample.setdefault("metadata", {})
         if not isinstance(metadata, dict):
             raise TypeError(f"sample row {row_index} metadata is not a dictionary")
         metadata[SAMPLE_REFERENCE_VERSION_KEY] = reference
         metadata[BOUND_REFERENCE_VERSION_KEY] = reference
-        metadata[DRAIN_VERSION_KEY] = args.drain_version
+        metadata[TRAIN_VERSION_KEY] = args.train_version
         lag_counts[lag] += 1
 
     payload_metadata = payload.setdefault("metadata", {})
     payload_metadata["staleness_telemetry_validation"] = {
         "source": str(args.input),
-        "drain_version": args.drain_version,
+        "train_version": args.train_version,
         "lag_counts": lag_counts,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)

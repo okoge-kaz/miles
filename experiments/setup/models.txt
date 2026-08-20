@@ -6,7 +6,7 @@
 # Everything <= 120B that has a MODEL_ARGS file in the repo and a public HF repo.
 # Sizes are the HF download; the torch_dist output is roughly the same again.
 #
-# --- RL experiment workhorses (experiments/math_sync, math_async, tool_multiturn) ---
+# --- RL experiment workhorses (experiments/scripts/math/{sync,async}) ---
 # Qwen3-4B (hybrid thinking) is already staged and is the model the first math
 # runs used. It sits at its post-training RLVR fixed point on math: raw_reward
 # 0.84 flat over 46 steps, 21.6/32 groups zero-variance, AIME24 avg@16 0.70 ->

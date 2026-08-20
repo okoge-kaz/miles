@@ -1,7 +1,7 @@
 import json
 from types import SimpleNamespace
 
-from experiments.src.difficulty_filter import apply_filter
+from experiments.tools.difficulty_filter import apply_filter
 
 
 def test_load_records_accepts_search_r1_operational_fields(tmp_path):

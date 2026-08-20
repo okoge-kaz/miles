@@ -4,7 +4,7 @@
 # TIS_CLIP_LOW, MIS_PROFILE, USE_OPSM, OPSM_DELTA, KL_LOSS_COEF, LR,
 # MAX_RESPONSE_LEN, NUM_STEPS_PER_ROLLOUT, ROLLOUT_BATCH_SIZE,
 # GLOBAL_BATCH_SIZE, N_SAMPLES_PER_PROMPT, TRAIN_SEED, ROLLOUT_SEED, and for PLACEMENT=async also
-# QUEUE_POLICY and, except for queue-drop, MAX_WEIGHT_STALENESS.
+# QUEUE_TYPE and, except for queue-drop, MAX_WEIGHT_STALENESS.
 # Optionally accepts TASK_FAMILY (default: math). Sets RL_ALGORITHM,
 # POLICY_REGIME, CONFIG_TAG, RUN_NAME, CKPT_PATH.
 # Sourced by both run.sbatch and train.sh so the two cannot disagree.
@@ -39,21 +39,23 @@ case "${PLACEMENT}" in
            && "${STALENESS_REFERENCE:-completion}" == completion ]] ||
             { echo "PLACEMENT=colocated cannot carry MAX_WEIGHT_STALENESS/PAUSE_GENERATION_MODE/STALENESS_REFERENCE" >&2; exit 1; }
         MAX_WEIGHT_STALENESS=0
-        QUEUE_POLICY=none
+        QUEUE_TYPE=none
         QUEUE_FACTOR=1
         PAUSE_GENERATION_MODE=none
         STALENESS_REFERENCE=completion
         ;;
     async)
-        : "${QUEUE_POLICY:=queue-recycle}"
+        : "${QUEUE_TYPE:=queue-recycle}"
         : "${QUEUE_FACTOR:=1}"
         : "${STALENESS_REFERENCE:=completion}"
         [[ "${STALENESS_REFERENCE}" == completion || "${STALENESS_REFERENCE}" == submission \
            || "${STALENESS_REFERENCE}" == prefill ]] ||
             { echo "STALENESS_REFERENCE must be completion, submission, or prefill, got '${STALENESS_REFERENCE}'" >&2; exit 1; }
-        case "${QUEUE_POLICY}" in
+        case "${QUEUE_TYPE}" in
             queue-recycle)
                 : "${MAX_WEIGHT_STALENESS:?}"
+                [[ "${MAX_WEIGHT_STALENESS}" =~ ^[1-9][0-9]*$ ]] ||
+                    { echo "queue-recycle requires MAX_WEIGHT_STALENESS to be an integer >= 1" >&2; exit 1; }
                 [[ "${QUEUE_FACTOR}" == 1 ]] ||
                     { echo "QUEUE_FACTOR is only used by queue-drop" >&2; exit 1; }
                 ;;
@@ -71,7 +73,7 @@ case "${PLACEMENT}" in
                     { echo "QUEUE_FACTOR must be an integer >= 1" >&2; exit 1; }
                 ;;
             *)
-                echo "QUEUE_POLICY must be queue-recycle, queue-max, or queue-drop, got '${QUEUE_POLICY}'" >&2
+                echo "QUEUE_TYPE must be queue-recycle, queue-max, or queue-drop, got '${QUEUE_TYPE}'" >&2
                 exit 1
                 ;;
         esac
@@ -92,9 +94,7 @@ TASK_FAMILY="${TASK_FAMILY:-math}"
 # categorized on-policy.
 if [[ "${NUM_STEPS_PER_ROLLOUT}" -eq 1 \
       && ( "${PLACEMENT}" == colocated \
-           || ( "${QUEUE_POLICY}" == queue-recycle && "${MAX_WEIGHT_STALENESS}" -eq 0 \
-                && "${STALENESS_REFERENCE}" != completion ) \
-           || ( "${QUEUE_POLICY}" == queue-max && "${MAX_WEIGHT_STALENESS}" -eq 0 ) ) ]]; then
+           || ( "${QUEUE_TYPE}" == queue-max && "${MAX_WEIGHT_STALENESS}" -eq 0 ) ) ]]; then
     POLICY_REGIME=on-policy
 else
     POLICY_REGIME=off-policy
@@ -162,7 +162,7 @@ fi
 # Suffixed only away from the default, so paths written before the option existed
 # keep their spelling. The reference changes the age decision, so two runs that
 # differ only here are different runs and must not share a directory.
-case "${QUEUE_POLICY}" in
+case "${QUEUE_TYPE}" in
     none|queue-recycle)
         STALENESS_TAG="max-weight-staleness-${MAX_WEIGHT_STALENESS}"
         [[ "${STALENESS_REFERENCE:-completion}" == completion ]] ||

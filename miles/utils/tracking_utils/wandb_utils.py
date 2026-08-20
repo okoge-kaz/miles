@@ -8,6 +8,23 @@ from miles.utils.env_report import decode_env_report
 
 logger = logging.getLogger(__name__)
 
+_STEP_METRIC_PREFIXES = {
+    "train/step": ("train", "sample_staleness"),
+    "rollout/step": (
+        "rollout",
+        "fully_async",
+        "resume",
+        "multi_turn",
+        "passrate",
+        "perf",
+        "staleness",
+        "selection_bias",
+        "throughput",
+        "queue",
+    ),
+    "eval/step": ("eval",),
+}
+
 
 def _is_offline_mode(args) -> bool:
     """Detect whether W&B should run in offline mode.
@@ -158,13 +175,7 @@ def init_wandb_secondary(args, router_addr=None):
 
 
 def _init_wandb_common():
-    wandb.define_metric("train/step")
-    wandb.define_metric("train/*", step_metric="train/step")
-    wandb.define_metric("rollout/step")
-    wandb.define_metric("rollout/*", step_metric="rollout/step")
-    wandb.define_metric("resume/*", step_metric="rollout/step")
-    wandb.define_metric("multi_turn/*", step_metric="rollout/step")
-    wandb.define_metric("passrate/*", step_metric="rollout/step")
-    wandb.define_metric("eval/step")
-    wandb.define_metric("eval/*", step_metric="eval/step")
-    wandb.define_metric("perf/*", step_metric="rollout/step")
+    for step_metric, prefixes in _STEP_METRIC_PREFIXES.items():
+        wandb.define_metric(step_metric)
+        for prefix in prefixes:
+            wandb.define_metric(f"{prefix}/*", step_metric=step_metric)

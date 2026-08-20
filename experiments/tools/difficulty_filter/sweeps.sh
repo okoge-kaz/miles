@@ -2,9 +2,9 @@
 #
 # Every (prompt file, verifier) pair we measure pass rates for, in one table.
 #
-#   experiments/src/difficulty_filter/sweeps.sh smoke            # all, 64 prompts each
-#   experiments/src/difficulty_filter/sweeps.sh full  arc-agi    # one, whole file
-#   experiments/src/difficulty_filter/sweeps.sh list
+#   experiments/tools/difficulty_filter/sweeps.sh smoke            # all, 64 prompts each
+#   experiments/tools/difficulty_filter/sweeps.sh full  arc-agi    # one, whole file
+#   experiments/tools/difficulty_filter/sweeps.sh list
 #
 # The pairing is the part worth version-controlling. A wrong verifier does not
 # crash -- it returns 0.0 for every row, and a dataset that looks uniformly
@@ -109,6 +109,6 @@ while IFS='|' read -r name data verifier extra; do
 
     id=$(sbatch --parsable -A "${ACCOUNT}" --job-name="${job}" \
         --export="${exports}" \
-        experiments/src/difficulty_filter/run_measure.sbatch)
+        experiments/tools/difficulty_filter/run_measure.sbatch)
     printf "%-22s %s  job=%s\n" "${name}" "${mode}" "${id}"
 done <<< "${SWEEPS}"

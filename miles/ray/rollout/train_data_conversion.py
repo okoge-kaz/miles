@@ -2,7 +2,7 @@ from typing import Any
 
 import torch
 
-from miles.rollout.recycle_compute_metrics import DRAIN_VERSION_KEY, SAMPLE_REFERENCE_VERSION_KEY
+from miles.rollout.recycle_compute_metrics import SAMPLE_REFERENCE_VERSION_KEY, TRAIN_VERSION_KEY
 from miles.utils import object_store
 from miles.utils.object_store import ValueSpec
 from miles.utils.seqlen_balancing import get_seqlen_balanced_partitions
@@ -87,19 +87,20 @@ def convert_samples_to_train_data(
         if (training_step := metadata.get("training_step")) is not None:
             train_data["training_steps"] = [int(training_step)] * len(samples)
 
-    if getattr(args, "log_staleness_gradient_metrics", False) or getattr(args, "dump_details", None) is not None:
+    if getattr(args, "log_sample_staleness_metrics", False) or getattr(args, "dump_details", None) is not None:
         staleness_rows = []
         for sample in samples:
             reference = sample.metadata.get(SAMPLE_REFERENCE_VERSION_KEY)
-            drain = sample.metadata.get(DRAIN_VERSION_KEY)
-            if not isinstance(reference, int) or not isinstance(drain, int):
+            train_version = sample.metadata.get(TRAIN_VERSION_KEY)
+            if not isinstance(reference, int) or not isinstance(train_version, int):
                 staleness_rows = []
                 break
-            if drain < reference:
+            if train_version < reference:
                 raise RuntimeError(
-                    f"Negative sample staleness for sample {sample.index}: " f"drain={drain}, reference={reference}"
+                    f"Negative sample staleness for sample {sample.index}: "
+                    f"train={train_version}, reference={reference}"
                 )
-            staleness_rows.append(drain - reference)
+            staleness_rows.append(train_version - reference)
         if staleness_rows:
             train_data["sample_staleness"] = staleness_rows
 

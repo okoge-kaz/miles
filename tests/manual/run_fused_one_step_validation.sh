@@ -133,14 +133,14 @@ if [[ "${VALIDATION_STALENESS_METRICS}" == 1 ]]; then
         echo "VALIDATION_STALENESS_METRICS=1 requires VALIDATION_FULLY_ASYNC=1" >&2
         exit 1
     fi
-    telemetry_args+=(--log-staleness-gradient-metrics)
+    telemetry_args+=(--log-sample-staleness-metrics)
 fi
 if [[ "${VALIDATION_STALENESS_RATIO_HISTOGRAM}" == 1 ]]; then
     if [[ "${VALIDATION_STALENESS_METRICS}" != 1 ]]; then
         echo "VALIDATION_STALENESS_RATIO_HISTOGRAM=1 requires VALIDATION_STALENESS_METRICS=1" >&2
         exit 1
     fi
-    telemetry_args+=(--log-staleness-gradient-ratio-histogram)
+    telemetry_args+=(--log-sample-staleness-ratio-histogram)
 fi
 if [[ "${VALIDATION_DUMPER}" == 1 ]]; then
     telemetry_args+=(

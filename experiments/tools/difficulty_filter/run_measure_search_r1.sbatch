@@ -15,12 +15,12 @@
 # Smoke (measures 64 prompts and does not write the production filtered set):
 #
 #   sbatch -A coreai_horizon_dilations --export=ALL,LIMIT=64 \
-#     experiments/src/difficulty_filter/run_measure_search_r1.sbatch
+#     experiments/tools/difficulty_filter/run_measure_search_r1.sbatch
 #
 # Full measurement + fixed p10-90 dataset:
 #
 #   sbatch -A coreai_horizon_dilations \
-#     experiments/src/difficulty_filter/run_measure_search_r1.sbatch
+#     experiments/tools/difficulty_filter/run_measure_search_r1.sbatch
 #
 # Defaults intentionally match the training recipes: Qwen3-4B-Instruct-2507,
 # n=8, temperature/top-p 1, 512 generated tokens per action, three turns, E5
@@ -100,4 +100,4 @@ srun \
     --container-writable \
     --no-container-mount-home \
     --export=ALL \
-    bash /root/miles/experiments/src/difficulty_filter/measure_search_r1_job.sh
+    bash /root/miles/experiments/tools/difficulty_filter/measure_search_r1_job.sh

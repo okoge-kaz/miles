@@ -30,7 +30,7 @@ fi
 
 ROLLOUT_ARGS=(
    --fully-async
-   --fully-async-queue-policy "${QUEUE_POLICY}"
+   --fully-async-queue-type "${QUEUE_TYPE}"
    --prompt-data "${PROMPT_DATA}"
    --input-key prompt
    --label-key label
@@ -54,7 +54,7 @@ ROLLOUT_ARGS=(
 if [[ "${ZERO_REWARD_ON_TRUNCATED}" != "0" ]]; then
    ROLLOUT_ARGS+=(--zero-reward-on-truncated)
 fi
-if [[ "${QUEUE_POLICY}" == queue-drop ]]; then
+if [[ "${QUEUE_TYPE}" == queue-drop ]]; then
    ROLLOUT_ARGS+=(--fully-async-queue-factor "${QUEUE_FACTOR}")
 else
    ROLLOUT_ARGS+=(--max-weight-staleness "${MAX_WEIGHT_STALENESS}")
@@ -85,15 +85,18 @@ if [[ "${DUMP_TRAIN_DATA}" == "0" ]]; then
 else
    TELEMETRY_ARGS+=(--use-rollout-entropy)
 fi
-if [[ "${LOG_STALENESS_GRADIENT_METRICS:-0}" != "0" ]]; then
-   TELEMETRY_ARGS+=(--log-staleness-gradient-metrics)
+if [[ "${LOG_SAMPLE_STALENESS_METRICS:-0}" != "0" ]]; then
+   TELEMETRY_ARGS+=(--log-sample-staleness-metrics)
 fi
-if [[ "${LOG_STALENESS_GRADIENT_RATIO_HISTOGRAM:-0}" != "0" ]]; then
-   if [[ "${LOG_STALENESS_GRADIENT_METRICS:-0}" == "0" ]]; then
-      echo "LOG_STALENESS_GRADIENT_RATIO_HISTOGRAM requires LOG_STALENESS_GRADIENT_METRICS=1" >&2
+if [[ "${LOG_SAMPLE_STALENESS_RATIO_HISTOGRAM:-0}" != "0" ]]; then
+   if [[ "${LOG_SAMPLE_STALENESS_METRICS:-0}" == "0" ]]; then
+      echo "LOG_SAMPLE_STALENESS_RATIO_HISTOGRAM requires LOG_SAMPLE_STALENESS_METRICS=1" >&2
       exit 1
    fi
-   TELEMETRY_ARGS+=(--log-staleness-gradient-ratio-histogram)
+   TELEMETRY_ARGS+=(--log-sample-staleness-ratio-histogram)
+fi
+if [[ "${LOG_UPDATE_DIAGNOSTICS:-0}" != "0" ]]; then
+   TELEMETRY_ARGS+=(--log-update-diagnostics)
 fi
 
 # EVAL_INTERVAL=0 passes no --eval-interval at all, which is what leaves

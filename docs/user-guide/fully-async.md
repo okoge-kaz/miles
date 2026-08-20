@@ -78,7 +78,7 @@ generation. If it is empty, rollout is still the bottleneck and async cannot hid
 | `--sglang-server-concurrency` | Per-engine request concurrency |
 | `--global-batch-size` | Number of samples the trainer drains per step |
 | `--num-steps-per-rollout` | Number of optimizer steps per queue drain cycle |
-| `--max-weight-staleness` | When the rollout engine's weight version lags the trainer's by more than this, the worker recycles the stale group instead of feeding it to the loss |
+| `--max-weight-staleness` | Maximum train-time policy-version gap for `queue-recycle`. Its strict dequeue rule is `D - F < max`, so the minimum usable bound is 1: a nonnegative gap can never satisfy `< 0`. This is independent of startup, where `T = D`; later prefetched batches normally have `T = D + 1`. |
 
 The worker caps its output queue at 1000 groups, so if training is slower than
 rollout the producer eventually blocks rather than growing the queue without
@@ -94,8 +94,20 @@ metrics:
 rollout/fully_async/queue_size
 rollout/fully_async/aborted_groups_recycled
 rollout/fully_async/stale_groups_recycled
-rollout/fully_async/avg_staleness, rollout/fully_async/max_staleness
+fully_async/train_weight_version
+staleness/rollout/{mean,max,p50,p90,p99}
+staleness/{pre_queue,in_queue,total}/{mean,max,p50,p90,p99}
+staleness/bound_exceeded_{samples,groups,tokens}
+staleness/bound_exceeded_sample_frac
 ```
+
+With `--staleness-reference prefill`, let `F` be first-prefill version, `Q` the
+group-ready version, `D` dequeue version, and `T` scheduled train version. The
+logged decomposition is `pre_queue = Q - F`, `in_queue = T - Q`, and
+`total = T - F`. `staleness/rollout/*` uses the same train-time endpoint for all
+groups examined before admission. Under the normal `queue-recycle` prefetch
+schedule, `T = D + 1`; the strict dequeue check `D - F < max` therefore ensures
+`T - F <= max`.
 
 A `No completed rollout groups for <N>s` warning in the logs means the drain is
 starved — rollout is the bottleneck.

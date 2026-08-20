@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from experiments.src.difficulty_filter.merge_pass_rate_shards import merge, meta_path
+from experiments.tools.difficulty_filter.merge_pass_rate_shards import merge, meta_path
 
 
 def write_jsonl(path, rows):

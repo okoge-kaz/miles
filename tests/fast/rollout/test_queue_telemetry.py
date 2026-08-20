@@ -65,10 +65,13 @@ def test_queue_lifecycle_checkpoint_roundtrip_uses_stable_group_identity():
         decision_version=3,
         rollout_id=11,
         reference_version=1,
+        train_version=3,
         bound_staleness=2,
     )
 
     metadata = restored.take_metadata(policy="queue-recycle", capacity_groups=1000)
+    assert metadata["schema_version"] == 2
+    assert metadata["bound_staleness_semantics"] == "scheduled_train_version_minus_reference"
     [record] = metadata["records"]
     assert record["attempt_id"] == 0
     assert record["submission_seq"] == 0
@@ -77,6 +80,7 @@ def test_queue_lifecycle_checkpoint_roundtrip_uses_stable_group_identity():
     assert record["sample_indices"] == [70, 71]
     assert record["reward_values"] == [0.0, 1.0]
     assert record["disposition"] == "trained"
+    assert record["train_version"] == 3
     assert record["bound_staleness"] == 2
 
     next_attempt = restored.begin_attempt(_group(8, (1, 1)), submission_version=3)

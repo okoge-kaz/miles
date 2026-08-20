@@ -22,10 +22,7 @@ from miles.rollout.replay_buffer_codec import SAMPLE_CODEC_VERSION, materialize_
 from miles.utils.types import Sample
 
 SCHEMA_VERSION = 4
-SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3, SCHEMA_VERSION})
-EXTERNAL_TENSOR_SCHEMA_VERSIONS = frozenset({3, SCHEMA_VERSION})
 STATE_PREFIX = "replay_buffer_"
-LEGACY_STATE_PREFIX = "fully_async_state_"
 STATE_SUFFIX = ".pt"
 CHECKSUM_SUFFIX = ".sha256.json"
 PARTS_MARKER = ".parts-"
@@ -174,31 +171,17 @@ def replay_buffer_path(root: str | os.PathLike[str], rollout_id: int) -> Path:
     return Path(root) / "rollout" / f"{STATE_PREFIX}{rollout_id}{STATE_SUFFIX}"
 
 
-def _legacy_replay_buffer_path(root: str | os.PathLike[str], rollout_id: int) -> Path:
-    return Path(root) / "rollout" / f"{LEGACY_STATE_PREFIX}{rollout_id}{STATE_SUFFIX}"
-
-
-def _existing_replay_buffer_path(root: str | os.PathLike[str], rollout_id: int) -> Path:
-    current = replay_buffer_path(root, rollout_id)
-    if current.is_file() or Path(f"{current}{CHECKSUM_SUFFIX}").is_file():
-        return current
-    legacy = _legacy_replay_buffer_path(root, rollout_id)
-    if legacy.is_file() or Path(f"{legacy}{CHECKSUM_SUFFIX}").is_file():
-        return legacy
-    return current
-
-
 def ensure_no_replay_buffer(root: str | os.PathLike[str] | None, rollout_id: int | None) -> None:
     """Reject a mode downgrade that would silently discard pending prompt state."""
     if root is None or rollout_id is None or rollout_id < 0:
         return
-    for path in (replay_buffer_path(root, rollout_id), _legacy_replay_buffer_path(root, rollout_id)):
-        checksum_path = Path(f"{path}{CHECKSUM_SUFFIX}")
-        if path.is_file() or checksum_path.is_file():
-            raise RuntimeError(
-                f"Model checkpoint {rollout_id} has a replay buffer; resume with "
-                "--use-replay-buffer instead of silently discarding its pending prompt ledger"
-            )
+    path = replay_buffer_path(root, rollout_id)
+    checksum_path = Path(f"{path}{CHECKSUM_SUFFIX}")
+    if path.is_file() or checksum_path.is_file():
+        raise RuntimeError(
+            f"Model checkpoint {rollout_id} has a replay buffer; resume with "
+            "--use-replay-buffer instead of silently discarding its pending prompt ledger"
+        )
 
 
 def save_replay_buffer(root: str | os.PathLike[str], rollout_id: int, state: dict[str, Any]) -> tuple[Path, int]:
@@ -215,8 +198,6 @@ def save_replay_buffer(root: str | os.PathLike[str], rollout_id: int, state: dic
         "schema_version": SCHEMA_VERSION,
         "rollout_id": rollout_id,
     }
-    state.pop("checkpoint_rollout_id", None)
-
     data_tmp = _temporary_path(path.parent, path.name)
     checksum_path = Path(f"{path}{CHECKSUM_SUFFIX}")
     checksum_tmp = _temporary_path(path.parent, checksum_path.name)
@@ -272,7 +253,7 @@ def load_replay_buffer(
     *,
     expected_fingerprint: str,
 ) -> dict[str, Any]:
-    path = _existing_replay_buffer_path(root, rollout_id)
+    path = replay_buffer_path(root, rollout_id)
     checksum_path = Path(f"{path}{CHECKSUM_SUFFIX}")
     if not path.is_file() or not checksum_path.is_file():
         raise FileNotFoundError(
@@ -283,21 +264,20 @@ def load_replay_buffer(
         manifest = json.loads(checksum_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise RuntimeError(f"Cannot read replay-buffer manifest: {checksum_path}") from error
-    if not isinstance(manifest, dict) or manifest.get("schema_version") not in SUPPORTED_SCHEMA_VERSIONS:
+    if not isinstance(manifest, dict) or manifest.get("schema_version") != SCHEMA_VERSION:
         raise RuntimeError(f"Unsupported replay-buffer manifest: {checksum_path}")
     digest, main_size = _file_digest(path)
     expected_main_size = manifest.get("main_size", manifest.get("size"))
     if expected_main_size != main_size or manifest.get("sha256") != digest:
         raise RuntimeError(f"Replay-buffer checksum mismatch: {path}")
-    if manifest.get("schema_version") in EXTERNAL_TENSOR_SCHEMA_VERSIONS:
-        parts = manifest.get("parts")
-        if not isinstance(parts, list) or any(not isinstance(part, dict) for part in parts):
-            raise RuntimeError(f"Malformed replay-buffer tensor manifest: {checksum_path}")
-        part_sizes = [part.get("size") for part in parts]
-        if any(type(size) is not int or size < 0 for size in part_sizes):
-            raise RuntimeError(f"Malformed replay-buffer tensor sizes: {checksum_path}")
-        if manifest.get("size") != main_size + sum(part_sizes):
-            raise RuntimeError(f"Replay-buffer size mismatch: {path}")
+    parts = manifest.get("parts")
+    if not isinstance(parts, list) or any(not isinstance(part, dict) for part in parts):
+        raise RuntimeError(f"Malformed replay-buffer tensor manifest: {checksum_path}")
+    part_sizes = [part.get("size") for part in parts]
+    if any(type(size) is not int or size < 0 for size in part_sizes):
+        raise RuntimeError(f"Malformed replay-buffer tensor sizes: {checksum_path}")
+    if manifest.get("size") != main_size + sum(part_sizes):
+        raise RuntimeError(f"Replay-buffer size mismatch: {path}")
 
     try:
         state = torch.load(path, map_location="cpu", weights_only=False)
@@ -305,38 +285,28 @@ def load_replay_buffer(
         raise RuntimeError(f"Cannot deserialize replay buffer: {path}") from error
     if not isinstance(state, dict):
         raise RuntimeError(f"Replay buffer is not a mapping: {path}")
-    if state.get("schema_version") not in SUPPORTED_SCHEMA_VERSIONS:
+    if state.get("schema_version") != SCHEMA_VERSION:
         raise RuntimeError(
-            f"Unsupported replay-buffer schema {state.get('schema_version')}; "
-            f"expected one of {sorted(SUPPORTED_SCHEMA_VERSIONS)}"
+            f"Unsupported replay-buffer schema {state.get('schema_version')}; expected {SCHEMA_VERSION}"
         )
     if state.get("schema_version") != manifest.get("schema_version"):
         raise RuntimeError(
             "Replay-buffer schema does not match its manifest: "
             f"state={state.get('schema_version')}, manifest={manifest.get('schema_version')}"
         )
-    if state.get("schema_version") in EXTERNAL_TENSOR_SCHEMA_VERSIONS:
-        state = _load_external_tensor_arrays(path, state, manifest)
-    rollout_id_key = "rollout_id" if state["schema_version"] == SCHEMA_VERSION else "checkpoint_rollout_id"
-    if state.get(rollout_id_key) != rollout_id:
+    state = _load_external_tensor_arrays(path, state, manifest)
+    if state.get("rollout_id") != rollout_id:
         raise RuntimeError(
-            f"Replay-buffer rollout id mismatch: requested={rollout_id}, stored={state.get(rollout_id_key)}"
+            f"Replay-buffer rollout id mismatch: requested={rollout_id}, stored={state.get('rollout_id')}"
         )
     if state.get("dataset_fingerprint") != expected_fingerprint:
         raise RuntimeError(
             "Replay-buffer dataset/config fingerprint does not match this run: "
             f"stored={state.get('dataset_fingerprint')}, current={expected_fingerprint}"
         )
-    missing_keys = REQUIRED_STATE_KEYS - state.keys()
-    if state.get("schema_version") == SCHEMA_VERSION:
-        missing_keys |= SCHEMA_4_REQUIRED_STATE_KEYS - state.keys()
+    missing_keys = (REQUIRED_STATE_KEYS | SCHEMA_4_REQUIRED_STATE_KEYS) - state.keys()
     if missing_keys:
         raise RuntimeError(f"Replay buffer is missing fields: {sorted(missing_keys)}")
-    if state["schema_version"] < SCHEMA_VERSION:
-        # The legacy schemas predate inflight continuation. Do not let
-        # unversioned extra keys opt an old payload into schema-4 semantics.
-        state["replay_buffer_type"] = REPLAY_BUFFER_ROLLOUT
-        state["inflight_items"] = []
     _validate_replay_buffer_payload(state["replay_buffer_type"], state["inflight_items"])
     return materialize_replay_buffer_state(state)
 
@@ -363,8 +333,7 @@ def prune_replay_buffers(
         return
     buffers = sorted(
         (rollout_id, path)
-        for prefix in (STATE_PREFIX, LEGACY_STATE_PREFIX)
-        for path in rollout_dir.glob(f"{prefix}*{STATE_SUFFIX}")
+        for path in rollout_dir.glob(f"{STATE_PREFIX}*{STATE_SUFFIX}")
         if (rollout_id := _rollout_id_from_path(path)) is not None and rollout_id <= current_rollout_id
     )
     all_ids = sorted({rollout_id for rollout_id, _ in buffers})
@@ -740,12 +709,9 @@ def _fsync_directory(path: Path) -> None:
 
 def _rollout_id_from_path(path: Path) -> int | None:
     stem = path.name.removesuffix(STATE_SUFFIX)
-    for prefix in (STATE_PREFIX, LEGACY_STATE_PREFIX):
-        if stem.startswith(prefix):
-            stem = stem.removeprefix(prefix)
-            break
-    else:
+    if not stem.startswith(STATE_PREFIX):
         return None
+    stem = stem.removeprefix(STATE_PREFIX)
     try:
         return int(stem)
     except ValueError:

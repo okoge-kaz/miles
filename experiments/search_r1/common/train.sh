@@ -162,11 +162,11 @@ ROLLOUT_ARGS=(
 if [[ "${PLACEMENT}" == "async" ]]; then
    ROLLOUT_ARGS+=(
       --fully-async
-      --fully-async-queue-policy "${QUEUE_POLICY}"
+      --fully-async-queue-type "${QUEUE_TYPE}"
       --staleness-reference "${STALENESS_REFERENCE}"
       --pause-generation-mode "${PAUSE_GENERATION_MODE}"
    )
-   if [[ "${QUEUE_POLICY}" == queue-drop ]]; then
+   if [[ "${QUEUE_TYPE}" == queue-drop ]]; then
       ROLLOUT_ARGS+=(--fully-async-queue-factor "${QUEUE_FACTOR}")
    else
       ROLLOUT_ARGS+=(--max-weight-staleness "${MAX_WEIGHT_STALENESS}")
@@ -205,15 +205,15 @@ if [[ "${DUMP_TRAIN_DATA}" == "0" ]]; then
 else
    TELEMETRY_ARGS+=(--use-rollout-entropy)
 fi
-if [[ "${LOG_STALENESS_GRADIENT_METRICS:-0}" != "0" ]]; then
-   TELEMETRY_ARGS+=(--log-staleness-gradient-metrics)
+if [[ "${LOG_SAMPLE_STALENESS_METRICS:-0}" != "0" ]]; then
+   TELEMETRY_ARGS+=(--log-sample-staleness-metrics)
 fi
-if [[ "${LOG_STALENESS_GRADIENT_RATIO_HISTOGRAM:-0}" != "0" ]]; then
-   if [[ "${LOG_STALENESS_GRADIENT_METRICS:-0}" == "0" ]]; then
-      echo "LOG_STALENESS_GRADIENT_RATIO_HISTOGRAM requires LOG_STALENESS_GRADIENT_METRICS=1" >&2
+if [[ "${LOG_SAMPLE_STALENESS_RATIO_HISTOGRAM:-0}" != "0" ]]; then
+   if [[ "${LOG_SAMPLE_STALENESS_METRICS:-0}" == "0" ]]; then
+      echo "LOG_SAMPLE_STALENESS_RATIO_HISTOGRAM requires LOG_SAMPLE_STALENESS_METRICS=1" >&2
       exit 1
    fi
-   TELEMETRY_ARGS+=(--log-staleness-gradient-ratio-histogram)
+   TELEMETRY_ARGS+=(--log-sample-staleness-ratio-histogram)
 fi
 
 # EVAL_INTERVAL=0 deliberately passes no eval arguments.  Search-R1 evaluation

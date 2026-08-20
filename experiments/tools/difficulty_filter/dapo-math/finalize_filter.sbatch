@@ -44,12 +44,12 @@ set -euo pipefail
 cd /root/miles
 export PYTHONPATH=/root/Megatron-LM:/root/miles
 
-python3 -m experiments.src.difficulty_filter.merge_pass_rate_shards \
+python3 -m experiments.tools.difficulty_filter.merge_pass_rate_shards \
     --inputs ${SHARD_0} ${SHARD_1} \
     --output ${MERGED_OUTPUT} \
     --prompt-data ${PROMPT_DATA}
 
-python3 -m experiments.src.difficulty_filter.apply_filter \
+python3 -m experiments.tools.difficulty_filter.apply_filter \
     --prompt-data ${PROMPT_DATA} \
     --pass-rates ${MERGED_OUTPUT} \
     --output ${FILTERED_OUTPUT} \
@@ -64,7 +64,7 @@ if [[ "${SUBMIT_REPLAY_BUFFER_VALIDATION:-1}" != "0" ]]; then
         echo "SUBMIT_REPLAY_BUFFER_VALIDATION requires a Slurm job" >&2
         exit 1
     }
-    "${REPO_ROOT}/experiments/math_async/dapo-math-p10-90/qwen3-4b/submit_replay_buffer_validation.sh" \
+    "${REPO_ROOT}/experiments/tools/replay_buffer_validation/dapo-math/submit_replay_buffer_validation.sh" \
         --submit \
         --afterok "${SLURM_JOB_ID}"
 fi

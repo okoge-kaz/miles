@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from experiments.src.difficulty_filter.reconcile_pass_rate_fragments import meta_path, reconcile
+from experiments.tools.difficulty_filter.reconcile_pass_rate_fragments import meta_path, reconcile
 
 
 def record(index, reward):

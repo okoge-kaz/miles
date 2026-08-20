@@ -18,6 +18,13 @@ from miles.utils.tracking_utils.tracking import finish_tracking, init_tracking
 logger = logging.getLogger(__name__)
 
 
+def _updates_before_training_rollout(args, rollout_id: int) -> int:
+    update_disabled = any(
+        getattr(args, flag, False) for flag in ("debug_train_only", "debug_rollout_only", "debug_skip_weight_update")
+    )
+    return int(not update_disabled and rollout_id % args.update_weights_interval == 0)
+
+
 # The framework supports other asynchronous approaches such as fully async (see miles/rollout/fully_async_rollout.py).
 async def train(args):
     assert not args.colocate, "Colocation is not supported for async training."
@@ -70,7 +77,10 @@ async def train(args):
 
     # async train loop.
     prefetch_rollout_batches = should_prefetch_rollout_batches(args)
-    rollout_data_next_future = rollout_manager.generate.remote(args.start_rollout_id)
+    rollout_data_next_future = rollout_manager.generate.remote(
+        args.start_rollout_id,
+        updates_before_train=0,
+    )
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
         # Sync the last generation
         if rollout_data_next_future is not None:
@@ -78,15 +88,16 @@ async def train(args):
 
         # Start the next rollout early.
         if prefetch_rollout_batches and rollout_id + 1 < args.num_rollout:
-            rollout_data_next_future = rollout_manager.generate.remote(rollout_id + 1)
+            rollout_data_next_future = rollout_manager.generate.remote(
+                rollout_id + 1,
+                updates_before_train=_updates_before_training_rollout(args, rollout_id + 1),
+            )
         elif not prefetch_rollout_batches:
             rollout_data_next_future = None
 
         if args.fully_async:
-            # Preserve the immediate prefetch above, then sample the authoritative
-            # applied version before the trainer call. No weight update can occur
-            # between these operations, so post-selection forward lag stays
-            # separate from the historical drain-time staleness metrics.
+            # Close the batch's queue-wait window and retain its throughput inputs
+            # immediately before the trainer call.
             await rollout_manager.record_batch_consumption.remote(rollout_id)
 
         actor_trained = False
@@ -181,7 +192,10 @@ async def train(args):
             # The persistent rollout worker kept filling its policy queue during
             # training. Ask it to select the next batch only now, when the trainer
             # is ready to consume that batch.
-            rollout_data_next_future = rollout_manager.generate.remote(rollout_id + 1)
+            rollout_data_next_future = rollout_manager.generate.remote(
+                rollout_id + 1,
+                updates_before_train=0,
+            )
 
     await rollout_manager.dispose.remote()
 

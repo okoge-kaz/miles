@@ -8,7 +8,7 @@ Companion documents:
 
 - [datasets.md](datasets.md) — how miles reads a JSONL, how to inspect one
 - [domains.md](domains.md) — measured sequence lengths, reward density, turn structure
-- `src/difficulty_filter/sweeps.sh` — the (prompt file, verifier) table, executable
+- `experiments/tools/difficulty_filter/sweeps.sh` — the (prompt file, verifier) table, executable
 
 **Status column.** The distinction that matters is between "converted" and
 "verified". A wrong verifier does not crash: it returns 0.0 on every row, and a
@@ -46,7 +46,8 @@ set in use.
 | eval (spare) | `/data/aime-2023/aime-2023.jsonl`, `/data/amc-2023/` | 30, parquet | `math` | not in a config |
 
 Eval config: `configs/eval_math.yaml` (aime24/25/26 + math500).
-Recipes: `math_sync/dapo-math-p10-90/qwen3-4b/`, `math_async/dapo-math-p10-90/qwen3-4b/` (the only surviving pair; the other four models were deleted unrun on 2026-08-05)
+Recipes: `experiments/scripts/math/{sync,async}/dapo-math-p10-90/qwen3-4b/`
+(the only surviving pair; the other four models were deleted unrun on 2026-08-05)
 for qwen3-1.7b / 4b / 4b-instruct-2507 / 8b / 30b-a3b.
 
 The current recipes use **`--rm-type deepscaler`** with the hybrid-thinking

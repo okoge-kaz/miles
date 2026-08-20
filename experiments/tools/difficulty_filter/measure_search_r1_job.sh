@@ -124,7 +124,7 @@ python3 experiments/src/offline_eval/measure_search_r1.py \
 if [[ "${APPLY_FILTER}" == "1" ]]; then
     filtered_partial="${FILTERED_OUTPUT}.partial"
     rm -f "${filtered_partial}"
-    python3 -m experiments.src.difficulty_filter.apply_filter \
+    python3 -m experiments.tools.difficulty_filter.apply_filter \
         --prompt-data "${PROMPT_DATA}" \
         --pass-rates "${OUTPUT}" \
         --output "${filtered_partial}" \

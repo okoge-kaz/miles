@@ -19,7 +19,7 @@ inside the container.
 DAPO-Math-17K is pulled by `experiments/setup/download_assets.sbatch` from
 `zhuzilin/dapo-math-17k` — the same repo the upstream miles scripts use, so the
 field names match what `run-qwen3-4B.sh` expects. The p10-80 file is produced from
-it by `experiments/src/difficulty_filter`.
+it by `experiments/tools/difficulty_filter`.
 
 The AIME years are staged by `experiments/src/offline_eval/prepare_aime.py`, which
 cross-checks every answer against a second AoPS-derived source and asserts that the

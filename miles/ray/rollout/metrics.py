@@ -22,31 +22,10 @@ def log_rollout_batch_consumption(
     rollout_id: int,
     args,
     *,
-    selection_weight_version: int | None,
-    train_start_weight_version: int,
     extra_metrics: dict[str, float | int] | None = None,
 ) -> dict[str, float | int]:
-    """Log the version gap introduced between queue selection and training."""
-    historical_metrics: dict[str, float | int] = {
-        "queue/consumption/train_start_weight_version": train_start_weight_version,
-    }
-    if selection_weight_version is not None:
-        gap = train_start_weight_version - selection_weight_version
-        if gap < 0:
-            raise RuntimeError(
-                "Applied weight version moved backwards between queue selection and "
-                f"training: selection={selection_weight_version}, train_start={train_start_weight_version}"
-            )
-        historical_metrics["queue/consumption/selection_weight_version"] = selection_weight_version
-        historical_metrics["queue/consumption/selection_to_train_gap"] = gap
-
+    """Log diagnostics computed immediately before the batch is trained."""
     log_dict = dict(extra_metrics or {})
-    for key, value in historical_metrics.items():
-        if key in log_dict and log_dict[key] != value:
-            raise RuntimeError(
-                f"Conflicting rollout consumption metric {key}: " f"historical={value}, telemetry={log_dict[key]}"
-            )
-        log_dict[key] = value
     logger.info(f"rollout batch consumption {rollout_id}: {log_dict}")
     step = compute_rollout_step(args, rollout_id)
     log_dict["rollout/step"] = step

@@ -1,10 +1,10 @@
 # Replay-buffer validation
 
 This note records the correctness, resume-latency, batching-efficiency, and
-short-horizon convergence checks for the opt-in replay buffer. These historical
-runs cover what is now `--replay-buffer-type rollout`; the newer `inflight`
-token-prefix mode is covered by its implementation tests and is not part of the
-measurements below. The record is retained so the results remain reproducible
+short-horizon convergence checks for the opt-in replay buffer. The earlier runs
+cover what is now `--replay-buffer-type rollout`. The 2026-08-19 production-shape
+validation below directly compares `rollout` with the newer `inflight`
+token-prefix mode. The record is retained so the results remain reproducible
 after the Slurm logs have aged out.
 
 ## Scope and revisions
@@ -19,6 +19,10 @@ after the Slurm logs have aged out.
   `/lustre/fsw/portfolios/coreai/users/kfujii/container/miles-prefill-weight-version-23aaf6597.sqsh`
 - Dataset: real `dapo-math-p10-90` prompts
 - Model: `Qwen3-4B-Instruct-2507`
+
+The later Qwen3-4B Base step-4000 comparison was integrated at revision
+`5dd7d1a5`; its model, dataset, and run shape are recorded in its own section
+below.
 
 The feature is opt-in through `--use-replay-buffer --replay-buffer-type
 rollout`. A checkpoint created without the option has no matching replay buffer, so enabling it in
@@ -136,8 +140,9 @@ matched the intended contracts:
   batch without starting the worker for that batch;
 - `queue-max` selected restored ready groups only after the resume-time update.
   With `max_weight_staleness=1`, both trained groups had prefill-bound
-  staleness exactly 1 (`frac_at_bound=1`), confirming that one version gap is
-  accepted rather than re-indexed as on-policy;
+  staleness exactly 1 (`staleness/total/count_1=2`) and no rejected samples,
+  confirming that one version gap is accepted rather than re-indexed as
+  on-policy;
 - `queue-drop` restored exactly its two-group capacity plus four active prompt
   leases for regeneration. Its first resumed metrics recovered 30 prior queue
   evictions, 15,360 evicted response tokens, and 60 aligned sample lengths from
@@ -324,7 +329,7 @@ export WANDB_API_KEY=offline
 
 sbatch -A "${SLURM_ACCOUNT_NAME}" -p interactive -N 2 -t 02:00:00 \
   --export=ALL,CONFIG_TAG=<unique-tag>,NUM_ROLLOUT=100,DEBUG_EXIT_AFTER_ROLLOUT=50,SAVE_INTERVAL=50,SAVE_RETAIN_INTERVAL=100,SAVE_HF=1,HF_SAVE_INTERVAL=100,USE_REPLAY_BUFFER=1,REPLAY_BUFFER_TYPE=rollout,MAX_RESPONSE_LEN=2048,ROLLOUT_BATCH_SIZE=8,N_SAMPLES_PER_PROMPT=4,GLOBAL_BATCH_SIZE=32,MAX_TOKENS_PER_GPU=8192,ASYNC_MAX_CONCURRENT_SAMPLES=64,SGLANG_MAX_RUNNING_REQUESTS=64,EVAL_INTERVAL=0,DUMP_TRAIN_DATA=0,FUSE_ONE_STEP_ACTOR_LOGPROBS=1 \
-  experiments/math_async/dapo-math-p10-90/qwen3-4b-instruct-2507/run.sbatch
+  experiments/scripts/math/async/dapo-math-p10-90/qwen3-4b-instruct-2507/run.sbatch
 ```
 
 Submit the second invocation with the same `CONFIG_TAG` and
@@ -347,3 +352,221 @@ checkpoint. For the control, change only
 - The 2048-token validation cap is intentionally cheaper than the production
   32K recipe. Serialization benchmarks separately cover large compact tensor
   payloads; full 32K training remains the production-scale confirmation.
+
+## Qwen3-4B Base step-4000 `rollout` versus `inflight` validation (2026-08-19)
+
+This validation tests the new Qwen3-4B Base checkpoint and its model-specific
+DAPO-Math p10--90 dataset at the production response length and batch shape. It
+also corrects an initially misleading comparison of whole-job staleness means:
+fresh and resumed jobs contain different startup phases, so their aggregate
+means do not measure the discontinuity at the restart boundary.
+
+### Run identity and configuration
+
+- Integrated revision: `5dd7d1a5`
+- Validation namespace: `rbtype-step4000-16080496`
+- W&B project: `async-rl-miles-replay-buffer`
+- Model: `Qwen3-4B-Base`, pretraining step 4000
+- Dataset: the corresponding 16-sample, 16K-response, zero-truncation-reward
+  DAPO-Math p10--90 filter output
+- Resources per training job: two nodes, eight actor GPUs plus eight rollout GPUs
+- Response cap: 16,384 tokens; context cap: 32,768 tokens
+- Rollout batch: 192 prompt groups x 16 samples = 3,072 samples
+- Global batch: 3,072; one optimizer step per rollout
+- Queue: `queue-recycle`, prefill staleness reference, maximum staleness 8
+- Reward: `deepscaler` with `--zero-reward-on-truncated`
+- Validation checkpointing: `SAVE_INTERVAL=1`, `SAVE_HF=0`
+
+The validation deliberately saved a replay buffer at every step and disabled HF
+exports to isolate replay-buffer cost. The production recipe instead uses
+`SAVE_INTERVAL=10` and `HF_SAVE_INTERVAL=10`; therefore the numbers below do not
+measure the complete production checkpoint pause when replay, MCore, and HF are
+all due.
+
+| Segment | Slurm job | Trained steps | Result |
+|---|---:|---|---|
+| `rollout` fresh | 16080545 | 0--3 | passed |
+| `rollout` resume | 16080547 | 4--5 | passed |
+| `inflight` fresh | 16080548 | 0--3 | passed |
+| `inflight` resume | 16080549 | 4--5 | passed |
+
+The generated report is retained at
+`experiments/outputs/replay_buffer_validation/rbtype-step4000-16080496.md`, and
+the four training logs are under
+`experiments/outputs/training/math/dapo-math-p10-90/qwen3-4b/`.
+
+### Correct restart-boundary comparison
+
+The fresh job trained steps 0--3. Before saving, it finished the already
+prefetched step-4 batch so that the replay buffer contained one complete
+prepared batch. The resume job trained that identical step-4 batch first; step
+5 is the first batch containing newly continued or regenerated work after the
+restart. A further step-6 metric was prepared after the resumed segment's last
+trained step and is likewise excluded from the trained-segment comparison.
+
+Consequently, compare prepared step 4 with newly produced step 5, not the mean
+of every metric in the fresh job with the mean of every metric in the resumed
+job. Counts in the following table are the number of prompt groups at total
+staleness 0, 1, and 2. Distribution distance is total variation,
+`0.5 * sum(abs(p_before - p_after))`.
+
+| Buffer | Saved/prepared step 4 mean and counts | First new step 5 mean and counts | Mean change | Distribution distance |
+|---|---|---|---:|---:|
+| `inflight` | 0.604167 `[77, 114, 1]` | 0.583333 `[82, 108, 2]` | -0.020833 | 0.03125 |
+| `rollout` | 0.682292 `[71, 111, 10]` | 0.020833 `[188, 4, 0]` | -0.661459 | 0.609375 |
+
+The conclusion is unchanged if the reference is the last batch actually
+trained before the stop rather than the saved prepared batch:
+
+| Buffer | Last pre-stop trained step 3 | First new post-resume step 5 | Mean change | Distribution distance |
+|---|---:|---:|---:|---:|
+| `inflight` | 0.630208 | 0.583333 | -0.046875 | 0.046875 |
+| `rollout` | 0.744792 | 0.020833 | -0.723959 | 0.6875 |
+
+The step-4 mean and histogram were exactly identical in the fresh and resume
+logs for each buffer type, and both resume jobs reported
+`warm_prepared_batch_hit=1`. This verifies prepared-batch restoration
+independently of the step-5 comparison.
+
+The initially reported whole-segment means must not be interpreted as boundary
+jumps. In particular, `inflight` fresh included cold-start steps 0 and 1 with
+mean staleness zero, while the resume segment started from a warm prepared
+batch. This composition effect makes its aggregate `0.3138 -> 0.5938` look like
+a large increase. Conversely, the `rollout` aggregates `0.3346 -> 0.3516` hide
+the severe step-5 reset. Boundary-aligned batches show the opposite and correct
+result: `inflight` preserves the distribution substantially better.
+
+### Restored work and resume latency
+
+| Resume metric | `rollout` | `inflight` |
+|---|---:|---:|
+| Restored inflight groups | 0 | 191 |
+| Restored inflight response tokens | 0 | 7,326,600 |
+| Regenerated active groups | 192 | 0 |
+| Restored pending groups | 388 | 388 |
+| Restored prepared batches | 1 | 1 |
+| First resumed rollout wait | 10.645 s | 10.609 s |
+| Second resumed rollout wait | 775.393 s | 517.877 s |
+
+The first wait is the same because both modes reuse the complete step-4
+prepared batch. The second wait exposes the active-generation treatment:
+continuing the saved prefixes reduced it by 257.516 seconds, while `rollout`
+regenerated all 192 active groups.
+
+This is one fresh/resume sequence with only two resumed training steps. It is
+strong evidence for the persistence mechanism and for restart-distribution
+continuity, but it is not a seed-general convergence result.
+
+### Value at a ten-step production interval
+
+| Replay save metric | `rollout` | `inflight` | `inflight - rollout` |
+|---|---:|---:|---:|
+| Capture median | 1.7945 s | 57.8465 s | +56.0520 s |
+| Durable-write median | 1.2630 s | 0.6380 s | -0.6250 s |
+| Total median | 2.9340 s | 58.5285 s | +55.5945 s |
+| Stored size median | 234.075 MiB | 333.692 MiB | +99.617 MiB |
+
+At `SAVE_INTERVAL=10`, the measured incremental `inflight` cost amortizes to
+5.559 seconds per optimizer step. Against the observed roughly 450--700-second
+steps, this is about 0.8--1.2%. One observed resume recovered 257.516 seconds on
+the second rollout and avoided the much larger staleness-distribution reset.
+The ten-step interval therefore gives `inflight` meaningful operational value
+for restart-heavy training, even before assigning value to preserving the
+experimental staleness distribution itself.
+
+The math-async recipe currently defaults to `REPLAY_BUFFER_TYPE=rollout`.
+Production uses `inflight` only when it is selected explicitly (or if the recipe
+default is changed); the validation jobs set the type explicitly and keep the
+two checkpoint namespaces separate.
+
+### Why `inflight` saving pauses training
+
+The durable file write is not the bottleneck. Across the six `inflight` saves,
+capture took 53.610--60.392 seconds while the durable write took only
+0.629--0.735 seconds. Each snapshot materialized 191--192 inflight prompt groups
+and approximately 6.0--7.3 million partial response tokens.
+
+The current capture path:
+
+1. stops the fully-async producer worker;
+2. sends `abort_all` to every SGLang engine;
+3. awaits every unfinished group task so roughly three thousand individual
+   `/generate` calls return partial token IDs and logprobs;
+4. encodes the mutable partial samples into the replay-buffer state;
+5. restarts the producer, then publishes the replay buffer.
+
+The SGLang `abort_request` endpoints acknowledged in the same log second in
+which capture started, but the `Captured replay buffer` record followed roughly
+54--60 seconds later. Packing statistics increased by roughly 4--5 seconds on
+later saves; the remaining delay is most plausibly dominated by draining and
+materializing the many large HTTP responses. There are not yet subphase timers,
+so this split is an evidence-based diagnosis rather than an exact measurement.
+
+Optimizing compression or making the final file write asynchronous can save
+less than one second. The semantics-preserving optimization order is:
+
+1. add separate timers for worker stop, abort RPC, active-task drain, encoding,
+   and durable write;
+2. replace thousands of independent JSON reply drains with an engine-level,
+   batched and compact `abort-and-snapshot` result, or continuously stream the
+   partial state to Miles so the save barrier only finalizes it;
+3. consider overlapping staged MCore/HF work only if the invariant
+   `durable replay buffer -> visible model tracker -> replay commit` remains
+   intact.
+
+Reducing active concurrency or deliberately draining the pipeline before every
+checkpoint would change throughput and the staleness distribution that the
+experiment is intended to preserve, so those are not equivalent optimizations.
+
+### Generation resumes before checkpoint saving finishes
+
+Replay capture is a barrier only through the point at which the replay state is
+materialized.  The capture path restarts the fully-async producer immediately
+after encoding that state; it does not keep generation paused until the replay
+file, MCore checkpoint, and optional HF export have all finished.  New rollout
+work can therefore run in the background during those later save phases and can
+advance under the pre-update weight version until the normal weight-update pause.
+
+The `inflight` validation at step 3 makes this ordering visible.  Replay capture
+finished at `03:38:03.270`, the producer restarted at `03:38:03.298`, and replay
+publication completed at `03:38:03.931`.  SGLang prefill/decode activity then
+overlapped the MCore save from approximately `03:38:03.970` to `03:38:09.510`;
+the weight-update pause began around `03:38:11`.  Thus there was an approximately
+eight-second post-snapshot generation window even with HF export disabled.
+
+This can affect the staleness distribution of work produced around a checkpoint,
+and a production checkpoint that also writes HF weights can make the window
+longer.  It does not invalidate the saved replay state: the resumed work is newer
+live state and is intentionally absent from the already materialized snapshot.
+For the current experiments this is accepted as a known caveat, and the producer
+restart behavior is left unchanged.  Comparisons around a restart should remain
+aligned to the first newly produced batch, and checkpoint-boundary effects should
+not be attributed solely to replay restoration.
+
+### Sixteen-thousand-token truncation reward
+
+Both the async and sync Qwen3-4B recipes set:
+
+```text
+MAX_RESPONSE_LEN=16384
+RM_TYPE=deepscaler
+ZERO_REWARD_ON_TRUNCATED=1
+```
+
+Their `train.sh` files translate the last setting into
+`--zero-reward-on-truncated`. The validation command line contained all three
+settings, and its trained batches had a roughly 5.1--5.6% truncated-response
+fraction, so the run did exercise length truncation.
+
+For the built-in single-turn SGLang path, `finish_reason=length` sets
+`Sample.Status.TRUNCATED`. The reward dispatcher then returns scalar zero before
+calling DeepScaler. The same status is used when the remaining 32K context
+budget prevents further generation, so both response-limit and context-limit
+truncations receive zero. A normal `finish_reason=stop` remains completed and is
+graded by DeepScaler.
+
+This remains an option rather than a global behavior change: argparse defaults
+`--zero-reward-on-truncated` to off, preserving the historical behavior of
+grading truncated text. The Qwen3-4B async/sync recipes and the model-specific
+difficulty-filter jobs enable it by default; setting
+`ZERO_REWARD_ON_TRUNCATED=0` disables it for a recipe invocation.

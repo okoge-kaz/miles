@@ -3,7 +3,7 @@
 Mounted the same way as the built-ins, via `--dynamic-sampling-filter-path`:
 
     --dynamic-sampling-filter-path \
-        experiments.src.difficulty_filter.filters.check_pass_rate_window
+        experiments.tools.difficulty_filter.filters.check_pass_rate_window
 
 Relationship to `miles.rollout.filter_hub.dynamic_sampling_filters`:
 `check_reward_nonzero_std` is the limiting case of `check_pass_rate_window` with
@@ -23,7 +23,7 @@ moved far enough that the offline measurement is stale.
 from miles.rollout.filter_hub.base_types import DynamicFilterOutput
 from miles.utils.types import Sample
 
-from experiments.src.difficulty_filter.pass_rate import (
+from experiments.tools.difficulty_filter.pass_rate import (
     DEFAULT_CORRECT_THRESHOLD,
     pass_rate_from_rewards,
     pass_rate_in_window,

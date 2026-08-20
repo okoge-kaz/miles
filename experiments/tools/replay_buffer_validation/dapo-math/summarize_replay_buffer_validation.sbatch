@@ -16,6 +16,6 @@ cd "${REPO_ROOT}"
 : "${VALIDATION_MANIFEST:?}"
 : "${VALIDATION_SUMMARY:?}"
 
-python3 experiments/math_async/dapo-math-p10-90/qwen3-4b/analyze_replay_buffer_validation.py \
+python3 experiments/tools/replay_buffer_validation/dapo-math/analyze_replay_buffer_validation.py \
     "${VALIDATION_MANIFEST}" \
     --output "${VALIDATION_SUMMARY}"

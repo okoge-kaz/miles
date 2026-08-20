@@ -28,6 +28,7 @@ from megatron.training.training import get_model
 from miles.backends.megatron_utils.ft.indep_dp import allreduce_grads_and_losses_across_replicas
 from miles.backends.megatron_utils.ft.types import TrainStepOutcome
 from miles.backends.megatron_utils.local_weight_checksum import dump_local_weight_checksums
+from miles.backends.training_utils.update_diagnostics import optimizer_step_diagnostics
 from miles.utils.audit_utils.witness.allocator import WitnessInfo
 from miles.utils.audit_utils.witness.module import witness_dump_and_clear_stale
 from miles.utils.dumper_utils import DumperMegatronUtil, DumperPhase
@@ -551,6 +552,8 @@ def train_one_step(
 
     outcome = TrainStepOutcome.NORMAL
     grad_norm = 0.0
+    num_zeros_in_grad = None
+    optimizer_step_applied = False
     valid_step = True
     indep_dp_loss_reduced: dict[str, float] = {}
 
@@ -598,9 +601,11 @@ def train_one_step(
             grad_norm = step_stepped_adapter_slots(
                 args, model, optimizer, data_iterator[0].rollout_data, rollout_id, step_id
             )
+            optimizer_step_applied = True
         else:
             # Update parameters.
             update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+            optimizer_step_applied = bool(update_successful)
 
             # Update learning rate.
             assert update_successful
@@ -629,6 +634,14 @@ def train_one_step(
         if mpu.is_pipeline_last_stage(ignore_virtual=True):
             loss_reduced = (
                 indep_dp_loss_reduced if parallel_state.indep_dp.size > 1 else aggregate_train_losses(losses_reduced)
+            )
+            loss_reduced.update(
+                optimizer_step_diagnostics(
+                    args,
+                    optimizer_step_applied=optimizer_step_applied,
+                    grad_norm=grad_norm,
+                    num_zeros_in_grad=num_zeros_in_grad,
+                )
             )
             return loss_reduced, grad_norm, outcome
 

@@ -25,6 +25,7 @@ class FullyAsyncPipelineTelemetry:
         self._accepted_tokens = 0
         self._accepted_tokens_known_batches = 0
         self._optimizer_updates = 0
+        self._cumulative_origin_available = True
         self._trainer_starvation_seconds = 0.0
         self._rollout_backpressure_seconds = 0.0
         self._snapshot_at = now
@@ -85,6 +86,45 @@ class FullyAsyncPipelineTelemetry:
         self._snapshot_at = now
         self._snapshot_counters = self._counters()
 
+    def checkpoint_state(self) -> dict[str, int]:
+        """Return counters needed for resume-stable convergence axes."""
+        return {
+            "schema_version": 1,
+            "completed_training_batches": self._completed_training_batches,
+            "accepted_loss_tokens": self._accepted_tokens,
+            "accepted_tokens_known_batches": self._accepted_tokens_known_batches,
+            "cumulative_origin_available": int(self._cumulative_origin_available),
+        }
+
+    def restore_checkpoint_state(self, state: dict | None) -> None:
+        """Restore cumulative counters while starting a fresh wall-time window."""
+        if state is None:
+            self._cumulative_origin_available = False
+            self.reset_window()
+            return
+        if state.get("schema_version") != 1:
+            raise RuntimeError(f"Unsupported pipeline telemetry checkpoint schema: {state.get('schema_version')!r}")
+
+        names = (
+            "completed_training_batches",
+            "accepted_loss_tokens",
+            "accepted_tokens_known_batches",
+            "cumulative_origin_available",
+        )
+        values = {name: int(state[name]) for name in names}
+        if any(value < 0 for value in values.values()):
+            raise RuntimeError(f"Pipeline telemetry checkpoint has negative counters: {values}")
+        if values["accepted_tokens_known_batches"] > values["completed_training_batches"]:
+            raise RuntimeError(f"Pipeline telemetry checkpoint has inconsistent counters: {values}")
+        if values["cumulative_origin_available"] not in (0, 1):
+            raise RuntimeError(f"Pipeline telemetry checkpoint has invalid availability: {values}")
+
+        self._completed_training_batches = values["completed_training_batches"]
+        self._accepted_tokens = values["accepted_loss_tokens"]
+        self._accepted_tokens_known_batches = values["accepted_tokens_known_batches"]
+        self._cumulative_origin_available = bool(values["cumulative_origin_available"])
+        self.reset_window()
+
     def _counters(self) -> dict[str, float]:
         return {
             "generated_tokens": float(self._generated_tokens),
@@ -116,6 +156,11 @@ class FullyAsyncPipelineTelemetry:
             "accepted_tokens": deltas["accepted_tokens"],
             "accepted_tokens_available": float(deltas["accepted_tokens_known_batches"] == completed_batches),
             "optimizer_updates": deltas["optimizer_updates"],
+            "cumulative_accepted_loss_tokens": float(self._accepted_tokens),
+            "cumulative_accepted_loss_tokens_available": float(
+                self._cumulative_origin_available
+                and self._accepted_tokens_known_batches == self._completed_training_batches
+            ),
             "trainer_starvation_seconds": deltas["trainer_starvation_seconds"],
             "rollout_backpressure_seconds": deltas["rollout_backpressure_seconds"],
             "rollout_idle_capacity_seconds": deltas["rollout_idle_capacity_integral"],

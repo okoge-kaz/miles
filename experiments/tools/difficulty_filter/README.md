@@ -89,7 +89,7 @@ Nothing errors — the sweep completes and reports a clean, entirely false
 | Qwen3-4B (hybrid thinking) | `deepscaler` or `math` |
 | **Qwen3-4B-Instruct-2507** (non-thinking) | **`math`** |
 
-This is not only a measurement concern. **Every `math_sync` / `math_async` /
+This is not only a measurement concern. **Every `math/sync` / `math/async` /
 `tool_multiturn` recipe ships `--rm-type deepscaler` except the
 `qwen3-4b-instruct-2507` recipes, which default to `math` for exactly this
 reason.** Pointing any of the others at a non-thinking checkpoint without
@@ -122,14 +122,14 @@ Two more ways to get a filter that lies to you:
    the pass-rate window no longer describes the training distribution.
 
    `--max-new-tokens` therefore defaults to **24576**, matching
-   `--rollout-max-response-len` in `experiments/math_sync`. Measured on
+   `--rollout-max-response-len` in `experiments/scripts/math/sync`. Measured on
    Qwen3-4B-Instruct-2507 over DAPO-Math, an 8192 budget truncated **18 of 32**
    prompts (median mean response 6762 tokens); raising it to 24576 dropped
    truncation to 3.5%. `truncated_frac` is recorded per prompt and reported in
    the summary — check it before trusting a window.
 
 `--n-samples` and `--temperature` default to 8 and 1.0 to match
-`experiments/math_sync`. The measured pass rate is then the same statistic the
+`experiments/scripts/math/sync`. The measured pass rate is then the same statistic the
 trainer sees per group, so a window maps onto training batches with no
 rescaling.
 
@@ -140,7 +140,7 @@ so it can run before or alongside training):
 
 ```bash
 sbatch -A coreai_horizon_dilations \
-  experiments/src/difficulty_filter/run_measure.sbatch
+  experiments/tools/difficulty_filter/run_measure.sbatch
 ```
 
 Resumable: results are appended and flushed per prompt and a rerun skips indices
@@ -150,7 +150,7 @@ Then select a window (seconds, no GPU) — this is why the measurement records t
 pass rate instead of a keep/drop decision:
 
 ```bash
-python -m experiments.src.difficulty_filter.apply_filter \
+python -m experiments.tools.difficulty_filter.apply_filter \
   --prompt-data  $DATASET_DIR/dapo-math-17k/dapo-math-17k.jsonl \
   --pass-rates   $DATASET_DIR/difficulty/dapo-math-17k.Qwen3-4B-Instruct-2507.passrate.jsonl \
   --output       $DATASET_DIR/dapo-math-17k/dapo-math-17k-p20-80.jsonl \
@@ -168,12 +168,12 @@ a new dataset — which is also what keeps its checkpoints, its wandb project an
 its results separate from the unfiltered ones:
 
 ```bash
-cp -r experiments/math_sync/dapo-math experiments/math_sync/dapo-math-p20-80
+cp -r experiments/scripts/math/sync/dapo-math experiments/scripts/math/sync/dapo-math-p20-80
 # then in each run.sbatch of the copy:
 #   DATASET_TAG=dapo-math-p20-80
 #   PROMPT_DATA=/data/dapo-math-17k/dapo-math-17k-p20-80.jsonl
 
-experiments/submit_training.sh math_sync/dapo-math-p20-80/qwen3-4b-instruct-2507 filtered-math
+experiments/submit_training.sh math/sync/dapo-math-p20-80/qwen3-4b-instruct-2507 filtered-math
 ```
 
 ## Search-R1
@@ -193,11 +193,11 @@ neither sync nor async passes an online dynamic filter.
 ```bash
 # First validate servers, parquet loading, retrieval, reward, and output schema.
 sbatch -A coreai_horizon_dilations --export=ALL,LIMIT=64 \
-  experiments/src/difficulty_filter/run_measure_search_r1.sbatch
+  experiments/tools/difficulty_filter/run_measure_search_r1.sbatch
 
 # Then resume/complete the whole 169,615-row source and materialize p10-90.
 sbatch -A coreai_horizon_dilations \
-  experiments/src/difficulty_filter/run_measure_search_r1.sbatch
+  experiments/tools/difficulty_filter/run_measure_search_r1.sbatch
 ```
 
 The default artifacts are:

@@ -113,7 +113,7 @@ GLOBAL_BATCH_SIZE=64 MAX_RESPONSE_LEN=2048 CONFIG_TAG=smoke-genspan-20260809
 SAVE_HF=0`, everything else at recipe defaults (`MAX_WEIGHT_STALENESS=2`,
 `in_place`, 1 train node + 8 rollout GPUs, `tp2 cp1 -> dp4`).
 
-| rollout | `weight_version/min..max` | `mixed_version_ratio` | `staleness/bound/train/mean` | `staleness/pre_queue/mean` | `staleness/total/max` |
+| rollout | `weight_version/min..max` | `mixed_version_ratio` | `staleness/total/mean` | `staleness/pre_queue/mean` | `staleness/total/max` |
 |---|---|---|---|---|---|
 | 0 | 1 .. 1 | 0.0 | 0.0 | 0.0 | 0.0 |
 | 1 | 1 .. 1 | 0.0 | 0.0 | 0.0 | 0.0 |
@@ -136,30 +136,32 @@ there is not evidence.
 `_generate_group` reads the version before generating and stamps it into
 `Sample.metadata["submission_weight_version"]` (`fully_async_rollout.py:64-90`),
 the same mechanism multi-LoRA already uses for `slot_version`
-(`multi_lora/async_rollout.py:141-146`). Two families over the trained batch,
-three families over the trained batch, none gated on `MAX_WEIGHT_STALENESS`, with
-S the submission version, Q the version the group entered the queue under and C
-the version at drain:
+(`multi_lora/async_rollout.py:141-146`). The accepted-batch decomposition is
+emitted whether or not `MAX_WEIGHT_STALENESS` is configured; `staleness/rollout`
+also records the offered population before admission. With S the selected
+reference, Q the group-ready version, D the dequeue version, and T the train
+version:
 
 | key | quantity |
 |---|---|
-| `staleness/pre_queue/*` | `Q - S` — updates crossed while generating |
-| `staleness/in_queue/*` | `C - Q` — updates crossed while waiting to be trained on |
-| `staleness/total/*` | `C - S` = `pre_queue + in_queue` |
+| `staleness/pre_queue/*` | `Q - S` — updates crossed before generation/reward/finalization made the group ready |
+| `staleness/in_queue/*` | `T - Q` — updates crossed from ready to training |
+| `staleness/total/*` | `T - S` = `pre_queue + in_queue` |
+| `staleness/rollout/*` | `T* - S` — would-be train staleness before admission |
 
-Names taken from Applied Compute's PQS/IQS decomposition. **Q is the group's
-*newest* sample version, not its oldest.** A group is one request per sample
-joined by `asyncio.gather` (`inference_rollout_common.py:137-146`), so it enters
-the queue when its slowest sample lands; keying on the oldest would charge a
-straggler's crossing to in-queue staleness, inverting the two components in
-exactly the straggler-driven case the split exists for.
+Names taken from Applied Compute's PQS/IQS decomposition. **Q is the version
+when the whole group becomes queue-ready.** It is stamped after generation,
+reward, and finalization, and can exceed the group's last-forward version when
+an update lands during post-forward work. Keying on an earlier sample boundary
+would charge pre-ready work to in-queue staleness and invert the split.
 
-What the bound tests keeps its own name, `staleness/bound/{rollout,train}/*` =
-`C - oldest`. That is **not** `in_queue`: it is `in_queue` plus the group's
-internal spread across versions. Enforcement is unchanged — still
-`current - oldest` at `fully_async_rollout.py:409`.
+For `queue-recycle`, the bound admits `D-S < max`; with one scheduled update
+before training this is equivalent to `T-S <= max`.
+The minimum bound of 1 follows from the strict rule and a nonnegative dequeue
+gap. It is independent of startup: startup uses `T=D`, while normal prefetched
+batches use `T=D+1`.
 
-All of it is absent, not zero, when the router cannot be read.
+Missing reference provenance stays absent rather than being reported as zero.
 
 Two things the change had to fix to be safe:
 
@@ -194,7 +196,7 @@ router was readable throughout. Rollout 2 is the interesting one:
 | `pre_queue` | 1.0 | 1 | `count_1: 8` |
 | `in_queue` | 0.0 | 0 | `count_0: 8` |
 | `total` | 1.0 | 1 | `count_1: 8` |
-| `bound/train` | 0.125 | 1 | `count_0: 7`, `count_1: 1` |
+| oldest-reference lag (historical diagnostic) | 0.125 | 1 | `count_0: 7`, `count_1: 1` |
 
 `in_queue` is 0 for all eight groups, so the single group reading 1 under the
 bound has `Q - oldest = 1`: **its samples split across v1 and v2**. That is the

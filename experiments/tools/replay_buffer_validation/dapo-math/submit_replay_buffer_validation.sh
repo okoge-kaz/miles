@@ -34,7 +34,7 @@ while (( $# > 0 )); do
     esac
 done
 
-RECIPE=experiments/math_async/dapo-math-p10-90/qwen3-4b/run.sbatch
+RECIPE=experiments/scripts/math/async/dapo-math-p10-90/qwen3-4b/run.sbatch
 ACCOUNT="${SLURM_ACCOUNT_NAME:-coreai_horizon_dilations}"
 : "${VALIDATION_NAMESPACE:=rbtype-step4000-${SLURM_JOB_ID:-$(date +%Y%m%d-%H%M%S)}}"
 WANDB_PROJECT=async-rl-miles-replay-buffer
@@ -95,7 +95,7 @@ COMMON_EXPORTS=(
     "N_SAMPLES_PER_PROMPT=16"
     "GLOBAL_BATCH_SIZE=3072"
     "NUM_STEPS_PER_ROLLOUT=1"
-    "QUEUE_POLICY=queue-recycle"
+    "QUEUE_TYPE=queue-recycle"
     "USE_REPLAY_BUFFER=1"
     "REPLAY_BUFFER_IDENTITY_TAG=1"
     "MAX_WEIGHT_STALENESS=8"
@@ -160,7 +160,7 @@ summary_job="$(sbatch --parsable \
     --dependency="afterany:${inflight_resume_job}" \
     --job-name=rbv-summary \
     --export="ALL,VALIDATION_MANIFEST=${manifest},VALIDATION_SUMMARY=${summary}" \
-    experiments/math_async/dapo-math-p10-90/qwen3-4b/summarize_replay_buffer_validation.sbatch)"
+    experiments/tools/replay_buffer_validation/dapo-math/summarize_replay_buffer_validation.sbatch)"
 {
     printf 'VALIDATION_NAMESPACE=%q\n' "${VALIDATION_NAMESPACE}"
     printf 'WANDB_PROJECT=%q\n' "${WANDB_PROJECT}"
@@ -180,5 +180,5 @@ printf 'inflight fresh=%s resume=%s\n' "${inflight_fresh_job}" "${inflight_resum
 printf 'summary=%s (after %s)\n' "${summary_job}" "${inflight_resume_job}"
 printf 'manifest: %s\n' "${manifest}"
 printf 'analyze: python3 %s %s\n' \
-    "experiments/math_async/dapo-math-p10-90/qwen3-4b/analyze_replay_buffer_validation.py" \
+    "experiments/tools/replay_buffer_validation/dapo-math/analyze_replay_buffer_validation.py" \
     "${manifest}"

@@ -52,8 +52,8 @@ export SAVE_RETAIN_INTERVAL=1000
 export SAVE_HF=0
 export DUMP_TRAIN_DATA=1
 export DUMP_POLICY_LOSS_DEBUG=1
-export LOG_STALENESS_GRADIENT_METRICS=1
-export LOG_STALENESS_GRADIENT_RATIO_HISTOGRAM=0
+export LOG_SAMPLE_STALENESS_METRICS=1
+export LOG_SAMPLE_STALENESS_RATIO_HISTOGRAM=0
 export SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS=1
 
 # Keep this validation self-contained and avoid creating an external run.
@@ -64,4 +64,4 @@ export WANDB_PROJECT="miles-prefill-version-smoke"
 test -f "${SQSH_IMAGE}"
 test -f "/lustre/fs1/portfolios/coreai/projects/coreai_horizon_dilations/users/kfujii/datasets/dapo-math-p10-90/dapo-math-p10-90.jsonl"
 
-bash "${REPO_ROOT}/experiments/math_async/dapo-math-p10-90/qwen3-4b/run.sbatch"
+bash "${REPO_ROOT}/experiments/scripts/math/async/dapo-math-p10-90/qwen3-4b/run.sbatch"

@@ -81,7 +81,7 @@ def make_args(**overrides) -> Namespace:
         sglang_router_port=30000,
         staleness_reference="completion",
         save_debug_rollout_data=None,
-        fully_async_queue_policy="queue-recycle",
+        fully_async_queue_type="queue-recycle",
         fully_async_queue_factor=1,
     )
     defaults.update(overrides)
@@ -124,10 +124,11 @@ async def test_queue_lifecycle_dump_is_primitive_and_opt_in(monkeypatch):
     fn = make_fn(monkeypatch, args, FakeDataSource(scripted=[group]))
     fn.commit_applied_weight_version(3)
 
-    output = await fn(RolloutFnTrainInput(rollout_id=7))
+    output = await fn(RolloutFnTrainInput(rollout_id=7, updates_before_train=1))
 
-    assert output.debug_metadata["schema_version"] == 1
+    assert output.debug_metadata["schema_version"] == 2
     assert output.debug_metadata["policy"] == "queue-recycle"
+    assert output.debug_metadata["bound_staleness_semantics"] == "scheduled_train_version_minus_reference"
     [record] = output.debug_metadata["records"]
     assert record["disposition"] == "trained"
     assert record["rollout_id"] == 7
@@ -138,11 +139,26 @@ async def test_queue_lifecycle_dump_is_primitive_and_opt_in(monkeypatch):
     assert record["queue_depth_before_enqueue"] == 0
     assert record["queue_depth_after_enqueue"] == 1
     assert record["decision_version"] == 3
+    assert record["train_version"] == 4
+    assert record["bound_staleness"] == 1
     assert not any(isinstance(value, Sample) for value in record.values())
+    [compute_record] = output.debug_metadata["recycle_compute"]["records"]
+    assert compute_record["versions"]["drain"] == 3
+    assert compute_record["versions"]["train"] == 4
+    assert compute_record["in_queue_staleness"] == [1, 1]
 
     no_dump = make_fn(monkeypatch, make_args(rollout_batch_size=1), FakeDataSource())
     no_dump_output = await no_dump(RolloutFnTrainInput(rollout_id=0))
     assert no_dump_output.debug_metadata is None
+
+
+def test_scheduled_train_version_is_fixed_for_the_whole_drain():
+    progress = fully_async._DrainProgress(rollout_id=3, updates_before_train=1)
+
+    assert fully_async._scheduled_train_version(progress, dequeue_version=5) == 6
+    assert fully_async._scheduled_train_version(progress, dequeue_version=6) == 6
+    with pytest.raises(RuntimeError, match="exceeds scheduled train version 6"):
+        fully_async._scheduled_train_version(progress, dequeue_version=7)
 
 
 async def test_eval_raises(monkeypatch):
@@ -198,9 +214,8 @@ async def test_stale_group_recycled(monkeypatch):
 
     assert data_source.recycled == [stale]
     assert output.metrics["rollout/fully_async/stale_groups_recycled"] == 1
-    # The reference version the staleness is a difference against: without it, a
-    # missing staleness metric cannot be told apart from a router that never answered.
-    assert output.metrics["rollout/fully_async/current_weight_version"] == 10
+    # The absolute scheduled train version is logged alongside all relative gaps.
+    assert output.metrics["fully_async/train_weight_version"] == 10
 
     # Queue selection is group-valued. The stale group's slowest sample had
     # length 3, while the replacement group has two length-1 samples.
@@ -212,26 +227,21 @@ async def test_stale_group_recycled(monkeypatch):
     assert output.metrics["queue/selection/generated/sample_length/count"] >= 4
     assert output.metrics["queue/selection/aborted_recycled/group_max_length/count"] == 0
 
-    # `staleness/bound/train/` is what the bound saw for the batch. The group at 5 exceeded the
-    # bound of 2 and was recycled, so only the fresh group at 10 -- lag 0 -- was
-    # trained on. A reader plotting "max_staleness" against a bound of 2 must never
-    # see a 5 there.
-    assert output.metrics["staleness/bound/train/max"] == 0
-    # Upstream's own key keeps upstream's meaning: the offered lag, before the
-    # bound check. Two miles runs must not plot different quantities under it.
-    assert output.metrics["rollout/fully_async/max_staleness"] == 5
-    assert output.metrics["staleness/bound/train/num_groups"] == 1
-    assert output.metrics["staleness/bound/train/frac_zero"] == pytest.approx(1.0)
-    assert output.metrics["staleness/bound/train/count_0"] == 1
-    assert output.metrics["staleness/bound/train/count_5"] == 0
+    # `staleness/total/` is the accepted training population. The group at 5
+    # exceeded the bound of 2 and was recycled, so only the fresh group at 10 --
+    # lag 0 -- was trained on.
+    assert output.metrics["staleness/total/max"] == 0
+    assert output.metrics["staleness/total/num_groups"] == 1
+    assert output.metrics["staleness/total/frac_zero"] == pytest.approx(1.0)
+    assert output.metrics["staleness/total/count_0"] == 1
+    assert output.metrics["staleness/total/count_5"] == 0
 
-    # `staleness/bound/rollout/` keeps both: it is the natural lag of this node ratio,
+    # `staleness/rollout/` keeps both: it is the natural lag of this node ratio,
     # and the gap between the two is what recycling cost.
-    assert output.metrics["staleness/bound/rollout/max"] == 5
-    assert output.metrics["staleness/bound/rollout/num_groups"] == 2
-    assert output.metrics["staleness/bound/rollout/p50"] == pytest.approx(2.5)
-    assert output.metrics["staleness/bound/rollout/frac_zero"] == pytest.approx(0.5)
-    assert output.metrics["staleness/bound/rollout/frac_at_bound"] == pytest.approx(0.5)
+    assert output.metrics["staleness/rollout/max"] == 5
+    assert output.metrics["staleness/rollout/num_groups"] == 2
+    assert output.metrics["staleness/rollout/p50"] == pytest.approx(2.5)
+    assert output.metrics["staleness/rollout/frac_zero"] == pytest.approx(0.5)
 
     # Tokens counted before reset_for_retry cleared them.
     stale_response_tokens = 4
@@ -250,6 +260,8 @@ async def test_stale_group_recycled(monkeypatch):
     # not have to be reconstructed by differencing group counts -- which would fold
     # in the dynamic-filter drops.
     assert output.metrics["staleness/bound_exceeded_groups"] == 1
+    assert output.metrics["staleness/bound_exceeded_samples"] == N_SAMPLES_PER_PROMPT
+    assert output.metrics["staleness/bound_exceeded_sample_frac"] == pytest.approx(0.5)
     assert output.metrics["staleness/bound_exceeded_tokens"] == 4
 
     # The recycled group was regenerated, so its retry counter advanced. The group
@@ -319,12 +331,12 @@ async def test_trained_staleness_excludes_dynamic_filter_drops(monkeypatch):
     output = await fn(RolloutFnTrainInput(rollout_id=0))
 
     # It was offered at lag 1 and the bound did not stop it...
-    assert output.metrics["staleness/bound/rollout/count_1"] == 1
+    assert output.metrics["staleness/rollout/count_1"] == 1
     assert output.metrics["rollout/fully_async/stale_groups_recycled"] == 0
     # ...but the filter dropped it, so the loss only ever saw the lag-0 group.
-    assert output.metrics["staleness/bound/train/count_1"] == 0
-    assert output.metrics["staleness/bound/train/count_0"] == 1
-    assert output.metrics["staleness/bound/train/num_groups"] == 1
+    assert output.metrics["staleness/total/count_1"] == 0
+    assert output.metrics["staleness/total/count_0"] == 1
+    assert output.metrics["staleness/total/num_groups"] == 1
 
 
 async def test_wasted_token_accounting(monkeypatch):
@@ -366,14 +378,13 @@ async def test_generated_token_denominator_precedes_post_generation_sample_filte
 def test_staleness_histogram_reports_the_shape_not_just_moments():
     """Percentiles cannot distinguish a rare tail from a common one.
 
-    A bound is only a real constraint if samples actually reach it, and
     ``staleness_p99`` alone cannot say whether lag 4 happened twice or two
     hundred times.
     """
     cap = fully_async.STALENESS_HISTOGRAM_MAX
     overflow = f"count_ge_{cap + 1}"
     values = [0] * 90 + [1] * 8 + [4, 12, cap + 3]
-    m = fully_async._staleness_metrics(values, bound=2)
+    m = fully_async._staleness_metrics(values)
 
     assert m["count_0"] == 90
     assert m["count_1"] == 8
@@ -386,6 +397,10 @@ def test_staleness_histogram_reports_the_shape_not_just_moments():
     # The moments still agree with the histogram.
     assert m["max"] == cap + 3
     assert m["frac_zero"] == 90 / len(values)
+    mean = sum(values) / len(values)
+    variance = sum((value - mean) ** 2 for value in values) / len(values)
+    assert m["variance"] == pytest.approx(variance)
+    assert m["std"] == pytest.approx(variance**0.5)
 
 
 async def test_weight_version_endpoint_is_discovered_not_assumed(monkeypatch):
@@ -455,8 +470,8 @@ async def test_unreachable_router_only_disables_submission_diagnostics(monkeypat
         output = await fn(RolloutFnTrainInput(rollout_id=0))
 
     assert "submission_weight_version diagnostics will be absent" in caplog.text
-    assert "rollout/fully_async/avg_staleness" not in output.metrics
-    assert output.metrics["rollout/fully_async/current_weight_version"] == 0
+    assert "staleness/rollout/mean" not in output.metrics
+    assert output.metrics["fully_async/train_weight_version"] == 0
 
 
 async def test_malformed_model_info_does_not_kill_the_drain(monkeypatch):
@@ -547,7 +562,7 @@ async def test_queue_recycle_preserves_completion_fifo_and_backpressure(monkeypa
 async def test_queue_drop_evicts_oldest_and_keeps_completion_fifo(monkeypatch):
     args = make_args(
         rollout_batch_size=2,
-        fully_async_queue_policy="queue-drop",
+        fully_async_queue_type="queue-drop",
         fully_async_queue_factor=1,
         max_weight_staleness=None,
         save_debug_rollout_data="/tmp/rollout_{rollout_id}.pt",
@@ -574,12 +589,13 @@ async def test_queue_drop_evicts_oldest_and_keeps_completion_fifo(monkeypatch):
     [evicted] = metadata["records"]
     assert evicted["group_index"] == 1
     assert evicted["disposition"] == "queue_evicted"
+    assert evicted["bound_staleness"] is None
 
 
 async def test_queue_max_waits_for_full_batch_then_takes_oldest(monkeypatch):
     args = make_args(
         rollout_batch_size=2,
-        fully_async_queue_policy="queue-max",
+        fully_async_queue_type="queue-max",
         max_weight_staleness=2,
         staleness_reference="prefill",
     )
@@ -609,7 +625,7 @@ async def test_queue_max_waits_for_full_batch_then_takes_oldest(monkeypatch):
 async def test_policy_queue_worker_failure_beats_queued_groups(monkeypatch):
     args = make_args(
         rollout_batch_size=1,
-        fully_async_queue_policy="queue-drop",
+        fully_async_queue_type="queue-drop",
         max_weight_staleness=None,
     )
     fn = make_fn(monkeypatch, args, FakeDataSource())
@@ -629,7 +645,7 @@ async def test_policy_queue_worker_failure_beats_queued_groups(monkeypatch):
 def test_queue_max_safety_capacity_cannot_deadlock_a_large_batch(monkeypatch):
     args = make_args(
         rollout_batch_size=fully_async.OUTPUT_QUEUE_MAX_GROUPS + 1,
-        fully_async_queue_policy="queue-max",
+        fully_async_queue_type="queue-max",
         max_weight_staleness=2,
         staleness_reference="prefill",
     )
@@ -662,7 +678,7 @@ async def test_queue_max_at_one_accepts_one_step_and_drops_two_step_without_recy
 
     args = make_args(
         rollout_batch_size=2,
-        fully_async_queue_policy="queue-max",
+        fully_async_queue_type="queue-max",
         max_weight_staleness=1,
         staleness_reference="prefill",
     )
@@ -678,8 +694,8 @@ async def test_queue_max_at_one_accepts_one_step_and_drops_two_step_without_recy
     assert output.metrics["rollout/fully_async/age_cutoff_tokens"] == 12
     assert output.metrics["queue/selection/age_cutoff_dropped/sample_length/mean"] == 6
     assert output.metrics["staleness/bound_exceeded_groups"] == 1
-    assert output.metrics["staleness/bound/train/count_1"] == 1
-    assert output.metrics["staleness/bound/train/max"] == 1
+    assert output.metrics["staleness/total/count_1"] == 1
+    assert output.metrics["staleness/total/max"] == 1
     assert stale not in output.samples
     assert allowed in output.samples
 
@@ -696,7 +712,7 @@ async def test_queue_max_at_zero_rejects_one_step_and_accepts_on_policy(monkeypa
 
     args = make_args(
         rollout_batch_size=1,
-        fully_async_queue_policy="queue-max",
+        fully_async_queue_type="queue-max",
         max_weight_staleness=0,
         staleness_reference="prefill",
     )
@@ -707,9 +723,9 @@ async def test_queue_max_at_zero_rejects_one_step_and_accepts_on_policy(monkeypa
     output = await fn(RolloutFnTrainInput(rollout_id=0))
 
     assert output.metrics["rollout/fully_async/stale_groups_dropped"] == 1
-    assert output.metrics["staleness/bound/rollout/count_1"] == 1
-    assert output.metrics["staleness/bound/train/count_0"] == 1
-    assert output.metrics["staleness/bound/train/max"] == 0
+    assert output.metrics["staleness/rollout/count_1"] == 1
+    assert output.metrics["staleness/total/count_0"] == 1
+    assert output.metrics["staleness/total/max"] == 0
     assert one_step_stale not in output.samples
     assert on_policy in output.samples
 
@@ -843,7 +859,7 @@ async def test_prefill_pre_queue_staleness_records_updates_crossed_during_genera
 
     fn = make_fn(
         monkeypatch,
-        make_args(rollout_batch_size=1, max_weight_staleness=2, staleness_reference="prefill"),
+        make_args(rollout_batch_size=1, max_weight_staleness=3, staleness_reference="prefill"),
         FakeDataSource(),
         generate=generate_crossing_an_update,
     )
@@ -852,7 +868,7 @@ async def test_prefill_pre_queue_staleness_records_updates_crossed_during_genera
 
     output = await fn(RolloutFnTrainInput(rollout_id=0))
 
-    assert output.metrics["staleness/bound/train/max"] == 2
+    assert output.metrics["staleness/total/max"] == 2
     assert output.metrics["rollout/fully_async/stale_groups_recycled"] == 0
 
     assert output.metrics["staleness/pre_queue/max"] == 2
@@ -894,9 +910,9 @@ async def test_straggler_is_charged_to_pre_queue_not_in_queue(monkeypatch):
     assert output.metrics["staleness/pre_queue/max"] == 1
     assert output.metrics["staleness/in_queue/max"] == 0
     assert output.metrics["staleness/total/max"] == 1
-    # The bound keys on the group's oldest sample, so it reads 1 here -- that is
+    # `total` keys on the group's oldest sample, so it reads 1 here -- that is
     # `in_queue` plus the group's internal spread, and is why it is not `in_queue`.
-    assert output.metrics["staleness/bound/train/max"] == 1
+    assert output.metrics["staleness/total/max"] == 1
 
 
 async def test_components_sum_to_the_total(monkeypatch):
@@ -941,11 +957,8 @@ async def test_components_sum_to_the_total(monkeypatch):
     )
     assert (pre, inq, total) == (2.0, 3.0, 5.0)
     assert pre + inq == total
-    # And none of the three inherits the bound's gating: `staleness/bound/*` is only
-    # computed when `--max-weight-staleness` is set, which is why the unbounded arm
-    # has to be run with a bound so large it never binds. The decomposition is a
-    # property of the pipeline, not of the cap.
-    assert not [k for k in output.metrics if k.startswith("staleness/bound/")]
+    # With no filtering, the offered and accepted populations agree.
+    assert output.metrics["staleness/rollout/max"] == output.metrics["staleness/total/max"]
 
 
 async def test_staleness_components_absent_when_the_router_never_answers(monkeypatch):
@@ -960,7 +973,7 @@ async def test_staleness_components_absent_when_the_router_never_answers(monkeyp
     output = await fn(RolloutFnTrainInput(rollout_id=0))
 
     assert len(output.samples) == 2
-    for family in ("pre_queue", "in_queue", "total"):
+    for family in ("rollout", "pre_queue", "in_queue", "total"):
         assert not [k for k in output.metrics if k.startswith(f"staleness/{family}/")]
 
 
@@ -1008,7 +1021,8 @@ async def _run_with_reference(monkeypatch, reference: str, bound: int):
     """One group submitted under v1 that finishes under v2, drained at v2.
 
     `total` is 1 and what the completion reference tests is 0, so the two
-    references disagree at a bound of 0 -- which is the point of the option.
+    references disagree at the strict queue-recycle bound of 1 -- which is the
+    point of the option.
     """
     version = StubWeightVersion(1)
 
@@ -1034,12 +1048,10 @@ async def _run_with_reference(monkeypatch, reference: str, bound: int):
 
 async def test_completion_reference_does_not_see_the_generation_span(monkeypatch):
     """The default. A group that crossed an update while generating passes a bound
-    of 0, because the gap is measured from the version it finished under."""
-    output, data_source = await _run_with_reference(monkeypatch, "completion", bound=0)
+    of 1, because the gap is measured from the version it finished under."""
+    output, data_source = await _run_with_reference(monkeypatch, "completion", bound=1)
 
     assert output.metrics["staleness/total/max"] == 0
-    assert output.metrics["staleness/bound/train/max"] == 0
-    assert output.metrics["staleness/total/max"] == output.metrics["staleness/bound/train/max"]
     assert output.metrics["rollout/fully_async/stale_groups_recycled"] == 0
     assert data_source.recycled == []
     assert output.metrics["staleness/bound_reference_is_submission"] == 0.0
@@ -1048,7 +1060,7 @@ async def test_completion_reference_does_not_see_the_generation_span(monkeypatch
 async def test_submission_reference_bounds_the_whole_off_policy_distance(monkeypatch):
     """The option. The same group is rejected at the same bound, because the gap is
     now measured from the version it was submitted under -- i.e. `staleness/total`."""
-    output, data_source = await _run_with_reference(monkeypatch, "submission", bound=0)
+    output, data_source = await _run_with_reference(monkeypatch, "submission", bound=1)
 
     assert output.metrics["rollout/fully_async/stale_groups_recycled"] >= 1
     assert data_source.recycled, "the group that crossed an update must be recycled"
@@ -1058,7 +1070,7 @@ async def test_submission_reference_bounds_the_whole_off_policy_distance(monkeyp
     # the bound rejected it; what survived into the batch crossed nothing. That gap
     # between the populations is the bound doing its job on `total` -- under the
     # completion reference the same group passes (see the test above).
-    assert output.metrics["staleness/bound/rollout/max"] == 1
+    assert output.metrics["staleness/rollout/max"] == 1
     assert output.metrics["staleness/total/max"] == 0
 
 
@@ -1098,7 +1110,7 @@ async def test_prefill_reference_ignores_update_while_waiting_for_prefill(monkey
         monkeypatch,
         make_args(
             rollout_batch_size=1,
-            max_weight_staleness=0,
+            max_weight_staleness=1,
             staleness_reference="prefill",
         ),
         FakeDataSource(),
@@ -1109,7 +1121,7 @@ async def test_prefill_reference_ignores_update_while_waiting_for_prefill(monkey
 
     output = await fn(RolloutFnTrainInput(rollout_id=0))
 
-    assert output.metrics["staleness/bound/train/max"] == 0
+    assert output.metrics["staleness/total/max"] == 0
     assert output.metrics["staleness/pre_queue/max"] == 0
     assert output.metrics["staleness/in_queue/max"] == 0
     assert output.metrics["staleness/total/max"] == 0
@@ -1119,10 +1131,11 @@ async def test_prefill_reference_ignores_update_while_waiting_for_prefill(monkey
     assert sample.metadata[fully_async.GROUP_READY_VERSION_KEY] == 11
     assert sample.metadata[fully_async.QUEUE_PUT_VERSION_KEY] == 11
     assert sample.metadata[fully_async.DRAIN_VERSION_KEY] == 11
+    assert sample.metadata[fully_async.TRAIN_VERSION_KEY] == 11
 
 
 async def test_prefill_reference_detects_mixed_generation_and_enforces_bound(monkeypatch):
-    """prefill=10, mixed decode=11, drain=11 is stale by one and is recycled at max=0."""
+    """prefill=10, mixed decode=11, drain=11 reaches max=1 and is recycled."""
     scripted = make_group(1)
     data_source = FakeDataSource(scripted=[scripted])
 
@@ -1138,7 +1151,7 @@ async def test_prefill_reference_detects_mixed_generation_and_enforces_bound(mon
         monkeypatch,
         make_args(
             rollout_batch_size=1,
-            max_weight_staleness=0,
+            max_weight_staleness=1,
             staleness_reference="prefill",
         ),
         data_source,
@@ -1147,16 +1160,17 @@ async def test_prefill_reference_detects_mixed_generation_and_enforces_bound(mon
     fn._weight_version = StubWeightVersion(10)
     fn.commit_applied_weight_version(10)
 
-    output = await fn(RolloutFnTrainInput(rollout_id=0))
+    output = await fn(RolloutFnTrainInput(rollout_id=0, updates_before_train=1))
 
     assert data_source.recycled == [scripted]
     assert output.metrics["rollout/fully_async/stale_groups_recycled"] == 1
-    assert output.metrics["staleness/bound/rollout/count_1"] == 1
+    assert output.metrics["staleness/rollout/count_2"] == 1
+    assert output.metrics["staleness/total/count_1"] == 1
     assert output.metrics["staleness/mixed_version_frac/rollout"] == pytest.approx(0.5)
     assert output.metrics["staleness/mixed_version_frac/train"] == 0.0
 
 
-async def test_prefill_reference_accepts_one_step_mixed_generation_at_max_one(monkeypatch):
+async def test_prefill_reference_trains_one_step_mixed_generation_at_max_two(monkeypatch):
     async def generate_mixed(state, group, sampling_params, evaluation=False):
         _stamp_prefill_provenance(group, first=10, minimum=10, maximum=11, last=11)
         fn.commit_applied_weight_version(11)
@@ -1166,7 +1180,7 @@ async def test_prefill_reference_accepts_one_step_mixed_generation_at_max_one(mo
         monkeypatch,
         make_args(
             rollout_batch_size=1,
-            max_weight_staleness=1,
+            max_weight_staleness=2,
             staleness_reference="prefill",
         ),
         FakeDataSource(),
@@ -1175,12 +1189,14 @@ async def test_prefill_reference_accepts_one_step_mixed_generation_at_max_one(mo
     fn._weight_version = StubWeightVersion(10)
     fn.commit_applied_weight_version(10)
 
-    output = await fn(RolloutFnTrainInput(rollout_id=0))
+    output = await fn(RolloutFnTrainInput(rollout_id=0, updates_before_train=1))
 
-    assert output.metrics["staleness/bound/train/max"] == 1
+    assert output.metrics["staleness/rollout/max"] == 2
     assert output.metrics["staleness/pre_queue/max"] == 1
-    assert output.metrics["staleness/in_queue/max"] == 0
-    assert output.metrics["staleness/total/max"] == 1
+    assert output.metrics["staleness/in_queue/max"] == 1
+    assert output.metrics["staleness/total/max"] == 2
+    assert output.metrics["fully_async/train_weight_version"] == 12
+    assert output.samples[0][0].metadata[fully_async.TRAIN_VERSION_KEY] == 12
     assert output.metrics["rollout/fully_async/stale_groups_recycled"] == 0
     assert output.metrics["staleness/mixed_version_frac/train"] == 1.0
 
@@ -1190,7 +1206,7 @@ async def test_prefill_reference_fails_fast_without_scheduler_metadata(monkeypat
         monkeypatch,
         make_args(
             rollout_batch_size=1,
-            max_weight_staleness=0,
+            max_weight_staleness=1,
             staleness_reference="prefill",
         ),
         FakeDataSource(),
@@ -1217,9 +1233,7 @@ async def test_decomposition_uses_the_selected_bound_reference(monkeypatch):
     assert completion.metrics["staleness/pre_queue/max"] == 0
     assert completion.metrics["staleness/in_queue/max"] == 0
     assert completion.metrics["staleness/total/max"] == 0
-    assert completion.metrics["staleness/total/max"] == completion.metrics["staleness/bound/train/max"]
 
     assert submission.metrics["staleness/pre_queue/max"] == 1
     assert submission.metrics["staleness/in_queue/max"] == 0
     assert submission.metrics["staleness/total/max"] == 1
-    assert submission.metrics["staleness/total/max"] == submission.metrics["staleness/bound/train/max"]

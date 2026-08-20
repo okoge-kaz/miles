@@ -24,6 +24,8 @@ from miles.rollout.recycle_compute_metrics import (
     SAMPLE_GENERATION_COMPLETE_TIME_KEY,
     SAMPLE_GENERATION_COMPLETE_VERSION_KEY,
     SAMPLE_REFERENCE_VERSION_KEY,
+    TRAIN_VERSION_KEY,
+    TRAIN_WEIGHT_VERSION_METRIC,
     TRAJECTORY_START_TIME_KEY,
     TRAJECTORY_START_VERSION_KEY,
     add_selection_population,
@@ -70,6 +72,7 @@ def _samples(count: int, group_size: int) -> list[Sample]:
                 SAMPLE_REFERENCE_VERSION_KEY: start,
                 BOUND_REFERENCE_VERSION_KEY: start,
                 DRAIN_VERSION_KEY: ready + 1,
+                TRAIN_VERSION_KEY: ready + 2,
                 TRAJECTORY_START_TIME_KEY: float(start),
                 SAMPLE_GENERATION_COMPLETE_TIME_KEY: float(sample_complete),
                 GROUP_GENERATION_COMPLETE_TIME_KEY: float(group_complete),
@@ -96,6 +99,19 @@ def _measure(call: Callable[[], None], repetitions: int) -> dict[str, float]:
     }
 
 
+def _set_exact_segments(samples: list[Sample], *, segments_per_sample: int) -> None:
+    for sample in samples:
+        if segments_per_sample == 0:
+            sample.response_weight_version_segments = []
+        elif segments_per_sample == 1:
+            sample.response_weight_version_segments = [[[0, sample.response_length, 109]]]
+        elif segments_per_sample == 2:
+            split = sample.response_length // 2
+            sample.response_weight_version_segments = [[[0, split, 108], [split, sample.response_length, 109]]]
+        else:
+            raise ValueError(f"Unsupported segment count: {segments_per_sample}")
+
+
 def main() -> None:
     args = _parse_args()
     if args.samples <= 0 or args.group_size <= 0 or args.repetitions <= 0:
@@ -116,11 +132,25 @@ def main() -> None:
             "rollout/fully_async/aborted_tokens": 0,
             "rollout/fully_async/stale_tokens": 0,
             "rollout/fully_async/dynamic_filter_tokens": 0,
-            "rollout/fully_async/current_weight_version": 110,
+            TRAIN_WEIGHT_VERSION_METRIC: 110,
         }
         finalize_useful_rollout_metrics(samples, metrics, has_custom_converter=False)
 
     group = samples[: args.group_size]
+    _set_exact_segments(samples, segments_per_sample=0)
+    no_exact = _measure(finalization_pass, args.repetitions)
+    _set_exact_segments(samples, segments_per_sample=1)
+    exact_single = _measure(finalization_pass, args.repetitions)
+    _set_exact_segments(samples, segments_per_sample=2)
+    exact_mixed = _measure(finalization_pass, args.repetitions)
+
+    for sample in samples:
+        sample.loss_mask = [1] * sample.response_length
+    _set_exact_segments(samples, segments_per_sample=0)
+    all_loss_no_exact = _measure(finalization_pass, args.repetitions)
+    _set_exact_segments(samples, segments_per_sample=1)
+    all_loss_exact_single = _measure(finalization_pass, args.repetitions)
+
     results = {
         "configuration": {
             "samples": args.samples,
@@ -129,7 +159,18 @@ def main() -> None:
             "repetitions": args.repetitions,
         },
         "generated_and_consumed_population_pass": _measure(population_pass, args.repetitions),
-        "batch_finalization_pass": _measure(finalization_pass, args.repetitions),
+        "batch_finalization_no_exact_segments": no_exact,
+        "batch_finalization_exact_single_segment_masked_tail": exact_single,
+        "batch_finalization_exact_two_segments_masked_tail": exact_mixed,
+        "batch_finalization_all_loss_tokens_no_exact_segments": all_loss_no_exact,
+        "batch_finalization_all_loss_tokens_exact_single_segment": all_loss_exact_single,
+        "exact_segment_increment": {
+            "single_segment_masked_tail_median_ms": exact_single["median_ms"] - no_exact["median_ms"],
+            "two_segments_masked_tail_median_ms": exact_mixed["median_ms"] - no_exact["median_ms"],
+            "single_segment_all_loss_tokens_median_ms": (
+                all_loss_exact_single["median_ms"] - all_loss_no_exact["median_ms"]
+            ),
+        },
         "prequeue_phase_pass": _measure(lambda: prequeue_phase_metrics(samples), args.repetitions),
         "discard_waste_vector_one_group": _measure(lambda: waste_vector(group), args.repetitions),
     }

@@ -2,7 +2,7 @@
 """Submit a grid of training jobs for one or more recipes.
 
     experiments/sweep.py --sweep experiments/sweeps/<name>.txt \\
-        --recipe math_async/dapo-math-p10-90/qwen3-4b [--recipe ...] \\
+        --recipe math/async/dapo-math-p10-90/qwen3-4b [--recipe ...] \\
         [-- <extra sbatch args>]
 
 Prints the grid and exits. Add --submit to actually submit.
@@ -49,6 +49,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EXPERIMENTS = REPO_ROOT / "experiments"
+EXPERIMENT_SCRIPTS = EXPERIMENTS / "scripts"
 
 # Short forms used in CONFIG_TAG, so a tag stays readable as a directory name.
 TAG_ABBREV = {
@@ -178,7 +179,7 @@ def main() -> int:
         "--recipe",
         required=True,
         action="append",
-        help="<task>/<dataset>/<model>, repeatable to run the same grid on several models",
+        help="<task>/<mode>/<dataset>/<model>, repeatable to run the same grid on several models",
     )
     ap.add_argument("--submit", action="store_true", help="actually submit; otherwise print the grid and exit")
     ap.add_argument("--max-jobs", type=int, default=32, help="refuse to submit more points than this (default 32)")
@@ -191,7 +192,7 @@ def main() -> int:
 
     recipes = []
     for rel in args.recipe:
-        path = EXPERIMENTS / rel
+        path = EXPERIMENT_SCRIPTS / rel
         if not (path / "run.sbatch").is_file():
             sys.exit(f"no such recipe: {rel}")
         recipes.append((rel, path))
@@ -235,7 +236,7 @@ def main() -> int:
                 args.account,
                 f"--export={export}",
                 *args.sbatch_args,
-                f"experiments/{rel}/run.sbatch",
+                f"experiments/scripts/{rel}/run.sbatch",
             ]
 
             if not args.submit:

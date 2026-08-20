@@ -66,10 +66,10 @@ resumable full measurement:
 sbatch -A coreai_horizon_dilations experiments/setup/prepare_search_r1.sbatch
 
 sbatch -A coreai_horizon_dilations --export=ALL,LIMIT=64 \
-  experiments/src/difficulty_filter/run_measure_search_r1.sbatch
+  experiments/tools/difficulty_filter/run_measure_search_r1.sbatch
 
 sbatch -A coreai_horizon_dilations \
-  experiments/src/difficulty_filter/run_measure_search_r1.sbatch
+  experiments/tools/difficulty_filter/run_measure_search_r1.sbatch
 ```
 
 The full job writes the cached per-prompt measurement under `/data/difficulty/`
@@ -207,7 +207,7 @@ nodes. Override `SHARED_WS`, `WS`, `SQSH_IMAGE`, `SLURM_ACCOUNT_NAME`, and, when
 needed, `GPUS_PER_NODE` before submission. Stage assets with
 `experiments/setup/stage_all.sh` and
 `experiments/setup/prepare_search_r1.sbatch`, then materialize the policy-specific
-fixed dataset with `experiments/src/difficulty_filter/run_measure_search_r1.sbatch`.
+fixed dataset with `experiments/tools/difficulty_filter/run_measure_search_r1.sbatch`.
 Copying the resulting JSONL and its pass-rate/meta artifacts is sufficient when
 the other cluster uses the same policy, tokenizer, E5 index/corpus, and sampling
 settings; otherwise re-measure there.

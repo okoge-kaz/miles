@@ -1,3 +1,4 @@
+import pytest
 from tests.ci.ci_register import register_cpu_ci
 
 from miles.rollout.fully_async_telemetry import FullyAsyncPipelineTelemetry
@@ -21,6 +22,8 @@ from miles.rollout.recycle_compute_metrics import (
     STALE_DURING_QUEUE_BACKPRESSURE,
     STALE_DURING_REWARD_FINALIZE,
     STALE_IN_OUTPUT_QUEUE,
+    STALE_STAGE_UNKNOWN,
+    TRAIN_VERSION_KEY,
     TRAJECTORY_START_TIME_KEY,
     TRAJECTORY_START_VERSION_KEY,
     add_selection_population,
@@ -101,6 +104,7 @@ def test_stale_reason_is_the_first_boundary_that_crosses_the_bound() -> None:
         "reference_version": 10,
         "drain_version": 15,
         "bound": 1,
+        "strict_bound": False,
     }
     assert (
         classify_stale_recycle_stage(
@@ -140,6 +144,20 @@ def test_stale_reason_is_the_first_boundary_that_crosses_the_bound() -> None:
     )
 
 
+def test_stale_reason_rejects_equality_only_for_a_strict_bound() -> None:
+    common = {
+        "reference_version": 10,
+        "generation_completion_version": 11,
+        "group_ready_version": 11,
+        "queue_put_version": 11,
+        "drain_version": 11,
+        "bound": 1,
+    }
+
+    assert classify_stale_recycle_stage(**common, strict_bound=True) == STALE_AT_GENERATION_COMPLETION
+    assert classify_stale_recycle_stage(**common, strict_bound=False) == STALE_STAGE_UNKNOWN
+
+
 def test_straggler_collateral_detects_crossing_during_group_wait() -> None:
     early = _sample(1, 2, [1, 1])
     straggler = _sample(2, 2, [1, 1])
@@ -155,6 +173,28 @@ def test_straggler_collateral_detects_crossing_during_group_wait() -> None:
         reference_mode="submission",
         drain_version=13,
         bound=1,
+        strict_bound=False,
+    )
+
+    assert collateral == [early.index]
+
+
+def test_straggler_collateral_uses_the_strict_queue_recycle_boundary() -> None:
+    early = _sample(1, 2, [1, 1])
+    straggler = _sample(2, 2, [1, 1])
+    for sample in (early, straggler):
+        sample.metadata["submission_weight_version"] = 10
+        sample.metadata[GROUP_GENERATION_COMPLETE_VERSION_KEY] = 11
+        sample.metadata[LIFECYCLE_EXACT_KEY] = True
+    early.metadata[SAMPLE_GENERATION_COMPLETE_VERSION_KEY] = 10
+    straggler.metadata[SAMPLE_GENERATION_COMPLETE_VERSION_KEY] = 11
+
+    collateral = straggler_collateral_indices(
+        [early, straggler],
+        reference_mode="submission",
+        drain_version=11,
+        bound=1,
+        strict_bound=True,
     )
 
     assert collateral == [early.index]
@@ -237,26 +277,26 @@ def test_pipeline_snapshot_yields_same_window_for_all_throughputs() -> None:
         {
             SAMPLE_REFERENCE_VERSION_KEY: 3,
             DRAIN_VERSION_KEY: 5,
+            TRAIN_VERSION_KEY: 6,
             QUEUE_PUT_TIME_KEY: 10.0,
             DRAIN_TIME_KEY: 12.0,
         }
     )
     snapshot = build_batch_consumption_snapshot(
         [sample],
-        selection_version=5,
-        bound=4,
         optimizer_updates=2,
         cohort_generated_tokens=10,
     )
     metrics = batch_consumption_metrics(
         snapshot,
-        train_start_version=5,
         pipeline_snapshot={
             "window_seconds": 2.0,
             "generated_tokens": 10.0,
             "completed_training_batches": 1.0,
             "accepted_tokens": 3.0,
             "accepted_tokens_available": 1.0,
+            "cumulative_accepted_loss_tokens": 30.0,
+            "cumulative_accepted_loss_tokens_available": 1.0,
             "optimizer_updates": 2.0,
             "queue_depth_time_mean": 3.0,
             "queue_depth_current": 4.0,
@@ -273,6 +313,7 @@ def test_pipeline_snapshot_yields_same_window_for_all_throughputs() -> None:
     assert metrics["throughput/cohort_useful_efficiency"] == 0.3
     assert metrics["throughput/cohort_projected_useful_tokens_per_second"] == 1.5
     assert metrics["throughput/optimizer_updates_per_second"] == 1
+    assert metrics["throughput/cumulative_accepted_loss_tokens"] == 30
     assert metrics["queue/consumption/wall_wait_seconds/p90"] == 2
 
 
@@ -280,15 +321,12 @@ def test_custom_converter_does_not_guess_accepted_token_throughput() -> None:
     sample = _sample(1, 4, [1, 1, 1, 0])
     snapshot = build_batch_consumption_snapshot(
         [sample],
-        selection_version=5,
-        bound=4,
         cohort_generated_tokens=4,
         has_custom_converter=True,
     )
 
     metrics = batch_consumption_metrics(
         snapshot,
-        train_start_version=5,
         pipeline_snapshot={
             "window_seconds": 2.0,
             "generated_tokens": 4.0,
@@ -324,11 +362,54 @@ def test_pipeline_telemetry_uses_time_weighted_queue_depth() -> None:
     assert snapshot["accepted_tokens"] == 6
     assert snapshot["accepted_tokens_available"] == 1
     assert snapshot["optimizer_updates"] == 2
+    assert snapshot["cumulative_accepted_loss_tokens"] == 6
+    assert snapshot["cumulative_accepted_loss_tokens_available"] == 1
     assert snapshot["trainer_starvation_seconds"] == 0.5
     assert snapshot["rollout_backpressure_seconds"] == 0.25
     assert snapshot["rollout_idle_capacity_seconds"] == 1.0
     assert snapshot["active_group_capacity_fraction"] == 0.75
     assert snapshot["active_group_capacity_time_mean"] == 0.75
+
+
+def test_pipeline_cumulative_loss_tokens_survive_resume_without_cross_job_rate_spike() -> None:
+    now = [0.0]
+    before = FullyAsyncPipelineTelemetry(clock=lambda: now[0])
+    before.add_trained_batch(accepted_tokens=6, optimizer_updates=2)
+    state = before.checkpoint_state()
+
+    now[0] = 100.0
+    after = FullyAsyncPipelineTelemetry(clock=lambda: now[0])
+    after.restore_checkpoint_state(state)
+    after.add_trained_batch(accepted_tokens=4, optimizer_updates=1)
+    now[0] = 102.0
+    snapshot = after.snapshot(active_groups=0, max_active_groups=1)
+
+    assert snapshot["accepted_tokens"] == 4
+    assert snapshot["accepted_tokens_available"] == 1
+    assert snapshot["cumulative_accepted_loss_tokens"] == 10
+    assert snapshot["cumulative_accepted_loss_tokens_available"] == 1
+    assert snapshot["optimizer_updates"] == 1
+
+
+def test_legacy_resume_marks_cumulative_loss_tokens_unavailable() -> None:
+    telemetry = FullyAsyncPipelineTelemetry(clock=lambda: 0.0)
+    telemetry.restore_checkpoint_state(None)
+    telemetry.add_trained_batch(accepted_tokens=4, optimizer_updates=1)
+
+    snapshot = telemetry.snapshot(active_groups=0, max_active_groups=1)
+
+    assert snapshot["accepted_tokens_available"] == 1
+    assert snapshot["cumulative_accepted_loss_tokens_available"] == 0
+
+    resumed_again = FullyAsyncPipelineTelemetry(clock=lambda: 0.0)
+    resumed_again.restore_checkpoint_state(telemetry.checkpoint_state())
+    assert (
+        resumed_again.snapshot(
+            active_groups=0,
+            max_active_groups=1,
+        )["cumulative_accepted_loss_tokens_available"]
+        == 0
+    )
 
 
 def test_exact_response_segments_produce_token_weighted_lag() -> None:
@@ -342,7 +423,62 @@ def test_exact_response_segments_produce_token_weighted_lag() -> None:
     assert metrics["staleness/token_lag/exact/covered_response_token_frac"] == 1.0
     assert metrics["staleness/token_lag/exact/num_tokens"] == 5.0
     assert metrics["staleness/token_lag/exact/mean"] == 1.4
+    assert metrics["staleness/token_lag/exact/variance"] == pytest.approx(0.24)
+    assert metrics["staleness/token_lag/exact/std"] == pytest.approx(0.24**0.5)
     assert metrics["staleness/token_lag/exact/p90"] == 2.0
+    assert metrics["staleness/token_lag/exact/tail_ge_2_frac"] == 0.4
+    assert metrics["staleness/token_lag/exact/loss_token/covered_loss_token_frac"] == 1.0
+    assert metrics["staleness/token_lag/exact/loss_token/mean"] == 1.4
+
+
+def test_exact_loss_token_lag_intersects_compact_segments_with_loss_mask() -> None:
+    sample = _sample(1, 5, [1, 0, 1, 1, 0])
+    # Segment offsets restart for each generation call. Flattened generation
+    # order still aligns exactly with the sample-level response loss mask.
+    sample.response_weight_version_segments = [
+        [[0, 2, 8]],
+        [[0, 3, 9]],
+    ]
+
+    metrics = sample_lag_metrics([sample], train_version=10)
+
+    prefix = "staleness/token_lag/exact/loss_token"
+    assert metrics[f"{prefix}/covered_loss_token_frac"] == 1.0
+    assert metrics[f"{prefix}/covered_sample_frac"] == 1.0
+    assert metrics[f"{prefix}/num_tokens"] == 3.0
+    assert metrics[f"{prefix}/mean"] == pytest.approx(4 / 3)
+    assert metrics[f"{prefix}/variance"] == pytest.approx(2 / 9)
+    assert metrics[f"{prefix}/tail_ge_1_frac"] == 1.0
+    assert metrics[f"{prefix}/tail_ge_2_frac"] == pytest.approx(1 / 3)
+    assert metrics[f"{prefix}/tail_ge_4_frac"] == 0.0
+    assert metrics["staleness/token_lag/exact/loss_sequence/mean"] == pytest.approx(4 / 3)
+
+
+def test_version_mix_metrics_cover_trained_samples_without_token_expansion() -> None:
+    mixed = _sample(1, 5, [1] * 5)
+    mixed.first_prefill_weight_versions = [8]
+    mixed.min_forward_weight_versions = [8]
+    mixed.max_forward_weight_versions = [9]
+    mixed.last_forward_weight_versions = [9]
+    single_version = _sample(2, 3, [1] * 3)
+    single_version.first_prefill_weight_versions = [9]
+    single_version.min_forward_weight_versions = [9]
+    single_version.max_forward_weight_versions = [9]
+    single_version.last_forward_weight_versions = [9]
+
+    metrics = sample_lag_metrics([mixed, single_version], train_version=10)
+
+    assert metrics["staleness/version_mix/train/provenance_sample_frac"] == 1.0
+    assert metrics["staleness/version_mix/train/provenance_response_token_frac"] == 1.0
+    assert metrics["staleness/version_mix/train/mixed_sample_frac"] == 0.5
+    assert metrics["staleness/version_mix/train/mixed_sample_response_token_frac"] == 5 / 8
+    assert metrics["staleness/version_mix/train/forward_version_span/sequence_mean"] == 0.5
+    assert metrics["staleness/version_mix/train/forward_version_span/sequence_variance"] == 0.25
+    assert metrics["staleness/version_mix/train/forward_version_span/sequence_std"] == 0.5
+    assert metrics["staleness/sample_lag/last_forward_to_train/sequence_mean"] == 1.0
+    assert metrics["staleness/sample_lag/total/sequence_mean"] == 1.5
+    assert metrics["staleness/sample_lag/total/sequence_variance"] == 0.25
+    assert metrics["staleness/sample_lag/total/sequence_std"] == 0.5
 
 
 def test_exact_response_segments_reject_overlapping_turns() -> None:
@@ -356,3 +492,5 @@ def test_exact_response_segments_reject_overlapping_turns() -> None:
     assert metrics["staleness/token_lag/exact/covered_response_token_frac"] == 0.0
     assert metrics["staleness/token_lag/exact/invalid_segments"] == 1.0
     assert metrics["staleness/token_lag/exact/invalid_turns"] == 1.0
+    assert metrics["staleness/token_lag/exact/loss_token/covered_sample_frac"] == 0.0
+    assert "staleness/token_lag/exact/loss_token/mean" not in metrics

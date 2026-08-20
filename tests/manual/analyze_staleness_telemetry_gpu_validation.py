@@ -20,6 +20,7 @@ _PERF_KEYS = (
     "perf/train_time",
     "perf/step_time",
 )
+_SAMPLE_STALENESS_PREFIXES = ("sample_staleness/", "train/sample_staleness/")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -75,7 +76,7 @@ def _compare_training_metrics(
         on = on_rows[step]
         common = sorted(set(off) & set(on))
         for key in common:
-            if not key.startswith("train/") or key.startswith("train/staleness_gradient/"):
+            if not key.startswith("train/") or key.startswith("train/sample_staleness/"):
                 continue
             off_value = float(off[key])
             on_value = float(on[key])
@@ -120,24 +121,32 @@ def _check_staleness_metrics(
     on_rows: dict[int, dict[str, float]],
 ) -> dict:
     off_keys = {key for row in off_rows.values() for key in row}
-    if any(key.startswith("train/staleness_gradient/") for key in off_keys):
-        raise AssertionError("OFF run unexpectedly logged staleness-gradient metrics")
+    if any(key.startswith(_SAMPLE_STALENESS_PREFIXES) for key in off_keys):
+        raise AssertionError("OFF run unexpectedly logged sample-staleness metrics")
 
     checked_distributions = 0
     bins_seen = set()
     for step, row in on_rows.items():
-        if row.get("train/staleness_gradient/effective_contribution_available") != 1.0:
+        prefix = next(
+            (
+                candidate
+                for candidate in _SAMPLE_STALENESS_PREFIXES
+                if f"{candidate}effective_contribution_available" in row
+            ),
+            None,
+        )
+        if prefix is None or row[f"{prefix}effective_contribution_available"] != 1.0:
             raise AssertionError(f"Step {step} has no effective contribution")
         for suffix in ("consumed_sequence_mass", "effective_contribution_mass"):
             values = [
                 float(value)
                 for key, value in row.items()
-                if key.startswith("train/staleness_gradient/s_") and key.endswith(f"/{suffix}")
+                if key.startswith(f"{prefix}s_") and key.endswith(f"/{suffix}")
             ]
             if not values or not math.isclose(sum(values), 1.0, rel_tol=1e-6, abs_tol=1e-6):
                 raise AssertionError(f"Step {step} {suffix} is not a normalized distribution: {sum(values):.9g}")
             checked_distributions += 1
-        bins_seen.update(key.split("/")[2] for key in row if key.startswith("train/staleness_gradient/s_"))
+        bins_seen.update(key.removeprefix(prefix).split("/", 1)[0] for key in row if key.startswith(f"{prefix}s_"))
     return {
         "steps": len(on_rows),
         "normalized_distributions_checked": checked_distributions,

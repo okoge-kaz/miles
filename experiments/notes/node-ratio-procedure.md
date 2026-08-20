@@ -33,12 +33,10 @@ changes buffer depth, which changes everyone else's lag. The steady state under 
 cap is a different dynamical system, not a censored view of the same one.
 Whatever an s=2 run reports as its lag distribution, it is not the natural one.
 
-Pass `MAX_WEIGHT_STALENESS=64`, not nothing. `fully_async_rollout.py:407` guards
-`staleness/bound/{rollout,train}/*` on `max_weight_staleness is not None`, so
-leaving it unset means no record of what the cap would have seen. 64 is far above
-anything observed and never binds, so it measures without acting.
-(`staleness/{total,pre_queue,in_queue}/*` are not gated this way -- see
-`notes/telemetry.md`, "Staleness is measured from the completion version".)
+Pass `MAX_WEIGHT_STALENESS=64`. It is far above anything observed and never
+binds, so `staleness/rollout/*` measures the offered train-time distribution
+without recycling groups. The accepted `staleness/{total,pre_queue,in_queue}/*`
+decomposition is emitted whether or not a bound is configured.
 
 `experiments/realized_staleness_sweep.sh` runs this pass (renamed from
 `node_ratio_sweep.sh`, whose name described the axis rather than the readout). It
@@ -49,10 +47,10 @@ has two modes:
 | `--mode verify` (default) | one 4 h job per ratio, 12 rollouts, 2 seeds, no checkpoints | the steady-state lag at a fixed response length |
 | `--mode convergence` | chained 4 h jobs to 300 rollouts, 1 seed, plus one colocated on-policy arm | what the lag *settles* at once training has lengthened responses |
 
-The reference stays at `completion` here: with the cap parked at 64 it never
-binds, so it only picks which quantity `staleness/bound/*` mirrors. The
-readout is `staleness/{total,pre_queue,in_queue}`, which is not gated on it.
-`staleness_ratio_sweep.sh` is where the reference changes behaviour.
+Use the study's `prefill` reference here as well. Even when the parked bound
+never binds, the reference changes every reported staleness quantity, so a
+completion-referenced discovery pass is not comparable with a prefill-referenced
+study arm.
 
 `verify` is the one to run first. `convergence` costs four figures in node-hours
 and only earns them once `verify` has shown the ratios differ.
@@ -70,7 +68,7 @@ observed at step 7 of 12 in the discarded runs, so 12 rollouts is the minimum):
 |---|---|
 | `tau_train(R)` | `actor_train + log_probs`, which does not depend on R |
 | `tau_roll(R)` | `perf/rollout_time` |
-| `P(L=k)` | `rollout/fully_async/staleness_count_<k>` |
+| `P(L=k)` | `staleness/rollout/count_<k>` |
 
 ## Step 2 — compute the split for a given cap, do not sweep for it
 
@@ -267,13 +265,10 @@ run, which split does that bound want?
   under test, not noise to be excluded: a tight bound slows production, which
   drains the queue, which lowers the lag — the feedback loop described above. The
   readout is therefore the pair (realized lag, throughput), never lag alone.
-- 8 nodes, `batch`, 4 h, one job per point. **`NUM_ROLLOUT` is not overridden**:
-  the recipe's 300 stands, the wall stops each job, and the points are compared
-  per step rather than by time-to-completion. Leaving it at the production value
-  is also what keeps a point resumable — `--num-rollout` feeds `train_iters` and
-  so `lr_decay_steps`, which `OptimizerParamScheduler.load_state_dict` asserts
-  against the checkpoint, so a probe budget would freeze the run at that budget
-  forever (`notes/cluster.md`).
+- 8 nodes, `batch`, 4 h. **`NUM_ROLLOUT` is not overridden**: the recipe's 300
+  stands. The launcher defaults to an `afterany` chain of ten allocations so a
+  point can reach that production horizon despite the partition wall limit;
+  `CHAIN_JOBS` changes only the allocation count, not the learning schedule.
 - **Checkpoints are written on the recipe's cadence**, the same one the
   convergence sweep runs at: `--save-interval 10`, `--save-retain-interval 100`,
   HF export every 10. A point that turns out to be the right balance is then a
@@ -283,48 +278,53 @@ run, which split does that bound want?
   prints `gbs/dp` per point, and drops any split megatron would reject, at
   submission. Across the four splits dp is 4/8/12/16 and gbs/dp is
   768/384/256/192 — all four divide.
-- **`--submit` deletes the checkpoint directory of each point it submits**,
-  unconditionally and without a flag — the script is meant to be handed to
-  someone else to run. A point is a fresh measurement; resuming would report a
-  warm queue and an already-moved policy as a cold start. Three guards, because
-  the operator is not necessarily the author: the path comes from
-  `run_identity.sh` rather than from a template, so it is the directory the job
-  will actually write to; the delete refuses anything outside `TRAIN_CKPT_DIR`;
-  and it refuses to touch a point whose job name is already in `squeue`, since
-  deleting under a running job corrupts that run and measures neither. The dry
-  run marks which directories would go.
-- `--check` reports **one log per point**, the highest job id, and says how many
-  it skipped. Re-running a point is now routine, and two runs of one
-  configuration in the table read as two configurations.
+- The launcher never deletes or repairs checkpoints. Its timestamped
+  `RUN_NAMESPACE` creates a fresh identity by default; explicitly reusing a
+  namespace is what opts into continuing that identity.
+- The interface is intentionally narrow: dry-run, `--submit`, and repeatable
+  `--point M:T:R`. Grid values and allocation details can be supplied through
+  environment variables. Log analysis and checkpoint administration are
+  separate tools, not branches in the submission script.
 - wandb project `async-rl-dapo-math-node-ratio`, separate from the convergence
   study's `off-policy-<dataset>`, because these runs are a throughput
   measurement and do not belong on the same board as the quality curves.
   `train.sh` honours `WANDB_PROJECT` with the old value as its default, so
   nothing else moves.
-- The wandb group is `s<S>-t<T>r<R>`: the two swept axes, nothing else.
-  `run_identity.sh`'s derivation is longer, not shorter, so it is overridden
-  rather than inherited. A rejection from `run_identity.sh` is fatal at
-  submission: a command substitution would otherwise swallow it and the job would
-  fail 100 s into an 8-node allocation instead.
+- The wandb group is `s<S>-t<T>r<R>-<namespace>`. The namespace prevents a new
+  invocation from silently joining an earlier checkpoint or W&B run.
 
-Read out `step_s` and `tok/s/gpu` from `--check` (`analyze_throughput.py`)
-against `staleness/bound/train/mean`, `staleness/bound/train/frac_at_bound`,
-`stale_groups_recycled` and `wasted_token_frac` from the same table. A split that
-wins on `step_s` while recycling a third of its generation has not won.
+All learning settings other than `MAX_WEIGHT_STALENESS` come from
+`experiments/scripts/math/async/dapo-math-p10-90/qwen3-4b/run.sbatch`. In
+particular the launcher no longer copies LR, TIS, replay-buffer, checkpoint,
+batch-shape, reward, or telemetry defaults. It reads the few recipe values
+needed to validate the node split, then exports only staleness, placement, and
+run identity.
+
+For `queue-recycle`, the dequeue-time admission test uses the generation-side
+comparison version and requires `D_g - F_g < M`. Logging intentionally uses the
+scheduled training version, so `staleness/total = T_b - F_g` and
+`staleness/rollout = T_b - Q_g`. The train-time values can therefore be one
+larger than the admission-side difference when the prefetched batch crosses the
+weight update. That is the pipeline timing, not an off-by-one in telemetry.
+
+Join `step_s` and `tok/s/gpu` with `staleness/total/mean`,
+`staleness/rollout/mean`, `staleness/bound_exceeded_sample_frac`,
+`stale_groups_recycled`, and `wasted_token_frac` in W&B. A split that wins on
+`step_s` while recycling a third of its generation has not won.
 
 **The s=8 row is not a fourth bound level.** The output queue caps realized lag
 at `(1000 + 192)/192 ~ 6.2` at k=1 (see the queue-ceiling section above), so a
 bound of 8 can never bite: that row measures the natural lag of each split and is
 the unbounded reference, not a point on the bound axis. Expect
-`stale_groups_recycled` 0 and `staleness/bound/train/frac_at_bound` 0 there; if either is non-zero,
-the ceiling arithmetic or the batch shape has changed and both notes need
-revisiting.
+`stale_groups_recycled` 0 and `staleness/bound_exceeded_sample_frac` 0 there; if
+either is non-zero, the ceiling arithmetic or the batch shape has changed and
+both notes need revisiting.
 
-One rollout seed, by decision rather than by default: 16 jobs, 512 node-hours.
-That orders the bounds. It does **not** separate two adjacent splits — generation
-order is the largest source of run-to-run spread here — so read a 2:6 vs 3:5
-difference as a direction, not a measurement, unless it is large next to the
-spread the first sweep recorded at fixed settings.
+One rollout seed orders the bounds but does **not** separate two adjacent splits:
+generation order is the largest source of run-to-run spread here. Read a 2:6 vs
+3:5 difference as a direction unless it is large next to the spread the first
+sweep recorded at fixed settings. The maximum allocation is
+`arms × CHAIN_JOBS × 8 nodes × 4 hours`; reduce `CHAIN_JOBS` for a probe.
 
 The checkpoint cost is small and its bias runs the other way from what
 `notes/checkpoints.md` estimates. Measured from the `save_model` timer on jobs

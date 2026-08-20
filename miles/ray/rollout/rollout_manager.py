@@ -161,16 +161,12 @@ class RolloutManager:
         return 0
 
     async def record_batch_consumption(self, rollout_id: int) -> dict[str, float | int]:
-        """Log the authoritative applied version immediately before training."""
+        """Close consumption telemetry immediately before training."""
         snapshot = self._fully_async_consumption_snapshots.pop(
             rollout_id,
-            {"selection_weight_version": None, "bound": None, "groups": []},
+            {},
         )
-        train_start_version = await self.get_current_applied_weight_version()
-        metrics = batch_consumption_metrics(
-            snapshot,
-            train_start_version=train_start_version,
-        )
+        metrics = batch_consumption_metrics(snapshot)
         raw_accepted_tokens = snapshot.get("loss_input_tokens")
         accepted_tokens = int(raw_accepted_tokens) if isinstance(raw_accepted_tokens, int) else None
         raw_generated_tokens = snapshot.get("cohort_generated_tokens")
@@ -183,8 +179,6 @@ class RolloutManager:
         return log_rollout_batch_consumption(
             rollout_id,
             self.args,
-            selection_weight_version=snapshot.get("selection_weight_version"),
-            train_start_weight_version=train_start_version,
             extra_metrics=metrics,
         )
 
@@ -236,7 +230,7 @@ class RolloutManager:
 
     # -------------------------- data generation -----------------------------
 
-    async def generate(self, rollout_id):
+    async def generate(self, rollout_id, *, updates_before_train: int = 0):
         start_time = time.time()
         self.rollout_id = rollout_id
         self._health_monitoring_resume()
@@ -246,20 +240,18 @@ class RolloutManager:
         if (get_buffer_length := getattr(self.data_source, "get_buffer_length", None)) is not None:
             dashboard_hooks.report_data_buffer(get_buffer_length())
         with timer("rollout"):
-            data, metadata, metrics, debug_metadata, batch_token = await self._get_rollout_data(rollout_id=rollout_id)
+            data, metadata, metrics, debug_metadata, batch_token = await self._get_rollout_data(
+                rollout_id=rollout_id,
+                updates_before_train=updates_before_train,
+            )
         dump_metadata = dict(metadata)
         if debug_metadata is not None:
             dump_metadata[ROLLOUT_FN_DEBUG_METADATA_KEY] = debug_metadata
         save_debug_rollout_data(self.args, data, rollout_id=rollout_id, evaluation=False, metadata=dump_metadata)
         log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
         if self.args.fully_async:
-            selection_version = None
-            if metrics is not None:
-                selection_version = metrics.get("rollout/fully_async/current_weight_version")
             self._fully_async_consumption_snapshots[rollout_id] = build_batch_consumption_snapshot(
                 data,
-                selection_version=selection_version,
-                bound=getattr(self.args, "max_weight_staleness", None),
                 optimizer_updates=(
                     len(data) // int(metadata.get("dynamic_global_batch_size", self.args.global_batch_size))
                 ),
@@ -321,7 +313,7 @@ class RolloutManager:
         if self._metric_checker is not None:
             self._metric_checker.on_eval(metrics)
 
-    async def _get_rollout_data(self, rollout_id):
+    async def _get_rollout_data(self, rollout_id: int, *, updates_before_train: int = 0):
         batch_token = None
         replay_buffer_sample_indices = None
         if self.args.load_debug_rollout_data:
@@ -332,7 +324,12 @@ class RolloutManager:
         else:
             if self.use_experimental_refactor:
                 data = await asyncio.to_thread(
-                    call_rollout_function, self.generate_rollout, RolloutFnTrainInput(rollout_id=rollout_id)
+                    call_rollout_function,
+                    self.generate_rollout,
+                    RolloutFnTrainInput(
+                        rollout_id=rollout_id,
+                        updates_before_train=updates_before_train,
+                    ),
                 )
             else:
                 data = await asyncio.to_thread(

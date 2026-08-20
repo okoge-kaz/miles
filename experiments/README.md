@@ -23,16 +23,17 @@ experiments/
   common/run_identity.sh        run name, config tag, checkpoint path
   common/placement.sh           derive + validate the GPU split, before srun
   common/ray_cluster.sh         multi-node ray bring-up
-  math_sync/<dataset>/          README.md + one directory per model
-  math_sync/<dataset>/<model>/  single-turn math RL (GRPO, deepscaler reward)
-  math_async/<dataset>/<model>/ the same task on the fully-async rollout
-  tool_multiturn/<model>/       multi-turn tool-calling RL (ReTool v2 style)
+  scripts/math/sync/<dataset>/          colocated single-turn math recipes
+  scripts/math/async/<dataset>/         fully-async single-turn math recipes
+  tools/difficulty_filter/              reusable dataset filtering tools
+  tools/difficulty_filter/dapo-math/    DAPO-Math filtering orchestration
   notes/                        reference notes + notes/agents/ work log
   outputs/                      job logs (git-ignored)
 ```
 
-A recipe is `<task>/<dataset>/<model>/`, e.g. `math_sync/dapo-math-p10-90/qwen3-4b/`.
-The task directory fixes the RL setup (rollout mode, reward, generate function),
+A recipe is `<task>/<mode>/<dataset>/<model>/` below `scripts/`, e.g.
+`math/sync/dapo-math-p10-90/qwen3-4b/`. The task and mode directories fix the
+RL setup (rollout mode, reward, generate function),
 the dataset directory fixes the prompt file and the eval benchmarks, and the
 model directory fixes the weights, the parallelism and the batch shape.
 
@@ -42,7 +43,7 @@ the file you read.
 
 ### Dataset directories
 
-**Every `<task>/<dataset>/` directory carries a `README.md`, and it has the same
+**Every `<task>/<mode>/<dataset>/` directory carries a `README.md`, and it has the same
 three parts in the same order.** A new dataset is not staged until its README
 exists — the point of the directory is that the numbers it is aiming at and the
 ranges it may be moved through are written down before any GPU time is spent.
@@ -71,7 +72,8 @@ A local baseline section — what this cluster actually measured — belongs bet
 (`RM_TYPE` against a non-thinking checkpoint, for instance) go in a closing
 "not a hyperparameter" note so they are not swept by accident.
 
-`math_sync/dapo-math-p10-90/README.md` and `math_async/dapo-math-p10-90/README.md` are the
+`scripts/math/sync/dapo-math-p10-90/README.md` and
+`scripts/math/async/dapo-math-p10-90/README.md` are the
 worked examples. The two differ only where the task differs: the async one
 searches staleness and the actor/rollout split, the colocated one does not have
 those knobs at all.
@@ -112,7 +114,7 @@ four-knob invariant into a startup assert (`arguments.py:3056` only checks it
 when the flag is present).
 
 Dynamic sampling is **off**: no `--dynamic-sampling-filter-path`, and difficulty
-is handled once, offline, by `experiments/src/difficulty_filter` — which is what
+is handled once, offline, by `experiments/tools/difficulty_filter` — which is what
 the `p10-90` in the dataset name is. The online filter drops a variable number of
 groups per step, so the generation cost of a step depends on the policy rather
 than on the configuration; with wall-clock as the study's primary axis, that is
@@ -130,8 +132,8 @@ there is no safety net when the window is stale. The recipe directory retains
 the shorter historical `dapo-math-p10-90` name; `PROMPT_DATA` identifies the
 policy-specific dataset actually used.
 
-`--partial-rollout` is on in `math_sync`, to carry over generation still in flight
-when a rollout batch closes. It does not exist in `math_async` —
+`--partial-rollout` is on in `math/sync`, to carry over generation still in flight
+when a rollout batch closes. It does not exist in `math/async` —
 `--fully-async` rejects the flag (`arguments.py:54`); the equivalent question
 there is `PAUSE_GENERATION_MODE`, which decides what happens to in-flight
 generation at a weight update.
@@ -140,7 +142,7 @@ generation at a weight update.
 over everything a resumed sample produced under the previous weights, which
 discards exactly the tokens partial rollout exists to keep.
 
-`math_async` additionally bounds staleness with `--max-weight-staleness`
+`math/async` additionally bounds staleness with `--max-weight-staleness`
 (default 2) — miles' own default is *no bound*, which lets an arbitrarily old
 group reach the optimizer — and corrects the remaining lag with `--use-tis`.
 
@@ -153,7 +155,7 @@ any of it on the command line — the `:=` form means an exported value wins:
 ```bash
 sbatch -A $ACC -N 4 \
   --export=ALL,ACTOR_NUM_NODES=2,ACTOR_GPUS_PER_NODE=8,ROLLOUT_NUM_GPUS=16 \
-  experiments/math_async/dapo-math-p10-90/qwen3-4b/run.sbatch
+  experiments/scripts/math/async/dapo-math-p10-90/qwen3-4b/run.sbatch
 ```
 
 Nothing is inferred from the allocation. `-N 4` allocates four nodes;
@@ -232,7 +234,7 @@ branch.
 Reported numbers come from `experiments/src/offline_eval/run_eval.sbatch` instead:
 every AIME year at `n=16` and a 32768 generation budget, run against the HF
 snapshots `--save-hf` leaves behind, in a separate job that costs the training run
-nothing. See `math_async/dapo-math-p10-90/README.md` §2.
+nothing. See `scripts/math/async/dapo-math-p10-90/README.md` §2.
 
 Search-R1 uses the analogous
 `experiments/src/offline_eval/run_search_r1_eval.sbatch`.  Its dedicated client
@@ -300,7 +302,7 @@ where you think — and leave it off for the long ones.
 
 ```bash
 experiments/sweep.py --sweep experiments/sweeps/offpolicy.txt \
-  --recipe math_async/dapo-math-p10-90/qwen3-4b \
+  --recipe math/async/dapo-math-p10-90/qwen3-4b \
   -- -N 2 -p batch_short --time=02:00:00
 ```
 
@@ -416,10 +418,10 @@ Then the training recipes:
 
 ```bash
 # 4a. Math RL, colocated.
-sbatch -A $ACC experiments/math_sync/dapo-math-p10-90/qwen3-4b/run.sbatch
+sbatch -A $ACC experiments/scripts/math/sync/dapo-math-p10-90/qwen3-4b/run.sbatch
 
 # 4b. The same task on the fully-async rollout.
-sbatch -A $ACC experiments/math_async/dapo-math-p10-90/qwen3-4b/run.sbatch
+sbatch -A $ACC experiments/scripts/math/async/dapo-math-p10-90/qwen3-4b/run.sbatch
 ```
 
 A fast smoke variant (a few rollouts, short responses), for checking a change
@@ -428,7 +430,7 @@ before spending a slot on a full run:
 ```bash
 sbatch -A $ACC -p interactive --time=01:00:00 \
   --export=ALL,NUM_ROLLOUT=3,ROLLOUT_BATCH_SIZE=8,N_SAMPLES_PER_PROMPT=8,GLOBAL_BATCH_SIZE=64,MAX_RESPONSE_LEN=1024 \
-  experiments/math_sync/dapo-math-p10-90/qwen3-4b/run.sbatch
+  experiments/scripts/math/sync/dapo-math-p10-90/qwen3-4b/run.sbatch
 ```
 
 Keep the four-knob invariant when changing batch sizes:

@@ -56,7 +56,7 @@ reconcile_tail() {
     tail_complete || return 0
 
     local primary="${PASS_RATES%.jsonl}.shard-0-of-2.jsonl"
-    python3 experiments/src/difficulty_filter/reconcile_pass_rate_fragments.py \
+    python3 experiments/tools/difficulty_filter/reconcile_pass_rate_fragments.py \
         --primary "${DATASET_DIR}/${primary#/data/}" \
         --fragments "${DATASET_DIR}/${TAIL_OUTPUT#/data/}" \
         --mark-complete
@@ -73,7 +73,7 @@ submit_shard() {
         -A "${ACCOUNT}" -p interactive --time=04:00:00 \
         --job-name="pr${shard}-qwen3-4b-step4000" \
         --export="$(filter_exports "${output}" "START_INDEX=${start_index},END_INDEX=${end_index},DUMP_RESPONSES=${audit},DUMP_LIMIT=8")" \
-        experiments/src/difficulty_filter/run_measure.sbatch
+        experiments/tools/difficulty_filter/run_measure.sbatch
 }
 
 submit_tail() {
@@ -83,14 +83,14 @@ submit_tail() {
         -A "${ACCOUNT}" -p interactive --time=04:00:00 \
         --job-name="pr0tail-qwen3-4b-step4000" \
         --export="$(filter_exports "${TAIL_OUTPUT}" "START_INDEX=${TAIL_START_INDEX},END_INDEX=${HALF_PROMPTS},DUMP_RESPONSES=${audit},DUMP_LIMIT=8")" \
-        experiments/src/difficulty_filter/run_measure.sbatch
+        experiments/tools/difficulty_filter/run_measure.sbatch
 }
 
 reconcile_tail
 
 if shard_complete 0 && shard_complete 1; then
     finalize_job="$(sbatch --parsable -A "${ACCOUNT}" \
-        experiments/math_async/dapo-math-p10-90/qwen3-4b/finalize_filter.sbatch)"
+        experiments/tools/difficulty_filter/dapo-math/finalize_filter.sbatch)"
     echo "both shards complete after round ${FILTER_ROUND}; finalize=${finalize_job}"
     exit 0
 fi
@@ -116,5 +116,5 @@ dependency="$(IFS=:; echo "${jobs[*]}")"
 continuation_job="$(sbatch --parsable -A "${ACCOUNT}" \
     --dependency="afterany:${dependency}" \
     --export="ALL,FILTER_ROUND=${next_round},FILTER_MAX_ROUNDS=${FILTER_MAX_ROUNDS},TAIL_START_INDEX=${TAIL_START_INDEX},HF_CKPT_DIR=${HF_CKPT_DIR}" \
-    experiments/math_async/dapo-math-p10-90/qwen3-4b/continue_filter.sbatch)"
+    experiments/tools/difficulty_filter/dapo-math/continue_filter.sbatch)"
 echo "round ${next_round}: shards=${jobs[*]} continuation=${continuation_job}"

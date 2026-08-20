@@ -21,7 +21,7 @@ travel with it for the same reason -- a rate measured at a 8k generation budget
 is not comparable to one measured at 24k.
 
     # annotate the whole file, and cut a window in the same pass
-    python -m experiments.src.difficulty_filter.apply_filter \
+    python -m experiments.tools.difficulty_filter.apply_filter \
         --prompt-data       /data/dapo-math-17k/dapo-math-17k.jsonl \
         --pass-rates        /data/difficulty/dapo-math-17k.Qwen3-4B-Instruct-2507.passrate.jsonl \
         --output-annotated  /data/dapo-math-17k/dapo-math-17k.annotated.jsonl \
@@ -29,7 +29,7 @@ is not comparable to one measured at 24k.
         --pass-rate-min 0.2 --pass-rate-max 0.8
 
     # add a second model to the same annotated file (feed it back in)
-    python -m experiments.src.difficulty_filter.apply_filter \
+    python -m experiments.tools.difficulty_filter.apply_filter \
         --prompt-data       /data/dapo-math-17k/dapo-math-17k.annotated.jsonl \
         --pass-rates        /data/difficulty/dapo-math-17k.Qwen3-4B.passrate.jsonl \
         --output-annotated  /data/dapo-math-17k/dapo-math-17k.annotated.jsonl.new
@@ -49,7 +49,7 @@ except ImportError:
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..")))
 
-from experiments.src.difficulty_filter.pass_rate import (  # noqa: E402
+from experiments.tools.difficulty_filter.pass_rate import (  # noqa: E402
     DEFAULT_PASS_RATE_MAX,
     DEFAULT_PASS_RATE_MIN,
     PassRateRecord,

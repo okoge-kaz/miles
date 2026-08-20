@@ -48,9 +48,9 @@ class _RolloutManager:
         self.eval = _RemoteMethod(lambda rollout_id: None)
         self.dispose = _RemoteMethod(self._dispose)
 
-    async def _generate(self, rollout_id):
+    async def _generate(self, rollout_id, *, updates_before_train):
         await asyncio.sleep(0)
-        self.events.append(("generate", rollout_id))
+        self.events.append(("generate", rollout_id, updates_before_train))
         return {
             "sample_indices": [rollout_id],
             "data_ref": object(),
@@ -99,7 +99,7 @@ def _args(**overrides):
     values = {
         "colocate": False,
         "fully_async": False,
-        "fully_async_queue_policy": "queue-recycle",
+        "fully_async_queue_type": "queue-recycle",
         "use_replay_buffer": True,
         "control_server_port": None,
         "ft_components": [],
@@ -143,6 +143,14 @@ def _patch_runtime(monkeypatch, manager, actor):
     monkeypatch.setattr(train_async, "should_run_periodic_action", lambda *args, **kwargs: False)
 
 
+def test_updates_before_training_rollout_tracks_real_weight_pushes():
+    args = _args(update_weights_interval=2)
+
+    assert train_async._updates_before_training_rollout(args, 1) == 0
+    assert train_async._updates_before_training_rollout(args, 2) == 1
+    assert train_async._updates_before_training_rollout(_args(debug_skip_weight_update=True), 1) == 0
+
+
 async def test_replay_buffer_commit_order(monkeypatch):
     events = []
     manager = _RolloutManager(events)
@@ -152,7 +160,7 @@ async def test_replay_buffer_commit_order(monkeypatch):
     await train_async.train(_args())
 
     assert events.index(("train", 0)) < events.index(("ack", 0, "token-0"))
-    assert events.index(("generate", 1)) < events.index(("rollout_save", 0))
+    assert events.index(("generate", 1, 1)) < events.index(("rollout_save", 0))
     assert events.index(("rollout_save", 0)) < events.index(("model", 0, True, True, False))
     assert events.index(("model", 0, True, True, False)) < events.index(("prune", 0))
 
@@ -189,7 +197,7 @@ async def test_legacy_checkpoint_order_and_async_save_semantics_are_unchanged(mo
     assert events.index(model_event) < events.index(("rollout_save", 0))
 
 
-async def test_queue_recycle_starts_legacy_prefetch_before_consumption(monkeypatch):
+async def test_queue_recycle_prefetches_next_batch_before_its_weight_update(monkeypatch):
     events = []
     manager = _RolloutManager(events)
     actor = _ActorModel(events)
@@ -199,13 +207,16 @@ async def test_queue_recycle_starts_legacy_prefetch_before_consumption(monkeypat
         _args(
             fully_async=True,
             use_replay_buffer=False,
-            debug_exit_after_rollout=1,
         )
     )
 
-    assert events.index(("generate", 1)) < events.index(("consume", 0))
+    assert events.index(("generate", 0, 0)) < events.index(("generate", 1, 1))
+    assert events.index(("generate", 1, 1)) < events.index(("consume", 0))
     assert events.index(("consume", 0)) < events.index(("train", 0))
     assert events.index(("train", 0)) < events.index(("trained_telemetry", 0, True))
+    assert events.index(("generate", 1, 1)) < events.index(("update_weights", 0))
+    assert events.index(("update_weights", 0)) < events.index(("consume", 1))
+    assert events.index(("consume", 1)) < events.index(("train", 1))
 
 
 @pytest.mark.parametrize("policy", ["queue-max", "queue-drop"])
@@ -218,10 +229,10 @@ async def test_selection_policies_defer_next_batch_until_after_weight_update(mon
     await train_async.train(
         _args(
             fully_async=True,
-            fully_async_queue_policy=policy,
+            fully_async_queue_type=policy,
             use_replay_buffer=False,
         )
     )
 
     assert events.index(("consume", 0)) < events.index(("train", 0))
-    assert events.index(("update_weights", 0)) < events.index(("generate", 1))
+    assert events.index(("update_weights", 0)) < events.index(("generate", 1, 0))

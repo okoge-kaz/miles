@@ -25,7 +25,7 @@ REQUIRED_ARGS = ["--rollout-batch-size", "64"]
 def _replay_buffer_args(**overrides) -> SimpleNamespace:
     values = {
         "fully_async": True,
-        "fully_async_queue_policy": "queue-recycle",
+        "fully_async_queue_type": "queue-recycle",
         "fully_async_queue_factor": 1,
         "max_weight_staleness": None,
         "staleness_reference": "completion",
@@ -114,8 +114,8 @@ def test_use_replay_buffer_guards(monkeypatch, override, message):
     "queue_config",
     [
         {},
-        {"fully_async_queue_policy": "queue-max", "max_weight_staleness": 0, "staleness_reference": "prefill"},
-        {"fully_async_queue_policy": "queue-drop", "fully_async_queue_factor": 2},
+        {"fully_async_queue_type": "queue-max", "max_weight_staleness": 0, "staleness_reference": "prefill"},
+        {"fully_async_queue_type": "queue-drop", "fully_async_queue_factor": 2},
     ],
 )
 def test_use_replay_buffer_accepts_supported_grpo_configuration(monkeypatch, queue_config):

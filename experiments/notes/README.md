@@ -20,7 +20,9 @@ Index:
 - [algorithm-ablation.md](algorithm-ablation.md) — the frame the algorithm arms run in, and what miles can express today
 - [rollout-scaling.md](rollout-scaling.md) — the two floors under rollout time, and when adding rollout GPUs stops helping
 - [offline-eval.md](offline-eval.md) — how a checkpoint is scored after the fact: the three-step procedure, why AIME-2023 is excluded, and the failure taxonomy
-- [telemetry.md](telemetry.md) — what the runs record to wandb, what the analysis needs, and the three gaps
+- [replay-buffer.md](replay-buffer.md) — persisted fully-async queue state, buffer types, commit semantics, and resume observability
+- [replay-buffer-validation.md](replay-buffer-validation.md) — correctness, restart-distribution, latency, and save-cost measurements for `rollout` and `inflight`
+- [telemetry.md](telemetry.md) — what the runs record to W&B, what the analysis needs, and known gaps
 
 Recipes under `experiments/math_*/` carry settings only; the reasoning for any
 setting lives in the notes above. See `.claude/rules/experiment-recipes.md`.

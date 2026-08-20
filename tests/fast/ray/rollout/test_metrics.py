@@ -54,7 +54,7 @@ class TestComputeZeroStdMetrics:
         assert "zero_std/all_one_percentage" not in out
 
 
-def test_log_rollout_batch_consumption_reports_prefetch_gap(monkeypatch):
+def test_log_rollout_batch_consumption_logs_precomputed_metrics(monkeypatch):
     captured = []
     monkeypatch.setattr("miles.ray.rollout.metrics.tracking.log", lambda *args, **kwargs: captured.append(args[1]))
     args = make_args(wandb_always_use_train_step=False)
@@ -62,28 +62,14 @@ def test_log_rollout_batch_consumption_reports_prefetch_gap(monkeypatch):
     metrics = log_rollout_batch_consumption(
         7,
         args,
-        selection_weight_version=3,
-        train_start_weight_version=4,
+        extra_metrics={"queue/consumption/wall_wait_seconds/mean": 0.25},
     )
 
     assert metrics == {
-        "queue/consumption/train_start_weight_version": 4,
-        "queue/consumption/selection_weight_version": 3,
-        "queue/consumption/selection_to_train_gap": 1,
+        "queue/consumption/wall_wait_seconds/mean": 0.25,
         "rollout/step": 7,
     }
     assert captured == [metrics]
-
-
-def test_log_rollout_batch_consumption_rejects_negative_gap():
-    args = make_args(wandb_always_use_train_step=False)
-    with pytest.raises(RuntimeError, match="moved backwards"):
-        log_rollout_batch_consumption(
-            0,
-            args,
-            selection_weight_version=2,
-            train_start_weight_version=1,
-        )
 
 
 class TestTitoMismatchMetrics:

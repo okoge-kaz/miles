@@ -1,21 +1,40 @@
 # What the runs record, and what the analysis needs
 
-Audited against a live async run (`v-3n-8t16r-r1`, job 15150858) plus the one
-earlier job that reached an eval (15113756). Every key below was observed in a
-log, not read off the source.
+The historical inventory was audited against a live async run
+(`v-3n-8t16r-r1`, job 15150858) plus an earlier job that reached an eval
+(15113756).  Later sections identify newer instrumentation and its validation
+envelope explicitly rather than implying that it existed in those old runs.
 
-wandb namespaces and their step axes are registered in
-`miles/utils/tracking_utils/wandb_utils.py:161-169`:
+## W&B namespace and producer map
+
+W&B namespace-to-axis assignment has one source of truth,
+`_STEP_METRIC_PREFIXES` in `miles/utils/tracking_utils/wandb_utils.py`:
 
 | namespace | step metric |
 |---|---|
 | `train/*` | `train/step` |
-| `rollout/*`, `multi_turn/*`, `passrate/*`, `perf/*` | `rollout/step` |
+| `sample_staleness/*` | `train/step` |
+| `rollout/*`, `fully_async/*`, `resume/*`, `multi_turn/*`, `passrate/*`, `perf/*` | `rollout/step` |
+| `staleness/*`, `selection_bias/*`, `throughput/*`, `queue/*` | `rollout/step` |
 | `eval/*` | `eval/step` |
 
 `train/step` and `rollout/step` are separate axes on purpose: with
 `--num-steps-per-rollout > 1` they advance at different rates, and the off-policy
 question is asked in both currencies.
+
+| producer | principal namespaces | contents |
+|---|---|---|
+| Ray rollout manager | `rollout/*`, `passrate/*`, `perf/*` | generated sample reward, length, truncation, version, pass rate, and generation timing |
+| fully-async rollout manager | `staleness/*`, `selection_bias/*`, `queue/*`, `throughput/*`, `fully_async/*`, `resume/*`, `rollout/fully_async/*` | queue lifecycle, exact/aggregate lag, filtering/recycling, useful-token ledger, batch train version, pipeline rates, and replay restore |
+| trainer rollout summary | `rollout/*`, `multi_turn/*`, `perf/*` | actor/ref/rollout log-prob, entropy/advantage summaries, multi-turn summaries, and trainer timers |
+| trainer optimizer step | `train/*`, `sample_staleness/*` | loss, gradient, LR, batching, TIS/PPO, mismatch/ESS, and sample-staleness-conditioned objective diagnostics |
+| evaluator | `eval/*` | benchmark score, reward failures, truncation, length, repetition, and optional pass rate |
+
+Thus a namespace identifies both meaning and plotting axis; several writers may
+contribute rows at one rollout step.  W&B automatic host telemetry and optional
+forwarded SGLang OpenMetrics (`sgl_engine.*`) are outside this Miles namespace
+registry.  Multi-LoRA adapter names are dynamic and register their own
+`<adapter>/step` axes on demand.
 
 ## Covered
 
@@ -23,8 +42,11 @@ question is asked in both currencies.
 than assumed:
 
     rollout/weight_version/{min,max,mean,median,mixed_version_ratio}
-    staleness/{total,pre_queue,in_queue}/*      # the decomposition
-    staleness/bound/{rollout,train}/*           # what --max-weight-staleness tests
+    staleness/rollout/*                         # before the max-staleness check
+    staleness/{total,pre_queue,in_queue}/*      # accepted training population
+    staleness/bound_exceeded_{samples,groups,tokens}
+    staleness/bound_exceeded_sample_frac        # rejected samples / evaluated samples
+    fully_async/train_weight_version             # absolute T_b used by those train-time gaps
 
 `--max-weight-staleness` is a bound; these are what actually happened. Any claim
 about off-policy degradation has to be plotted against these, not against the
@@ -45,10 +67,19 @@ exist alongside it.
     train/policy_rollout_abs_diff, train/policy_rollout_kl,
     train/policy_rollout_token_ess, train/policy_rollout_sequence_ess
 
-`train_rollout_logprob_abs_diff` is the direct numerical-mismatch probe --
-non-zero even at zero staleness, because it also picks up the Megatron/SGLang
-kernel difference. Separating that floor from the staleness-induced part is what
-makes the `--true-on-policy-mode` parity run worth having as a baseline.
+`train_rollout_logprob_abs_diff` combines policy lag with the Megatron/SGLang
+scoring mismatch.  It can be non-zero at zero staleness, so the zero-lag or
+`--true-on-policy-mode` value is the numerical floor; only the excess above a
+matched floor can be associated with staleness.  The signed log-ratio is also
+needed to distinguish a directional drift from symmetric numerical noise.
+
+For vanilla TIS, `tis_clipfrac` is the fraction of valid pre-rejection loss
+tokens whose importance weight was changed by `clamp(tis, low, high)`.  Those
+tokens are not removed: they remain in the loss with the capped weight.  It is
+therefore neither response truncation nor a discarded-sample fraction.  A
+custom rejection-style correction such as IcePop can instead turn out-of-range
+weights into zero, so the correction mode must accompany this metric when runs
+are compared.  `pg_clipfrac` separately measures PPO objective clipping.
 
 The historical token-level ESS is Kish's ratio over tokens *within each
 response*, averaged with the training reducer. It remains for compatibility but
@@ -98,12 +129,24 @@ moving because it got better.
 the real cost is 4x forward, so the logged number is 3/4 of the truth. Multiply
 by 4/3 before quoting an MFU. This is a reporting correction, not a data loss.
 
-**No cumulative sample or token counter.** The plan calls for reporting sample
-efficiency, and there is no running total. It is recoverable: samples consumed
-through step *n* is `n * rollout_batch_size * n_samples_per_prompt`, and tokens
-is the running sum of the `rollout/fully_async/*_tokens` family, all of which are
-per-step on the `rollout/step` axis. Summation after the fact is exact as long as
-no step is missing from the export.
+**Cumulative accepted loss tokens are recorded for new replay-buffer
+checkpoints.** `throughput/cumulative_accepted_loss_tokens` is the running sum
+of postprocessed response tokens whose built-in loss mask is one.  It excludes
+prompt, padding, postprocess-trimmed, and initially masked response tokens.  It
+is a pre-correction eligibility count: vanilla TIS clipping retains these
+tokens, while a rejection-style custom correction can subsequently set some
+final masks to zero.  The companion
+`throughput/cumulative_accepted_loss_tokens_available` must be one before the
+counter is used.  The counter is persisted in the replay state, so it continues
+across a replay-enabled resume without
+turning the pre-resume total into a first-window rate spike.  A legacy replay
+checkpoint or custom sample converter reports unavailable instead of silently
+restarting at zero.  Cumulative samples remain recoverable from the batch
+shape, and historical token totals can still be reconstructed by summing the
+per-step cohort counter after selecting the valid checkpoint lineage.
+Without replay-buffer restoration, a new process starts this counter at zero;
+the value is then cumulative only within that job, just as the applied numeric
+weight-version label is.  The current async recipe uses replay restoration.
 
 **Wall clock does not survive a resume.** Every chained job is a new wandb run
 with its own `_runtime` starting at zero. `--wandb-group` puts them in one group
@@ -180,7 +223,7 @@ warmup was added: one config is enough to pick a decay of 0.0 (the alternatives
 had worse provenance) but not enough to move the LR. Its `3.0e-6` belongs in the
 LR axis as a level, not as the default.
 
-**`--partial-rollout` removed from the `math_sync` recipes.** It recycles
+**`--partial-rollout` removed from the `math/sync` recipes.** It recycles
 in-flight generations into the data buffer at abort time, and those samples
 resume against a newer policy in a later rollout step -- so any sample it
 collects is off-policy by construction. The colocated arm is the on-policy
@@ -452,41 +495,35 @@ resubmission is needed beyond the normal chain boundary. Runs that straddle the
 boundary will have a discontinuity in the series, which is the reason not to
 pull mid-chain without noting the rollout index where it happened.
 
-## The staleness keys, renamed for the side they describe (2026-08-08)
-
-`staleness/*` and `staleness/offered/*` were not readable as a pair: the trained
-lag sat unprefixed, which reads like a total rather than one of two populations,
-and "offered" describes the transaction rather than the producer. Both are now
-subgroups:
+## The two staleness populations (updated 2026-08-19)
 
 | key | population |
 |---|---|
-| `staleness/bound/rollout/*` | every group the pipeline handed over, counted **before** the bound check — the natural lag of this node ratio |
-| `staleness/bound/train/*` | what survived into the batch — what the loss actually saw |
+| `staleness/rollout/*` | would-be train staleness of every group examined before the max-staleness check |
+| `staleness/total/*` | train staleness of groups accepted by the max-staleness check and dynamic filter |
 
-Sub-keys, identical under both: `mean max p50 p90 p99 frac_zero num_groups
-frac_at_bound count_0 … count_16 count_ge_17`. `frac_at_bound` is a `>=` test, so
-it is "how often the cap was reached", not the rejection rate.
+Both distributions contain `mean`, `variance`, `std`, `max`, `p50`, `p90`,
+`p99`, `frac_zero`, `num_groups`, and the fixed histogram `count_0` through
+`count_16` plus `count_ge_17`. There is no `frac_at_bound`: the admission check
+uses dequeue staleness while these distributions use scheduled train
+staleness, and the exact boundary also depends on queue policy. Rejection is
+therefore recorded directly rather than inferred from a histogram bin.
 
-Scalars that belong to neither population stay at the root: `bound_exceeded_{groups,tokens}`,
-`retry_count_{mean,max}`, `retry_frac_nonzero`.
+Actual rejection by `--max-weight-staleness` is recorded directly as
+`staleness/bound_exceeded_samples`, `staleness/bound_exceeded_sample_frac`,
+`staleness/bound_exceeded_groups`, and `staleness/bound_exceeded_tokens`. The
+sample fraction is
 
-Three things the pair does not say on its own:
+```
+rejected samples / samples whose reference version was available at dequeue
+```
 
-- **The gap is not all bound.** A group is dropped between the two populations
-  either by the bound *or* by the dynamic filter, which fires for a reason
-  unrelated to staleness. Attribute the bound's share with
-  `staleness/bound_exceeded_groups`, not by differencing `num_groups`.
-- **Neither population contains aborted groups**, nor groups whose weight
-  version could not be read. Those are recycled before the count.
-- `rollout/fully_async/{avg,max}_staleness` are upstream's keys and still mean
-  the **offered** lag. They were not renamed, because two miles versions must not
-  plot different quantities under one name.
+Do not infer the rejection count by subtracting the two distributions: the
+dynamic filter can also remove a group after it passes the bound. Neither
+distribution contains aborted groups or groups whose reference version could
+not be read.
 
-Old runs keep the old keys. A chart or a script that spans the rename has to
-accept both spellings; nothing back-fills.
-
-## Staleness reference and queue policy (2026-08-09; updated 2026-08-13)
+## Staleness reference and queue policy (2026-08-09; updated 2026-08-19)
 
 `Sample.weight_versions` alone cannot identify the policy at the start of a
 request. SGLang stamps it when it builds a reply, so single-turn generation
@@ -502,53 +539,80 @@ The patched SGLang image also returns scheduler-authoritative
 turn in the group. Unlike the submission-side HTTP snapshot, it does not charge
 router or scheduler waiting before the first actual forward.
 
-### The decomposition
+### The decomposition with `--staleness-reference prefill`
 
 The scalar families follow Applied Compute's PQS/IQS split
 ([staleness in fully-async RL](https://www.appliedcompute.com/research/staleness-in-fully-async-rl)).
-Let **R** be the configured reference, **Q** the applied version when the whole
-group became ready, and **C** the applied version at queue selection:
+For group `g`, let **F_g** be the minimum first-prefill version across its
+samples and turns, **Q_g** the applied version when the whole group became
+ready, **P_g** its actual queue-put version, **D_g** the applied version at
+dequeue/selection, and **T_b** the version used to train batch `b`:
 
 | key | quantity | gated on the bound? |
 |---|---|---|
-| `staleness/pre_queue/*` | `Q - R` — updates crossed before the whole group became ready | no |
-| `staleness/in_queue/*` | `C - Q` — updates crossed while waiting for selection | no |
-| `staleness/total/*` | `C - R` = `pre_queue + in_queue` | no |
+| `staleness/pre_queue/*` | `Q_g - F_g` — updates crossed before the whole group became ready | accepted groups |
+| `staleness/in_queue/*` | `T_b - Q_g` — updates crossed from ready to training | accepted groups |
+| `staleness/total/*` | `T_b - F_g` = `pre_queue + in_queue` | accepted groups |
+| `staleness/rollout/*` | `T*_b - F_g`, where `T*_b` is the scheduled train version if offered | before the bound check |
 
-Q is stamped only after the group's slowest sample lands. A group is one
-concurrent request per sample joined by `asyncio.gather`; using an earlier sample
-completion would incorrectly charge the straggler interval to `in_queue`.
+Q is stamped only after the whole group has completed generation, reward, and
+postprocessing and is ready for the queue. The actual queue-put version is a
+separate boundary `P_g`, stamped after any output-capacity backpressure. A group
+is one concurrent request per sample joined by `asyncio.gather`; using an earlier
+sample completion would incorrectly charge the straggler interval to `in_queue`.
+`G_g`, the last model-forward boundary, equals `Q_g` only when no weight update
+is applied during the post-forward reward/finalization interval. Likewise,
+`Q_g = P_g` only when no update lands while the ready group waits for an output
+slot. The lifecycle order is `G_g <= Q_g <= P_g <= D_g <= T_b`, although adjacent
+boundaries often have the same numeric version. The current `in_queue` metric
+starts at Q and therefore contains both ready-to-put backpressure and
+put-to-train queue residence.
 
-The `submission` reference is a TTL-cached HTTP snapshot written immediately
-before generation and carried in `Sample.metadata` under
-`submission_weight_version`. The `prefill` reference comes from the engine
-provenance above. Missing provenance stays missing rather than becoming zero;
-`prefill` enforcement fails fast if those fields are absent or misaligned.
+The `prefill` reference comes from scheduler-authoritative engine provenance.
+Missing provenance stays missing rather than becoming zero; `prefill`
+enforcement fails fast if those fields are absent or misaligned.
 
 ### What the bound tests
 
-`staleness/bound/{rollout,train}/*` records the exact quantity tested by
-`--max-weight-staleness`:
+For `queue-recycle`, dequeue admission is strict:
 
-| `--staleness-reference` | bound tests | relation to the components |
-|---|---|---|
-| `completion` (library default) | `C - oldest completion` | includes in-queue lag plus the group's internal completion spread; not `total` |
-| `submission` | `C - S` | exactly `total` |
-| `prefill` (math-async recipe default) | `C - F` | exactly `total` |
+```
+D_g - F_g < --max-weight-staleness
+```
 
-The choice is also logged as `staleness/bound_reference_is_submission` and
-`staleness/bound_reference_is_prefill` and included in the run path. `rollout`
-means every group offered before the check; `train` means the groups that
-survived selection.
+With the normal prefetched schedule and `--update-weights-interval 1`, `T_b=D_g+1`,
+so this is equivalent to `T_b-F_g <= max`. Equality at dequeue is rejected only
+for `queue-recycle`; `queue-max` retains its inclusive dequeue condition.
+`staleness/rollout/*` reports the would-be train-time quantity and
+`staleness/total/*` reports the accepted train-time population. Actual rejection is counted directly by the
+`staleness/bound_exceeded_*` metrics.
 
-Under `submission` or `prefill`, `s=N` accepts a group exactly when the tested
-version gap is at most N; equality is accepted. In particular, queue-max with
-the prefill reference treats `s=0` as on-policy and `s=1` as permitting one
-policy-version gap. Its selection after the preceding update does not shift or
-re-index that definition. Queue-recycle uses the same inequality at its
-historical drain point. `queue/consumption/selection_to_train_gap` is a separate
-scheduling diagnostic, not an offset to apply to the configured queue-max
-bound.
+The minimum usable queue-recycle bound is 1 because `D_g-F_g` is nonnegative:
+no group can satisfy the strict rule when `max=0`. This has nothing to do with
+the startup offset. The startup batch has `updates_before_train=0` and therefore
+`T_b=D_g`; the same strict check is deliberately conservative for that one
+batch. Later prefetched batches normally have `updates_before_train=1` and
+`T_b=D_g+1`.
+
+This dequeue-time definition is not always the version gap at the trainer
+forward. `queue-recycle` reserves the next batch while the current batch is
+training. With the recipe's `--update-weights-interval 1`, after the first batch
+the complete order is
+
+```
+time ---------------------------------------------------------------------->
+next batch: prefill/decode(F...) -> ready(Q) -> dequeue/prefetch(D) ---------+
+trainer:                                         train current batch        |
+                                                 -> publish D + 1            |
+                                                 -> train next batch at T=D+1
+```
+
+Therefore its train-time group gap is `D_g + 1 - F_g`; the strict dequeue check
+keeps that gap at or below `max`. For `queue-max` and `queue-drop`, the
+driver does not prefetch a training batch: selection occurs after the preceding
+weight update, so no corresponding `+1` is introduced. The deterministic
+offset is reflected in `T_b` and the train-time staleness metrics; it is not
+reported as a separate handoff metric.
 
 A bound tighter than the pipeline can meet collapses overlap rather than
 deadlocking. While drain waits, training cannot publish a new version, so fresh
@@ -556,10 +620,9 @@ groups eventually pass under the frozen version. The signatures are a high
 `wasted_token_frac`, many bound-exceeded groups, and rising retry counts.
 
 The staleness histograms resolve `count_0` through `count_16` plus
-`count_ge_17`. Under `completion`, an arm label is not an upper bound on `total`;
-under `submission` or `prefill`, it is. Dumps carry the submission stamp, all
-four forward-provenance arrays, completion versions, and the queue lifecycle's
-ready/enqueue/dequeue/decision fields for offline reconstruction.
+`count_ge_17`. Dumps carry all four forward-provenance arrays, completion
+versions, and the queue lifecycle's ready/enqueue/dequeue/decision fields for
+offline reconstruction.
 
 Each new lifecycle record also carries scalar `reward_values` aligned with its
 `sample_indices` and `response_lengths`. Reward evaluation has already completed
@@ -572,7 +635,7 @@ reward coverage rather than inventing zero rewards.
 
 ### Queue policies and the formula boundary
 
-- `queue-recycle` is the compatibility default: completion FIFO, immediate
+- `queue-recycle` is the default: completion FIFO, immediate
   next-batch prefetch by the driver, safety backpressure at 1000 completed
   groups, and over-age groups returned to the prompt buffer. With
   `--staleness-reference prefill`, this is the former
@@ -613,11 +676,11 @@ Runs before 2026-08-09 have none of these keys, and nothing back-fills.
 
 ## Additive recycle, contribution, and pipeline telemetry (2026-08-13)
 
-This instrumentation is additive.  The historical meanings of
-`rollout/fully_async/{avg,max}_staleness`, `staleness/bound/*`, and
-`staleness/{pre_queue,in_queue,total}/*` above are unchanged.  New analyses use
-new namespaces so a dashboard spanning old and new jobs cannot silently change
-its estimand.
+The 2026-08-19 logging revision moves `staleness/rollout`,
+`staleness/{in_queue,total}`, lifecycle `bound_staleness`, sample lag, and exact
+token lag to the scheduled train version. It also removes the former
+selection-to-train and train-side bound diagnostics. Do not merge pre-revision
+and post-revision series as if their estimands were identical.
 
 ### The generated-token ledger
 
@@ -693,9 +756,6 @@ Reason keys have fixed cardinality, including zero-valued series:
 `rollout/fully_async/recycle_aux/group_straggler_collateral/*` is an auxiliary
 label: it counts samples that would have passed the same bound independently but
 were recycled with their stale group.  It is not added again to total waste.
-Likewise, `staleness/late_stale_trained/forward_handoff_*` is a diagnostic for a
-group that crossed the bound after queue selection but before the trainer
-forward; it was trained, not recycled.
 
 ### Pre-queue critical-path split
 
@@ -703,8 +763,8 @@ For each sample, four lifecycle boundaries are stamped by the rollout event loop
 
 ```
 A = trajectory generation/environment work starts
-G_i = this sample finishes generation/environment interaction
-G = the last generation task in its prompt group finishes
+C_i = this sample's generation/environment task returns
+C_g = the last generation task in its prompt group returns
 Q = group reward/postprocess finishes and the group is trainable
 ```
 
@@ -712,9 +772,9 @@ Both applied-weight-version and wall-second views are logged under
 `staleness/pre_queue_phase/{version,wall_seconds}/`:
 
 ```
-active      = G_i - A
-group_wait  = G - G_i
-postprocess = Q - G
+active      = C_i - A
+group_wait  = C_g - C_i
+postprocess = Q - C_g
 total       = Q - A
 ```
 
@@ -732,7 +792,6 @@ The mitigation mapping is now testable rather than inferred from one total:
 | group wait | group scheduling, partial admission, straggler handling |
 | postprocess | verifier/reward/serialization pipeline |
 | in queue | train/rollout allocation and backpressure |
-| selection-to-forward gap | updates-per-rollout or trainer scheduling |
 
 ### Generated, consumed, recycled, and dropped populations
 
@@ -764,10 +823,10 @@ trimmed later by sample filtering or rollout postprocessing remain visible in
 `postprocess_trimmed`.
 
 Marginals answer whether the trained distribution shifted, but not a joint
-conditional.  With `--dump-details`, schema-v2 primitive records contain the
+conditional.  With `--dump-details`, schema-v3 primitive records contain the
 group/prompt index, sample index, generation attempt id, disposition and reason,
-versions, lengths, durations, rewards, difficulty, phase splits, waste vector,
-and final training step/loss-input tokens.  Run:
+dequeue and scheduled-train versions, lengths, durations, rewards, difficulty,
+phase splits, waste vector, and final training step/loss-input tokens.  Run:
 
 ```
 python -m experiments.src.offpolicy_acceleration.analyze_staleness_telemetry \
@@ -792,9 +851,9 @@ per-sample generation duration, remain missing instead of being imputed.
 The full records are debug-only because their storage and CPU transfer are not a
 reasonable default for production training.
 
-### Consumed versus effective-contribution staleness
+### Trainer diagnostics conditioned on each sample's staleness
 
-Pass `--log-staleness-gradient-metrics` to enable fixed bins `s_0` through
+Pass `--log-sample-staleness-metrics` to enable fixed bins `s_0` through
 `s_<max>` plus one overflow bin (default max 16).  No additional model forward is
 performed.  The implementation reuses the final tokenwise policy objective after
 PPO/dual clipping, OPSM, TIS/MIS correction, rejection masks, and the actual loss
@@ -810,11 +869,80 @@ to the loss that was differentiated, but remains an objective-contribution
 proxy, not a gradient norm: it does not contain parameter Jacobians or
 cross-token cancellation.
 
-The bin value is the consumed sample's own `drain_version - selected_reference`
-(`prefill`, `submission`, or `completion` according to the run). It is not the
-historical group-weighted scalar and does not silently include a later trainer
-handoff; crossings after drain are reported separately under
-`staleness/late_stale_trained/`.
+These metrics use the top-level `sample_staleness/*` namespace and the
+`train/step` axis. The name deliberately does not say "gradient": the logged
+quantity is an objective-contribution proxy grouped by staleness, not a gradient
+norm.
+
+With the prefill reference, sample `i` uses
+
+```
+s_i = T_b - F_i
+```
+
+where `F_i` is that sample's own minimum first-prefill version and `T_b` is the
+batch train version. This differs from the group-control reference `F_g`, which
+is the minimum across the whole group.
+
+The rollout-side `staleness/sample_lag/*` decomposition uses two additional
+scheduler-provenance boundaries:
+
+```
+G_i = max(sample_i.last_forward_weight_versions)
+G_g = max_i(G_i)
+
+generation            = G_i - F_i
+group_sync            = G_g - G_i
+last_forward_to_train = T_b - G_g
+total                 = T_b - F_i
+```
+
+`G_i` is the applied SGLang weight version of sample `i`'s last model forward,
+not a group id, gradient, or wall-clock timestamp. `G_g` is the latest such
+version among samples in the prompt group. Consequently `group_sync` measures
+weight updates crossed while an early sample waited for the group's last model
+forward; environment/reward/postprocess work after that forward is included in
+`last_forward_to_train`.
+
+`last_forward_to_train` is not the in-queue staleness. Let `Q_g` be the
+group-ready version and `P_g` the later actual queue-put version. Then
+
+```
+in_queue             = T_b - Q_g
+last_forward_to_train = T_b - G_g
+                      = (Q_g - G_g) + (T_b - Q_g)
+in_queue              = (P_g - Q_g) + (T_b - P_g)
+```
+
+`Q_g - G_g` covers work after the group's last model forward but before it is
+queue-ready. `P_g - Q_g` is output-capacity backpressure, and `T_b - P_g` covers
+the interval after the actual put through training. Calling all of
+`T_b - G_g` an in-queue or handoff lag would therefore hide real boundaries.
+
+With `--staleness-reference prefill`, `sample_staleness` and
+`staleness/sample_lag/total` therefore use exactly the same per-sample scalar,
+`T_b - F_i`. They are not duplicate log products: `sample_staleness/*` bins
+trainer-side loss/objective diagnostics, while `sample_lag/total` reports
+rollout-side sequence-, generated-token-, and loss-token-weighted summaries and
+correlations. `sample_lag` additionally requires complete last-forward
+provenance for the group, so its `provenance_sample_frac` can be below one even
+when the simpler sample-staleness scalar is available.
+
+This assignment is per sample.  If one response was decoded across several
+weight versions, every token in that response currently enters the same
+`sample_staleness/s_*` bin.  The section is consequently exact for the
+selected sample-reference definition, but it is not yet an exact-token-version
+breakdown for mixed-version responses.
+
+For example, suppose training uses version 12, the selected prefill
+reference is version 10, but 100 response tokens were actually decoded under
+version 10 and 900 under version 11.  The current sample-level implementation
+puts all 1,000 tokens in `sample_staleness/s_2`, because
+`12 - selected_reference = 2`.  An exact-token implementation would put 100
+tokens in lag 2 and 900 in lag 1.  This is what it means that compact mixed
+response segments are not yet reflected in `sample_staleness`: the segments
+are retained and summarized on the rollout side, but are not carried into the
+trainer's per-token bin ids.
 
 For each lag bin, the log contains:
 
@@ -825,6 +953,31 @@ For each lag bin, the log contains:
 - mean absolute policy/rollout and PPO-objective (`current/old_actor`) log-ratios;
 - current/rollout token and sequence ESS;
 - non-zero contribution fraction.
+
+The main conditionals have the following meanings:
+
+- `mean_abs_policy_rollout_log_ratio` averages
+  `abs(log pi_train(token) - log pi_rollout(token))` over pre-loss tokens in the
+  bin.  It measures behavior/current disagreement, including both true policy
+  lag and the Megatron/SGLang numerical floor.
+- `importance_clip_fraction` is the fraction of those tokens whose TIS/MIS
+  importance correction was clipped or truncated.  Vanilla TIS keeps a clipped
+  token at the capped weight; this is not response truncation.
+- `ppo_clip_fraction` is clipping of the current/old-actor proximal objective,
+  not TIS.  In the current one-step fused-actor recipe the old-actor anchor is a
+  detach of the same forward, so its ratio is exactly one and this metric should
+  be zero.  TIS, not PPO clipping, is the relevant stale-policy correction in
+  that recipe.
+- `policy_rollout_ratio_token_ess` is normalized Kish ESS of token importance
+  weights, `(sum w)^2 / (N sum w^2)`, within the lag bin.  One means uniform
+  weights; values near zero mean that a small token subset dominates.
+- `policy_rollout_ratio_sequence_ess` applies the same formula to per-response
+  weights `exp(sum_t log(pi_train/pi_rollout))`.  It exposes response-level
+  concentration that a within-response token ESS can hide.
+- `effective_contribution_mass` is the bin's share of
+  `abs(final tokenwise policy objective) * reducer weight` after masks,
+  PPO/dual clipping, OPSM, and importance correction.  It is a scalar-objective
+  attribution proxy, not a parameter-gradient norm or direction.
 
 The pre-loss-token masses are also the sufficient statistics for the age seen
 by the loss.  When the overflow bin is empty,
@@ -879,10 +1032,37 @@ only while dispatching these detached CUDA bincounts and is restored before the
 loss returns. Training kernels and gradients remain deterministic; the new
 diagnostic sums themselves may differ in their last floating-point bits because
 CUDA bincount uses atomic additions.
-`--log-staleness-gradient-ratio-histogram` adds a fixed 15-bin signed log-ratio
+`--log-sample-staleness-ratio-histogram` adds a fixed 15-bin signed log-ratio
 histogram and a capped approximate p95; it is separate because it emits many
 more scalar series.  Custom policy-gradient reducers are rejected for this
 metric rather than reported with the wrong normalization.
+
+### Low-overhead optimizer-update diagnostics (2026-08-19)
+
+The async DAPO-Math recipe enables `--log-update-diagnostics`. It adds the
+following train-step scalars without another model forward or parameter scan:
+
+- `train/optimizer_step_applied`: one only when the optimizer step ran;
+- `train/grad_norm_pre_clip`: the pre-clip norm already returned by Megatron's
+  optimizer (`train/grad_norm` remains as the compatibility name);
+- `train/grad_clip_coefficient`: `min(1, clip_grad / (grad_norm + 1e-6))`;
+- `train/final_loss_tokens`: tokens surviving the final loss mask after
+  importance correction or rejection;
+- `train/advantage_std`, `train/advantage_rms`, and
+  `train/advantage_abs_mean`, weighted over those final loss tokens.
+
+The advantage sums, squared sums, absolute sums, and token count join the
+existing loss-metric reduction, so they add elementwise operations over tensors
+already resident in policy loss but no new distributed collective.
+`train/num_zeros_in_grad` is emitted only if the optimizer has already computed
+that value; the recipe does not enable Megatron's extra gradient-zero scan.
+
+`train/update_norm`, `train/parameter_norm`, `train/relative_update_norm`, and
+`train/cumulative_update_path_norm` are deliberately not produced. Exact values
+would require traversing all parameters and, for update norms, retaining or
+reconstructing the preconditioned parameter delta. That cost is not justified
+for an always-on diagnostic, and an LR-scaled gradient norm is not labeled as an
+Adam parameter displacement.
 
 ### Exact token versions and throughput
 
@@ -895,6 +1075,104 @@ exact token-weighted lag distribution under `staleness/token_lag/exact/*`.
 Malformed, overlapping, gapped, or future-version segments are excluded rather
 than repaired, with explicit invalid segment/turn/sample counters.
 
+Here **exact** means that each covered response token is assigned the applied
+SGLang scheduler weight version that produced it.  It does not mean request
+submission version, first/last/min/max forward version, or one version inferred
+for a whole sample. For covered response token `t`, lag is evaluated at training as
+
+```
+L_t = T_b - V_t
+```
+
+where `V_t` is the scheduler-applied version that actually produced the token.
+Coverage and invalid counters must accompany the distribution; uncovered tokens
+are not imputed.
+
+The response-token distribution remains at the root.  The
+`staleness/token_lag/exact/loss_token/*` child intersects complete ordered
+segments with the built-in pre-correction response loss mask and reports
+coverage, mean, population variance/std, max, p50/p90/p99, count, and tail
+fractions at lags 1, 2, 4, 8, and 16.  It expands no object-store token-version
+array: all-one/all-zero masks and single-version responses reduce directly, and
+only a mixed mask spanning multiple version segments builds one response-local
+prefix sum.  The sibling
+`loss_sequence/*` distribution gives each covered response one
+loss-token-weighted effective lag, then weights responses equally.
+
+The async DAPO-Math Qwen3-4B recipe enables this flag by default.  Other recipes
+retain their existing defaults.  Group-, trained-sequence-, lifecycle-, and exact
+token-weighted staleness distributions report population variance and standard
+deviation (`ddof=0`) alongside their mean and percentiles.  The fixed
+`staleness/version_mix/train/*` section summarizes the always-on min/max forward
+provenance: coverage, mixed-sample fraction, response-token mass belonging to
+mixed samples, and the distribution of each sample's forward-version span.  It
+does not create absolute-version keys, so metric cardinality stays fixed.
+
+For mixed-version responses, one mean should not replace the distribution.  Four
+weightings answer different questions:
+
+- sequence weighting gives every sampled response equal mass and describes the
+  sampling/queue population;
+- response-token weighting describes generated compute and is the meaning of
+  the current `staleness/token_lag/exact/*` distribution;
+- loss-token weighting intersects the exact token-version segments with the
+  pre-correction loss mask and is the preferred measure of staleness exposure
+  seen by training;
+- effective-contribution weighting describes how much of the final scalar
+  policy objective came from each lag, after masks, clipping, and importance
+  correction.
+
+The rollout-side exact loss-token distribution and tail fractions are now
+present.  A later training-facing mixed-version extension should retain the
+fixed sample-reference bins for queue-control compatibility and add fixed
+relative lag bins (not absolute version-number keys) for exact final
+objective-contribution mass.  Useful per-lag conditionals are signed and
+absolute train/rollout log-ratio, TIS and PPO clip fractions, token/sequence ESS,
+and non-zero objective contribution.  Carry the existing compact segments to
+the trainer and expand only local lag-bin ids on GPU; do not materialize an
+object-store int64 version array for every token.  Those exact-lag conditionals
+are not emitted by the current `sample_staleness/*` implementation.
+
+### Applied SGLang weight version across resume
+
+The version label continues only when replay-buffer state is restored.  Miles
+captures the rollout manager's committed `applied_weight_version = N`, restores
+both that tracker and the trainer weight-updater counter to N, then performs the
+normal startup weight push.  The updater tags that push N+1, and the rollout
+manager commits N+1 only after every SGLang engine has finalized the update.
+The current async DAPO-Math recipe has `USE_REPLAY_BUFFER=1`, so its version
+sequence is continuous across checkpoint jobs.
+`resume/replay_buffer/applied_weight_version_restored` records N.  A restored
+prepared batch also records
+`resume/replay_buffer/current_applied_weight_version`; otherwise compare it with
+`fully_async/train_weight_version`.  The first post-startup value must
+be N+1, providing a direct W&B continuity check.
+
+SGLang does not independently recover the numeric label from the Megatron model
+checkpoint.  With replay disabled (or with no usable replay state), new
+processes initialize the counter at zero and the startup push is version 1 even
+though the model parameters themselves resume correctly.  In that case the
+label is locally consistent within the new job but not a cross-job global
+version axis.
+
+Even that is an objective-level attribution, not a parameter-gradient
+attribution.  Exact per-lag gradient norms or gradient cosines require separate
+backward/per-sample-gradient work and are unsuitable as an always-on metric.
+For instability and convergence, pair the lag conditionals with global gradient
+norm and optimizer-clipping incidence, applied update norm divided by parameter
+norm, entropy, reward/eval score, response truncation/repetition, accepted loss
+tokens, and wall time.  Plot convergence against cumulative accepted loss tokens
+as well as optimizer step; logging alone establishes association, so causal
+claims still require matched runs that vary staleness while holding inference
+engine and token budget fixed.
+
+On a 3,072-sample synthetic batch, the `version_mix` reduction took a median
+1.24 ms and emitted 11 scalars.  The SGLang CPU hot-path microbenchmark measured
+approximately 222--223 ns per generated token for compact segment maintenance
+when a version remained stable for 32--512 tokens; changing version every token
+cost approximately 1.9 microseconds per token.  These are isolated CPU costs,
+not an end-to-end GPU throughput measurement.
+
 The pipeline telemetry closes one non-overlapping wall window immediately after
 each successful actor train call. Generated tokens, accepted loss-input tokens,
 and completed optimizer updates therefore refer to the same elapsed interval;
@@ -903,6 +1181,7 @@ the first and final batches are not shifted into adjacent windows.
 It reports:
 
 - `throughput/{generated,accepted,useful}_tokens_per_second`;
+- `throughput/cumulative_accepted_loss_tokens`, with its availability flag;
 - `throughput/optimizer_updates_per_second`;
 - time-weighted `queue/depth_time_mean` and instantaneous `depth_current`;
 - trainer starvation and rollout backpressure seconds;
@@ -952,8 +1231,9 @@ The performance check discarded two warmup steps and measured eight steps:
 | ratio histogram minus gradient bins | +0.109% (+34.5 ms) | +0.087% (+27.1 ms) | +0 MiB |
 
 These are short-run operational measurements, not confidence intervals.  They
-bound the observed cost in the production training path and show why the bins
-and histogram remain opt-in.  The always-on Python hot-path benchmark processed
+bound the observed cost in the production training path.  The implementation
+remains flag-gated; the later Qwen3-4B recipe decision is recorded in the
+2026-08-19 validation below.  The always-on Python hot-path benchmark processed
 3072 samples / 3.21M generated tokens in 61.1 ms for final accounting; the
 individual generated/consumed population and pre-queue passes were 29.5 ms and
 33.9 ms.  One discarded group's waste vector took 8.4 us.
@@ -970,6 +1250,56 @@ with exact response-token segment coverage 1.0, zero useful-token accounting
 error, and the consumption/throughput streams present.  Its short 1024-token
 responses all truncated and had zero reward variance, so it validates live
 integration rather than non-zero contribution; job 15728682 supplies the latter.
+
+### Current recipe validation (2026-08-19)
+
+Job 16109706 reran the fixed Qwen3-4B workload on one 8-H100 interactive node
+after adding the loss-token exact-lag and resume-stable cumulative-token
+telemetry.  A single trainer node is the relevant isolation boundary here:
+`sample_staleness/*` consists of trainer-local detached CUDA reductions and
+does not add a rollout-engine or cross-node communication path.  A two-node live
+rollout would add queue and generation noise without exercising a different
+implementation path.
+
+The deterministic telemetry-off versus base-bin check compared 99 common
+training scalars at each of three steps plus three saved gradient-norm files.
+They were bitwise equal as logged, with maximum absolute difference zero.  The
+performance check discarded two warmup steps and measured eight steps:
+
+| increment | median `perf/step_time` | median `perf/actor_train_time` | peak HBM |
+|---|---:|---:|---:|
+| base bins minus telemetry off | +0.537% (+168.7 ms) | +0.673% (+208.1 ms) | +4 MiB |
+| ratio histogram minus base bins | +0.273% (+86.3 ms) | +0.330% (+102.7 ms) | +0 MiB |
+
+The corresponding end-to-end wall deltas were within short-run noise: -0.022%
+for base bins versus off and +0.222% for the histogram versus base bins.  These
+are operational point measurements, not confidence intervals.  On this evidence
+the async DAPO-Math Qwen3-4B recipe sets
+`LOG_SAMPLE_STALENESS_METRICS=1`; the high-cardinality ratio histogram remains
+off by default.
+
+The same job measured rollout-side exact-lag accounting over 3,072 samples and
+3.21M generated tokens.  Compared with the 60.71 ms no-segment finalization
+path, one exact version segment per response added 7.14 ms per whole batch
+(2.32 us/sample), while the synthetic two-segment responses with a loss mask
+crossing the version boundary added 57.92 ms (18.85 us/sample).  The all-loss-
+token, single-segment case added 7.27 ms.  These costs occur once during rollout
+batch finalization, not per training token or model forward.
+
+The isolated SGLang benchmark found approximately 0.20 us per generated token
+for compact segment maintenance when a version remained stable for 32--512
+tokens and 1.70 us/token in the adversarial every-token-version-change case.
+Scheduler version stamping was at most 2.9 ns/request for tested batch sizes
+8--512 (19 ns at batch size one).  The production pattern is the stable-version
+case, since versions change only on weight updates.  The recipe therefore keeps
+`SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS=1` so exact response- and loss-token lag
+remain observable.
+
+The result bundle is under
+`experiments/outputs/staleness-telemetry-gpu-16109706/`.  Its analyzer also has
+a nominal `clean_head` arm, but this invocation pointed that arm at the same
+working tree; only the telemetry-off versus enabled deltas above are used as a
+code-path comparison.
 
 ### What can be causal
 

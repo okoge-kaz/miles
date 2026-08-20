@@ -62,7 +62,7 @@ everything the inner ones would do (`docs/user-guide/environments.md`).
 
 Our two recipes sit at different depths:
 
-- `math_sync/<model>` — everything default, `--rm-type deepscaler`.
+- `math/sync/<model>` — everything default, `--rm-type deepscaler`.
 - `tool_multiturn/<model>` — `--custom-generate-function-path
   miles.rollout.generate_hub.multi_turn.generate` plus tool specs, a tool
   executor and `--custom-rm-path`; the framework still owns turn scheduling,

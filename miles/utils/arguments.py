@@ -717,14 +717,15 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
-                "--fully-async-queue-policy",
+                "--fully-async-queue-type",
+                dest="fully_async_queue_type",
                 type=str,
                 default="queue-recycle",
                 choices=FULLY_ASYNC_QUEUE_POLICIES,
                 help=(
-                    "Queue selection policy for --fully-async. "
+                    "Queue implementation used by --fully-async. "
                     "'queue-recycle' preserves the existing completion-FIFO, prefetched-drain "
-                    "behavior and recycles groups that exceed --max-weight-staleness under the "
+                    "behavior and recycles groups that would exceed --max-weight-staleness at training under the "
                     "selected --staleness-reference. 'queue-max' consumes completion-FIFO "
                     "groups when the trainer is ready and drops groups above a required "
                     "prefill-referenced max staleness. 'queue-drop' uses a bounded "
@@ -745,12 +746,14 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 type=int,
                 default=None,
                 help=(
-                    "Maximum allowed gap between a group's weight version and the current engine "
-                    "weight version. queue-recycle returns groups exceeding this threshold to the "
-                    "data buffer; queue-max discards them. Which version the gap is measured from "
-                    "is --staleness-reference. Only effective in fully async mode. None (default) "
-                    "disables staleness filtering. A group exactly at the bound is accepted: with "
-                    "the prefill reference, 0 means on-policy and 1 permits one policy-version gap."
+                    "Maximum allowed policy-version gap at training for queue-recycle. It admits a group "
+                    "only when its dequeue gap is strictly below the threshold. The threshold must be at "
+                    "least 1 because a nonnegative gap cannot satisfy gap < 0; this is independent of the "
+                    "startup batch. At startup the train version equals the dequeue version. A later "
+                    "prefetched batch is normally trained after one scheduled weight update, so its train "
+                    "version is dequeue version + 1. queue-max instead bounds the dequeue gap, discards "
+                    "groups above the threshold, and accepts equality. Only effective in fully async mode. "
+                    "None (default) disables staleness filtering."
                 ),
             )
             parser.add_argument(
@@ -767,7 +770,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "to end and 0 is genuinely on-policy. "
                     "'prefill' uses the scheduler-authoritative version at the first "
                     "prefill forward and requires the patched SGLang provenance metadata. "
-                    "staleness/total uses the same reference as the selected bound in every mode. "
+                    "staleness/total ends at the scheduled train version and uses the selected reference. "
                     "All references remain available for historical reproduction."
                 ),
             )
@@ -1447,30 +1450,46 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--lambd", type=float, default=1.0, help="PPO GAE lambd")
             parser.add_argument("--normalize-advantages", action="store_true", default=False)
             parser.add_argument(
-                "--log-staleness-gradient-metrics",
+                "--log-sample-staleness-metrics",
+                dest="log_sample_staleness_metrics",
                 action="store_true",
                 default=False,
                 help=(
-                    "Log consumed and effective policy-gradient contribution by sample staleness. "
-                    "Uses tensors already present in policy loss and performs no extra model forward."
+                    "Log trainer-side diagnostics conditioned on each sample's train-time staleness. "
+                    "With the prefill reference, this is train weight version minus that sample's "
+                    "first-prefill weight version. Every token in a sample uses this one bin; this is "
+                    "distinct from exact per-token generation-version staleness. Uses tensors already "
+                    "present in policy loss and performs no extra model forward."
                 ),
             )
             parser.add_argument(
-                "--staleness-gradient-max-bin",
+                "--sample-staleness-max-bin",
+                dest="sample_staleness_max_bin",
                 type=int,
                 default=16,
                 help=(
-                    "Largest exact staleness bin for --log-staleness-gradient-metrics; "
+                    "Largest exact staleness bin for --log-sample-staleness-metrics; "
                     "larger values share one overflow bin."
                 ),
             )
             parser.add_argument(
-                "--log-staleness-gradient-ratio-histogram",
+                "--log-sample-staleness-ratio-histogram",
+                dest="log_sample_staleness_ratio_histogram",
                 action="store_true",
                 default=False,
                 help=(
                     "Also log a fixed signed log-ratio histogram and histogram-derived p95 in each "
                     "staleness bin. This adds metric cardinality but stores no raw token arrays."
+                ),
+            )
+            parser.add_argument(
+                "--log-update-diagnostics",
+                action="store_true",
+                default=False,
+                help=(
+                    "Log optimizer-step status, pre-clip gradient norm, clip coefficient, final loss-token "
+                    "count, and advantage dispersion. This reuses the optimizer result and tensors already "
+                    "present in policy loss; it does not scan parameters or enable gradient-zero counting."
                 ),
             )
             parser.add_argument(
@@ -3418,22 +3437,22 @@ def miles_validate_args(args):
             f"so one group already puts n_samples_per_prompt trajectories in flight"
         )
 
-    assert getattr(args, "staleness_gradient_max_bin", 16) >= 0, "--staleness-gradient-max-bin must be non-negative"
-    if getattr(args, "log_staleness_gradient_ratio_histogram", False):
+    assert getattr(args, "sample_staleness_max_bin", 16) >= 0, "--sample-staleness-max-bin must be non-negative"
+    if getattr(args, "log_sample_staleness_ratio_histogram", False):
         assert getattr(
-            args, "log_staleness_gradient_metrics", False
-        ), "--log-staleness-gradient-ratio-histogram requires --log-staleness-gradient-metrics"
-    if getattr(args, "log_staleness_gradient_metrics", False):
-        assert args.fully_async, "--log-staleness-gradient-metrics requires --fully-async"
+            args, "log_sample_staleness_metrics", False
+        ), "--log-sample-staleness-ratio-histogram requires --log-sample-staleness-metrics"
+    if getattr(args, "log_sample_staleness_metrics", False):
+        assert args.fully_async, "--log-sample-staleness-metrics requires --fully-async"
         assert (
             args.loss_type == "policy_loss"
-        ), "--log-staleness-gradient-metrics currently instruments the built-in policy loss"
+        ), "--log-sample-staleness-metrics currently instruments the built-in policy loss"
         assert getattr(args, "custom_pg_loss_reducer_function_path", None) is None, (
-            "--log-staleness-gradient-metrics cannot infer exact objective normalization from "
+            "--log-sample-staleness-metrics cannot infer exact objective normalization from "
             "a custom policy-gradient loss reducer"
         )
         assert getattr(args, "custom_convert_samples_to_train_data_path", None) is None, (
-            "--log-staleness-gradient-metrics requires the built-in sample-to-train-data "
+            "--log-sample-staleness-metrics requires the built-in sample-to-train-data "
             "converter to carry sample staleness"
         )
 

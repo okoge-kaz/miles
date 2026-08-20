@@ -30,6 +30,8 @@ class RolloutFnBaseInput:
 # subclassing for different data in the future
 @dataclass(frozen=True)
 class RolloutFnTrainInput(RolloutFnBaseInput):
+    updates_before_train: int = 0
+
     @property
     def evaluation(self):
         return False

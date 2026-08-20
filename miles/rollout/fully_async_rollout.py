@@ -28,11 +28,17 @@ from typing import Any
 import httpx
 import numpy as np
 
-from miles.rollout.base_types import RolloutFnConstructorInput, RolloutFnInput, RolloutFnOutput, RolloutFnTrainOutput
+from miles.rollout.base_types import (
+    RolloutFnConstructorInput,
+    RolloutFnInput,
+    RolloutFnOutput,
+    RolloutFnTrainInput,
+    RolloutFnTrainOutput,
+)
 from miles.rollout.filter_hub.base_types import call_dynamic_filter
 from miles.rollout.fully_async_telemetry import FullyAsyncPipelineTelemetry
 from miles.rollout.inference_rollout.inference_rollout_common import GenerateState, generate_and_rm_group
-from miles.rollout.queue_policy import LEGACY_QUEUE_POLICY, QUEUE_DROP_POLICY, QUEUE_MAX_POLICY
+from miles.rollout.queue_policy import QUEUE_DROP_POLICY, QUEUE_MAX_POLICY, QUEUE_RECYCLE_POLICY
 from miles.rollout.queue_telemetry import (
     DEFAULT_RESPONSE_LENGTH_POPULATIONS,
     Group,
@@ -68,6 +74,8 @@ from miles.rollout.recycle_compute_metrics import (
     SAMPLE_GENERATION_COMPLETE_TIME_KEY,
     SAMPLE_GENERATION_COMPLETE_VERSION_KEY,
     SUBMISSION_VERSION_KEY,
+    TRAIN_VERSION_KEY,
+    TRAIN_WEIGHT_VERSION_METRIC,
     TRAJECTORY_START_TIME_KEY,
     TRAJECTORY_START_VERSION_KEY,
     aborted_recycle_reason,
@@ -132,6 +140,7 @@ _TERMINAL_CONTINUATION_METADATA_KEYS = (
 @dataclass
 class _DrainProgress:
     rollout_id: int
+    updates_before_train: int
     data: list[Group] = field(default_factory=list)
     group_ids: list[int] = field(default_factory=list)
     queue_size_start: int | None = None
@@ -139,12 +148,13 @@ class _DrainProgress:
     aborted_groups_recycled: int = 0
     stale_groups_recycled: int = 0
     stale_groups_dropped: int = 0
-    trained_bound_staleness: list[int] = field(default_factory=list)
-    offered_bound_staleness: list[int] = field(default_factory=list)
+    rollout_staleness: list[int] = field(default_factory=list)
+    bound_evaluated_samples: int = 0
+    bound_exceeded_samples: int = 0
     trained_pre_queue: list[int] = field(default_factory=list)
     trained_in_queue: list[int] = field(default_factory=list)
     trained_total: list[int] = field(default_factory=list)
-    current_version: int = 0
+    train_version: int | None = None
     offered_mixed_versions: list[bool] = field(default_factory=list)
     trained_mixed_versions: list[bool] = field(default_factory=list)
     aborted_tokens: int = 0
@@ -548,18 +558,29 @@ def _record_reason(
     token_counts[reason] = token_counts.get(reason, 0) + tokens
 
 
-def _staleness_metrics(values: list[int], bound: int | None) -> dict[str, float]:
+def _scheduled_train_version(progress: _DrainProgress, dequeue_version: int) -> int:
+    if progress.train_version is None:
+        progress.train_version = dequeue_version + progress.updates_before_train
+    if dequeue_version > progress.train_version:
+        raise RuntimeError(
+            f"Dequeue version {dequeue_version} exceeds scheduled train version {progress.train_version} "
+            f"for rollout {progress.rollout_id}"
+        )
+    return progress.train_version
+
+
+def _staleness_metrics(values: list[int]) -> dict[str, float]:
     """P(L) reduced to bounded scalars: the logger takes scalars, not histograms.
 
     Percentiles rather than a mean alone because the tail is the quantity of
     interest -- a mean of 0.4 with a p99 of 12 and a mean of 0.4 with a p99 of 1
-    are different training regimes. ``frac_at_bound`` says whether the configured
-    cap is binding at all; a plateau in a results table is otherwise easy to read
-    as insensitivity to staleness when the run was simply never stale.
+    are different training regimes.
     """
     array = np.asarray(values, dtype=float)
     metrics = {
         "mean": float(array.mean()),
+        "variance": float(array.var()),
+        "std": float(array.std()),
         "max": float(array.max()),
         "p50": float(np.percentile(array, 50)),
         "p90": float(np.percentile(array, 90)),
@@ -567,12 +588,6 @@ def _staleness_metrics(values: list[int], bound: int | None) -> dict[str, float]
         "frac_zero": float((array <= 0).mean()),
         "num_groups": float(array.size),
     }
-    if bound is not None:
-        # `>=`, not `>`: a group exactly at the bound is kept. This is "how often
-        # did the pipeline reach the cap", not the rejection rate -- for that, see
-        # `staleness/bound_exceeded_groups`.
-        metrics["frac_at_bound"] = float((array >= bound).mean())
-
     # The full histogram, not just moments. Realized lag is a small integer, so
     # P(L) fits in a handful of scalars, and the shape is the result: percentiles
     # cannot say whether lag 4 happened twice or two hundred times, and that is
@@ -616,7 +631,7 @@ class FullyAsyncRolloutFn:
     The worker runs as a long-lived task on the shared rollout event loop, created
     lazily on the first train call. Groups whose samples were aborted (e.g. by a
     weight update pausing generation) are recycled back into the data source.
-    Age-bound failures are recycled by the legacy policy and discarded by
+    Age-bound failures are recycled by ``queue-recycle`` and discarded by
     queue-max; queue-drop instead discards the oldest completed group when its
     bounded queue overflows.
     """
@@ -805,7 +820,7 @@ class FullyAsyncRolloutFn:
         claimed_items = [task.result() for task in self._queue_gets if task.done() and not task.cancelled()]
         finished_active_items = [task.result() for task in self._active if task.done() and not task.cancelled()]
         queued_items = list(claimed_items)
-        if self._queue_policy() == LEGACY_QUEUE_POLICY:
+        if self._queue_policy() == QUEUE_RECYCLE_POLICY:
             queued_items.extend(list(self._output._queue) if self._output is not None else [])
         else:
             queued_items.extend(list(self._policy_output) if self._policy_output is not None else [])
@@ -855,6 +870,7 @@ class FullyAsyncRolloutFn:
                 "queue_evicted_groups": queue_snapshot.queue_evicted_groups,
                 "queue_evicted_tokens": queue_snapshot.queue_evicted_tokens,
             },
+            "pipeline_telemetry": self._pipeline_telemetry.checkpoint_state(),
             "snapshot_counts": {
                 "pending_groups": len(queue_snapshot.pending_prompts),
                 "ready_groups": len(ready_items),
@@ -958,7 +974,6 @@ class FullyAsyncRolloutFn:
             decision_version=decision_version,
             rollout_id=None,
             reference_version=reference,
-            bound_staleness=decision_version - reference if reference is not None else None,
         )
         return group_response_tokens(group)
 
@@ -971,10 +986,7 @@ class FullyAsyncRolloutFn:
     def _validate_replay_buffer_queue_config(self, state: dict[str, Any]) -> None:
         stored = state.get("queue_config")
         if stored is None:
-            stored = {
-                "policy": LEGACY_QUEUE_POLICY,
-                "capacity_groups": OUTPUT_QUEUE_MAX_GROUPS,
-            }
+            raise RuntimeError("Replay-buffer state is missing required queue_config")
         try:
             stored_config = {
                 "policy": stored["policy"],
@@ -1011,6 +1023,7 @@ class FullyAsyncRolloutFn:
         self._producer_selection_populations = copy.deepcopy(telemetry_state.get("producer_selection_populations", {}))
         self._queue_evicted_groups = int(telemetry_state.get("queue_evicted_groups", 0))
         self._queue_evicted_tokens = int(telemetry_state.get("queue_evicted_tokens", 0))
+        self._pipeline_telemetry.restore_checkpoint_state(state.get("pipeline_telemetry"))
         applied_version = int(state["applied_weight_version"])
         self._applied_weight_version = AppliedWeightVersionTracker(applied_version)
 
@@ -1102,7 +1115,7 @@ class FullyAsyncRolloutFn:
 
     def _restore_ready_queue(self, ready_items: list[QueueItem]) -> None:
         policy = self._queue_policy()
-        if policy == LEGACY_QUEUE_POLICY:
+        if policy == QUEUE_RECYCLE_POLICY:
             self._output = asyncio.Queue()
             for item in ready_items:
                 self._output.put_nowait(item)
@@ -1125,7 +1138,7 @@ class FullyAsyncRolloutFn:
                 depth_before=depth_before,
                 depth_after=depth_before + 1,
             )
-        if policy in (LEGACY_QUEUE_POLICY, QUEUE_MAX_POLICY):
+        if policy in (QUEUE_RECYCLE_POLICY, QUEUE_MAX_POLICY):
             available_slots = max(0, self._queue_capacity_groups() - len(ready_items))
             self._output_slots = asyncio.Semaphore(available_slots)
         else:
@@ -1235,6 +1248,9 @@ class FullyAsyncRolloutFn:
                 "FullyAsyncRolloutFn does not serve eval; set --eval-function-path to "
                 "miles.rollout.inference_rollout.inference_rollout_common.InferenceRolloutFn"
             )
+        assert isinstance(input, RolloutFnTrainInput)
+        if input.updates_before_train < 0:
+            raise ValueError("updates_before_train must be non-negative")
         if prepared := self._prepared_batches.get(input.rollout_id):
             prepared.output.metrics = {
                 **(prepared.output.metrics or {}),
@@ -1246,7 +1262,7 @@ class FullyAsyncRolloutFn:
             return prepared.output
 
         self._ensure_worker()
-        output = await self._drain(input.rollout_id)
+        output = await self._drain(input.rollout_id, input.updates_before_train)
         if self._replay_buffer_enabled:
             group_ids = tuple(prompt_group_id([_first_sample(group)]) for group in output.samples)
             prepared = _PreparedBatch(
@@ -1260,7 +1276,7 @@ class FullyAsyncRolloutFn:
     def _ensure_worker(self) -> None:
         if self._worker is not None:
             return
-        if self._queue_policy() == LEGACY_QUEUE_POLICY:
+        if self._queue_policy() == QUEUE_RECYCLE_POLICY:
             if self._output is None:
                 self._output = asyncio.Queue()
             if self._output_slots is None:
@@ -1279,13 +1295,13 @@ class FullyAsyncRolloutFn:
         self._pipeline_telemetry.reset_window()
         self._worker = asyncio.create_task(self._worker_loop())
         logger.info(
-            "Started fully-async rollout worker (queue_policy=%s, capacity_groups=%d)",
+            "Started fully-async rollout worker (queue_type=%s, capacity_groups=%d)",
             self._queue_policy(),
             self._queue_capacity_groups(),
         )
 
     def _queue_policy(self) -> str:
-        return getattr(self.args, "fully_async_queue_policy", LEGACY_QUEUE_POLICY)
+        return getattr(self.args, "fully_async_queue_type", QUEUE_RECYCLE_POLICY)
 
     def _queue_capacity_groups(self) -> int:
         if self._queue_policy() == QUEUE_DROP_POLICY:
@@ -1297,7 +1313,7 @@ class FullyAsyncRolloutFn:
         return OUTPUT_QUEUE_MAX_GROUPS
 
     def _queue_size(self) -> int:
-        if self._queue_policy() == LEGACY_QUEUE_POLICY:
+        if self._queue_policy() == QUEUE_RECYCLE_POLICY:
             return self._output.qsize()
         return len(self._policy_output)
 
@@ -1508,7 +1524,7 @@ class FullyAsyncRolloutFn:
 
     async def _enqueue_completed_group(self, item: QueueItem) -> None:
         policy = self._queue_policy()
-        if policy in (LEGACY_QUEUE_POLICY, QUEUE_MAX_POLICY):
+        if policy in (QUEUE_RECYCLE_POLICY, QUEUE_MAX_POLICY):
             # These policies control age at selection time. The 1000-group limit
             # is only a safety backpressure bound, not their experimental queue
             # capacity.
@@ -1528,7 +1544,7 @@ class FullyAsyncRolloutFn:
             wall_time=queue_put_time,
         )
 
-        if policy == LEGACY_QUEUE_POLICY:
+        if policy == QUEUE_RECYCLE_POLICY:
             self._output.put_nowait(item)
         else:
             if policy == QUEUE_DROP_POLICY and depth_before >= self._queue_capacity_groups():
@@ -1544,7 +1560,6 @@ class FullyAsyncRolloutFn:
                     decision_version=queue_put_version,
                     rollout_id=None,
                     reference_version=reference,
-                    bound_staleness=queue_put_version - reference if reference is not None else None,
                 )
                 self._finish_prompt(evicted_prompt_group)
             self._policy_output.append(item)
@@ -1604,8 +1619,8 @@ class FullyAsyncRolloutFn:
 
     async def _take_policy_groups(self, count: int) -> list[tuple[QueueItem, int]]:
         """Wait for and atomically remove ``count`` oldest completed groups."""
-        assert self._queue_policy() != LEGACY_QUEUE_POLICY
-        # Match the legacy queue's fail-fast contract even when a dead worker
+        assert self._queue_policy() != QUEUE_RECYCLE_POLICY
+        # Match queue-recycle's fail-fast contract even when a dead worker
         # left enough completed groups to satisfy this request immediately.
         if self._worker is not None and self._worker.done():
             self._worker.result()
@@ -1654,7 +1669,7 @@ class FullyAsyncRolloutFn:
         if self._queue_size() < self._queue_capacity_groups():
             self._output_slots.release()
 
-    async def _drain(self, rollout_id: int) -> RolloutFnTrainOutput:
+    async def _drain(self, rollout_id: int, updates_before_train: int) -> RolloutFnTrainOutput:
         args = self.args
         assert args.rollout_global_dataset
 
@@ -1667,13 +1682,13 @@ class FullyAsyncRolloutFn:
                 rollout_id,
                 _DrainProgress(
                     rollout_id=rollout_id,
-                    current_version=self._applied_weight_version.current(),
+                    updates_before_train=updates_before_train,
                 ),
             )
         else:
             progress = _DrainProgress(
                 rollout_id=rollout_id,
-                current_version=self._applied_weight_version.current(),
+                updates_before_train=updates_before_train,
             )
         data = progress.data
         if progress.queue_size_start is None:
@@ -1681,24 +1696,16 @@ class FullyAsyncRolloutFn:
         queue_size_start = progress.queue_size_start
         queue_sizes_after_dequeue = progress.queue_sizes_after_dequeue
         candidates: deque[tuple[QueueItem, int]] = deque()
-        # Two populations, because they answer different questions and only one of
-        # them is the study's variable. ``offered`` (logged as
-        # ``staleness/bound/rollout/``) is every group the pipeline handed over,
-        # including those the bound then sent back -- that is the *natural* lag of
-        # this node ratio. ``trained`` (``staleness/bound/train/``) is what survived into
-        # the batch, and is what the loss actually saw. They diverge where the
-        # bound bites and where the dynamic filter drops a group, which is where a
-        # reader is most likely to be misled.
-        # What `--max-weight-staleness` is tested against, in its two populations.
-        # This is `current - reference`; the reference is completion, submission,
-        # or first prefill according to the configured semantics.
-        trained_bound_staleness = progress.trained_bound_staleness
-        offered_bound_staleness = progress.offered_bound_staleness
+        # Would-be train staleness of every group handed to the drain, before the
+        # bound check. This is ``train_version - reference``; the reference is
+        # completion, submission, or first prefill according to the configured semantics.
+        # The accepted population is already recorded by ``trained_total`` below.
+        rollout_staleness = progress.rollout_staleness
         # The decomposition. Per group, with R the selected bound reference, Q
-        # the version the group became trainable under, and C the version at drain:
+        # the version the group became trainable under, and T the train version:
         #   pre-queue = Q - R   updates crossed before the group became trainable
-        #   in-queue  = C - Q   updates crossed while waiting to be trained on
-        #   total     = C - R   = pre-queue + in-queue = the bound quantity
+        #   in-queue  = T - Q   updates crossed before training
+        #   total     = T - R   = pre-queue + in-queue
         trained_pre_queue = progress.trained_pre_queue
         trained_in_queue = progress.trained_in_queue
         trained_total = progress.trained_total
@@ -1713,7 +1720,7 @@ class FullyAsyncRolloutFn:
         )
         while len(data) < target_data_size:
             if not candidates:
-                if self._queue_policy() == LEGACY_QUEUE_POLICY:
+                if self._queue_policy() == QUEUE_RECYCLE_POLICY:
                     item = await self._next_group()
                     candidates.append((item, self._queue_size()))
                 else:
@@ -1729,6 +1736,7 @@ class FullyAsyncRolloutFn:
                 samples = list(_iter_samples(group))
                 tokens = group_response_tokens(group)
                 current = self._applied_weight_version.current()
+                train_version = _scheduled_train_version(progress, current)
                 submitted = group_submission_weight_version(group)
                 ready = group_lifecycle_weight_version(group, GROUP_READY_VERSION_KEY)
                 queue_put = group_lifecycle_weight_version(group, QUEUE_PUT_VERSION_KEY)
@@ -1739,6 +1747,7 @@ class FullyAsyncRolloutFn:
                     time_key=DRAIN_TIME_KEY,
                     wall_time=time.time(),
                 )
+                stamp_group_weight_version(group, TRAIN_VERSION_KEY, train_version)
                 add_selection_population(
                     progress.selection_populations,
                     population_name="recycled",
@@ -1766,6 +1775,7 @@ class FullyAsyncRolloutFn:
                             group_ready_version=ready,
                             queue_put_version=queue_put,
                             drain_version=current,
+                            train_version=train_version,
                             bound=args.max_weight_staleness,
                             waste=waste,
                         )
@@ -1776,6 +1786,7 @@ class FullyAsyncRolloutFn:
                     disposition="aborted_recycled",
                     decision_version=current,
                     rollout_id=rollout_id,
+                    train_version=train_version,
                 )
                 self._recycle(prompt_group)
                 progress.aborted_groups_recycled += 1
@@ -1788,7 +1799,7 @@ class FullyAsyncRolloutFn:
             ready = group_lifecycle_weight_version(group, GROUP_READY_VERSION_KEY)
             queue_put = group_lifecycle_weight_version(group, QUEUE_PUT_VERSION_KEY)
             current = self._applied_weight_version.current()
-            progress.current_version = current
+            train_version = _scheduled_train_version(progress, current)
             stamp_sample_lifecycle_boundary(
                 _iter_samples(group),
                 version_key=DRAIN_VERSION_KEY,
@@ -1796,6 +1807,7 @@ class FullyAsyncRolloutFn:
                 time_key=DRAIN_TIME_KEY,
                 wall_time=time.time(),
             )
+            stamp_group_weight_version(group, TRAIN_VERSION_KEY, train_version)
 
             first_prefill = group_first_prefill_weight_version(group)
             if args.staleness_reference == "prefill":
@@ -1820,109 +1832,122 @@ class FullyAsyncRolloutFn:
                 stamp_group_weight_version(group, BOUND_REFERENCE_VERSION_KEY, reference)
             stamp_sample_reference_versions(_iter_samples(group), args.staleness_reference)
 
-            group_bound_staleness: int | None = None
-            if args.max_weight_staleness is not None:
-                if reference is not None:
-                    staleness = current - reference
-                    if staleness < 0:
-                        raise RuntimeError(
-                            f"Negative weight staleness: current={current}, reference={reference}, "
-                            f"mode={args.staleness_reference}"
+            samples = list(_iter_samples(group))
+            group_train_staleness: int | None = None
+            if reference is not None:
+                dequeue_staleness = current - reference
+                train_staleness = train_version - reference
+                if dequeue_staleness < 0 or train_staleness < 0:
+                    raise RuntimeError(
+                        f"Negative weight staleness: dequeue={current}, train={train_version}, "
+                        f"reference={reference}, mode={args.staleness_reference}"
+                    )
+                group_train_staleness = train_staleness
+                rollout_staleness.append(train_staleness)
+                progress.bound_evaluated_samples += len(samples)
+                max_staleness = args.max_weight_staleness
+                strict_bound = self._queue_policy() == QUEUE_RECYCLE_POLICY
+                exceeds_bound = max_staleness is not None and (
+                    dequeue_staleness >= max_staleness if strict_bound else dequeue_staleness > max_staleness
+                )
+                if exceeds_bound:
+                    progress.bound_exceeded_samples += len(samples)
+                    tokens = group_response_tokens(group)
+                    disposition = (
+                        "age_cutoff_dropped" if self._queue_policy() == QUEUE_MAX_POLICY else "stale_recycled"
+                    )
+                    generation_completion = group_generation_completion_version(samples)
+                    reason = classify_stale_recycle_stage(
+                        reference_version=reference,
+                        generation_completion_version=generation_completion,
+                        group_ready_version=ready,
+                        queue_put_version=queue_put,
+                        drain_version=current,
+                        bound=args.max_weight_staleness,
+                        strict_bound=strict_bound,
+                    )
+                    collateral = straggler_collateral_indices(
+                        samples,
+                        reference_mode=args.staleness_reference,
+                        drain_version=current,
+                        bound=args.max_weight_staleness,
+                        strict_bound=strict_bound,
+                    )
+                    waste = add_discard_accounting(
+                        progress.waste_by_reason,
+                        reason=reason,
+                        samples=samples,
+                    )
+                    outcome_population = "dropped" if disposition == "age_cutoff_dropped" else "recycled"
+                    add_selection_population(
+                        progress.selection_populations,
+                        population_name=outcome_population,
+                        samples=samples,
+                    )
+                    _record_reason(progress, reason=reason, tokens=tokens)
+                    if collateral:
+                        collateral_tokens = sum(
+                            sample.response_length for sample in samples if sample.index in collateral
                         )
-                    group_bound_staleness = staleness
-                    offered_bound_staleness.append(staleness)
-                    if staleness > args.max_weight_staleness:
-                        samples = list(_iter_samples(group))
-                        tokens = group_response_tokens(group)
-                        disposition = (
-                            "age_cutoff_dropped" if self._queue_policy() == QUEUE_MAX_POLICY else "stale_recycled"
+                        _record_reason(
+                            progress,
+                            reason="group_straggler_collateral",
+                            tokens=collateral_tokens,
+                            auxiliary=True,
                         )
-                        generation_completion = group_generation_completion_version(samples)
-                        reason = classify_stale_recycle_stage(
-                            reference_version=reference,
-                            generation_completion_version=generation_completion,
-                            group_ready_version=ready,
-                            queue_put_version=queue_put,
-                            drain_version=current,
-                            bound=args.max_weight_staleness,
-                        )
-                        collateral = straggler_collateral_indices(
-                            samples,
-                            reference_mode=args.staleness_reference,
-                            drain_version=current,
-                            bound=args.max_weight_staleness,
-                        )
-                        waste = add_discard_accounting(
-                            progress.waste_by_reason,
-                            reason=reason,
-                            samples=samples,
-                        )
-                        outcome_population = "dropped" if disposition == "age_cutoff_dropped" else "recycled"
-                        add_selection_population(
-                            progress.selection_populations,
-                            population_name=outcome_population,
-                            samples=samples,
-                        )
-                        _record_reason(progress, reason=reason, tokens=tokens)
-                        if collateral:
-                            collateral_tokens = sum(
-                                sample.response_length for sample in samples if sample.index in collateral
+                    if getattr(args, "save_debug_rollout_data", None) is not None:
+                        progress.discard_records.append(
+                            recycle_record(
+                                samples,
+                                disposition=disposition,
+                                reason_code=reason,
+                                reference_mode=args.staleness_reference,
+                                reference_version=reference,
+                                generation_completion_version=generation_completion,
+                                group_ready_version=ready,
+                                queue_put_version=queue_put,
+                                drain_version=current,
+                                train_version=train_version,
+                                bound=args.max_weight_staleness,
+                                waste=waste,
+                                collateral_indices=collateral,
                             )
-                            _record_reason(
-                                progress,
-                                reason="group_straggler_collateral",
-                                tokens=collateral_tokens,
-                                auxiliary=True,
-                            )
-                        if getattr(args, "save_debug_rollout_data", None) is not None:
-                            progress.discard_records.append(
-                                recycle_record(
-                                    samples,
-                                    disposition=disposition,
-                                    reason_code=reason,
-                                    reference_mode=args.staleness_reference,
-                                    reference_version=reference,
-                                    generation_completion_version=generation_completion,
-                                    group_ready_version=ready,
-                                    queue_put_version=queue_put,
-                                    drain_version=current,
-                                    bound=args.max_weight_staleness,
-                                    waste=waste,
-                                    collateral_indices=collateral,
-                                )
-                            )
-                        response_length_metrics.record(disposition, group)
-                        self._queue_lifecycle.finish(
-                            group,
-                            disposition=disposition,
-                            decision_version=current,
-                            rollout_id=rollout_id,
-                            reference_version=reference,
-                            bound_staleness=staleness,
                         )
-                        if disposition == "age_cutoff_dropped":
-                            progress.age_cutoff_tokens += tokens
-                            progress.stale_groups_dropped += 1
-                            self._finish_prompt(prompt_group)
-                        else:
-                            progress.stale_tokens += tokens
-                            progress.stale_groups_recycled += 1
-                            self._recycle(prompt_group)
-                        logger.info(
-                            f"Rejected stale group ({args.staleness_reference}_version={reference}, "
-                            f"current={current}, staleness={staleness} > max={args.max_weight_staleness})"
-                        )
-                        continue
+                    response_length_metrics.record(disposition, group)
+                    self._queue_lifecycle.finish(
+                        group,
+                        disposition=disposition,
+                        decision_version=current,
+                        rollout_id=rollout_id,
+                        reference_version=reference,
+                        train_version=train_version,
+                        bound_staleness=train_staleness,
+                    )
+                    if disposition == "age_cutoff_dropped":
+                        progress.age_cutoff_tokens += tokens
+                        progress.stale_groups_dropped += 1
+                        self._finish_prompt(prompt_group)
+                    else:
+                        progress.stale_tokens += tokens
+                        progress.stale_groups_recycled += 1
+                        self._recycle(prompt_group)
+                    comparison = ">=" if strict_bound else ">"
+                    logger.info(
+                        f"Rejected stale group ({args.staleness_reference}_version={reference}, "
+                        f"dequeue={current}, dequeue_staleness={dequeue_staleness} {comparison} "
+                        f"max={max_staleness}, train={train_version}, train_staleness={train_staleness})"
+                    )
+                    continue
 
             # Not gated on the bound: the bound tests one derived quantity, and every
             # arm -- including an unbounded one -- needs the decomposition.
-            # The decomposition uses the exact same start as the bound. This keeps
-            # `staleness/total` equal to the enforced quantity in every reference mode.
+            # The decomposition uses the exact same start as the bound and ends at
+            # the scheduled train version.
             span_start = reference
             have_span = ready is not None and span_start is not None
             group_pre_queue = ready - span_start if have_span else None
-            group_in_queue = current - ready if have_span else None
-            group_total = current - span_start if have_span else None
+            group_in_queue = train_version - ready if have_span else None
+            group_total = train_version - span_start if have_span else None
             for name, value in (
                 ("pre_queue", group_pre_queue),
                 ("in_queue", group_in_queue),
@@ -1931,7 +1956,7 @@ class FullyAsyncRolloutFn:
                 if value is not None and value < 0:
                     raise RuntimeError(
                         f"Negative {name} weight staleness for group: start={span_start}, "
-                        f"ready={ready}, drain={current}"
+                        f"ready={ready}, drain={current}, train={train_version}"
                     )
 
             filter_output = call_dynamic_filter(self._dynamic_filter, args, group)
@@ -1962,6 +1987,7 @@ class FullyAsyncRolloutFn:
                             group_ready_version=ready,
                             queue_put_version=queue_put,
                             drain_version=current,
+                            train_version=train_version,
                             bound=args.max_weight_staleness,
                             waste=waste,
                             detail=filter_output.reason,
@@ -1974,7 +2000,8 @@ class FullyAsyncRolloutFn:
                     decision_version=current,
                     rollout_id=rollout_id,
                     reference_version=reference,
-                    bound_staleness=group_bound_staleness,
+                    train_version=train_version,
+                    bound_staleness=group_train_staleness,
                     detail=filter_output.reason,
                 )
                 if filter_output.reason:
@@ -1992,8 +2019,6 @@ class FullyAsyncRolloutFn:
                 )
                 progress.do_print = False
 
-            if group_bound_staleness is not None:
-                trained_bound_staleness.append(group_bound_staleness)
             if group_pre_queue is not None:
                 trained_pre_queue.append(group_pre_queue)
             if group_in_queue is not None:
@@ -2020,6 +2045,7 @@ class FullyAsyncRolloutFn:
                         group_ready_version=ready,
                         queue_put_version=queue_put,
                         drain_version=current,
+                        train_version=train_version,
                         bound=args.max_weight_staleness,
                         waste={},
                     )
@@ -2030,7 +2056,8 @@ class FullyAsyncRolloutFn:
                 decision_version=current,
                 rollout_id=rollout_id,
                 reference_version=reference,
-                bound_staleness=group_bound_staleness,
+                train_version=train_version,
+                bound_staleness=group_train_staleness,
             )
             data.append(group)
             progress.group_ids.append(prompt_group_id(prompt_group))
@@ -2068,9 +2095,9 @@ class FullyAsyncRolloutFn:
             "queue/occupancy/end_groups": self._queue_size(),
             "queue/occupancy/capacity_groups": self._queue_capacity_groups(),
             "queue/occupancy/max_in_flight_groups": self._max_in_flight_groups(),
-            "queue/config/policy_is_queue_recycle": float(self._queue_policy() == LEGACY_QUEUE_POLICY),
-            "queue/config/policy_is_queue_max": float(self._queue_policy() == QUEUE_MAX_POLICY),
-            "queue/config/policy_is_queue_drop": float(self._queue_policy() == QUEUE_DROP_POLICY),
+            "queue/config/type_is_queue_recycle": float(self._queue_policy() == QUEUE_RECYCLE_POLICY),
+            "queue/config/type_is_queue_max": float(self._queue_policy() == QUEUE_MAX_POLICY),
+            "queue/config/type_is_queue_drop": float(self._queue_policy() == QUEUE_DROP_POLICY),
             "queue/config/factor": getattr(args, "fully_async_queue_factor", 1),
             "rollout/fully_async/aborted_groups_recycled": progress.aborted_groups_recycled,
             "rollout/fully_async/stale_groups_recycled": progress.stale_groups_recycled,
@@ -2118,58 +2145,26 @@ class FullyAsyncRolloutFn:
             count = progress.recycle_aux_groups.get(reason, 0)
             metrics[f"rollout/fully_async/recycle_aux/{reason}/groups"] = count
             metrics[f"rollout/fully_async/recycle_aux/{reason}/tokens"] = progress.recycle_aux_tokens.get(reason, 0)
-        if progress.current_version is not None:
-            # Logged next to the staleness itself: staleness is a difference against
-            # this version, and without it a missing staleness metric is impossible to
-            # tell apart from a router that never answered.
-            metrics["rollout/fully_async/current_weight_version"] = progress.current_version
+        if progress.train_version is not None:
+            metrics[TRAIN_WEIGHT_VERSION_METRIC] = progress.train_version
         if offered_mixed_versions:
             metrics["staleness/mixed_version_frac/rollout"] = sum(offered_mixed_versions) / len(offered_mixed_versions)
         if trained_mixed_versions:
             metrics["staleness/mixed_version_frac/train"] = sum(trained_mixed_versions) / len(trained_mixed_versions)
-        # `rollout/fully_async/{avg,max}_staleness` are upstream's and keep
-        # upstream's meaning: the lag as *offered*, counted before the bound check.
-        # Redefining them to the trained lag would leave two miles runs plotting
-        # the same key against different quantities.
-        if offered_bound_staleness:
-            metrics["rollout/fully_async/avg_staleness"] = sum(offered_bound_staleness) / len(offered_bound_staleness)
-            metrics["rollout/fully_async/max_staleness"] = max(offered_bound_staleness)
+        if rollout_staleness:
+            metrics |= {
+                f"staleness/rollout/{name}": value for name, value in _staleness_metrics(rollout_staleness).items()
+            }
 
-        # The decomposition, over the trained batch. `total` is the selected bound
-        # quantity. The two components say where it came from: `pre_queue` is the
-        # selected reference to group-ready span, and `in_queue` is queue waiting.
-        # `frac_at_bound` is absent from all three: `--max-weight-staleness` is not
-        # applied to any of them, see `staleness/bound/` below.
+        # The decomposition over the trained batch. `pre_queue` is the selected
+        # reference-to-ready span, and `in_queue` is ready-to-train staleness.
         for name, values in (
             ("total", trained_total),
             ("pre_queue", trained_pre_queue),
             ("in_queue", trained_in_queue),
         ):
             if values:
-                metrics |= {
-                    f"staleness/{name}/{key}": value for key, value in _staleness_metrics(values, None).items()
-                }
-
-        # What the bound actually tests, which depends on `--staleness-reference`:
-        #
-        #   completion (default)  current - oldest  = in_queue + the group's internal
-        #                         completion-version spread = `total` exactly.
-        #   submission            current - S       = `total` exactly.
-        #   prefill               current - first prefill = `total` exactly.
-        #
-        # Kept under its own name because it is the only quantity that explains which
-        # groups were recycled, in the two populations the bound separates: `rollout`
-        # is every group offered, counted before the check; `train` is what survived.
-        if trained_bound_staleness:
-            metrics |= {
-                f"staleness/bound/train/{name}": value
-                for name, value in _staleness_metrics(trained_bound_staleness, args.max_weight_staleness).items()
-            }
-        if offered_bound_staleness:
-            metrics |= {
-                f"staleness/bound/rollout/{name}": value
-                for name, value in _staleness_metrics(offered_bound_staleness, args.max_weight_staleness).items()
-            }
+                metrics |= {f"staleness/{name}/{key}": value for key, value in _staleness_metrics(values).items()}
 
         # Named for the reason rather than the mechanism: `stale_groups_recycled`
         # is what happened, `bound_exceeded` is why. Split from the dynamic-filter
@@ -2178,9 +2173,15 @@ class FullyAsyncRolloutFn:
         bound_exceeded_groups = progress.stale_groups_recycled + progress.stale_groups_dropped
         bound_exceeded_tokens = progress.stale_tokens + progress.age_cutoff_tokens
         metrics["staleness/bound_exceeded_groups"] = bound_exceeded_groups
+        metrics["staleness/bound_exceeded_samples"] = progress.bound_exceeded_samples
+        metrics["staleness/bound_exceeded_sample_frac"] = (
+            progress.bound_exceeded_samples / progress.bound_evaluated_samples
+            if progress.bound_evaluated_samples
+            else 0.0
+        )
         metrics["staleness/bound_exceeded_tokens"] = bound_exceeded_tokens
-        # `staleness/bound/*` means a different quantity under each reference, so the
-        # choice is logged next to it rather than left to the run config.
+        # The staleness namespaces mean a different quantity under each reference,
+        # so the choice is logged next to them rather than left to the run config.
         metrics["staleness/bound_reference_is_submission"] = float(args.staleness_reference == "submission")
         metrics["staleness/bound_reference_is_prefill"] = float(args.staleness_reference == "prefill")
 
@@ -2193,7 +2194,7 @@ class FullyAsyncRolloutFn:
             logger.warning(
                 f"Rejected {bound_exceeded_groups} groups to keep {target_data_size} at "
                 f"--max-weight-staleness {args.max_weight_staleness} "
-                f"(--staleness-reference {args.staleness_reference}, queue-policy "
+                f"(--staleness-reference {args.staleness_reference}, queue-type "
                 f"{self._queue_policy()}). If this persists, the age cap is collapsing "
                 "rollout/training overlap and discarding most generated groups."
             )

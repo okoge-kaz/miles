@@ -1,14 +1,15 @@
-"""Additive telemetry for fully-async rollout lag and discarded compute.
+"""Telemetry for fully-async train-time lag and discarded compute.
 
-The existing ``staleness/*`` metrics intentionally remain group-weighted and
-selection-time based.  This module owns new sample/token-weighted views and the
-reason-coded accounting for work that never reaches the training loss.
+Group metrics use the scheduled batch train version. This module also owns
+sample/token-weighted views and reason-coded accounting for work that never
+reaches the training loss.
 """
 
 from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Iterable
+from itertools import accumulate
 from typing import Any
 
 import numpy as np
@@ -19,6 +20,7 @@ SUBMISSION_VERSION_KEY = "submission_weight_version"
 GROUP_READY_VERSION_KEY = "group_ready_weight_version"
 QUEUE_PUT_VERSION_KEY = "queue_put_weight_version"
 DRAIN_VERSION_KEY = "drain_weight_version"
+TRAIN_VERSION_KEY = "train_weight_version"
 BOUND_REFERENCE_VERSION_KEY = "bound_reference_weight_version"
 SAMPLE_REFERENCE_VERSION_KEY = "sample_staleness_reference_weight_version"
 
@@ -41,8 +43,10 @@ REWARD_SECONDS_KEY = "fully_async_reward_seconds"
 
 GENERATED_TOKENS_KEY = "rollout/fully_async/useful_rollout/generated_tokens"
 ADMITTED_TOKENS_KEY = "rollout/fully_async/useful_rollout/admitted_tokens"
+TRAIN_WEIGHT_VERSION_METRIC = "fully_async/train_weight_version"
+EXACT_LAG_TAIL_THRESHOLDS = (1, 2, 4, 8, 16)
 
-RECYCLE_DEBUG_SCHEMA_VERSION = 2
+RECYCLE_DEBUG_SCHEMA_VERSION = 3
 SELECTION_POPULATIONS = ("generated", "admitted", "consumed", "recycled", "dropped")
 
 STALE_AT_GENERATION_COMPLETION = "stale_at_generation_completion"
@@ -84,6 +88,7 @@ _ATTEMPT_METADATA_KEYS = (
     GROUP_READY_VERSION_KEY,
     QUEUE_PUT_VERSION_KEY,
     DRAIN_VERSION_KEY,
+    TRAIN_VERSION_KEY,
     TRAJECTORY_START_TIME_KEY,
     SAMPLE_GENERATION_COMPLETE_TIME_KEY,
     GROUP_GENERATION_COMPLETE_TIME_KEY,
@@ -208,6 +213,10 @@ def group_generation_completion_version(samples: Iterable[Sample]) -> int | None
     return max(numeric) if numeric else None
 
 
+def _fails_staleness_bound(staleness: int, bound: int, *, strict_bound: bool) -> bool:
+    return staleness >= bound if strict_bound else staleness > bound
+
+
 def classify_stale_recycle_stage(
     *,
     reference_version: int | None,
@@ -216,6 +225,7 @@ def classify_stale_recycle_stage(
     queue_put_version: int | None,
     drain_version: int,
     bound: int,
+    strict_bound: bool,
 ) -> str:
     """Locate the first lifecycle boundary at which the configured bound failed."""
     if reference_version is None:
@@ -227,7 +237,11 @@ def classify_stale_recycle_stage(
         (STALE_IN_OUTPUT_QUEUE, drain_version),
     )
     for reason, version in stages:
-        if version is not None and version - reference_version > bound:
+        if version is not None and _fails_staleness_bound(
+            version - reference_version,
+            bound,
+            strict_bound=strict_bound,
+        ):
             return reason
     return STALE_STAGE_UNKNOWN
 
@@ -260,6 +274,7 @@ def straggler_collateral_indices(
     reference_mode: str,
     drain_version: int,
     bound: int,
+    strict_bound: bool,
 ) -> list[int | None]:
     """Samples that pass independently or cross only while awaiting a straggler."""
     samples = list(samples)
@@ -269,14 +284,25 @@ def straggler_collateral_indices(
         reference = sample_reference_version(sample, reference_mode)
         if reference is None:
             continue
-        passes_at_drain = drain_version - reference <= bound
+        drain_staleness = drain_version - reference
+        passes_at_drain = not _fails_staleness_bound(drain_staleness, bound, strict_bound=strict_bound)
         sample_completion = sample.metadata.get(SAMPLE_GENERATION_COMPLETE_VERSION_KEY)
+        sample_passes_at_completion = isinstance(sample_completion, int) and not _fails_staleness_bound(
+            sample_completion - reference,
+            bound,
+            strict_bound=strict_bound,
+        )
+        group_fails_at_completion = group_completion is not None and _fails_staleness_bound(
+            group_completion - reference,
+            bound,
+            strict_bound=strict_bound,
+        )
         crosses_during_group_wait = (
             isinstance(sample_completion, int)
             and group_completion is not None
             and sample_completion < group_completion
-            and sample_completion - reference <= bound
-            and group_completion - reference > bound
+            and sample_passes_at_completion
+            and group_fails_at_completion
         )
         if passes_at_drain or crosses_during_group_wait:
             collateral.append(sample.index)
@@ -294,6 +320,7 @@ def recycle_record(
     group_ready_version: int | None,
     queue_put_version: int | None,
     drain_version: int,
+    train_version: int,
     bound: int | None,
     waste: dict[str, float],
     collateral_indices: list[int | None] | None = None,
@@ -327,6 +354,7 @@ def recycle_record(
             "group_ready": group_ready_version,
             "queue_put": queue_put_version,
             "drain": drain_version,
+            "train": train_version,
         },
         "response_lengths": [sample.response_length for sample in samples],
         "generation_duration_seconds": [_sample_generation_duration(sample) for sample in samples],
@@ -350,7 +378,7 @@ def recycle_record(
             GROUP_GENERATION_COMPLETE_VERSION_KEY,
             GROUP_READY_VERSION_KEY,
         ),
-        "in_queue_staleness": _sample_phase_values(samples, GROUP_READY_VERSION_KEY, DRAIN_VERSION_KEY),
+        "in_queue_staleness": _sample_phase_values(samples, GROUP_READY_VERSION_KEY, TRAIN_VERSION_KEY),
         "queue_wait_seconds": _sample_phase_values(samples, QUEUE_PUT_TIME_KEY, DRAIN_TIME_KEY),
         "attempt_wall_seconds": max(
             (float(sample.metadata.get(ATTEMPT_WALL_SECONDS_KEY, 0.0)) for sample in samples),
@@ -400,6 +428,7 @@ def append_final_consumed_records(
         ready_versions = [sample.metadata.get(GROUP_READY_VERSION_KEY) for sample in group]
         queue_versions = [sample.metadata.get(QUEUE_PUT_VERSION_KEY) for sample in group]
         drain_versions = [sample.metadata.get(DRAIN_VERSION_KEY) for sample in group]
+        train_versions = [sample.metadata.get(TRAIN_VERSION_KEY) for sample in group]
         record = recycle_record(
             group,
             disposition="consumed",
@@ -410,6 +439,7 @@ def append_final_consumed_records(
             group_ready_version=_single_numeric_value(ready_versions),
             queue_put_version=_single_numeric_value(queue_versions),
             drain_version=_single_numeric_value(drain_versions, default=-1),
+            train_version=_single_numeric_value(train_versions, default=-1),
             bound=bound,
             waste={},
         )
@@ -495,7 +525,7 @@ def add_selection_population(
             ("pre_queue_active", TRAJECTORY_START_VERSION_KEY, SAMPLE_GENERATION_COMPLETE_VERSION_KEY),
             ("pre_queue_group_wait", SAMPLE_GENERATION_COMPLETE_VERSION_KEY, GROUP_GENERATION_COMPLETE_VERSION_KEY),
             ("pre_queue_postprocess", GROUP_GENERATION_COMPLETE_VERSION_KEY, GROUP_READY_VERSION_KEY),
-            ("in_queue_staleness", GROUP_READY_VERSION_KEY, DRAIN_VERSION_KEY),
+            ("in_queue_staleness", GROUP_READY_VERSION_KEY, TRAIN_VERSION_KEY),
             ("queue_wait_seconds", QUEUE_PUT_TIME_KEY, DRAIN_TIME_KEY),
         ):
             [value] = _sample_phase_values([sample], start_key, end_key)
@@ -546,7 +576,8 @@ def finalize_useful_rollout_metrics(
     generated_tokens = int(metrics[GENERATED_TOKENS_KEY])
     admitted_tokens = int(metrics[ADMITTED_TOKENS_KEY])
     selected_tokens = sum(sample.response_length for sample in samples)
-    loss_input_tokens = sum(_loss_input_tokens(sample) for sample in samples)
+    loss_token_counts = [_loss_input_tokens(sample) for sample in samples]
+    loss_input_tokens = sum(loss_token_counts)
     postprocess_trimmed_tokens = admitted_tokens - selected_tokens
     loss_masked_tokens = selected_tokens - loss_input_tokens
     useful_efficiency = loss_input_tokens / generated_tokens if generated_tokens else 0.0
@@ -584,9 +615,15 @@ def finalize_useful_rollout_metrics(
         )
     )
 
-    train_version = metrics.get("rollout/fully_async/current_weight_version")
+    train_version = metrics.get(TRAIN_WEIGHT_VERSION_METRIC)
     if isinstance(train_version, int):
-        metrics.update(sample_lag_metrics(samples, train_version=train_version))
+        metrics.update(
+            sample_lag_metrics(
+                samples,
+                train_version=train_version,
+                loss_token_counts=loss_token_counts,
+            )
+        )
     metrics.update(prequeue_phase_metrics(samples))
 
 
@@ -597,20 +634,28 @@ def _weighted_mean(values: list[int], weights: list[int]) -> float | None:
     return sum(value * weight for value, weight in zip(values, weights, strict=True)) / total_weight
 
 
-def _distribution_metrics(values: list[int | float]) -> dict[str, float]:
+def _distribution_metrics(
+    values: list[int | float],
+    *,
+    include_dispersion: bool = False,
+) -> dict[str, float]:
     if not values:
         return {}
     array = np.asarray(values, dtype=float)
-    return {
+    metrics = {
         "mean": float(array.mean()),
         "max": float(array.max()),
         "p50": float(np.percentile(array, 50)),
         "p90": float(np.percentile(array, 90)),
         "p99": float(np.percentile(array, 99)),
     }
+    if include_dispersion:
+        metrics["variance"] = float(array.var())
+        metrics["std"] = float(array.std())
+    return metrics
 
 
-def _weighted_distribution_metrics(weight_by_value: dict[int, int]) -> dict[str, float]:
+def _weighted_distribution_metrics(weight_by_value: dict[int, int | float]) -> dict[str, float]:
     positive = sorted((value, weight) for value, weight in weight_by_value.items() if weight > 0)
     if not positive:
         return {}
@@ -625,14 +670,40 @@ def _weighted_distribution_metrics(weight_by_value: dict[int, int]) -> dict[str,
                 return float(value)
         return float(positive[-1][0])
 
+    mean = sum(value * weight for value, weight in positive) / total
+    variance = sum(weight * (value - mean) ** 2 for value, weight in positive) / total
     return {
-        "mean": sum(value * weight for value, weight in positive) / total,
+        "mean": mean,
+        "variance": variance,
+        "std": variance**0.5,
         "max": float(positive[-1][0]),
         "p50": percentile(0.50),
         "p90": percentile(0.90),
         "p99": percentile(0.99),
         "num_tokens": float(total),
     }
+
+
+def _weighted_tail_metrics(weight_by_value: dict[int, int | float]) -> dict[str, float]:
+    total = sum(max(0, weight) for weight in weight_by_value.values())
+    if total <= 0:
+        return {}
+    return {
+        f"tail_ge_{threshold}_frac": (
+            sum(weight for value, weight in weight_by_value.items() if value >= threshold and weight > 0) / total
+        )
+        for threshold in EXACT_LAG_TAIL_THRESHOLDS
+    }
+
+
+def _add_weighted_lag_distribution(
+    metrics: dict[str, float],
+    *,
+    prefix: str,
+    lag_weights: dict[int, int | float],
+) -> None:
+    for name, value in (_weighted_distribution_metrics(lag_weights) | _weighted_tail_metrics(lag_weights)).items():
+        metrics[f"{prefix}/{name}"] = value
 
 
 def _numeric_reward(sample: Sample) -> float | None:
@@ -704,7 +775,7 @@ def _phase_component_metrics(
     generated_weights = [sample.response_length for sample, *_ in rows]
     loss_weights = [_loss_input_tokens(sample) for sample, *_ in rows]
     for component, values in components.items():
-        for name, value in _distribution_metrics(values).items():
+        for name, value in _distribution_metrics(values, include_dispersion=True).items():
             metrics[f"{prefix}/{component}/sequence_{name}"] = value
         for weighting, weights in (("generated_token", generated_weights), ("loss_token", loss_weights)):
             mean = _weighted_mean(values, weights)
@@ -766,21 +837,97 @@ def prequeue_phase_metrics(samples: list[Sample]) -> dict[str, float]:
     metrics["staleness/pre_queue_phase/selected_reference_alignment_sample_frac"] = (
         len(reference_deltas) / len(samples) if samples else 0.0
     )
-    for name, value in _distribution_metrics(reference_deltas).items():
+    for name, value in _distribution_metrics(reference_deltas, include_dispersion=True).items():
         metrics[f"staleness/pre_queue_phase/active_start_minus_selected_reference/{name}"] = value
     return metrics
 
 
-def _exact_token_lag_metrics(samples: list[Sample], train_version: int) -> dict[str, float]:
+def _version_mix_metrics(samples: list[Sample]) -> dict[str, float]:
+    """Summarize trained-sample version mixing from always-on provenance."""
+    rows: list[tuple[Sample, int]] = []
+    for sample in samples:
+        if not sample.min_forward_weight_versions or not sample.max_forward_weight_versions:
+            continue
+        minimum = min(sample.min_forward_weight_versions)
+        maximum = max(sample.max_forward_weight_versions)
+        if minimum < 0 or maximum < minimum:
+            continue
+        rows.append((sample, maximum - minimum))
+
+    total_response_tokens = sum(sample.response_length for sample in samples)
+    provenance_response_tokens = sum(sample.response_length for sample, _ in rows)
+    metrics = {
+        "staleness/version_mix/train/provenance_sample_frac": len(rows) / len(samples) if samples else 0.0,
+        "staleness/version_mix/train/provenance_response_token_frac": (
+            provenance_response_tokens / total_response_tokens if total_response_tokens else 0.0
+        ),
+    }
+    if not rows:
+        return metrics
+
+    spans = [span for _, span in rows]
+    mixed_samples = [(sample, span) for sample, span in rows if span > 0]
+    metrics["staleness/version_mix/train/mixed_sample_frac"] = len(mixed_samples) / len(rows)
+    metrics["staleness/version_mix/train/mixed_sample_response_token_frac"] = (
+        sum(sample.response_length for sample, _ in mixed_samples) / provenance_response_tokens
+        if provenance_response_tokens
+        else 0.0
+    )
+    metrics.update(
+        {
+            f"staleness/version_mix/train/forward_version_span/sequence_{name}": value
+            for name, value in _distribution_metrics(spans, include_dispersion=True).items()
+        }
+    )
+    return metrics
+
+
+def _exact_token_lag_metrics(
+    samples: list[Sample],
+    train_version: int,
+    *,
+    loss_token_counts: list[int] | None = None,
+    has_exact_segments: bool | None = None,
+) -> dict[str, float]:
+    """Measure each response token from its forward version to batch training.
+
+    Unlike ``sample_staleness``, tokens in one sample can have different lags.
+    This is exact only where compact response-version segments provide complete
+    token coverage; the coverage metrics make partial provenance explicit.
+    """
+    if has_exact_segments is None:
+        has_exact_segments = any(sample.response_weight_version_segments for sample in samples)
+    if not has_exact_segments:
+        return {
+            "staleness/token_lag/exact/covered_response_token_frac": 0.0,
+            "staleness/token_lag/exact/invalid_segments": 0.0,
+            "staleness/token_lag/exact/invalid_turns": 0.0,
+            "staleness/token_lag/exact/invalid_samples": 0.0,
+            "staleness/token_lag/exact/loss_token/covered_loss_token_frac": 0.0,
+            "staleness/token_lag/exact/loss_token/covered_sample_frac": 0.0,
+            "staleness/token_lag/exact/loss_token/invalid_loss_masks": 0.0,
+        }
+
     lag_weights: dict[int, int] = defaultdict(int)
+    loss_lag_weights: dict[int, int | float] = defaultdict(int)
+    loss_sequence_lags: list[float] = []
     covered_tokens = 0
     total_response_tokens = sum(sample.response_length for sample in samples)
+    if loss_token_counts is None:
+        loss_token_counts = [_loss_input_tokens(sample) for sample in samples]
+    elif len(loss_token_counts) != len(samples):
+        raise ValueError(f"Got {len(loss_token_counts)} loss-token counts for {len(samples)} samples")
+    total_loss_tokens = sum(loss_token_counts)
+    loss_covered_samples = 0
     invalid_segments = 0
     invalid_turns = 0
     invalid_samples = 0
-    for sample in samples:
+    invalid_loss_masks = 0
+    for sample, sample_loss_tokens in zip(samples, loss_token_counts, strict=True):
         sample_lag_weights: dict[int, int] = defaultdict(int)
+        flat_segments: list[tuple[int, int]] = []
         sample_covered_tokens = 0
+        all_turns_valid = True
         for turn_segments in sample.response_weight_version_segments:
             parsed_segments = []
             expected_start = 0
@@ -804,10 +951,13 @@ def _exact_token_lag_metrics(samples: list[Sample], train_version: int) -> dict[
 
             if not turn_is_valid:
                 invalid_turns += 1
+                all_turns_valid = False
                 continue
             for start, end, version in parsed_segments:
                 tokens = end - start
-                sample_lag_weights[train_version - version] += tokens
+                lag = train_version - version
+                sample_lag_weights[lag] += tokens
+                flat_segments.append((tokens, lag))
                 sample_covered_tokens += tokens
 
         if sample_covered_tokens > sample.response_length:
@@ -817,6 +967,39 @@ def _exact_token_lag_metrics(samples: list[Sample], train_version: int) -> dict[
             lag_weights[lag] += tokens
         covered_tokens += sample_covered_tokens
 
+        # A response-token distribution can safely use partial exact coverage.
+        # Intersecting with the loss mask requires a complete ordered mapping;
+        # otherwise a missing turn would shift every later mask position.
+        if not all_turns_valid or sample_covered_tokens != sample.response_length:
+            continue
+        loss_mask = sample.loss_mask
+        if loss_mask is not None and len(loss_mask) != sample.response_length:
+            invalid_loss_masks += 1
+            continue
+        loss_covered_samples += 1
+        if sample_loss_tokens <= 0:
+            continue
+
+        if loss_mask is None or sample_loss_tokens == sample.response_length:
+            segment_loss_tokens = [tokens for tokens, _ in flat_segments]
+        elif len(flat_segments) == 1:
+            segment_loss_tokens = [sample_loss_tokens]
+        else:
+            prefix_sums = [0, *accumulate(loss_mask)]
+            segment_loss_tokens = []
+            offset = 0
+            for tokens, _ in flat_segments:
+                segment_loss_tokens.append(prefix_sums[offset + tokens] - prefix_sums[offset])
+                offset += tokens
+
+        weighted_lag_sum = 0.0
+        for (_, lag), tokens in zip(flat_segments, segment_loss_tokens, strict=True):
+            if tokens <= 0:
+                continue
+            loss_lag_weights[lag] += tokens
+            weighted_lag_sum += lag * tokens
+        loss_sequence_lags.append(weighted_lag_sum / sample_loss_tokens)
+
     metrics = {
         "staleness/token_lag/exact/covered_response_token_frac": (
             covered_tokens / total_response_tokens if total_response_tokens else 0.0
@@ -824,18 +1007,46 @@ def _exact_token_lag_metrics(samples: list[Sample], train_version: int) -> dict[
         "staleness/token_lag/exact/invalid_segments": float(invalid_segments),
         "staleness/token_lag/exact/invalid_turns": float(invalid_turns),
         "staleness/token_lag/exact/invalid_samples": float(invalid_samples),
+        "staleness/token_lag/exact/loss_token/covered_loss_token_frac": (
+            sum(loss_lag_weights.values()) / total_loss_tokens if total_loss_tokens else 0.0
+        ),
+        "staleness/token_lag/exact/loss_token/covered_sample_frac": (
+            loss_covered_samples / len(samples) if samples else 0.0
+        ),
+        "staleness/token_lag/exact/loss_token/invalid_loss_masks": float(invalid_loss_masks),
     }
-    metrics.update(
-        {
-            f"staleness/token_lag/exact/{name}": value
-            for name, value in _weighted_distribution_metrics(lag_weights).items()
-        }
+    _add_weighted_lag_distribution(
+        metrics,
+        prefix="staleness/token_lag/exact",
+        lag_weights=lag_weights,
     )
+    _add_weighted_lag_distribution(
+        metrics,
+        prefix="staleness/token_lag/exact/loss_token",
+        lag_weights=loss_lag_weights,
+    )
+    for name, value in _distribution_metrics(loss_sequence_lags, include_dispersion=True).items():
+        metrics[f"staleness/token_lag/exact/loss_sequence/{name}"] = value
     return metrics
 
 
-def sample_lag_metrics(samples: list[Sample], *, train_version: int) -> dict[str, float]:
-    """Compute sequence/token-weighted D2 lag components over the trained rows."""
+def sample_lag_metrics(
+    samples: list[Sample],
+    *,
+    train_version: int,
+    loss_token_counts: list[int] | None = None,
+) -> dict[str, float]:
+    """Compute generation-to-training lag components over admitted samples."""
+    has_exact_segments = any(sample.response_weight_version_segments for sample in samples)
+    if loss_token_counts is None and has_exact_segments:
+        loss_token_counts = [_loss_input_tokens(sample) for sample in samples]
+    if loss_token_counts is not None and len(loss_token_counts) != len(samples):
+        raise ValueError(f"Got {len(loss_token_counts)} loss-token counts for {len(samples)} samples")
+    loss_tokens_by_sample = (
+        {id(sample): count for sample, count in zip(samples, loss_token_counts, strict=True)}
+        if loss_token_counts is not None
+        else None
+    )
     grouped: dict[int | None, list[Sample]] = defaultdict(list)
     for sample in samples:
         grouped[sample.group_index].append(sample)
@@ -859,20 +1070,32 @@ def sample_lag_metrics(samples: list[Sample], *, train_version: int) -> dict[str
     metrics: dict[str, float] = {
         "staleness/sample_lag/provenance_sample_frac": len(rows) / len(samples) if samples else 0.0,
     }
+    metrics.update(_version_mix_metrics(samples))
     if not rows:
-        metrics.update(_exact_token_lag_metrics(samples, train_version))
+        metrics.update(
+            _exact_token_lag_metrics(
+                samples,
+                train_version,
+                loss_token_counts=loss_token_counts,
+                has_exact_segments=has_exact_segments,
+            )
+        )
         return metrics
 
     components = {
         "generation": [end - start for _, start, end, _ in rows],
         "group_sync": [group_completion - end for _, _, end, group_completion in rows],
-        "train_handoff": [train_version - group_completion for _, _, _, group_completion in rows],
+        "last_forward_to_train": [train_version - group_completion for _, _, _, group_completion in rows],
         "total": [train_version - start for _, start, _, _ in rows],
     }
     generated_weights = [sample.response_length for sample, *_ in rows]
-    loss_weights = [_loss_input_tokens(sample) for sample, *_ in rows]
+    loss_weights = (
+        [loss_tokens_by_sample[id(sample)] for sample, *_ in rows]
+        if loss_tokens_by_sample is not None
+        else [_loss_input_tokens(sample) for sample, *_ in rows]
+    )
     for component, values in components.items():
-        for name, value in _distribution_metrics(values).items():
+        for name, value in _distribution_metrics(values, include_dispersion=True).items():
             metrics[f"staleness/sample_lag/{component}/sequence_{name}"] = value
         for weighting, weights in (("generated_token", generated_weights), ("loss_token", loss_weights)):
             mean = _weighted_mean(values, weights)
@@ -882,7 +1105,7 @@ def sample_lag_metrics(samples: list[Sample], *, train_version: int) -> dict[str
     metrics.update(
         {
             f"staleness/sample_lag/within_group_end_spread/{name}": value
-            for name, value in _distribution_metrics(group_spreads).items()
+            for name, value in _distribution_metrics(group_spreads, include_dispersion=True).items()
         }
     )
     total_lags = components["total"]
@@ -898,33 +1121,25 @@ def sample_lag_metrics(samples: list[Sample], *, train_version: int) -> dict[str
     if reward_corr is not None:
         metrics["staleness/sample_lag/corr_reward_total"] = reward_corr
 
-    metrics.update(_exact_token_lag_metrics(samples, train_version))
+    metrics.update(
+        _exact_token_lag_metrics(
+            samples,
+            train_version,
+            loss_token_counts=loss_token_counts,
+            has_exact_segments=has_exact_segments,
+        )
+    )
     return metrics
 
 
 def build_batch_consumption_snapshot(
     samples: list[Sample],
     *,
-    selection_version: int | None,
-    bound: int | None,
     optimizer_updates: int = 1,
     cohort_generated_tokens: int | None = None,
     has_custom_converter: bool = False,
 ) -> dict[str, Any]:
-    """Retain only compact group primitives until the trainer consumes the batch."""
-    groups: dict[int | None, list[Sample]] = defaultdict(list)
-    for sample in samples:
-        groups[sample.group_index].append(sample)
-    group_rows = []
-    for group in groups.values():
-        references = [sample.metadata.get(BOUND_REFERENCE_VERSION_KEY) for sample in group]
-        numeric = [version for version in references if isinstance(version, int)]
-        group_rows.append(
-            {
-                "reference_version": min(numeric) if numeric else None,
-                "response_tokens": sum(sample.response_length for sample in group),
-            }
-        )
+    """Retain compact throughput and wall-wait inputs until training starts."""
     queue_wait_seconds = []
     for sample in samples:
         queue_put = sample.metadata.get(QUEUE_PUT_TIME_KEY)
@@ -932,9 +1147,6 @@ def build_batch_consumption_snapshot(
         if isinstance(queue_put, (int, float)) and isinstance(drain, (int, float)) and drain >= queue_put:
             queue_wait_seconds.append(float(drain - queue_put))
     return {
-        "selection_weight_version": selection_version,
-        "bound": bound,
-        "groups": group_rows,
         "loss_input_tokens": (None if has_custom_converter else sum(_loss_input_tokens(sample) for sample in samples)),
         "queue_wait_seconds": queue_wait_seconds,
         "optimizer_updates": optimizer_updates,
@@ -945,33 +1157,10 @@ def build_batch_consumption_snapshot(
 def batch_consumption_metrics(
     snapshot: dict[str, Any],
     *,
-    train_start_version: int,
     pipeline_snapshot: dict[str, float] | None = None,
 ) -> dict[str, float | int]:
-    """Attribute bound crossings after queue selection without calling them recycled."""
-    selection_version = snapshot.get("selection_weight_version")
-    metrics = {"queue/consumption/train_start_weight_version": train_start_version}
-    if isinstance(selection_version, int):
-        gap = train_start_version - selection_version
-        if gap < 0:
-            raise RuntimeError(
-                "Applied weight version moved backwards between queue selection and training: "
-                f"selection={selection_version}, train_start={train_start_version}"
-            )
-        metrics["queue/consumption/selection_weight_version"] = selection_version
-        metrics["queue/consumption/selection_to_train_gap"] = gap
-
-    bound = snapshot.get("bound")
-    late_groups = 0
-    late_tokens = 0
-    if isinstance(bound, int):
-        for group in snapshot.get("groups", []):
-            reference = group.get("reference_version")
-            if isinstance(reference, int) and train_start_version - reference > bound:
-                late_groups += 1
-                late_tokens += int(group.get("response_tokens", 0))
-    metrics["staleness/late_stale_trained/forward_handoff_groups"] = late_groups
-    metrics["staleness/late_stale_trained/forward_handoff_tokens"] = late_tokens
+    """Summarize batch wait time and throughput inputs at consumption."""
+    metrics: dict[str, float | int] = {}
     for name, value in _distribution_metrics(snapshot.get("queue_wait_seconds", [])).items():
         metrics[f"queue/consumption/wall_wait_seconds/{name}"] = value
 
@@ -1019,6 +1208,9 @@ def pipeline_throughput_metrics(
         "throughput/completed_training_batches": float(pipeline_snapshot.get("completed_training_batches", 0.0)),
         "throughput/optimizer_updates_available": float(completed_updates_available),
         "throughput/window_accepted_loss_tokens_available": float(window_accepted_available),
+        "throughput/cumulative_accepted_loss_tokens_available": float(
+            pipeline_snapshot.get("cumulative_accepted_loss_tokens_available", False)
+        ),
         "queue/depth_time_mean": float(pipeline_snapshot.get("queue_depth_time_mean", 0.0)),
         "queue/depth_current": float(pipeline_snapshot.get("queue_depth_current", 0.0)),
         "queue/trainer_starvation_seconds": float(pipeline_snapshot.get("trainer_starvation_seconds", 0.0)),
@@ -1043,6 +1235,10 @@ def pipeline_throughput_metrics(
         )
         metrics["throughput/window_useful_efficiency"] = (
             window_accepted_tokens / generated_tokens if generated_tokens > 0.0 else 0.0
+        )
+    if pipeline_snapshot.get("cumulative_accepted_loss_tokens_available", False):
+        metrics["throughput/cumulative_accepted_loss_tokens"] = float(
+            pipeline_snapshot["cumulative_accepted_loss_tokens"]
         )
     if cohort_accepted_tokens is not None and cohort_generated_tokens is not None and cohort_generated_tokens >= 0:
         cohort_efficiency = cohort_accepted_tokens / cohort_generated_tokens if cohort_generated_tokens > 0 else 0.0

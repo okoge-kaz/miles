@@ -149,7 +149,7 @@ async def _wait_until(predicate, timeout: float = 2.0) -> None:
 
 def _queue_args(policy: str, **overrides) -> Namespace:
     policy_args = {
-        "fully_async_queue_policy": policy,
+        "fully_async_queue_type": policy,
         "fully_async_queue_factor": 1,
     }
     if policy == "queue-max":
@@ -220,15 +220,16 @@ async def test_replay_buffer_rejects_cross_policy_and_capacity_restore(monkeypat
     with pytest.raises(RuntimeError, match="queue configuration"):
         await queue_max.restore_replay_buffer_state(recycle_state)
 
-    legacy_state = copy.deepcopy(recycle_state)
-    del legacy_state["queue_config"]
+    state_without_queue_config = copy.deepcopy(recycle_state)
+    del state_without_queue_config["queue_config"]
     restored_recycle = _make_fn(
         monkeypatch,
         _queue_args("queue-recycle"),
         _DataSource(),
         lambda *args, **kwargs: None,
     )
-    await restored_recycle.restore_replay_buffer_state(legacy_state)
+    with pytest.raises(RuntimeError, match="missing required queue_config"):
+        await restored_recycle.restore_replay_buffer_state(state_without_queue_config)
 
     queue_drop = _make_fn(
         monkeypatch,
@@ -280,6 +281,7 @@ async def test_queue_drop_snapshot_applies_waiting_completion_evictions(monkeypa
                 depth_after=depth_before + 1,
             )
 
+    original._pipeline_telemetry.add_trained_batch(accepted_tokens=7, optimizer_updates=2)
     state = await original.replay_buffer_state(0)
     materialized = materialize_replay_buffer_state(state)
     ready_items = [fully_async._decode_ready_item(item) for item in materialized["ready_items"]]
@@ -289,6 +291,7 @@ async def test_queue_drop_snapshot_applies_waiting_completion_evictions(monkeypa
     assert [item[0][0].group_index for item in ready_items] == [3, 4]
     assert pending_ids == [3, 4]
     assert state["snapshot_counts"]["queue_evicted_groups"] == 2
+    assert state["pipeline_telemetry"]["accepted_loss_tokens"] == 7
     assert telemetry["queue_evicted_groups"] == 2
     assert telemetry["queue_evicted_tokens"] == 4
     assert telemetry["producer_response_lengths"]["sample_lengths"]["queue_evicted"] == [1, 1, 1, 1]
@@ -302,6 +305,7 @@ async def test_queue_drop_snapshot_applies_waiting_completion_evictions(monkeypa
     assert set(restored._pending_prompts) == {3, 4}
     assert restored._queue_evicted_groups == 2
     assert restored._queue_evicted_tokens == 4
+    assert restored._pipeline_telemetry.checkpoint_state()["accepted_loss_tokens"] == 7
     assert len(restored._producer_selection_populations["generated"]["_sample_count"]) == 8
     assert restored.data_source.buffer == []
 
@@ -712,7 +716,7 @@ async def test_ready_group_rechecks_staleness_after_resume(monkeypatch):
             await gate.wait()
         return _complete(group, 5)
 
-    args = _args(max_weight_staleness=0)
+    args = _args(max_weight_staleness=1)
     original = _make_fn(monkeypatch, args, _DataSource([_prompt_group(1), _prompt_group(2)]), first_generate)
     original._ensure_worker()
     await _wait_until(lambda: original._output.qsize() == 1 and len(original._active) == 1)
@@ -788,10 +792,10 @@ async def test_partial_drain_keeps_already_admitted_group_after_resume(monkeypat
             await gate.wait()
         return _complete(group, 5)
 
-    args = _args(rollout_batch_size=2, async_max_concurrent_samples=4, max_weight_staleness=0)
+    args = _args(rollout_batch_size=2, async_max_concurrent_samples=4, max_weight_staleness=1)
     original = _make_fn(monkeypatch, args, _DataSource([_prompt_group(1), _prompt_group(2)]), first_generate)
     drain = asyncio.create_task(original(RolloutFnTrainInput(rollout_id=0)))
-    await _wait_until(lambda: len(original._drain_progress.get(0, fully_async._DrainProgress(0)).data) == 1)
+    await _wait_until(lambda: len(original._drain_progress.get(0, fully_async._DrainProgress(0, 0)).data) == 1)
     state = await original.replay_buffer_state(0)
     drain.cancel()
     await asyncio.gather(drain, return_exceptions=True)
@@ -800,13 +804,16 @@ async def test_partial_drain_keeps_already_admitted_group_after_resume(monkeypat
     async def resumed_generate(state, group, sampling_params, evaluation=False):
         if group[0].group_index != 2:
             await gate.wait()
-        return _complete(group, 6)
+        return _complete(group, 5)
 
     restored_source = _DataSource()
     restored = _make_fn(monkeypatch, args, restored_source, resumed_generate)
     await restored.restore_replay_buffer_state(state)
-    restored._weight_version = _Version(6)
-    restored.commit_applied_weight_version(6)
+    # A partial drain resumes with the model checkpoint that scheduled its fixed
+    # train version. Advancing to version 6 here would change T_b halfway through
+    # the same batch, which is not a valid resume sequence.
+    restored._weight_version = _Version(5)
+    restored.commit_applied_weight_version(5)
 
     output = await restored(RolloutFnTrainInput(rollout_id=0))
     assert {group[0].group_index for group in output.samples} == {1, 2}
@@ -1184,16 +1191,11 @@ def test_save_replay_buffer_does_not_reread_payload_for_checksum(tmp_path: Path,
     assert path.stat().st_size == size
 
 
-def test_load_replay_buffer_accepts_legacy_schema_one(tmp_path: Path):
+def test_load_replay_buffer_does_not_search_old_filename(tmp_path: Path):
     state = {
         **_codec_state([], ReplayBufferSampleEncoder().finish()),
         "schema_version": 1,
         "checkpoint_rollout_id": 7,
-        "value": "legacy",
-        # Legacy schemas are always rollout buffers, even if a producer wrote
-        # unknown extra fields before schema 4 assigned them semantics.
-        "replay_buffer_type": "inflight",
-        "inflight_items": [{}],
     }
     state.pop(SAMPLE_CODEC_STATE_KEY)
     path = tmp_path / "rollout" / "fully_async_state_7.pt"
@@ -1205,26 +1207,13 @@ def test_load_replay_buffer_accepts_legacy_schema_one(tmp_path: Path):
         encoding="utf-8",
     )
 
-    loaded = load_replay_buffer(tmp_path, 7, expected_fingerprint="dataset-a")
-    assert loaded["value"] == "legacy"
-    assert loaded["replay_buffer_type"] == "rollout"
-    assert loaded["inflight_items"] == []
-    with pytest.raises(RuntimeError, match="resume with --use-replay-buffer"):
-        ensure_no_replay_buffer(tmp_path, 7)
+    with pytest.raises(FileNotFoundError, match="replay_buffer_7.pt"):
+        load_replay_buffer(tmp_path, 7, expected_fingerprint="dataset-a")
 
 
-def test_load_replay_buffer_accepts_legacy_schema_two_with_monolithic_arrays(tmp_path: Path):
-    sample = Sample(tokens=[1, 2, 3], rollout_log_probs=[-1.0, -2.0, -3.0])
-    encoder = ReplayBufferSampleEncoder()
-    group_state = encoder.encode_group([sample])
-    codec = encoder.finish()
-    codec["version"] = 1
-    codec["arrays"] = {
-        field: torch.cat(codec["arrays"][field]) if codec["arrays"][field] else torch.empty(0, dtype=spec.torch_dtype)
-        for field, spec in codec_module._PACKED_FIELDS.items()
-    }
+def test_load_replay_buffer_rejects_old_schema(tmp_path: Path):
     state = {
-        **_codec_state(group_state, codec),
+        **_codec_state([], ReplayBufferSampleEncoder().finish()),
         "schema_version": 2,
         "checkpoint_rollout_id": 8,
     }
@@ -1237,10 +1226,8 @@ def test_load_replay_buffer_accepts_legacy_schema_two_with_monolithic_arrays(tmp
         encoding="utf-8",
     )
 
-    loaded = load_replay_buffer(tmp_path, 8, expected_fingerprint="dataset-a")
-    [sample_state] = loaded["pending_prompts"][0]
-    assert sample_state["tokens"] == sample.tokens
-    assert sample_state["rollout_log_probs"] == sample.rollout_log_probs
+    with pytest.raises(RuntimeError, match="Unsupported replay-buffer manifest"):
+        load_replay_buffer(tmp_path, 8, expected_fingerprint="dataset-a")
 
 
 def test_dataset_fingerprint_includes_model_tokenizer_and_chat_template(tmp_path: Path):

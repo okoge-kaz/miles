@@ -522,12 +522,9 @@ class TestGenerate:
             captured.append(input)
             return RolloutFnTrainOutput(
                 samples=[make_samples_grouped(n_groups=2, group_size=4)],
-                metrics={"my_metric": 1.23, "rollout/fully_async/current_weight_version": 3},
+                metrics={"my_metric": 1.23, "fully_async/train_weight_version": 3},
                 debug_metadata={"schema_version": 1, "records": [{"attempt_id": 9}]},
             )
-
-        async def current_applied_weight_version():
-            return 4
 
         completed_training = []
 
@@ -542,29 +539,27 @@ class TestGenerate:
                 "optimizer_updates": float(optimizer_updates),
             }
 
-        fake_rollout_fn.current_applied_weight_version = current_applied_weight_version
         fake_rollout_fn.complete_trained_batch_telemetry_on_loop = complete_trained_batch_telemetry_on_loop
         manager.generate_rollout = fake_rollout_fn
 
-        result = await manager.generate(rollout_id=42)
+        result = await manager.generate(rollout_id=42, updates_before_train=1)
 
         assert manager.rollout_id == 42
         assert len(captured) == 1
         assert isinstance(captured[0], RolloutFnTrainInput)
         assert captured[0].rollout_id == 42
+        assert captured[0].updates_before_train == 1
         assert len(captured_dump_metadata) == 1
         rollout_debug = captured_dump_metadata[0]["rollout_fn_debug"]
         assert rollout_debug["schema_version"] == 1
         assert rollout_debug["records"] == [{"attempt_id": 9}]
         recycle_debug = rollout_debug["recycle_compute"]
-        assert recycle_debug["schema_version"] == 2
+        assert recycle_debug["schema_version"] == 3
         assert all(record["disposition"] == "consumed" for record in recycle_debug["records"])
         assert all(record["training_step"] == 42 for record in recycle_debug["records"])
         assert sum(len(record["sample_indices"]) for record in recycle_debug["records"]) == 8
         consumption = await manager.record_batch_consumption(42)
-        assert consumption["selection_weight_version"] == 3
-        assert consumption["train_start_weight_version"] == 4
-        assert consumption["extra_metrics"]["queue/consumption/selection_to_train_gap"] == 1
+        assert consumption["extra_metrics"]["throughput/accepted_loss_tokens"] == 32
         assert captured_consumption == [consumption]
         await manager.record_batch_trained(42, actor_trained=True)
         assert completed_training == [(32, 1)]

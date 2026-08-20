@@ -45,7 +45,7 @@ length*, they are long-context single-step tasks, not multi-turn ones.
 So the controlled comparison for the multi-turn axis is:
 
 ```
-dapo-math-17k, single turn          →  math_sync recipe
+dapo-math-17k, single turn          →  math/sync recipe
 dapo-math-17k, ReTool multi-turn    →  tool_multiturn recipe, --generate-max-turns N
 ```
 

@@ -145,34 +145,37 @@ Since 2026-08-09 the missing interval is measured, and the logged staleness is a
 decomposition rather than one number. `_generate_group` reads the current version
 before generating and stamps it on the group (`fully_async_rollout.py:64-90`, the
 same idea as multi-LoRA's `metadata["slot_version"]`,
-`multi_lora/async_rollout.py:141-146`). With **S** at submission, **Q** at queue
-entry and **C** at drain, over the trained batch:
+`multi_lora/async_rollout.py:141-146`). With **S** as the selected reference,
+**Q** at group-ready, **D** at dequeue, and **T** at training:
 
 | key | quantity |
 |---|---|
-| `staleness/pre_queue/*` | `Q - S` — updates crossed while generating |
-| `staleness/in_queue/*` | `C - Q` — updates crossed while waiting to be trained on |
-| `staleness/total/*` | `C - S` = `pre_queue + in_queue` |
+| `staleness/pre_queue/*` | `Q - S` — updates crossed before generation/reward/finalization made the group ready |
+| `staleness/in_queue/*` | `T - Q` — updates crossed from ready to training |
+| `staleness/total/*` | `T - S` = `pre_queue + in_queue` |
+| `staleness/rollout/*` | `T* - S` — would-be train staleness before admission |
 
 The names are Applied Compute's PQS/IQS
 ([staleness in fully-async RL](https://www.appliedcompute.com/research/staleness-in-fully-async-rl)).
-Q is the group's *newest* sample, because a group enters the queue when its
-slowest sample lands — see `notes/telemetry.md` for why keying on the oldest
-inverts the split. None of the three is gated on `MAX_WEIGHT_STALENESS`, and all
-three are absent when the router never answers, deliberately: a zero there would
-read as "nothing crossed" exactly when the instrument is broken.
+Q is stamped only after the complete group has finished generation, reward, and
+finalization. It can exceed the group's last-forward version if a weight update
+lands during post-forward work. See `notes/telemetry.md` for the exact boundaries.
+The accepted-group decomposition is emitted whether or not a
+bound is configured, but a group rejected by the bound or dynamic filter does
+not enter it. The metrics are absent when their provenance is unavailable; a
+zero there would incorrectly mean that no update was crossed.
 
-`staleness/bound/{rollout,train}/*` is a fourth quantity: what
-`--max-weight-staleness` was tested against. **`--staleness-reference` selects
-which:** `completion` (default) tests `C - oldest`, i.e. `in_queue` plus the
-group's internal version spread — it does not cover the generation; `submission`
-tests `C - S`, i.e. `total` exactly. The flag changes only what is enforced, never
-what is measured, and it is in the checkpoint path
+For `queue-recycle`, `--max-weight-staleness` admits `D-S < max`; with one
+scheduled update before training this is equivalent to `T-S <= max`.
+The bound must be at least 1 because the nonnegative dequeue gap cannot satisfy
+the strict rule at 0, not because of startup. Startup has `T=D`; normal
+prefetched batches have `T=D+1`.
+`--staleness-reference` selects `S`. The flag is in the checkpoint path
 (`max-weight-staleness-<s>-from-submission`) because it changes which groups are
 recycled. A tight bound under `submission` collapses throughput to the
 synchronous condition rather than hanging -- see `notes/telemetry.md`.
 
-**`total` is the number a staleness claim is about, and `pre_queue` is the one to
+**`total` is the train-time number a staleness claim is about, and `pre_queue` is the one to
 read first.** If `pre_queue` is materially non-zero the arms are separated by less
 off-policy distance than their `MAX_WEIGHT_STALENESS` labels claim, because the
 bound never sees it.
@@ -229,7 +232,7 @@ what decides the fate of in-flight generation there:
 
 Why the two never coexist:
 
-| | colocated (`math_sync`) | fully-async (`math_async`) |
+| | colocated (`math/sync`) | fully-async (`math/async`) |
 |---|---|---|
 | end of a rollout batch | `abort()` kills everything in flight; `--partial-rollout` decides carry-over vs discard | no such boundary — the worker generates continuously and nothing calls `abort()` |
 | weight update | nothing is generating by then, so the pause mode is moot | the *only* interruption; `--pause-generation-mode` decides |
@@ -314,7 +317,7 @@ part of the configuration rather than a variable.
 | variable | flag / env | values | affects |
 |---|---|---|---|
 | weight staleness | `MAX_WEIGHT_STALENESS` | 1, 2, 4, 1000000 (= effectively unbounded, see below) | both |
-| what the bound measures from | `STALENESS_REFERENCE` | `completion` (default), `submission` | both |
+| what the bound measures from | `STALENESS_REFERENCE` | `prefill` (current study), `completion`, `submission` | both |
 | minibatch reuse | `NUM_STEPS_PER_ROLLOUT` | 1, 2, 4 | both |
 | generation concurrency | `ASYNC_MAX_CONCURRENT_SAMPLES` | 1×, 2×, 4× `rollout_batch × n` | both |
 | in-flight fate at weight update | `PAUSE_GENERATION_MODE` | `retract`, `in_place`, `abort` | both |
@@ -339,7 +342,7 @@ off-policy looks better than it is. Compare at equal length, and record
 | variable | value | why |
 |---|---|---|
 | `GLOBAL_BATCH_SIZE`, `N_SAMPLES_PER_PROMPT`, `ROLLOUT_BATCH_SIZE` | prior-work values | see the dataset README; not a research question here |
-| dynamic sampling | **off**, and no over-sampling | `--dynamic-sampling-filter-path` is not passed, and `--over-sampling-batch-size` is left to default to `rollout_batch_size`. The prompt set is already filtered offline to a 10–80% pass-rate window (`dapo-math-p10-90`, see `src/difficulty_filter/`), which is where the online filter's value went. Keeping it off also removes the only source of discarded generation from the colocated reference arm: the rollout loop tops up by a whole `over_sampling_batch_size` whenever the filter rejects a group (`inference_rollout_train.py:101-104`), and the surplus is what `abort()` throws away at the batch boundary. With the filter off, `pendings` drains to zero, `abort()` has nothing to discard, and the reference arm's wall-clock contains no wasted generation for the off-policy arms to be compared against |
+| dynamic sampling | **off**, and no over-sampling | `--dynamic-sampling-filter-path` is not passed, and `--over-sampling-batch-size` is left to default to `rollout_batch_size`. The prompt set is already filtered offline to a 10–80% pass-rate window (`dapo-math-p10-90`, see `tools/difficulty_filter/`), which is where the online filter's value went. Keeping it off also removes the only source of discarded generation from the colocated reference arm: the rollout loop tops up by a whole `over_sampling_batch_size` whenever the filter rejects a group (`inference_rollout_train.py:101-104`), and the surplus is what `abort()` throws away at the batch boundary. With the filter off, `pendings` drains to zero, `abort()` has nothing to discard, and the reference arm's wall-clock contains no wasted generation for the off-policy arms to be compared against |
 | R3 (MoE) | always on | removes routing mismatch; MoE RL is known to collapse without it |
 | verifier (`RM_TYPE`) | per checkpoint | correctness, not a knob |
 | temperature, KL coefficient | 1.0, 0 | matches DAPO |
@@ -369,21 +372,15 @@ the fact**, or sample-efficiency claims cannot be made later without rerunning:
 | optimizer steps | `rollout_id × num_steps_per_rollout` |
 | samples consumed | `rollout_batch × n_samples` per rollout. With dynamic sampling off there is nothing else to add on the colocated side; on the fully-async side, generation is still discarded by the staleness bound and by weight-update aborts, counted in tokens by `rollout/fully_async/{stale,aborted,dynamic_filter}_tokens` and `wasted_token_frac` |
 | tokens generated | `dump/response_length_mean × samples`, and `perf/*` from `ray/rollout/metrics.py` |
-| realised staleness | `staleness/total/*` (the whole distance), split into `staleness/pre_queue/*` and `staleness/in_queue/*`. `staleness/bound/{rollout,train}/*` is what the cap tested; `rollout/fully_async/{avg,max}_staleness` is the offered form of that. **Not** `dump/mixed_version_frac` — structurally 0 here, see "The bound measures queue residency" |
+| realised staleness | `staleness/total/*` (the accepted train-time distance), split into `staleness/pre_queue/*` and `staleness/in_queue/*`; `staleness/rollout/*` is the would-be train-time distribution before admission, and `staleness/bound_exceeded_*` directly counts max-staleness rejection. **Not** `dump/mixed_version_frac` — structurally 0 here, see "The bound measures queue residency" |
 | realised drift | `dump/mean_abs_lp_diff`, per-sample `mean_imp_ratio` |
 | wasted generation | `rollout/fully_async/aborted_groups_recycled`, `stale_groups_recycled` |
 
 The staleness bound is a *cap*, not the realised value — always report
-`avg_staleness` next to the setting, or a plateau in the results will be
-misread as insensitivity when it was actually the bound never binding.
-
-**The bound's own metric is gated on the bound being set.**
-`fully_async_rollout.py:407` only measures `staleness/bound/{rollout,train}/*`
-when `args.max_weight_staleness is not None`, so an arm run with the bound unset
-would have no record of what the cap would have seen. Run that arm with a bound
-so large it never binds (`MAX_WEIGHT_STALENESS=1000000`) rather than unsetting it.
-`staleness/{total,pre_queue,in_queue}/*` are not gated this way and appear either
-way.
+`staleness/total/mean` and the direct `staleness/bound_exceeded_sample_frac`
+next to the setting, or a plateau can be misread as insensitivity when the bound
+simply never binds. `staleness/rollout/*` is emitted even when the bound is
+unset; the direct rejection counters are then zero.
 
 ## Future work, deliberately out of scope
 
@@ -567,12 +564,14 @@ rejects it outright), and `IS_CORRECTION=mis` without a `MIS_PROFILE`.
 `on-policy` iff `MAX_WEIGHT_STALENESS == 0` **and** `NUM_STEPS_PER_ROLLOUT == 1`.
 Those are the two ways a sample goes off-policy: generated under older weights,
 or reused across more than one optimizer step. The test is placement-independent
--- an async run pinned to staleness 0 with one step per rollout is genuinely
-on-policy, and a colocated run at 4 steps per rollout genuinely is not.
+-- an async `queue-max` run pinned to staleness 0 with one step per rollout is
+genuinely on-policy, and a colocated run at 4 steps per rollout genuinely is not.
+`queue-recycle` cannot use the zero endpoint because its strict dequeue rule
+would admit no group; its minimum bound is 1.
 
 ### `PLACEMENT`
 
-`colocated` or `async`. `math_sync` passes `--colocate` and never passes
+`colocated` or `async`. `math/sync` passes `--colocate` and never passes
 `--max-weight-staleness` or `--pause-generation-mode`, so `run_identity.sh`
 forces those to `0` and `none` and *errors* if the caller set them -- otherwise
 a colocated point in a staleness sweep would land in a directory claiming a

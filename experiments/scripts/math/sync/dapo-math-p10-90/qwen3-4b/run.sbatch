@@ -10,7 +10,7 @@
 
 set -euo pipefail
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
+REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../../../.." &>/dev/null && pwd)}"
 export HF_CKPT_DIR="${QWEN3_4B_BASE_HF_ROOT:-/lustre/fsw/portfolios/coreai/users/kfujii/checkpoints/huggingface/Qwen3-4B-Base/LR2.0e-5-SEQ32768-GBS128-MBS1-TP1-PP1-CP1-EP1-PACK1-standard-cp-STEPS4000}"
 source "${REPO_ROOT}/experiments/env.sh"
 
@@ -132,4 +132,4 @@ srun \
     --container-writable \
     --no-container-mount-home \
     --export=ALL \
-    bash /root/miles/experiments/math_sync/dapo-math-p10-90/qwen3-4b/train.sh
+    bash /root/miles/experiments/scripts/math/sync/dapo-math-p10-90/qwen3-4b/train.sh

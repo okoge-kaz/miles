@@ -32,7 +32,7 @@ def main() -> None:
             report["rollout_metrics"][index] = select(
                 values,
                 (
-                    "rollout/fully_async/current_weight_version",
+                    "fully_async/train_weight_version",
                     "staleness/mixed_version_frac/rollout",
                     "staleness/mixed_version_frac/train",
                     "staleness/total/mean",
@@ -74,11 +74,7 @@ def main() -> None:
     if args.ray_log_root:
         texts = []
         for path in args.ray_log_root.rglob("*"):
-            if (
-                path.is_symlink()
-                or not path.name.startswith("worker-")
-                or path.suffix not in {".out", ".err"}
-            ):
+            if path.is_symlink() or not path.name.startswith("worker-") or path.suffix not in {".out", ".err"}:
                 continue
             try:
                 if path.is_file():

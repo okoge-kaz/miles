@@ -181,7 +181,7 @@ or stage:
 
 Otherwise run `experiments/setup/stage_all.sh`,
 `experiments/setup/prepare_search_r1.sbatch`, and the resumable
-`experiments/src/difficulty_filter/run_measure_search_r1.sbatch` on the new
+`experiments/tools/difficulty_filter/run_measure_search_r1.sbatch` on the new
 environment. Verify checksums before measuring; the fixed difficulty set is
 part of the experiment definition.
 

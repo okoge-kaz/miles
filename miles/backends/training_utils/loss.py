@@ -15,7 +15,7 @@ from miles.utils.audit_utils.event_logger.models import TrainAdvantageComputatio
 from miles.utils.multi_lora import is_multi_lora_enabled
 from miles.utils.types import RolloutBatch
 
-_STALENESS_GRADIENT_PART_PREFIX = "_staleness_gradient_part/"
+_SAMPLE_STALENESS_PART_PREFIX = "_sample_staleness_part/"
 
 
 def _pack_logging_values(
@@ -27,10 +27,10 @@ def _pack_logging_values(
     """Keep the historical vector unchanged and isolate opt-in diagnostics."""
 
     standard_metrics = {
-        key: value for key, value in metrics.items() if not key.startswith(_STALENESS_GRADIENT_PART_PREFIX)
+        key: value for key, value in metrics.items() if not key.startswith(_SAMPLE_STALENESS_PART_PREFIX)
     }
     diagnostic_metrics = {
-        key: value for key, value in metrics.items() if key.startswith(_STALENESS_GRADIENT_PART_PREFIX)
+        key: value for key, value in metrics.items() if key.startswith(_SAMPLE_STALENESS_PART_PREFIX)
     }
     detached_values = [
         value.detach() if isinstance(value, torch.Tensor) else value for value in (count, *standard_metrics.values())

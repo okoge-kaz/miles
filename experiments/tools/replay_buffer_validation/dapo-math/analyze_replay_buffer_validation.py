@@ -13,8 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 
-from experiments.src.offpolicy_acceleration import log_source
-
+from experiments.tools.replay_buffer_validation import log_parser
 
 JOB_SPECS = (
     ("rollout_fresh", "ROLLOUT_FRESH_JOB", "rollout", "fresh"),
@@ -158,8 +157,8 @@ def parse_segment(name: str, job_id: str, buffer_type: str, phase: str, log_dir:
             missing_config_args=[],
         )
 
-    text = log_source.ANSI.sub("", path.read_text(errors="replace"))
-    records = log_source.merge_step_records(log_source.parse_log(path))
+    text = log_parser.ANSI.sub("", path.read_text(errors="replace"))
+    records = log_parser.merge_step_records(log_parser.parse_log(path))
     rollout_records = [record for record in records if record["step_key"] == "rollout/step"]
     train_records = [record for record in records if record["step_key"] == "train/step"]
     trained_records = [
@@ -210,7 +209,7 @@ def parse_segment(name: str, job_id: str, buffer_type: str, phase: str, log_dir:
         "--n-samples-per-prompt 16",
         "--global-batch-size 3072",
         "--num-steps-per-rollout 1",
-        "--fully-async-queue-policy queue-recycle",
+        "--fully-async-queue-type queue-recycle",
         "--rm-type deepscaler",
         "--zero-reward-on-truncated",
         "--max-weight-staleness 8",
@@ -243,9 +242,9 @@ def parse_segment(name: str, job_id: str, buffer_type: str, phase: str, log_dir:
         rollout_times=metric_values(trained_records, "perf/rollout_time"),
         step_times=metric_values(trained_records, "perf/step_time"),
         train_wait_times=metric_values(trained_records, "perf/train_wait_time"),
-        trained_staleness_means=metric_values(trained_records, "staleness/bound/train/mean"),
-        trained_staleness_maxes=metric_values(trained_records, "staleness/bound/train/max"),
-        offered_staleness_maxes=metric_values(trained_records, "staleness/bound/rollout/max"),
+        trained_staleness_means=metric_values(trained_records, "staleness/total/mean"),
+        trained_staleness_maxes=metric_values(trained_records, "staleness/total/max"),
+        offered_staleness_maxes=metric_values(trained_records, "staleness/rollout/max"),
         bound_exceeded_groups=metric_values(trained_records, "staleness/bound_exceeded_groups"),
         saves=saves,
         loads=loads,
@@ -325,12 +324,7 @@ def render_resume_table(segments: list[Segment]) -> list[str]:
 def render_comparison(segments: list[Segment]) -> list[str]:
     by_name = {segment.name: segment for segment in segments}
     saves = {
-        buffer_type: [
-            save
-            for segment in segments
-            if segment.buffer_type == buffer_type
-            for save in segment.saves
-        ]
+        buffer_type: [save for segment in segments if segment.buffer_type == buffer_type for save in segment.saves]
         for buffer_type in ("rollout", "inflight")
     }
 
@@ -348,10 +342,7 @@ def render_comparison(segments: list[Segment]) -> list[str]:
 
     def metric_by_buffer(field: str, buffer_type: str) -> list[float]:
         return [
-            value
-            for segment in segments
-            if segment.buffer_type == buffer_type
-            for value in getattr(segment, field)
+            value for segment in segments if segment.buffer_type == buffer_type for value in getattr(segment, field)
         ]
 
     def indexed_or_none(values: list[float], index: int) -> float | None:
@@ -434,12 +425,16 @@ def render_comparison(segments: list[Segment]) -> list[str]:
         ),
         (
             "resume load + first rollout wait (s)",
-            rollout_load_total + rollout_first_wait
-            if rollout_load_total is not None and rollout_first_wait is not None
-            else None,
-            inflight_load_total + inflight_first_wait
-            if inflight_load_total is not None and inflight_first_wait is not None
-            else None,
+            (
+                rollout_load_total + rollout_first_wait
+                if rollout_load_total is not None and rollout_first_wait is not None
+                else None
+            ),
+            (
+                inflight_load_total + inflight_first_wait
+                if inflight_load_total is not None and inflight_first_wait is not None
+                else None
+            ),
         ),
         (
             "resume first rollout wait (s)",
@@ -453,30 +448,30 @@ def render_comparison(segments: list[Segment]) -> list[str]:
         ),
         (
             "resume train wait mean (s)",
-            statistics.fmean(by_name["rollout_resume"].train_wait_times)
-            if by_name["rollout_resume"].train_wait_times
-            else None,
-            statistics.fmean(by_name["inflight_resume"].train_wait_times)
-            if by_name["inflight_resume"].train_wait_times
-            else None,
+            (
+                statistics.fmean(by_name["rollout_resume"].train_wait_times)
+                if by_name["rollout_resume"].train_wait_times
+                else None
+            ),
+            (
+                statistics.fmean(by_name["inflight_resume"].train_wait_times)
+                if by_name["inflight_resume"].train_wait_times
+                else None
+            ),
         ),
         (
             "fresh raw reward mean",
-            statistics.fmean(by_name["rollout_fresh"].raw_rewards)
-            if by_name["rollout_fresh"].raw_rewards
-            else None,
-            statistics.fmean(by_name["inflight_fresh"].raw_rewards)
-            if by_name["inflight_fresh"].raw_rewards
-            else None,
+            statistics.fmean(by_name["rollout_fresh"].raw_rewards) if by_name["rollout_fresh"].raw_rewards else None,
+            statistics.fmean(by_name["inflight_fresh"].raw_rewards) if by_name["inflight_fresh"].raw_rewards else None,
         ),
         (
             "resume raw reward mean",
-            statistics.fmean(by_name["rollout_resume"].raw_rewards)
-            if by_name["rollout_resume"].raw_rewards
-            else None,
-            statistics.fmean(by_name["inflight_resume"].raw_rewards)
-            if by_name["inflight_resume"].raw_rewards
-            else None,
+            statistics.fmean(by_name["rollout_resume"].raw_rewards) if by_name["rollout_resume"].raw_rewards else None,
+            (
+                statistics.fmean(by_name["inflight_resume"].raw_rewards)
+                if by_name["inflight_resume"].raw_rewards
+                else None
+            ),
         ),
     )
     lines = [
@@ -523,9 +518,7 @@ def audit(segments: list[Segment], manifest: dict[str, str]) -> list[str]:
         if effective_start is None and segment.rollout_steps:
             effective_start = segment.rollout_steps[0]
         if effective_start != expected_start:
-            failures.append(
-                f"{segment.name}: start_rollout_id={effective_start}, expected {expected_start}"
-            )
+            failures.append(f"{segment.name}: start_rollout_id={effective_start}, expected {expected_start}")
         if segment.rollout_steps != expected_steps:
             failures.append(f"{segment.name}: rollout steps={segment.rollout_steps}, expected {expected_steps}")
         if segment.train_steps != expected_steps:
@@ -535,9 +528,7 @@ def audit(segments: list[Segment], manifest: dict[str, str]) -> list[str]:
         if segment.entry_epoch is None:
             failures.append(f"{segment.name}: RL entry timestamp missing")
         if segment.first_rollout_wall_seconds is None or segment.first_rollout_wall_seconds < 0:
-            failures.append(
-                f"{segment.name}: invalid entry-to-rollout time {segment.first_rollout_wall_seconds}"
-            )
+            failures.append(f"{segment.name}: invalid entry-to-rollout time {segment.first_rollout_wall_seconds}")
         if segment.first_train_wall_seconds is None or segment.first_train_wall_seconds < 0:
             failures.append(f"{segment.name}: invalid entry-to-train time {segment.first_train_wall_seconds}")
         if len(segment.saves) != expected_count:
@@ -565,9 +556,7 @@ def audit(segments: list[Segment], manifest: dict[str, str]) -> list[str]:
             else:
                 metrics = segment.resume_metrics
                 if metrics["prepared_batches_restored"] < 1 or metrics["warm_prepared_batch_hit"] != 1:
-                    failures.append(
-                        f"{segment.name}: prepared replay batch was not restored and reused: {metrics}"
-                    )
+                    failures.append(f"{segment.name}: prepared replay batch was not restored and reused: {metrics}")
                 expected_current_version = metrics["applied_weight_version_restored"] + 1
                 if metrics["current_applied_weight_version"] != expected_current_version:
                     failures.append(
@@ -582,11 +571,7 @@ def audit(segments: list[Segment], manifest: dict[str, str]) -> list[str]:
                     failures.append(f"{segment.name}: inflight replay restored no partial generation state")
         if segment.phase == "resume" and len(segment.loads) != 1:
             failures.append(f"{segment.name}: replay-buffer loads={len(segment.loads)}, expected 1")
-        if (
-            segment.phase == "resume"
-            and len(segment.loads) == 1
-            and segment.loads[0].rollout_id != fresh_count - 1
-        ):
+        if segment.phase == "resume" and len(segment.loads) == 1 and segment.loads[0].rollout_id != fresh_count - 1:
             failures.append(
                 f"{segment.name}: loaded rollout={segment.loads[0].rollout_id}, expected {fresh_count - 1}"
             )
@@ -611,13 +596,9 @@ def audit(segments: list[Segment], manifest: dict[str, str]) -> list[str]:
                 failures.append(f"{segment.name}: {metric_name}={len(values)}, expected {expected_count}")
             elif not all(math.isfinite(value) for value in values):
                 failures.append(f"{segment.name}: {metric_name} contains a non-finite value")
-        invalid_trained_staleness = [
-            value for value in segment.trained_staleness_maxes if value < 0 or value > 8
-        ]
+        invalid_trained_staleness = [value for value in segment.trained_staleness_maxes if value < 0 or value > 8]
         if invalid_trained_staleness:
-            failures.append(
-                f"{segment.name}: trained staleness exceeded [0, 8]: {invalid_trained_staleness}"
-            )
+            failures.append(f"{segment.name}: trained staleness exceeded [0, 8]: {invalid_trained_staleness}")
         if segment.grad_norms and not any(value > 0 for value in segment.grad_norms):
             failures.append(f"{segment.name}: no positive gradient norm: {segment.grad_norms}")
         if segment.learning_rates and not all(value > 0 for value in segment.learning_rates):
@@ -630,9 +611,7 @@ def audit(segments: list[Segment], manifest: dict[str, str]) -> list[str]:
         fresh_paths = by_name[f"{buffer_type}_fresh"].checkpoint_paths
         resume_paths = by_name[f"{buffer_type}_resume"].checkpoint_paths
         if len(fresh_paths) == 1 and len(resume_paths) == 1 and fresh_paths[0] != resume_paths[0]:
-            failures.append(
-                f"{buffer_type}: fresh/resume checkpoint mismatch: {fresh_paths[0]} != {resume_paths[0]}"
-            )
+            failures.append(f"{buffer_type}: fresh/resume checkpoint mismatch: {fresh_paths[0]} != {resume_paths[0]}")
     rollout_paths = by_name["rollout_fresh"].checkpoint_paths
     inflight_paths = by_name["inflight_fresh"].checkpoint_paths
     if len(rollout_paths) == 1 and len(inflight_paths) == 1 and rollout_paths[0] == inflight_paths[0]:

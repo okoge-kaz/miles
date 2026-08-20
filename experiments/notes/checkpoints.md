@@ -108,7 +108,7 @@ so it biases `S` in the direction of the effect being measured -- roughly 1% on 
 `--save-interval` stays at 20. It is sized by preemption, not by analysis: 4h of
 wall-clock is about 98 rollouts, so 20 caps redone work at ~50 min.
 
-The current `math_async/.../run.sbatch` defaults to `SAVE_INTERVAL=10`,
+The current `math/async/.../run.sbatch` defaults to `SAVE_INTERVAL=10`,
 `SAVE_RETAIN_INTERVAL=100`, and `HF_SAVE_INTERVAL=10`, matching the sizing
 argument above. Historical convergence-sweep jobs used `HF_SAVE_INTERVAL=5`
 (verified on job 15319206's command line), so do not reinterpret those runs as

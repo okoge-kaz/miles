@@ -1,4 +1,4 @@
-# math_async / dapo-math-p10-90
+# math/async / dapo-math-p10-90
 
 DAPO-Math-17K を step-4000 Qwen3-4B policy で難易度フィルタした 10,778 問の
 上での fully-async GRPO。**dynamic sampling は行わない**（§4.0）。学習中の
@@ -12,7 +12,7 @@ DAPO-Math-17K を step-4000 Qwen3-4B policy で難易度フィルタした 10,77
 
 > **このファイルだけ日本語。** 他の全 README は英語のまま。contract 側は本ファイルを
 > 型の worked example として名指ししているので、型（3部構成）は保っている。
-> 対になる `math_sync/dapo-math-p10-90/README.md` は未作成（§10-1）。
+> 対になる `math/sync/dapo-math-p10-90/README.md` は未作成（§10-1）。
 
 ---
 
@@ -141,8 +141,8 @@ M2PO は *Stale-k RL training* を導入し、**k 回の model update 分だけ�
 
 本実験では staleness は **設定する独立変数ではなく、train/rollout の速度比から
 発生する従属変数**であり、`--max-weight-staleness` はその上限に過ぎない。だから
-測る（`avg_staleness`, `staleness_p50/p90/p99`, `frac_at_bound`,
-`mixed_version_ratio`）。逆向きのリスクも引き受けることになる — **自然な lag が
+測る（`staleness/rollout/{mean,p50,p90,p99,max}`、
+`staleness/bound_exceeded_sample_frac`、`mixed_version_ratio`）。逆向きのリスクも引き受けることになる — **自然な lag が
 小さければ staleness 軸が動かない**。§5.1 の事前確認はそのためにある。
 
 両者は競合ではなく**別の問いを測っている**: 先行研究は「人為的に課した lag に
@@ -166,8 +166,9 @@ M2PO は *Stale-k RL training* を導入し、**k 回の model update 分だけ�
 **ESTR の staleness 分解は取り込む価値がある。** ESTR は staleness を
 **intra-trajectory**（1 本の生成が重み更新をまたぐ）と **inter-trajectory**
 （バッチが古い重みで作られた）に分けている。miles ではこれが
-`rollout/weight_version/mixed_version_ratio`（intra）と `avg_staleness`（inter）に
-対応する。**両方すでに記録している**ので、この分解に沿った報告ができる。
+`rollout/weight_version/mixed_version_ratio`（intra）と
+`staleness/total/mean`（inter）に対応する。**両方すでに記録している**ので、この
+分解に沿った報告ができる。
 
 > **Provenance.** M2PO / ESTR / GAC / ROLL Flash / Nemotron 3 Ultra は
 > **PDF 本文を取得して全文検索済み**。上表の「0 件」は実際に検索した結果。
@@ -308,7 +309,7 @@ step 時間が学習内容と無関係な要因で揺れるのは許容できな
 | 測定ポリシー | **Qwen3-4B-Base-LR2e-5-Step4000** |
 | 測定条件 | n=16, T=1.0, max_new_tokens=16384, max_context_length=32768, `rm_type=deepscaler`, truncation reward 0 |
 
-生成手順は [`src/difficulty_filter`](../../src/difficulty_filter/README.md)。
+生成手順は [`tools/difficulty_filter`](../../../../tools/difficulty_filter/README.md)。
 測定（GPU 1 ジョブ）と window 選択（CPU 数秒）が分離されているので、window を
 変えるだけなら再測定は要らない。
 
@@ -348,7 +349,7 @@ NUM_STEPS_PER_ROLLOUT × PAUSE_GENERATION_MODE × …` は入れ子探索では�
 
 | knob | 水準 | 数 | 何を測るか |
 |---|---|---|---|
-| `MAX_WEIGHT_STALENESS` | **0, 1, 2, 4, 8, 16, 32** | 7 | 主軸そのもの。**math では自然には大きな off-policy ness が発生しない**という仮説の検証も兼ねる。設定値ではなく実現値で判定する |
+| `MAX_WEIGHT_STALENESS` | **1, 2, 4, 8, 16, 32** | 6 | `queue-recycle` の主軸。**math では自然には大きな off-policy ness が発生しない**という仮説の検証も兼ねる。設定値ではなく実現値で判定する。on-policy 端点は別の colocated baseline とする |
 | `MAX_RESPONSE_LEN` | **4k, 8k, 16k, 32k** | 4 | **制御変数から主軸に昇格。** 短い出力長で検証している先行研究への示唆が目的で、**下端の 4k は VCPO 系の設定域に合わせてある**（VCPO 自体は 2k だが MATH での検証なので 4k を採る）。短い予算は 1 サンプルが跨ぐ weight sync 数を機械的に減らすので、off-policy が実力以上に良く見える。§5.4 の警告を読んでから回すこと |
 | RL algorithm | DAPO(GRPO), VCPO, CISPO, … | **A（未定）** | off-policy に有効と報告のあるものを一通り。**clip low/high と `--use-tis` はアルゴリズムの一部**として、ここで一緒に決める |
 | `LR` | **1e-7, 1e-6, 5e-6** | **3** | 低 / コンセンサス / 上限付近。1e-6 は DAPO と Nemotron 系 GRPO の既定値。5e-6 は公開されたチューニング範囲 {5e-6, 1e-6, 5e-5} の上側で、**試されて 1e-6 に負けた値**なので「発散する」ではなく「訓練はできるが劣る」ことが分かっている高値。最適 LR が off-policy 度合いとともに動くなら、その交互作用が結果 |
@@ -386,14 +387,15 @@ window が意味を失う方向に効く。grid の 1/4 を投じる前に 1 本
 
 **staleness の両端には確認が要る。**
 
-* `0` — async で bound 0 は「current より古い group を全て recycle」を意味する。
-  生成は train step より遅い（実測 `wait_time_ratio` 0.83）のでほぼ全ての group が
-  1 回以上の更新を跨ぎ、**recycle → 再生成 → また跨ぐ で livelock する可能性がある。**
-  135 セルを焼く前に 1 本で確認する。`wasted_token_frac` と
-  `stale_groups_recycled` で即座に見える。
-* `32` — 自然発生しないなら軸を削る。判定は `staleness_frac_at_bound`（bound に
-  張り付いた group の割合）と `avg_staleness`。両方とも 0 に近ければ、その水準は
-  下位の水準と同じ実験を別名で回しているだけ。
+* `1` — `queue-recycle` の最小値。dequeue 判定は `D-F < M` なので `M=0` は
+  非負の gap を 1 件も admit できず、設定時点で拒否される。on-policy 端点には
+  colocated baseline を使う。fully-async の staleness-0 を別途測る場合は
+  equality を admit する `queue-max M=0` と明記し、queue type の差を混同しない。
+* `32` — 自然発生しないなら軸を削る。判定は
+  `staleness/rollout/max < 32` かつ
+  `staleness/bound_exceeded_sample_frac = 0` であることと、
+  `staleness/rollout/mean`。上限に届かなければ、その水準は下位の水準と同じ実験を
+  別名で回しているだけ。
 
 **algorithm 軸は実装から。** miles が持つのは `grpo`, `gspo`,
 `reinforce_plus_plus`, `reinforce_plus_plus_baseline`, `ppo` の 5 つだけ
@@ -593,7 +595,7 @@ interruption が頻繁に起きるときだけ**なので、staleness が実際�
 **lag は定常状態を測る。** 起動直後はキューが空なので lag は 0 から始まり、生成が
 学習に先行するにつれて積み上がって定常値に落ち着く。したがって報告すべきは
 「1 点の lag」ではなく**時系列と、その定常部分の分布**である。
-`avg_staleness` / `staleness_p50` / `p90` / `p99` は **rollout step ごとに**記録される
+`staleness/total/{mean,p50,p90,p99}` は **rollout step ごとに**記録される
 ので、立ち上がりと定常部分は事後に分離できる（`analyze.py` の plateau 判定と同じ
 考え方を lag に適用すればよい）。
 
@@ -673,7 +675,7 @@ dynamic sampling を外すとこの状況は改善する方向に動く：実測
 | 品質（報告値） | オフライン eval の avg@16 × 4–5 年 | `Q(t)`, `τ_m(δ)`, `S_m(p)` |
 | 品質（監視） | `eval/aime25` | 学習しているかの確認、崩壊検出 |
 | 速度 | `perf/rollout_time`, `train_wait_time`, `wait_time_ratio`, `tokens_per_gpu_per_sec` | arm が速い**理由**。どちらが律速か |
-| off-policy 実現度 | `rollout/fully_async/{avg,max}_staleness`, `staleness_p50/p90/p99`, `staleness_frac_zero`, **`staleness_frac_at_bound`**, `current_weight_version`, `weight_version/{min,mean,p90,max}`, `mixed_version_ratio` | **設定値ではなく実現値**。ここが動いていない結果は無効（§6.2）。`frac_at_bound` が 0 なら上限が binding していない = その水準は下位と同じ実験 |
+| off-policy 実現度 | `staleness/rollout/{mean,max,p50,p90,p99,frac_zero}`, `staleness/total/*`, **`staleness/bound_exceeded_sample_frac`**, `fully_async/train_weight_version`, `rollout/weight_version/{min,mean,p90,max}`, `rollout/weight_version/mixed_version_ratio` | **設定値ではなく実現値**。ここが動いていない結果は無効（§6.2）。`rollout/max` が上限未満かつ排除率が 0 なら上限は binding していない |
 | drift | `train/tis`, `tis_abs`, `tis_clipfrac`, `train_rollout_logprob_abs_diff`, `train_rollout_kl`, **`rollout_ess_ratio`** | 実現した mismatch。0.0100 の数値床を引いてから policy lag に帰属させる。`train/ess_ratio` は**別物** — PPO 内側ループの ESS で `NUM_STEPS_PER_ROLLOUT=1` では恒等的に 1.0。長系列での ESS 崩壊は `rollout_ess_ratio` で見る |
 | 崩壊ガード | `rollout/raw_reward`, `truncated_ratio`, `repetition_frac`, `train/grad_norm`, `train/entropy_loss` | 収束定義の前提条件。entropy は `--observe-training-entropy` が要る（§6.4） |
 | 無駄 | `stale_groups_recycled`, `aborted_groups_recycled`, **`{stale,aborted,dynamic_filter}_tokens`, `kept_tokens`, `wasted_token_frac`** | off-policy 化のコスト側。個数ではなくトークンで測る |
@@ -691,7 +693,7 @@ dynamic sampling を外すとこの状況は改善する方向に動く：実測
 | **済** | datasets | AIME-2023 を配置、`run_eval.sbatch` の既定を 4 年に | §2 の 4 年構成 |
 | **済** | datasets | AIME-2024 に instruction wrapper を付与し 4 年を統一 | 年をまたいだ比較可能性（§2） |
 | 未 | 全レシピ | `SEED` を `CONFIG_TAG` に、`--seed` / `--rollout-seed` を `train.sh` に | 現状 2 seed が**同じ checkpoint ディレクトリを共有して互いの optimizer state から resume する**。seed 複製が物理的に不可能 |
-| **済** | `fully_async_rollout.py` | staleness の percentile / `frac_at_bound` / `current_weight_version`、router クエリ失敗の warning 昇格 | **設定済みでも `avg_staleness` が 1 件も出ていなかった。** 原因は router `/model_info` の失敗が `logger.debug` に落ちること。`current` が None になると**メトリクスが出ないだけでなく上限自体が黙って無効化される** |
+| **済** | `fully_async_rollout.py` | staleness の percentile / max-staleness 排除 sample 数・率 / `train_weight_version`、router クエリ失敗の warning 昇格 | **設定済みでも staleness metric が 1 件も出ていなかった。** 原因は router `/model_info` の失敗が `logger.debug` に落ちること。`current` が None になると**メトリクスが出ないだけでなく上限自体が黙って無効化される** |
 | **済** | `fully_async_rollout.py` | 廃棄生成をトークンで計上 | 個数では「捨てた量」が測れない。サンプル効率の主張に必要 |
 | **済** | `loss_hub/losses.py` | `train/rollout_ess_ratio` | 長系列での ESS 崩壊は平均（`tis_abs`）からは判定できない |
 | **済** | `metric_utils.py` | `compute_statistics` に p90 / p99 | 応答長の裾。`max` だけでは「1 本だけ長い」と「1 割が長い」を区別できない |
@@ -743,7 +745,7 @@ Stage 3 が Stage 4 より前にあるのは、**run 間分散が未測定のう
 実験していない規模（より大きなモデル）への外挿ができる。
 規模を変えると生成／学習の比が変わるので、**律速がどちらかも変わる** — つまり
 同じ `MAX_WEIGHT_STALENESS` が実現する lag が変わる。設定値ではなく
-**実現 lag を横軸にして比較する**こと（`avg_staleness` を必ず並べる）。
+**実現 lag を横軸にして比較する**こと（`staleness/total/mean` を必ず並べる）。
 
 各モデルで必要になるのは、§4.2 の通り:
 
@@ -766,8 +768,8 @@ Stage 3 が Stage 4 より前にあるのは、**run 間分散が未測定のう
 
 ## 10. 未決事項
 
-1. **`math_sync/dapo-math-p10-90/` に README が無い。** `dapo-math` を消した際に
-   worked example だった `math_sync/dapo-math/README.md` も消えた。contract は
+1. **`math/sync/dapo-math-p10-90/` に README が無い。** `dapo-math` を消した際に
+   worked example だった `math/sync/dapo-math/README.md` も消えた。contract は
    「README が無いデータセットは staged ではない」としているので、colocated 側にも
    README が要る。本ファイルから async 固有の節を落とした版になる。
 2. **`S_m(p)` の報告形式。** AReaL の 2.77× はスループット比なので、

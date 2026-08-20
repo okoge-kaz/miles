@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
+REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../../../.." &>/dev/null && pwd)}"
 # This checkpoint lives outside the shared checkpoints/hf directory. Mount its
 # parent directly so both SGLang and the tokenizer read iter_0004000 in place.
 export HF_CKPT_DIR="${QWEN3_4B_BASE_HF_ROOT:-/lustre/fsw/portfolios/coreai/users/kfujii/checkpoints/huggingface/Qwen3-4B-Base/LR2.0e-5-SEQ32768-GBS128-MBS1-TP1-PP1-CP1-EP1-PACK1-standard-cp-STEPS4000}"
@@ -58,11 +58,11 @@ PROMPT_DATA=/data/dapo-math-p10-90-qwen3-4b-base-lr2e-5-step4000/dapo-math-p10-9
 : "${NUM_STEPS_PER_ROLLOUT:=1}"
 
 # queue selection and what happens to in-flight generation at a weight update
-: "${QUEUE_POLICY:=queue-recycle}" # queue-recycle | queue-max | queue-drop
+: "${QUEUE_TYPE:=queue-recycle}" # queue-recycle | queue-max | queue-drop
 : "${QUEUE_FACTOR:=1}"                       # queue-drop capacity in training batches
-if [[ "${QUEUE_POLICY}" == queue-drop ]]; then
+if [[ "${QUEUE_TYPE}" == queue-drop ]]; then
    [[ -z "${MAX_WEIGHT_STALENESS:-}" ]] || {
-      echo "QUEUE_POLICY=queue-drop does not use MAX_WEIGHT_STALENESS" >&2
+      echo "QUEUE_TYPE=queue-drop does not use MAX_WEIGHT_STALENESS" >&2
       exit 1
    }
    unset MAX_WEIGHT_STALENESS
@@ -120,9 +120,10 @@ fi
 : "${DUMP_POLICY_LOSS_DEBUG:=0}"
 : "${FUSE_ONE_STEP_ACTOR_LOGPROBS:=1}"
 : "${VERIFY_FUSED_ONE_STEP_ACTOR_LOGPROBS:=0}"  # debug only; retains legacy forward
-: "${LOG_STALENESS_GRADIENT_METRICS:=0}"
-: "${LOG_STALENESS_GRADIENT_RATIO_HISTOGRAM:=0}"  # high-cardinality, debug only
-: "${SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS:=0}"  # exact token boundaries, opt-in
+: "${LOG_SAMPLE_STALENESS_METRICS:=1}"
+: "${LOG_SAMPLE_STALENESS_RATIO_HISTOGRAM:=0}"  # high-cardinality, debug only
+: "${LOG_UPDATE_DIAGNOSTICS:=1}"                 # no parameter/update tensor scan
+: "${SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS:=1}"  # compact exact token/version boundaries
 : "${DEBUG_EXIT_AFTER_ROLLOUT:=}"               # validation only; empty runs the full schedule
 
 export MODEL_NAME HF_MODEL_NAME PLACEMENT DATASET_TAG PROMPT_DATA
@@ -130,7 +131,7 @@ export ADVANTAGE_ESTIMATOR ENTROPY_COEF KL_LOSS_COEF EPS_CLIP EPS_CLIP_HIGH EPS_
 export RATIO_DENOMINATOR IS_CORRECTION TIS_CLIP TIS_CLIP_LOW MIS_PROFILE M2PO_BUDGET USE_OPSM OPSM_DELTA
 export LR MAX_RESPONSE_LEN NUM_ROLLOUT TRAIN_SEED ROLLOUT_SEED
 export ROLLOUT_BATCH_SIZE N_SAMPLES_PER_PROMPT GLOBAL_BATCH_SIZE NUM_STEPS_PER_ROLLOUT
-export QUEUE_POLICY QUEUE_FACTOR MAX_WEIGHT_STALENESS STALENESS_REFERENCE
+export QUEUE_TYPE QUEUE_FACTOR MAX_WEIGHT_STALENESS STALENESS_REFERENCE
 export PAUSE_GENERATION_MODE ASYNC_MAX_CONCURRENT_SAMPLES
 export USE_REPLAY_BUFFER REPLAY_BUFFER_TYPE REPLAY_BUFFER_IDENTITY_TAG
 export ACTOR_NUM_NODES ACTOR_GPUS_PER_NODE ROLLOUT_NUM_GPUS
@@ -141,7 +142,7 @@ export RM_TYPE ZERO_REWARD_ON_TRUNCATED
 export EVAL_INTERVAL N_SAMPLES_PER_EVAL_PROMPT EVAL_MAX_RESPONSE_LEN SKIP_EVAL_BEFORE_TRAIN
 export SAVE_INTERVAL SAVE_RETAIN_INTERVAL SAVE_HF HF_SAVE_INTERVAL
 export DUMP_TRAIN_DATA DUMP_POLICY_LOSS_DEBUG FUSE_ONE_STEP_ACTOR_LOGPROBS VERIFY_FUSED_ONE_STEP_ACTOR_LOGPROBS
-export LOG_STALENESS_GRADIENT_METRICS LOG_STALENESS_GRADIENT_RATIO_HISTOGRAM
+export LOG_SAMPLE_STALENESS_METRICS LOG_SAMPLE_STALENESS_RATIO_HISTOGRAM LOG_UPDATE_DIAGNOSTICS
 export SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS
 export DEBUG_EXIT_AFTER_ROLLOUT
 
@@ -184,4 +185,4 @@ srun \
     --container-writable \
     --no-container-mount-home \
     --export=ALL \
-    bash /root/miles/experiments/math_async/dapo-math-p10-90/qwen3-4b/train.sh
+    bash /root/miles/experiments/scripts/math/async/dapo-math-p10-90/qwen3-4b/train.sh
