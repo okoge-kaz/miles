@@ -235,8 +235,21 @@ def _wallclock_decomposition(intervals: list[dict[str, Any]]) -> list[dict[str, 
         if hours is not None and hours > 0.0 and delta_macro is not None:
             by_arm[interval["arm"]].append(interval)
 
+    interval_keys_by_arm = [
+        {(int(interval["start_step"]), int(interval["end_step"])) for interval in arm_intervals}
+        for arm_intervals in by_arm.values()
+    ]
+    common_interval_keys = set.intersection(*interval_keys_by_arm) if interval_keys_by_arm else set()
+
     rows: list[dict[str, Any]] = []
     for arm, arm_intervals in sorted(by_arm.items()):
+        arm_intervals = [
+            interval
+            for interval in arm_intervals
+            if (int(interval["start_step"]), int(interval["end_step"])) in common_interval_keys
+        ]
+        if not arm_intervals:
+            continue
         active_hours = sum(float(interval["active_interval_hours"]) for interval in arm_intervals)
         covered_updates = sum(int(interval["end_step"]) - int(interval["start_step"]) for interval in arm_intervals)
         first = arm_intervals[0]
@@ -245,6 +258,8 @@ def _wallclock_decomposition(intervals: list[dict[str, Any]]) -> list[dict[str, 
             "ratio": first["ratio"],
             "max_weight_staleness": first["max_weight_staleness"],
             "interval_count": len(arm_intervals),
+            "common_start_step": min(int(interval["start_step"]) for interval in arm_intervals),
+            "common_end_step": max(int(interval["end_step"]) for interval in arm_intervals),
             "covered_updates": covered_updates,
             "active_interval_hours": active_hours,
             "updates_per_active_hour": covered_updates / active_hours,

@@ -139,6 +139,37 @@ def test_fixed_effect_correlation_centers_same_step_and_ratio():
     assert result.slope == pytest.approx(2.0)
 
 
+def test_wallclock_decomposition_uses_only_intervals_shared_by_all_arms():
+    def interval(arm, start_step, end_step, delta):
+        return {
+            "arm": arm,
+            "ratio": arm.split("-", 1)[1],
+            "max_weight_staleness": arm[1],
+            "start_step": start_step,
+            "end_step": end_step,
+            "active_interval_hours": 1.0,
+            "delta_aime24": delta,
+            "delta_aime25": delta,
+            "delta_aime26": delta,
+            "delta_macro": delta,
+        }
+
+    intervals = [
+        interval("s1-t1r7", 10, 20, 2.0),
+        interval("s1-t1r7", 20, 30, 100.0),
+        interval("s2-t1r7", 10, 20, 1.0),
+    ]
+
+    rows = ANALYZE._wallclock_decomposition(intervals)
+
+    assert len(rows) == 2
+    assert {row["interval_count"] for row in rows} == {1}
+    assert {row["common_start_step"] for row in rows} == {10}
+    assert {row["common_end_step"] for row in rows} == {20}
+    s1 = next(row for row in rows if row["arm"] == "s1-t1r7")
+    assert s1["macro_points_per_update"] == pytest.approx(0.2)
+
+
 def test_score_panel_svg_is_well_formed():
     rows = [
         PLOT.SeriesRow(

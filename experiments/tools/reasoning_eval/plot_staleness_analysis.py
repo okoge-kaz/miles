@@ -673,7 +673,7 @@ def _render_wallclock_decomposition(rows: list[DecompositionRow]) -> str:
         width,
         height,
         "Learning-effect and throughput decomposition by setting",
-        "dQ/dt = (dQ/dU) × (dU/dt), aggregated over adjacent evaluated ten-update intervals",
+        "dQ/dt = (dQ/dU) × (dU/dt), using only ten-update intervals shared by all 17 settings",
     )
     elements.extend(
         _legend(

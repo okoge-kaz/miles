@@ -105,8 +105,9 @@ following under `analysis/<protocol>/full/staleness/`:
   training step and once by active wall-clock;
 - a macro wall-clock comparison that separates max-weight-staleness panels and
   trainer:rollout ratios;
-- a per-setting `dQ/dt = (dQ/dU) × (dU/dt)` decomposition separating macro
-  points per update, optimizer-update throughput, and macro points per hour;
+- a balanced-common-window, per-setting `dQ/dt = (dQ/dU) × (dU/dt)`
+  decomposition separating macro points per update, optimizer-update
+  throughput, and macro points per hour;
 - figures for metrics associated with realized staleness mean/variance and for
   realized-staleness associations with ten-update AIME improvement;
 - a reduced downstream trajectory figure only when a relationship has
