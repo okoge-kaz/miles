@@ -73,6 +73,17 @@ class CorrelationRow:
     ci_high: float | None
 
 
+@dataclass(frozen=True)
+class DecompositionRow:
+    """Arm-level dQ/dt factorization over evaluated adjacent intervals."""
+
+    arm: str
+    trainer_nodes: int
+    macro_points_per_update: float
+    updates_per_active_hour: float
+    macro_points_per_active_hour: float
+
+
 def _optional_float(value: str | None) -> float | None:
     if value is None or value.strip() == "":
         return None
@@ -107,6 +118,28 @@ def _read_correlations(path: Path) -> list[CorrelationRow]:
                     correlation=_optional_float(record.get("correlation")),
                     ci_low=_optional_float(record.get("ci_low")),
                     ci_high=_optional_float(record.get("ci_high")),
+                )
+            )
+    return rows
+
+
+def _trainer_nodes(arm: str) -> int:
+    if arm == "s0-colocated":
+        return 0
+    return int(arm.split("-t", 1)[1].split("r", 1)[0])
+
+
+def _read_decomposition(path: Path) -> list[DecompositionRow]:
+    rows: list[DecompositionRow] = []
+    with path.open(encoding="utf-8", newline="") as stream:
+        for record in csv.DictReader(stream):
+            rows.append(
+                DecompositionRow(
+                    arm=record["arm"],
+                    trainer_nodes=_trainer_nodes(record["arm"]),
+                    macro_points_per_update=float(record["macro_points_per_update"]),
+                    updates_per_active_hour=float(record["updates_per_active_hour"]),
+                    macro_points_per_active_hour=float(record["macro_points_per_active_hour"]),
                 )
             )
     return rows
@@ -570,6 +603,123 @@ def _render_downstream_correlations(rows: list[CorrelationRow]) -> str:
     return "\n".join(elements) + "\n"
 
 
+def _factor_bounds(values: Iterable[float], *, signed: bool) -> tuple[float, float]:
+    finite = [value for value in values if math.isfinite(value)]
+    if not signed:
+        return _numeric_bounds(finite)
+    _, bound = _numeric_bounds(abs(value) for value in finite)
+    return -bound, bound
+
+
+def _factor_x(value: float, *, plot_x: float, plot_width: float, bounds: tuple[float, float]) -> float:
+    lower, upper = bounds
+    return plot_x + plot_width * (value - lower) / max(upper - lower, 1e-12)
+
+
+def _factor_grid(
+    *, plot_x: float, plot_y: float, plot_width: float, plot_height: float, bounds: tuple[float, float]
+) -> list[str]:
+    lower, upper = bounds
+    elements: list[str] = []
+    for index in range(5):
+        value = lower + (upper - lower) * index / 4.0
+        x = _factor_x(value, plot_x=plot_x, plot_width=plot_width, bounds=bounds)
+        css_class = "axis" if abs(value) < 1e-12 else "grid"
+        elements.append(
+            f'<line class="{css_class}" x1="{x:.2f}" y1="{plot_y}" x2="{x:.2f}" y2="{plot_y + plot_height}"/>'
+        )
+        elements.append(
+            f'<text class="tick" x="{x:.2f}" y="{plot_y + plot_height + 18}" '
+            f'text-anchor="middle">{value:.3g}</text>'
+        )
+    return elements
+
+
+def _factor_bar(
+    *,
+    value: float,
+    y: float,
+    color: str,
+    plot_x: float,
+    plot_width: float,
+    bounds: tuple[float, float],
+) -> list[str]:
+    zero = _factor_x(0.0, plot_x=plot_x, plot_width=plot_width, bounds=bounds)
+    endpoint = _factor_x(value, plot_x=plot_x, plot_width=plot_width, bounds=bounds)
+    x = min(zero, endpoint)
+    width = max(abs(endpoint - zero), 0.8)
+    label_x = endpoint + (5.0 if value >= 0.0 else -5.0)
+    anchor = "start" if value >= 0.0 else "end"
+    return [
+        f'<rect x="{x:.2f}" y="{y - 9:.2f}" width="{width:.2f}" height="18" fill="{color}"/>',
+        f'<text class="tick" x="{label_x:.2f}" y="{y + 4:.2f}" text-anchor="{anchor}">{value:+.3g}</text>',
+    ]
+
+
+def _render_wallclock_decomposition(rows: list[DecompositionRow]) -> str:
+    ordered = sorted(rows, key=lambda row: ALL_ARMS.index(row.arm))
+    row_height = 40
+    plot_y = 125.0
+    plot_height = row_height * len(ordered)
+    width, height = 1900, int(plot_y + plot_height + 70)
+    panel_width = 500.0
+    panel_xs = (270.0, 825.0, 1380.0)
+    metrics = (
+        ("macro_points_per_update", "dQ/dU", "Macro points per update", True),
+        ("updates_per_active_hour", "dU/dt", "Updates per active hour", False),
+        ("macro_points_per_active_hour", "dQ/dt", "Macro points per active hour", True),
+    )
+    elements = _svg_header(
+        width,
+        height,
+        "Learning-effect and throughput decomposition by setting",
+        "dQ/dt = (dQ/dU) × (dU/dt), aggregated over adjacent evaluated ten-update intervals",
+    )
+    elements.extend(
+        _legend(
+            ((f"T:R={trainer}:{8 - trainer}", RATIO_COLORS[trainer], False) for trainer in (1, 2, 3, 4)),
+            y=78,
+            center_x=width / 2,
+            spacing=190,
+        )
+    )
+    for panel_x, (attribute, symbol, label, signed) in zip(panel_xs, metrics, strict=True):
+        values = [float(getattr(row, attribute)) for row in ordered]
+        bounds = _factor_bounds(values, signed=signed)
+        elements.append(
+            f'<text class="panel-title" x="{panel_x + panel_width / 2:.2f}" y="108" '
+            f'text-anchor="middle">{html.escape(symbol)} — {html.escape(label)}</text>'
+        )
+        elements.extend(
+            _factor_grid(
+                plot_x=panel_x,
+                plot_y=plot_y,
+                plot_width=panel_width,
+                plot_height=plot_height,
+                bounds=bounds,
+            )
+        )
+        for index, row in enumerate(ordered):
+            center_y = plot_y + (index + 0.5) * row_height
+            if panel_x == panel_xs[0]:
+                elements.append(
+                    f'<text class="label" x="{panel_x - 16}" y="{center_y + 4:.2f}" '
+                    f'text-anchor="end">{html.escape(row.arm)}</text>'
+                )
+            elements.extend(
+                _factor_bar(
+                    value=float(getattr(row, attribute)),
+                    y=center_y,
+                    color=RATIO_COLORS[row.trainer_nodes],
+                    plot_x=panel_x,
+                    plot_width=panel_width,
+                    bounds=bounds,
+                )
+            )
+    elements.append("</svg>")
+    return "\n".join(elements) + "\n"
+
+
 def _selected_arms(groups: list[dict[str, object]]) -> tuple[str, ...]:
     selected: set[str] = set()
     for group in groups:
@@ -583,6 +733,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-series-csv", type=Path, required=True)
     parser.add_argument("--downstream-correlations-csv", type=Path, required=True)
     parser.add_argument("--staleness-correlations-csv", type=Path, required=True)
+    parser.add_argument("--wallclock-decomposition-csv", type=Path, required=True)
     parser.add_argument("--selected-relationships-json", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     return parser.parse_args()
@@ -593,6 +744,7 @@ def main() -> None:
     series = _read_series(args.checkpoint_series_csv.resolve())
     downstream = _read_correlations(args.downstream_correlations_csv.resolve())
     staleness = _read_correlations(args.staleness_correlations_csv.resolve())
+    decomposition = _read_decomposition(args.wallclock_decomposition_csv.resolve())
     selected_groups = json.loads(args.selected_relationships_json.resolve().read_text(encoding="utf-8"))
     output_dir = args.output_dir.resolve()
     figures = {
@@ -613,6 +765,7 @@ def main() -> None:
             subtitle="Active wall-clock excludes scheduler requeue gaps",
         ),
         "macro-vs-active-wallclock-by-staleness.svg": _render_wallclock_macro(series),
+        "learning-throughput-decomposition.svg": _render_wallclock_decomposition(decomposition),
         "staleness-metric-correlations.svg": _render_staleness_metric_correlations(staleness),
         "staleness-downstream-correlations.svg": _render_downstream_correlations(downstream),
     }

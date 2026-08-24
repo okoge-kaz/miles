@@ -227,6 +227,37 @@ def _interval_records(
     return intervals
 
 
+def _wallclock_decomposition(intervals: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_arm: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for interval in intervals:
+        hours = _optional_float(interval.get("active_interval_hours"))
+        delta_macro = _optional_float(interval.get("delta_macro"))
+        if hours is not None and hours > 0.0 and delta_macro is not None:
+            by_arm[interval["arm"]].append(interval)
+
+    rows: list[dict[str, Any]] = []
+    for arm, arm_intervals in sorted(by_arm.items()):
+        active_hours = sum(float(interval["active_interval_hours"]) for interval in arm_intervals)
+        covered_updates = sum(int(interval["end_step"]) - int(interval["start_step"]) for interval in arm_intervals)
+        first = arm_intervals[0]
+        row: dict[str, Any] = {
+            "arm": arm,
+            "ratio": first["ratio"],
+            "max_weight_staleness": first["max_weight_staleness"],
+            "interval_count": len(arm_intervals),
+            "covered_updates": covered_updates,
+            "active_interval_hours": active_hours,
+            "updates_per_active_hour": covered_updates / active_hours,
+        }
+        for label in SCORE_COLUMNS:
+            score_change = sum(float(interval[f"delta_{label}"]) for interval in arm_intervals)
+            row[f"{label}_score_change"] = score_change
+            row[f"{label}_points_per_update"] = score_change / covered_updates
+            row[f"{label}_points_per_active_hour"] = score_change / active_hours
+        rows.append(row)
+    return rows
+
+
 def _center_records(
     records: list[dict[str, Any]],
     *,
@@ -521,16 +552,22 @@ def main() -> None:
     histories = _history_index(_read_csv(args.training_history_csv.resolve()))
     series = _checkpoint_series(aggregates, histories)
     intervals = _interval_records(aggregates, histories)
+    decomposition = _wallclock_decomposition(intervals)
     downstream = _downstream_correlations(intervals, args.bootstrap_samples)
     staleness = _staleness_correlations(histories)
     selected_groups = _selected_arm_groups(intervals, _selected_metrics(downstream))
     output_dir = args.output_dir.resolve()
     series_fields = list(series[0]) if series else []
     interval_fields = list(intervals[0]) if intervals else []
-    if not series_fields or not interval_fields:
+    if not series_fields or not interval_fields or not decomposition:
         raise ValueError("analysis requires completed checkpoint series and adjacent intervals")
     _atomic_write_csv(output_dir / "checkpoint-series.csv", series, series_fields)
     _atomic_write_csv(output_dir / "score-intervals.csv", intervals, interval_fields)
+    _atomic_write_csv(
+        output_dir / "wallclock-decomposition.csv",
+        decomposition,
+        list(decomposition[0]),
+    )
     correlation_fields = ["predictor", "outcome", "observations", "correlation", "slope", "ci_low", "ci_high"]
     _atomic_write_csv(
         output_dir / "downstream-correlations.csv",

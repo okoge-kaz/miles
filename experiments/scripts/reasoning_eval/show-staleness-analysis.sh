@@ -54,6 +54,7 @@ mkdir -p "${STALENESS_ROOT}"
     --checkpoint-series-csv "${STALENESS_ROOT}/checkpoint-series.csv" \
     --downstream-correlations-csv "${STALENESS_ROOT}/downstream-correlations.csv" \
     --staleness-correlations-csv "${STALENESS_ROOT}/staleness-metric-correlations.csv" \
+    --wallclock-decomposition-csv "${STALENESS_ROOT}/wallclock-decomposition.csv" \
     --selected-relationships-json "${STALENESS_ROOT}/selected-relationships.json" \
     --output-dir "${STALENESS_ROOT}/figures"
 

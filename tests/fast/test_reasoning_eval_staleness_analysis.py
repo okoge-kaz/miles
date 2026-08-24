@@ -103,6 +103,15 @@ def test_score_interval_separates_update_effect_and_throughput():
     assert intervals[0]["macro_points_per_active_hour"] == pytest.approx(3.0)
     assert intervals[0]["staleness/total/mean"] == pytest.approx(2.0)
 
+    decomposition = ANALYZE._wallclock_decomposition(intervals)
+    assert len(decomposition) == 1
+    assert decomposition[0]["macro_points_per_update"] == pytest.approx(0.3)
+    assert decomposition[0]["updates_per_active_hour"] == pytest.approx(10.0)
+    assert decomposition[0]["macro_points_per_active_hour"] == pytest.approx(3.0)
+    assert decomposition[0]["macro_points_per_update"] * decomposition[0]["updates_per_active_hour"] == pytest.approx(
+        decomposition[0]["macro_points_per_active_hour"]
+    )
+
 
 def test_fixed_effect_correlation_centers_same_step_and_ratio():
     records = [
@@ -173,3 +182,29 @@ def test_selected_arms_preserve_sweep_order_and_deduplicate():
         "s4-t3r5",
         "s8-t4r4",
     )
+
+
+def test_wallclock_decomposition_svg_is_well_formed():
+    rows = [
+        PLOT.DecompositionRow(
+            arm="s1-t1r7",
+            trainer_nodes=1,
+            macro_points_per_update=0.2,
+            updates_per_active_hour=10.0,
+            macro_points_per_active_hour=2.0,
+        ),
+        PLOT.DecompositionRow(
+            arm="s2-t2r6",
+            trainer_nodes=2,
+            macro_points_per_update=-0.1,
+            updates_per_active_hour=12.0,
+            macro_points_per_active_hour=-1.2,
+        ),
+    ]
+
+    svg = PLOT._render_wallclock_decomposition(rows)
+
+    root = ElementTree.fromstring(svg)
+    assert root.tag.endswith("svg")
+    assert "dQ/dt" in svg
+    assert "s1-t1r7" in svg
