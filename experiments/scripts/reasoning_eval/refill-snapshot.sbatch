@@ -157,8 +157,11 @@ while true; do
     complete_count="$(extract_status_count "${scan_output}" complete)"
     active_count="$(extract_status_count "${scan_output}" active)"
     pending_count="$(extract_status_count "${scan_output}" pending)"
+    incomplete_count="$(extract_status_count "${scan_output}" incomplete)"
+    unreadable_count="$(extract_status_count "${scan_output}" unreadable)"
     [[ -n "${available_count}" && -n "${complete_count}" \
-        && -n "${active_count}" && -n "${pending_count}" ]] || {
+        && -n "${active_count}" && -n "${pending_count}" \
+        && -n "${incomplete_count}" && -n "${unreadable_count}" ]] || {
         echo "could not parse launcher status" >&2
         exit 4
     }
@@ -173,7 +176,8 @@ while true; do
         fi
     else
         if (( available_count > 0 && complete_count == available_count \
-            && active_count == 0 && pending_count == 0 )); then
+            && active_count == 0 && pending_count == 0 \
+            && incomplete_count == 0 && unreadable_count == 0 )); then
             if (( available_count == last_available_count )); then
                 ((quiescent_scan_count += 1))
             else
@@ -186,6 +190,12 @@ while true; do
                 exit 0
             fi
         else
+            if (( available_count > 0 && complete_count == available_count \
+                && active_count == 0 && pending_count == 0 \
+                && (incomplete_count > 0 || unreadable_count > 0) )); then
+                echo "all readable evaluations are complete; waiting for " \
+                    "incomplete=${incomplete_count} unreadable=${unreadable_count} checkpoint(s)"
+            fi
             quiescent_scan_count=0
         fi
         last_available_count="${available_count}"
