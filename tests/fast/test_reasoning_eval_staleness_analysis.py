@@ -40,7 +40,15 @@ def test_latest_wandb_segment_replaces_replayed_metrics_and_rebuilds_clock():
         arm="s1-t1r7",
         run_id="old",
         created_at="2026-08-01T00:00:00Z",
-        rollout={0: {"_timestamp": 100.0, "perf/step_time": 10.0, "staleness/total/mean": 1.0}},
+        rollout={
+            0: {
+                "_timestamp": 100.0,
+                "perf/step_time": 10.0,
+                "perf/train_time": 6.0,
+                "perf/train_wait_time": 4.0,
+                "staleness/total/mean": 1.0,
+            }
+        },
         train={0: {"_timestamp": 101.0, "train/loss": 0.5}},
     )
     resumed = EXPORT.RunHistory(
@@ -48,8 +56,20 @@ def test_latest_wandb_segment_replaces_replayed_metrics_and_rebuilds_clock():
         run_id="new",
         created_at="2026-08-02T00:00:00Z",
         rollout={
-            0: {"_timestamp": 200.0, "perf/step_time": 20.0, "staleness/total/mean": 2.0},
-            1: {"_timestamp": 230.0, "perf/step_time": 30.0, "staleness/total/mean": 3.0},
+            0: {
+                "_timestamp": 200.0,
+                "perf/step_time": 20.0,
+                "perf/train_time": 6.0,
+                "perf/train_wait_time": 14.0,
+                "staleness/total/mean": 2.0,
+            },
+            1: {
+                "_timestamp": 230.0,
+                "perf/step_time": 10.0,
+                "perf/train_time": 6.0,
+                "perf/train_wait_time": 4.0,
+                "staleness/total/mean": 3.0,
+            },
         },
         train={
             0: {"_timestamp": 201.0, "train/loss": 0.4},
@@ -63,8 +83,12 @@ def test_latest_wandb_segment_replaces_replayed_metrics_and_rebuilds_clock():
     assert replacements > 0
     assert [row["training_step"] for row in rows] == [1, 2]
     assert rows[0]["staleness/total/mean"] == 2.0
-    assert rows[0]["active_wallclock_seconds"] == 20.0
-    assert rows[1]["active_wallclock_seconds"] == 50.0
+    assert rows[0]["resume_boundary"] == 1
+    assert rows[0]["observed_active_wallclock_seconds"] == 20.0
+    assert rows[0]["estimated_uninterrupted_wallclock_seconds"] == 10.0
+    assert rows[1]["observed_active_wallclock_seconds"] == 30.0
+    assert rows[1]["estimated_uninterrupted_wallclock_seconds"] == 20.0
+    assert rows[1]["resume_overhead_removed_seconds"] == 10.0
     assert rows[1]["active_wallclock_coverage"] == 1.0
     assert rows[0]["calendar_elapsed_seconds"] == 1.0
 
@@ -106,7 +130,9 @@ def test_score_interval_separates_update_effect_and_throughput():
     ]
     history = {
         step: {
-            "active_wallclock_seconds": str(100.0 if step == 10 else 3700.0 if step == 20 else 0.0),
+            "estimated_uninterrupted_wallclock_seconds": str(
+                100.0 if step == 10 else 3700.0 if step == 20 else 0.0
+            ),
             "staleness/total/mean": "2.0",
         }
         for step in range(10, 21)
@@ -126,6 +152,7 @@ def test_score_interval_separates_update_effect_and_throughput():
     assert decomposition[0]["macro_points_per_update"] == pytest.approx(0.3)
     assert decomposition[0]["updates_per_active_hour"] == pytest.approx(10.0)
     assert decomposition[0]["macro_points_per_active_hour"] == pytest.approx(3.0)
+    assert decomposition[0]["training_staleness_mean"] == pytest.approx(2.0)
     assert decomposition[0]["macro_points_per_update"] * decomposition[0]["updates_per_active_hour"] == pytest.approx(
         decomposition[0]["macro_points_per_active_hour"]
     )
@@ -166,6 +193,7 @@ def test_wallclock_decomposition_uses_only_intervals_shared_by_all_arms():
             "start_step": start_step,
             "end_step": end_step,
             "active_interval_hours": 1.0,
+            "staleness/total/mean": 1.5,
             "delta_aime24": delta,
             "delta_aime25": delta,
             "delta_aime26": delta,
@@ -194,13 +222,13 @@ def test_score_panel_svg_is_well_formed():
             arm="s1-t1r7",
             training_step=10,
             active_wallclock_hours=1.5,
-            scores={"AIME24": 50.0, "AIME25": 40.0, "AIME26": 30.0, "Macro": 40.0},
+            scores={"AIME24": 50.0, "AIME25": 40.0, "AIME26": 30.0, "AIME mean": 40.0},
         ),
         PLOT.SeriesRow(
             arm="s1-t1r7",
             training_step=20,
             active_wallclock_hours=3.0,
-            scores={"AIME24": 55.0, "AIME25": 43.0, "AIME26": 32.0, "Macro": 43.3},
+            scores={"AIME24": 55.0, "AIME25": 43.0, "AIME26": 32.0, "AIME mean": 43.3},
         ),
     ]
 
@@ -216,7 +244,7 @@ def test_score_panel_svg_is_well_formed():
     root = ElementTree.fromstring(svg)
     assert root.tag.endswith("svg")
     assert "s1-t1r7" in svg
-    assert "Macro" in svg
+    assert "AIME mean" in svg
 
 
 def test_selected_arms_preserve_sweep_order_and_deduplicate():
@@ -241,6 +269,7 @@ def test_wallclock_decomposition_svg_is_well_formed():
             macro_points_per_update=0.2,
             updates_per_active_hour=10.0,
             macro_points_per_active_hour=2.0,
+            training_staleness_mean=0.5,
         ),
         PLOT.DecompositionRow(
             arm="s2-t2r6",
@@ -248,6 +277,15 @@ def test_wallclock_decomposition_svg_is_well_formed():
             macro_points_per_update=-0.1,
             updates_per_active_hour=12.0,
             macro_points_per_active_hour=-1.2,
+            training_staleness_mean=2.0,
+        ),
+        PLOT.DecompositionRow(
+            arm="s0-colocated",
+            trainer_nodes=0,
+            macro_points_per_update=0.15,
+            updates_per_active_hour=8.0,
+            macro_points_per_active_hour=1.2,
+            training_staleness_mean=None,
         ),
     ]
 
@@ -256,4 +294,80 @@ def test_wallclock_decomposition_svg_is_well_formed():
     root = ElementTree.fromstring(svg)
     assert root.tag.endswith("svg")
     assert "dQ/dt" in svg
-    assert "s1-t1r7" in svg
+    assert "AIME mean points per update" in svg
+    assert "s1-t1-r7" in svg
+    assert "s=max weight staleness, t=train nodes, r=rollout nodes" in svg
+    assert "Training staleness mean" in svg
+    assert "not logged" in svg
+    assert svg.count('class="panel-frame"') == 4
+    assert 'class="setting-label"' in svg
+    assert ".setting-label{font-size:24px" in svg
+
+
+def test_positive_factor_bounds_put_zero_at_left_edge():
+    lower, upper = PLOT._factor_bounds([0.09, 0.11, 0.15], signed=True)
+
+    assert lower == 0.0
+    assert upper >= 0.15
+
+
+def test_downstream_correlation_bound_uses_tight_padding():
+    bound = PLOT._correlation_bound([-0.123, 0.084])
+
+    assert bound == pytest.approx(0.15)
+
+
+def test_downstream_plot_bounds_only_visible_staleness_predictors():
+    rows = [
+        PLOT.CorrelationRow(
+            predictor="staleness/pre_queue/variance",
+            outcome="delta_macro",
+            observations=20,
+            correlation=0.06,
+            ci_low=None,
+            ci_high=None,
+        ),
+        PLOT.CorrelationRow(
+            predictor="train/tis_abs",
+            outcome="delta_macro",
+            observations=20,
+            correlation=0.9,
+            ci_low=None,
+            ci_high=None,
+        ),
+    ]
+
+    svg = PLOT._render_downstream_correlations(rows)
+
+    assert "pre-queue/variance" in svg
+    assert ">-0.08</text>" in svg
+    assert ">0.08</text>" in svg
+
+
+def test_staleness_metric_heatmap_includes_phase_and_version_predictors():
+    predictors = (
+        "staleness/pre_queue/variance",
+        "staleness/in_queue/variance",
+        "staleness/token_lag/exact/mean",
+        "staleness/version_mix/train/forward_version_span/sequence_mean",
+    )
+    rows = [
+        PLOT.CorrelationRow(
+            predictor=predictor,
+            outcome="train/policy_rollout_kl",
+            observations=20,
+            correlation=0.1 * (index + 1),
+            ci_low=None,
+            ci_high=None,
+        )
+        for index, predictor in enumerate(predictors)
+    ]
+
+    svg = PLOT._render_staleness_metric_correlations(rows)
+
+    root = ElementTree.fromstring(svg)
+    assert root.tag.endswith("svg")
+    assert "pre-queue" in svg
+    assert "in-queue" in svg
+    assert "exact token lag" in svg
+    assert "version span" in svg

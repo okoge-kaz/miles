@@ -168,7 +168,7 @@ def _render_learning_curves(rows: list[ResultRow]) -> str:
     min_step = min((row.training_step for row in rows), default=10)
     max_step = max((row.training_step for row in rows), default=300)
     y_bounds = _score_bounds(row.macro_mean for row in rows if row.macro_mean is not None)
-    elements = _svg_header(width, height, "AIME24/25/26 macro mean by staleness and node ratio")
+    elements = _svg_header(width, height, "AIME mean by staleness and node ratio")
     legend_y = 60
     for index, train_nodes in enumerate((1, 2, 3, 4)):
         legend_x = 210 + index * 180
@@ -274,8 +274,11 @@ def main() -> None:
     aggregate_csv = args.aggregate_csv.resolve()
     output_dir = args.output_dir or aggregate_csv.parent / "figures"
     rows = _read_rows(aggregate_csv)
-    _atomic_write(output_dir / "aime-macro-mean-vs-step.svg", _render_learning_curves(rows))
+    _atomic_write(output_dir / "aime-mean-vs-step.svg", _render_learning_curves(rows))
     _atomic_write(output_dir / "latest-aime-by-arm.svg", _render_latest_scores(rows))
+    obsolete_path = output_dir / "aime-macro-mean-vs-step.svg"
+    if obsolete_path.exists():
+        obsolete_path.unlink()
     print(output_dir)
 
 

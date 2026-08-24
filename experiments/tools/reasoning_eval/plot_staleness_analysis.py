@@ -22,22 +22,32 @@ TASK_FIELDS = {
     "AIME24": "aime24_percent",
     "AIME25": "aime25_percent",
     "AIME26": "aime26_percent",
-    "Macro": "aime_macro_mean_percent",
+    "AIME mean": "aime_macro_mean_percent",
 }
 TASK_COLORS = {
     "AIME24": "#4C78A8",
     "AIME25": "#F58518",
     "AIME26": "#54A24B",
-    "Macro": "#222222",
+    "AIME mean": "#222222",
 }
 RATIO_COLORS = {1: "#0072B2", 2: "#D55E00", 3: "#009E73", 4: "#CC79A7", 0: "#222222"}
-STALENESS_FEATURES = (
-    "staleness/total/mean",
-    "staleness/total/variance",
-    "staleness/total/std",
-    "staleness/total/p90",
-    "staleness/pre_queue/mean",
-    "staleness/in_queue/mean",
+STALENESS_PHASES = ("total", "pre_queue", "in_queue")
+STALENESS_STATISTICS = ("mean", "variance", "std", "p90", "max")
+STALENESS_FEATURES = tuple(
+    f"staleness/{phase}/{statistic}" for phase in STALENESS_PHASES for statistic in STALENESS_STATISTICS
+)
+STALENESS_CORRELATION_FEATURES = (
+    ("staleness/total/mean", ("total", "mean")),
+    ("staleness/total/variance", ("total", "variance")),
+    ("staleness/pre_queue/mean", ("pre-queue", "mean")),
+    ("staleness/pre_queue/variance", ("pre-queue", "variance")),
+    ("staleness/in_queue/mean", ("in-queue", "mean")),
+    ("staleness/in_queue/variance", ("in-queue", "variance")),
+    ("staleness/token_lag/exact/mean", ("exact token lag", "mean")),
+    (
+        "staleness/version_mix/train/forward_version_span/sequence_mean",
+        ("within-sample", "version span"),
+    ),
 )
 SELECTED_ARM_COLORS = (
     "#0072B2",
@@ -82,6 +92,7 @@ class DecompositionRow:
     macro_points_per_update: float
     updates_per_active_hour: float
     macro_points_per_active_hour: float
+    training_staleness_mean: float | None
 
 
 def _optional_float(value: str | None) -> float | None:
@@ -129,6 +140,14 @@ def _trainer_nodes(arm: str) -> int:
     return int(arm.split("-t", 1)[1].split("r", 1)[0])
 
 
+def _display_arm(arm: str) -> str:
+    if arm == "s0-colocated":
+        return arm
+    staleness, ratio = arm.split("-t", 1)
+    train_nodes, rollout_nodes = ratio.split("r", 1)
+    return f"{staleness}-t{train_nodes}-r{rollout_nodes}"
+
+
 def _read_decomposition(path: Path) -> list[DecompositionRow]:
     rows: list[DecompositionRow] = []
     with path.open(encoding="utf-8", newline="") as stream:
@@ -140,6 +159,7 @@ def _read_decomposition(path: Path) -> list[DecompositionRow]:
                     macro_points_per_update=float(record["macro_points_per_update"]),
                     updates_per_active_hour=float(record["updates_per_active_hour"]),
                     macro_points_per_active_hour=float(record["macro_points_per_active_hour"]),
+                    training_staleness_mean=_optional_float(record.get("training_staleness_mean")),
                 )
             )
     return rows
@@ -157,8 +177,11 @@ def _svg_header(width: int, height: int, title: str, subtitle: str = "") -> list
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
         f'viewBox="0 0 {width} {height}">',
         "<style>text{font-family:Arial,sans-serif;fill:#222}.axis{stroke:#555;stroke-width:1}"
-        ".grid{stroke:#ddd;stroke-width:1}.series{fill:none;stroke-width:2.2}"
-        ".tick{font-size:11px}.label{font-size:13px}.panel-title{font-size:15px;font-weight:bold}"
+        ".grid{stroke:#ddd;stroke-width:1}.zero-line{stroke:#333;stroke-width:1.6}"
+        ".panel-frame{fill:#fafbfc;stroke:#777;stroke-width:1.2}.series{fill:none;stroke-width:2.2}"
+        ".tick{font-size:11px}.label{font-size:13px}.setting-label{font-size:24px;font-weight:700}"
+        ".heatmap-light{fill:white}"
+        ".panel-title{font-size:15px;font-weight:bold}"
         ".title{font-size:22px;font-weight:bold}.subtitle{font-size:13px;fill:#555}</style>",
         '<rect width="100%" height="100%" fill="white"/>',
         f'<text class="title" x="{width / 2:.1f}" y="30" text-anchor="middle">{html.escape(title)}</text>',
@@ -308,7 +331,7 @@ def _render_arm_score_panels(
     elements = _svg_header(width, height, title, subtitle)
     elements.extend(
         _legend(
-            ((label, TASK_COLORS[label], label == "Macro") for label in TASK_FIELDS),
+            ((label, TASK_COLORS[label], label == "AIME mean") for label in TASK_FIELDS),
             y=73,
             center_x=width / 2,
             spacing=145,
@@ -342,7 +365,7 @@ def _render_arm_score_panels(
                 _line_elements(
                     points,
                     color=TASK_COLORS[label],
-                    dashed=label == "Macro",
+                    dashed=label == "AIME mean",
                     x_position=x_position,
                     y_position=y_position,
                 )
@@ -351,17 +374,17 @@ def _render_arm_score_panels(
     return "\n".join(elements) + "\n"
 
 
-def _render_wallclock_macro(rows: list[SeriesRow]) -> str:
+def _render_wallclock_aime_mean(rows: list[SeriesRow]) -> str:
     width, height = 1320, 850
     panel_width, panel_height = 630, 360
-    valid = [row for row in rows if row.active_wallclock_hours is not None and row.scores["Macro"] is not None]
+    valid = [row for row in rows if row.active_wallclock_hours is not None and row.scores["AIME mean"] is not None]
     x_bounds = _numeric_bounds(row.active_wallclock_hours for row in valid if row.active_wallclock_hours is not None)
-    y_bounds = _score_bounds(row.scores["Macro"] for row in valid if row.scores["Macro"] is not None)
+    y_bounds = _score_bounds(row.scores["AIME mean"] for row in valid if row.scores["AIME mean"] is not None)
     elements = _svg_header(
         width,
         height,
-        "AIME macro mean versus active training wall-clock",
-        "Active wall-clock sums selected-lineage perf/step_time and excludes scheduler requeue gaps",
+        "AIME mean versus estimated uninterrupted training wall-clock",
+        "Resume-boundary wait is capped at its nearby steady-state median; scheduler gaps are excluded",
     )
     entries = [(f"T:R={train}:{8 - train}", RATIO_COLORS[train], False) for train in (1, 2, 3, 4)]
     entries.append(("colocated", RATIO_COLORS[0], True))
@@ -380,15 +403,15 @@ def _render_wallclock_macro(rows: list[SeriesRow]) -> str:
             height=panel_height,
             x_bounds=x_bounds,
             y_bounds=y_bounds,
-            x_label="Active training wall-clock (hours)",
+            x_label="Estimated uninterrupted wall-clock (hours)",
         )
         elements.extend(axes)
         for train_nodes in (1, 2, 3, 4):
             arm = f"s{staleness}-t{train_nodes}r{8 - train_nodes}"
             points = [
-                (row.active_wallclock_hours, row.scores["Macro"])
+                (row.active_wallclock_hours, row.scores["AIME mean"])
                 for row in valid
-                if row.arm == arm and row.active_wallclock_hours is not None and row.scores["Macro"] is not None
+                if row.arm == arm and row.active_wallclock_hours is not None and row.scores["AIME mean"] is not None
             ]
             elements.extend(
                 _line_elements(
@@ -399,9 +422,11 @@ def _render_wallclock_macro(rows: list[SeriesRow]) -> str:
                 )
             )
         colocated = [
-            (row.active_wallclock_hours, row.scores["Macro"])
+            (row.active_wallclock_hours, row.scores["AIME mean"])
             for row in valid
-            if row.arm == "s0-colocated" and row.active_wallclock_hours is not None and row.scores["Macro"] is not None
+            if row.arm == "s0-colocated"
+            and row.active_wallclock_hours is not None
+            and row.scores["AIME mean"] is not None
         ]
         elements.extend(
             _line_elements(
@@ -437,6 +462,18 @@ def _correlation_x(value: float, *, plot_x: float, plot_width: float, bound: flo
     return plot_x + plot_width * (value + bound) / (2.0 * bound)
 
 
+def _correlation_bound(values: Iterable[float]) -> float:
+    maximum = max((abs(value) for value in values if math.isfinite(value)), default=0.0)
+    if maximum == 0.0:
+        return 0.1
+    padded = maximum * 1.08
+    magnitude = 10 ** math.floor(math.log10(padded))
+    normalized = padded / magnitude
+    nice_steps = (1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0)
+    rounded = next(step for step in nice_steps if normalized <= step) * magnitude
+    return min(1.0, max(0.02, rounded))
+
+
 def _correlation_grid(
     *, plot_x: float, plot_y: float, plot_width: float, plot_height: float, bound: float
 ) -> list[str]:
@@ -469,21 +506,32 @@ def _correlation_bar(
     ]
 
 
+def _heatmap_color(value: float) -> str:
+    strength = min(1.0, abs(value))
+    target = (59, 120, 168) if value < 0.0 else (196, 78, 82)
+    channels = tuple(round(255 + (channel - 255) * strength) for channel in target)
+    return "#" + "".join(f"{channel:02x}" for channel in channels)
+
+
 def _render_staleness_metric_correlations(rows: list[CorrelationRow]) -> str:
-    predictor_colors = (
-        ("staleness/total/mean", "#4C78A8"),
-        ("staleness/total/variance", "#F58518"),
-    )
-    predictors = tuple(predictor for predictor, _ in predictor_colors)
     lookup = {(row.predictor, row.outcome): row.correlation for row in rows}
+    predictors = tuple(
+        (predictor, labels)
+        for predictor, labels in STALENESS_CORRELATION_FEATURES
+        if any(lookup.get((predictor, row.outcome)) is not None for row in rows)
+    )
     outcomes = sorted(
         {row.outcome for row in rows},
-        key=lambda outcome: max(abs(lookup.get((predictor, outcome)) or 0.0) for predictor in predictors),
+        key=lambda outcome: max(
+            (abs(lookup.get((predictor, outcome)) or 0.0) for predictor, _ in predictors),
+            default=0.0,
+        ),
         reverse=True,
     )[:14]
-    width, row_height = 1540, 48
-    height = 150 + row_height * len(outcomes)
-    plot_x, plot_y, plot_width = 455.0, 100.0, 1000.0
+    width, row_height = 1570, 44
+    height = 225 + row_height * len(outcomes)
+    plot_x, plot_y, cell_width = 375.0, 130.0, 140.0
+    plot_width = cell_width * len(predictors)
     plot_height = row_height * len(outcomes)
     elements = _svg_header(
         width,
@@ -491,47 +539,47 @@ def _render_staleness_metric_correlations(rows: list[CorrelationRow]) -> str:
         "Metrics most associated with realized training-data staleness",
         "Fixed-effect Pearson r after centering within the same update and trainer:rollout ratio",
     )
-    elements.extend(
-        _legend(
-            (("total mean", "#4C78A8", False), ("total variance", "#F58518", False)),
-            y=73,
-            center_x=width / 2,
-            spacing=210,
+    for column, (_, labels) in enumerate(predictors):
+        center_x = plot_x + (column + 0.5) * cell_width
+        elements.append(
+            f'<text class="label" x="{center_x:.2f}" y="91" text-anchor="middle">'
+            f'<tspan x="{center_x:.2f}">{html.escape(labels[0])}</tspan>'
+            f'<tspan x="{center_x:.2f}" dy="16">{html.escape(labels[1])}</tspan></text>'
         )
-    )
-    elements.extend(
-        _correlation_grid(
-            plot_x=plot_x,
-            plot_y=plot_y,
-            plot_width=plot_width,
-            plot_height=plot_height,
-            bound=1.0,
-        )
-    )
     for index, outcome in enumerate(outcomes):
         center_y = plot_y + (index + 0.5) * row_height
         elements.append(
             f'<text class="label" x="{plot_x - 18}" y="{center_y + 4:.2f}" '
             f'text-anchor="end">{html.escape(_short_metric(outcome))}</text>'
         )
-        for offset, (predictor, color) in enumerate(predictor_colors):
+        for column, (predictor, _) in enumerate(predictors):
             value = lookup.get((predictor, outcome))
             if value is None:
                 continue
-            elements.extend(
-                _correlation_bar(
-                    value=value,
-                    y=center_y - 13 + offset * 14,
-                    height=11,
-                    color=color,
-                    plot_x=plot_x,
-                    plot_width=plot_width,
-                    bound=1.0,
-                )
+            cell_x = plot_x + column * cell_width
+            cell_y = plot_y + index * row_height
+            text_class = "tick heatmap-light" if abs(value) >= 0.55 else "tick"
+            elements.append(
+                f'<g><rect x="{cell_x:.2f}" y="{cell_y:.2f}" width="{cell_width:.2f}" '
+                f'height="{row_height:.2f}" fill="{_heatmap_color(value)}" stroke="white"/>'
+                f'<title>{html.escape(predictor)} versus {html.escape(outcome)}: '
+                f'r={value:+.3f}</title><text class="{text_class}" x="{cell_x + cell_width / 2:.2f}" '
+                f'y="{center_y + 4:.2f}" text-anchor="middle">{value:+.2f}</text></g>'
             )
+    legend_y = plot_y + plot_height + 28
+    for index, value in enumerate((-1.0, -0.5, 0.0, 0.5, 1.0)):
+        cell_x = plot_x + plot_width / 2 - 125 + index * 50
+        elements.append(
+            f'<rect x="{cell_x:.2f}" y="{legend_y:.2f}" width="50" height="13" '
+            f'fill="{_heatmap_color(value)}" stroke="white"/>'
+        )
+        elements.append(
+            f'<text class="tick" x="{cell_x + 25:.2f}" y="{legend_y + 28:.2f}" '
+            f'text-anchor="middle">{value:+.1f}</text>'
+        )
     elements.append(
-        f'<text class="label" x="{plot_x + plot_width / 2:.2f}" y="{height - 10}" '
-        'text-anchor="middle">Correlation with realized staleness</text>'
+        f'<text class="label" x="{plot_x + plot_width / 2:.2f}" y="{legend_y + 48:.2f}" '
+        'text-anchor="middle">Fixed-effect Pearson correlation</text>'
     )
     elements.append("</svg>")
     return "\n".join(elements) + "\n"
@@ -539,15 +587,19 @@ def _render_staleness_metric_correlations(rows: list[CorrelationRow]) -> str:
 
 def _render_downstream_correlations(rows: list[CorrelationRow]) -> str:
     outcome_colors = (
-        ("delta_aime24", "#4C78A8"),
-        ("delta_aime25", "#F58518"),
-        ("delta_aime26", "#54A24B"),
-        ("delta_macro", "#222222"),
+        ("delta_aime24", "AIME24", "#4C78A8"),
+        ("delta_aime25", "AIME25", "#F58518"),
+        ("delta_aime26", "AIME26", "#54A24B"),
+        ("delta_macro", "AIME mean", "#222222"),
     )
     lookup = {(row.predictor, row.outcome): row.correlation for row in rows}
-    observed = [abs(value) for value in lookup.values() if value is not None]
-    bound = max(0.1, math.ceil(max(observed, default=0.1) * 10.0) / 10.0)
-    width, group_height = 1540, 100
+    bound = _correlation_bound(
+        value
+        for predictor in STALENESS_FEATURES
+        for outcome, _, _ in outcome_colors
+        if (value := lookup.get((predictor, outcome))) is not None
+    )
+    width, group_height = 1540, 82
     height = 155 + group_height * len(STALENESS_FEATURES)
     plot_x, plot_y, plot_width = 430.0, 105.0, 1020.0
     plot_height = group_height * len(STALENESS_FEATURES)
@@ -559,7 +611,7 @@ def _render_downstream_correlations(rows: list[CorrelationRow]) -> str:
     )
     elements.extend(
         _legend(
-            ((label.replace("delta_", "").upper(), color, False) for label, color in outcome_colors),
+            ((label, color, False) for _, label, color in outcome_colors),
             y=75,
             center_x=width / 2,
             spacing=170,
@@ -578,9 +630,9 @@ def _render_downstream_correlations(rows: list[CorrelationRow]) -> str:
         center_y = plot_y + (group_index + 0.5) * group_height
         elements.append(
             f'<text class="label" x="{plot_x - 18}" y="{center_y + 4:.2f}" '
-            f'text-anchor="end">{html.escape(predictor.replace("staleness/", ""))}</text>'
+            f'text-anchor="end">{html.escape(predictor.removeprefix("staleness/").replace("_", "-"))}</text>'
         )
-        for outcome_index, (outcome, color) in enumerate(outcome_colors):
+        for outcome_index, (outcome, _, color) in enumerate(outcome_colors):
             value = lookup.get((predictor, outcome))
             if value is None:
                 continue
@@ -607,8 +659,13 @@ def _factor_bounds(values: Iterable[float], *, signed: bool) -> tuple[float, flo
     finite = [value for value in values if math.isfinite(value)]
     if not signed:
         return _numeric_bounds(finite)
-    _, bound = _numeric_bounds(abs(value) for value in finite)
-    return -bound, bound
+    negative = [-value for value in finite if value < 0.0]
+    positive = [value for value in finite if value > 0.0]
+    lower = -_numeric_bounds(negative)[1] if negative else 0.0
+    upper = _numeric_bounds(positive)[1] if positive else 0.0
+    if lower == upper:
+        return 0.0, 1.0
+    return lower, upper
 
 
 def _factor_x(value: float, *, plot_x: float, plot_width: float, bounds: tuple[float, float]) -> float:
@@ -621,10 +678,13 @@ def _factor_grid(
 ) -> list[str]:
     lower, upper = bounds
     elements: list[str] = []
-    for index in range(5):
-        value = lower + (upper - lower) * index / 4.0
+    if lower < 0.0 < upper:
+        ticks = (lower, lower / 2.0, 0.0, upper / 2.0, upper)
+    else:
+        ticks = tuple(lower + (upper - lower) * index / 4.0 for index in range(5))
+    for value in ticks:
         x = _factor_x(value, plot_x=plot_x, plot_width=plot_width, bounds=bounds)
-        css_class = "axis" if abs(value) < 1e-12 else "grid"
+        css_class = "zero-line" if abs(value) < 1e-12 else "grid"
         elements.append(
             f'<line class="{css_class}" x1="{x:.2f}" y1="{plot_y}" x2="{x:.2f}" y2="{plot_y + plot_height}"/>'
         )
@@ -658,22 +718,24 @@ def _factor_bar(
 
 def _render_wallclock_decomposition(rows: list[DecompositionRow]) -> str:
     ordered = sorted(rows, key=lambda row: ALL_ARMS.index(row.arm))
-    row_height = 40
+    row_height = 42
     plot_y = 125.0
     plot_height = row_height * len(ordered)
-    width, height = 1900, int(plot_y + plot_height + 70)
-    panel_width = 500.0
-    panel_xs = (270.0, 825.0, 1380.0)
+    width, height = 2325, int(plot_y + plot_height + 70)
+    panel_width = 480.0
+    panel_xs = (190.0, 720.0, 1250.0, 1780.0)
     metrics = (
-        ("macro_points_per_update", "dQ/dU", "Macro points per update", True),
+        ("macro_points_per_update", "dQ/dU", "AIME mean points per update", True),
         ("updates_per_active_hour", "dU/dt", "Updates per active hour", False),
-        ("macro_points_per_active_hour", "dQ/dt", "Macro points per active hour", True),
+        ("macro_points_per_active_hour", "dQ/dt", "AIME mean points per active hour", True),
+        ("training_staleness_mean", "L train", "Training staleness mean", False),
     )
     elements = _svg_header(
         width,
         height,
         "Learning-effect and throughput decomposition by setting",
-        "dQ/dt = (dQ/dU) × (dU/dt), using only ten-update intervals shared by all 17 settings",
+        "s=max weight staleness, t=train nodes, r=rollout nodes; s0-colocated is the baseline; "
+        "dQ/dt = (dQ/dU) × (dU/dt)",
     )
     elements.extend(
         _legend(
@@ -684,8 +746,12 @@ def _render_wallclock_decomposition(rows: list[DecompositionRow]) -> str:
         )
     )
     for panel_x, (attribute, symbol, label, signed) in zip(panel_xs, metrics, strict=True):
-        values = [float(getattr(row, attribute)) for row in ordered]
+        values = [float(value) for row in ordered if (value := getattr(row, attribute)) is not None]
         bounds = _factor_bounds(values, signed=signed)
+        elements.append(
+            f'<rect class="panel-frame" x="{panel_x - 15:.2f}" y="91" '
+            f'width="{panel_width + 30:.2f}" height="{plot_height + 72:.2f}" rx="4"/>'
+        )
         elements.append(
             f'<text class="panel-title" x="{panel_x + panel_width / 2:.2f}" y="108" '
             f'text-anchor="middle">{html.escape(symbol)} — {html.escape(label)}</text>'
@@ -703,19 +769,25 @@ def _render_wallclock_decomposition(rows: list[DecompositionRow]) -> str:
             center_y = plot_y + (index + 0.5) * row_height
             if panel_x == panel_xs[0]:
                 elements.append(
-                    f'<text class="label" x="{panel_x - 16}" y="{center_y + 4:.2f}" '
-                    f'text-anchor="end">{html.escape(row.arm)}</text>'
+                    f'<text class="setting-label" x="{panel_x - 35}" y="{center_y + 5:.2f}" '
+                    f'text-anchor="end">{html.escape(_display_arm(row.arm))}</text>'
                 )
-            elements.extend(
-                _factor_bar(
-                    value=float(getattr(row, attribute)),
-                    y=center_y,
-                    color=RATIO_COLORS[row.trainer_nodes],
-                    plot_x=panel_x,
-                    plot_width=panel_width,
-                    bounds=bounds,
+            value = getattr(row, attribute)
+            if value is None:
+                elements.append(
+                    f'<text class="tick" x="{panel_x + 8:.2f}" y="{center_y + 4:.2f}">not logged</text>'
                 )
-            )
+            else:
+                elements.extend(
+                    _factor_bar(
+                        value=float(value),
+                        y=center_y,
+                        color=RATIO_COLORS[row.trainer_nodes],
+                        plot_x=panel_x,
+                        plot_width=panel_width,
+                        bounds=bounds,
+                    )
+                )
     elements.append("</svg>")
     return "\n".join(elements) + "\n"
 
@@ -760,17 +832,20 @@ def main() -> None:
             series,
             arms=ALL_ARMS,
             x_attribute="active_wallclock_hours",
-            x_label="Active wall-clock (hours)",
-            title="AIME score trajectory versus active wall-clock for every setting",
-            subtitle="Active wall-clock excludes scheduler requeue gaps",
+            x_label="Estimated uninterrupted wall-clock (hours)",
+            title="AIME score trajectory versus estimated uninterrupted wall-clock for every setting",
+            subtitle="Repeated resume startup wait is removed; the first startup and every training update remain",
         ),
-        "macro-vs-active-wallclock-by-staleness.svg": _render_wallclock_macro(series),
+        "aime-mean-vs-active-wallclock-by-staleness.svg": _render_wallclock_aime_mean(series),
         "learning-throughput-decomposition.svg": _render_wallclock_decomposition(decomposition),
         "staleness-metric-correlations.svg": _render_staleness_metric_correlations(staleness),
         "staleness-downstream-correlations.svg": _render_downstream_correlations(downstream),
     }
     for filename, content in figures.items():
         _atomic_write(output_dir / filename, content)
+    obsolete_path = output_dir / "macro-vs-active-wallclock-by-staleness.svg"
+    if obsolete_path.exists():
+        obsolete_path.unlink()
     selected_path = output_dir / "selected-downstream-trajectories.svg"
     arms = _selected_arms(selected_groups)
     if arms:

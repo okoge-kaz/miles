@@ -22,13 +22,20 @@ SCORE_COLUMNS = {
     "aime26": "aime26_percent",
     "macro": "aime_macro_mean_percent",
 }
-STALENESS_FEATURES = (
+STALENESS_PHASES = ("total", "pre_queue", "in_queue")
+STALENESS_STATISTICS = ("mean", "variance", "std", "p90", "max")
+STALENESS_FEATURES = tuple(
+    f"staleness/{phase}/{statistic}" for phase in STALENESS_PHASES for statistic in STALENESS_STATISTICS
+)
+STALENESS_CORRELATION_FEATURES = (
     "staleness/total/mean",
     "staleness/total/variance",
-    "staleness/total/std",
-    "staleness/total/p90",
     "staleness/pre_queue/mean",
+    "staleness/pre_queue/variance",
     "staleness/in_queue/mean",
+    "staleness/in_queue/variance",
+    "staleness/token_lag/exact/mean",
+    "staleness/version_mix/train/forward_version_span/sequence_mean",
 )
 MEDIATOR_METRICS = (
     "train/policy_rollout_kl",
@@ -146,9 +153,15 @@ def _checkpoint_series(
         step = int(aggregate["training_step"])
         history = histories.get(arm, {}).get(step, {})
         row: dict[str, Any] = dict(aggregate)
-        active_seconds = _optional_float(history.get("active_wallclock_seconds"))
+        active_seconds = _optional_float(history.get("estimated_uninterrupted_wallclock_seconds"))
+        observed_seconds = _optional_float(history.get("observed_active_wallclock_seconds"))
+        removed_seconds = _optional_float(history.get("resume_overhead_removed_seconds"))
         calendar_seconds = _optional_float(history.get("calendar_elapsed_seconds"))
         row["active_wallclock_hours"] = active_seconds / 3600.0 if active_seconds is not None else ""
+        row["observed_active_wallclock_hours"] = (
+            observed_seconds / 3600.0 if observed_seconds is not None else ""
+        )
+        row["resume_overhead_removed_hours"] = removed_seconds / 3600.0 if removed_seconds is not None else ""
         row["calendar_elapsed_hours"] = calendar_seconds / 3600.0 if calendar_seconds is not None else ""
         row["active_wallclock_coverage"] = history.get("active_wallclock_coverage", "")
         window_start = max(0, step - 10)
@@ -199,8 +212,12 @@ def _interval_records(
                 record[f"delta_{label}"] = (
                     end_score - start_score if start_score is not None and end_score is not None else ""
                 )
-            start_hours = _optional_float(histories.get(arm, {}).get(start_step, {}).get("active_wallclock_seconds"))
-            end_hours = _optional_float(histories.get(arm, {}).get(end_step, {}).get("active_wallclock_seconds"))
+            start_hours = _optional_float(
+                histories.get(arm, {}).get(start_step, {}).get("estimated_uninterrupted_wallclock_seconds")
+            )
+            end_hours = _optional_float(
+                histories.get(arm, {}).get(end_step, {}).get("estimated_uninterrupted_wallclock_seconds")
+            )
             record["active_interval_hours"] = (
                 (end_hours - start_hours) / 3600.0 if start_hours is not None and end_hours is not None else ""
             )
@@ -264,6 +281,19 @@ def _wallclock_decomposition(intervals: list[dict[str, Any]]) -> list[dict[str, 
             "active_interval_hours": active_hours,
             "updates_per_active_hour": covered_updates / active_hours,
         }
+        staleness_values = [
+            _optional_float(interval.get("staleness/total/mean")) for interval in arm_intervals
+        ]
+        row["training_staleness_mean"] = (
+            sum(
+                value * (int(interval["end_step"]) - int(interval["start_step"]))
+                for interval, value in zip(arm_intervals, staleness_values, strict=True)
+                if value is not None
+            )
+            / covered_updates
+            if all(value is not None for value in staleness_values)
+            else ""
+        )
         for label in SCORE_COLUMNS:
             score_change = sum(float(interval[f"delta_{label}"]) for interval in arm_intervals)
             row[f"{label}_score_change"] = score_change
@@ -414,7 +444,7 @@ def _staleness_correlations(
 ) -> list[Correlation]:
     records = _per_step_records(histories)
     correlations = []
-    for predictor in ("staleness/total/mean", "staleness/total/variance"):
+    for predictor in STALENESS_CORRELATION_FEATURES:
         for outcome in MEDIATOR_METRICS:
             correlations.append(
                 _fixed_effect_correlation(
@@ -519,10 +549,10 @@ def _summary_markdown(
         f"Complete checkpoint suites represented: **{len(complete)}**",
         "",
         "Correlations use ten-update AIME score changes. Predictor values are averaged over the same interval,",
-        "then centered within the same ending step and trainer:rollout ratio. Active wall-clock is the cumulative",
-        "selected-lineage `perf/step_time`; scheduler requeue gaps are excluded.",
+        "then centered within the same ending step and trainer:rollout ratio. Wall-clock uses cumulative",
+        "step time after clipping repeated resume-boundary wait to the nearby steady-state median.",
         "",
-        "## Largest absolute macro correlations",
+        "## Largest absolute AIME mean correlations",
         "",
         "| Predictor | n | r | 95% arm-bootstrap interval |",
         "|---|---:|---:|---:|",

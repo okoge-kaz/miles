@@ -10,6 +10,7 @@ import json
 import math
 import os
 import re
+import statistics
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -21,6 +22,8 @@ ROLLOUT_STEP = "rollout/step"
 TRAIN_STEP = "train/step"
 ROLLOUT_METRICS = (
     "perf/step_time",
+    "perf/train_time",
+    "perf/train_wait_time",
     "throughput/generated_tokens_per_second",
     "throughput/accepted_tokens_per_second",
     "throughput/useful_tokens_per_second",
@@ -35,7 +38,17 @@ ROLLOUT_METRICS = (
     "staleness/total/max",
     "staleness/total/p90",
     "staleness/pre_queue/mean",
+    "staleness/pre_queue/variance",
+    "staleness/pre_queue/std",
+    "staleness/pre_queue/max",
+    "staleness/pre_queue/p90",
     "staleness/in_queue/mean",
+    "staleness/in_queue/variance",
+    "staleness/in_queue/std",
+    "staleness/in_queue/max",
+    "staleness/in_queue/p90",
+    "staleness/token_lag/exact/mean",
+    "staleness/version_mix/train/forward_version_span/sequence_mean",
     "staleness/bound_exceeded_sample_frac",
     "rollout/fully_async/wasted_token_frac",
     "rollout/fully_async/stale_groups_recycled",
@@ -74,7 +87,11 @@ OUTPUT_FIELDS = (
     "rollout_timestamp",
     "train_timestamp",
     "calendar_elapsed_seconds",
-    "active_wallclock_seconds",
+    "resume_boundary",
+    "observed_active_wallclock_seconds",
+    "estimated_uninterrupted_wallclock_seconds",
+    "resume_overhead_removed_seconds",
+    "estimated_step_time_seconds",
     "active_wallclock_coverage",
     *ROLLOUT_METRICS,
     *TRAIN_METRICS,
@@ -166,8 +183,11 @@ def _merge_lineage(
 ) -> tuple[dict[str, dict[str, dict[int, dict[str, float]]]], int]:
     lineage: dict[str, dict[str, dict[int, dict[str, float]]]] = {}
     replacements = 0
+    seen_rollout_arms: set[str] = set()
     for history in sorted(histories, key=lambda item: (item.created_at, item.run_id)):
         arm_lineage = lineage.setdefault(history.arm, {"rollout": {}, "train": {}})
+        is_resume = history.arm in seen_rollout_arms
+        resume_boundary = min(history.rollout) if is_resume and history.rollout else None
         for axis in ("rollout", "train"):
             source = getattr(history, axis)
             for step, values in source.items():
@@ -176,6 +196,10 @@ def _merge_lineage(
                     if metric in target and target[metric] != value:
                         replacements += 1
                     target[metric] = value
+                if axis == "rollout":
+                    target["_resume_boundary"] = float(step == resume_boundary)
+        if history.rollout:
+            seen_rollout_arms.add(history.arm)
     return lineage, replacements
 
 
@@ -186,6 +210,48 @@ def _selected_timestamps(arm_lineage: dict[str, dict[int, dict[str, float]]]) ->
             if "_timestamp" in record:
                 timestamps.append(record["_timestamp"])
     return timestamps
+
+
+def _nearby_median(
+    rollout: dict[int, dict[str, float]],
+    *,
+    step: int,
+    metric: str,
+    limit: int = 8,
+) -> float | None:
+    candidates = [
+        (abs(candidate_step - step), value)
+        for candidate_step, record in rollout.items()
+        if candidate_step != step
+        and not bool(record.get("_resume_boundary"))
+        and (value := record.get(metric)) is not None
+        and value >= 0.0
+    ]
+    if not candidates:
+        return None
+    nearest = [value for _, value in sorted(candidates)[:limit]]
+    return float(statistics.median(nearest))
+
+
+def _estimated_step_times(rollout: dict[int, dict[str, float]]) -> dict[int, float]:
+    estimates: dict[int, float] = {}
+    for step, record in rollout.items():
+        observed = record.get("perf/step_time")
+        if observed is None or observed < 0.0:
+            continue
+        estimated = observed
+        if bool(record.get("_resume_boundary")):
+            train_time = record.get("perf/train_time")
+            wait_time = record.get("perf/train_wait_time")
+            typical_wait = _nearby_median(rollout, step=step, metric="perf/train_wait_time")
+            if train_time is not None and wait_time is not None and typical_wait is not None:
+                estimated = min(observed, train_time + min(wait_time, typical_wait))
+            else:
+                typical_step = _nearby_median(rollout, step=step, metric="perf/step_time")
+                if typical_step is not None:
+                    estimated = min(observed, typical_step)
+        estimates[step] = estimated
+    return estimates
 
 
 def _history_rows(
@@ -200,13 +266,21 @@ def _history_rows(
             continue
         timestamps = _selected_timestamps(arm_lineage)
         first_timestamp = min(timestamps) if timestamps else None
-        cumulative_seconds = 0.0
+        estimated_step_times = _estimated_step_times(rollout)
+        observed_cumulative_seconds = 0.0
+        estimated_cumulative_seconds = 0.0
+        removed_cumulative_seconds = 0.0
         covered_steps = 0
         for update_index in range(max(steps) + 1):
             step_time = rollout.get(update_index, {}).get("perf/step_time")
             if step_time is not None and step_time >= 0.0:
-                cumulative_seconds += step_time
+                estimated_step_time = estimated_step_times[update_index]
+                observed_cumulative_seconds += step_time
+                estimated_cumulative_seconds += estimated_step_time
+                removed_cumulative_seconds += step_time - estimated_step_time
                 covered_steps += 1
+            else:
+                estimated_step_time = None
             if update_index not in rollout and update_index not in train:
                 continue
             rollout_timestamp = rollout.get(update_index, {}).get("_timestamp")
@@ -226,7 +300,11 @@ def _history_rows(
                     if selected_timestamp is not None and first_timestamp is not None
                     else ""
                 ),
-                "active_wallclock_seconds": cumulative_seconds,
+                "resume_boundary": int(bool(rollout.get(update_index, {}).get("_resume_boundary"))),
+                "observed_active_wallclock_seconds": observed_cumulative_seconds,
+                "estimated_uninterrupted_wallclock_seconds": estimated_cumulative_seconds,
+                "resume_overhead_removed_seconds": removed_cumulative_seconds,
+                "estimated_step_time_seconds": estimated_step_time if estimated_step_time is not None else "",
                 "active_wallclock_coverage": covered_steps / (update_index + 1),
             }
             row.update({metric: rollout.get(update_index, {}).get(metric, "") for metric in ROLLOUT_METRICS})
@@ -298,7 +376,7 @@ def main() -> None:
     _atomic_write_json(
         metadata_json.resolve(),
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "generated_at_utc": datetime.now(timezone.utc).isoformat(),
             "entity": entity,
             "project": args.project,
@@ -307,6 +385,18 @@ def main() -> None:
             "arms": sorted(lineage),
             "lineage_replacements": replacements,
             "history_rows": len(rows),
+            "resume_boundaries": sum(int(row["resume_boundary"]) for row in rows),
+            "resume_overhead_removed_seconds": sum(
+                max(
+                    (
+                        float(row["resume_overhead_removed_seconds"])
+                        for row in rows
+                        if row["arm"] == arm
+                    ),
+                    default=0.0,
+                )
+                for arm in lineage
+            ),
         },
     )
     print(output_csv)

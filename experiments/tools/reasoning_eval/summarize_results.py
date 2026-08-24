@@ -44,7 +44,7 @@ class ScoreRecord:
 
 @dataclass(frozen=True)
 class AggregateRecord:
-    """Three-task macro score for one arm and training step."""
+    """Three-task AIME mean for one arm and training step."""
 
     arm: str
     placement: str
@@ -232,7 +232,7 @@ def _render_markdown(
         "",
         "## Latest complete checkpoint per arm",
         "",
-        "| Arm | Step | AIME24 | AIME25 | AIME26 | Macro mean |",
+        "| Arm | Step | AIME24 | AIME25 | AIME26 | AIME mean |",
         "|---|---:|---:|---:|---:|---:|",
     ]
     for arm in _expected_arms():
@@ -248,7 +248,7 @@ def _render_markdown(
     lines.extend(
         [
             "",
-            "The macro mean is emitted only when all three AIME tasks completed for that checkpoint.",
+            "The AIME mean is emitted only when all three AIME tasks completed for that checkpoint.",
             "Detailed and aggregate machine-readable data are in `task-results.csv`, "
             "`aggregate-results.csv`, and `summary.json`.",
             "",

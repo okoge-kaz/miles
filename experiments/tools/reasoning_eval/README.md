@@ -87,10 +87,10 @@ reassigning, or submitting any evaluation job.
 experiments/scripts/reasoning_eval/show-results.sh sr-20260819-212906
 ```
 
-This writes detailed task scores, three-task macro means, JSON, Markdown, and
+This writes detailed task scores, three-task AIME means, JSON, Markdown, and
 two dependency-free SVG figures below the study's `analysis/` directory.
 `summarize_results.py` reads the NeMo Skills metric exactly from
-`metrics.json[task]["pass@1"]["symbolic_correct"]`; a macro mean is emitted only
+`metrics.json[task]["pass@1"]["symbolic_correct"]`; an AIME mean is emitted only
 after AIME24/25/26 have all completed for a checkpoint.
 
 For the joined staleness, throughput, and wall-clock analysis, use a Python
@@ -113,21 +113,26 @@ following under `analysis/<protocol>/full/staleness/`:
 
 - the selected training history, ten-update score intervals, full correlation
   tables, and an analysis summary;
-- AIME24, AIME25, AIME26, and macro trajectories for all 17 settings, once by
+- AIME24, AIME25, AIME26, and AIME mean trajectories for all 17 settings, once by
   training step and once by active wall-clock;
-- a macro wall-clock comparison that separates max-weight-staleness panels and
+- an AIME mean wall-clock comparison that separates max-weight-staleness panels and
   trainer:rollout ratios;
 - a balanced-common-window, per-setting `dQ/dt = (dQ/dU) × (dU/dt)`
-  decomposition separating macro points per update, optimizer-update
-  throughput, and macro points per hour;
-- figures for metrics associated with realized staleness mean/variance and for
-  realized-staleness associations with ten-update AIME improvement;
+  decomposition separating AIME mean points per update, optimizer-update
+  throughput, and AIME mean points per hour;
+- a correlation heatmap spanning total, pre-queue, and in-queue mean/variance,
+  exact token lag, and within-sample forward-version span;
+- downstream-correlation rows for mean, variance, standard deviation, p90, and
+  maximum total/pre-queue/in-queue staleness versus ten-update AIME improvement;
 - a reduced downstream trajectory figure only when a relationship has
   `|r| >= 0.2` and its arm-cluster bootstrap interval excludes zero.
 
-Active wall-clock is the cumulative `perf/step_time` on the selected lineage.
-It measures training work and excludes scheduler/requeue downtime. Calendar
-elapsed time is retained separately in `training-history.csv`. Correlations are
+The plotted wall-clock estimates one uninterrupted training run. It cumulatively
+sums `perf/step_time`, but at the first update of each resumed W&B segment it caps
+`perf/train_wait_time` at the median of the eight nearest non-boundary updates;
+the actual `perf/train_time` remains. Raw cumulative active time, removed resume
+overhead, resume-boundary markers, and calendar elapsed time are retained in
+`training-history.csv`. Scheduler/requeue downtime is excluded. Correlations are
 centered within the same update or ending checkpoint and trainer:rollout ratio,
 so they compare realized staleness across max-weight-staleness settings without
 confounding the nominal training ratio.
