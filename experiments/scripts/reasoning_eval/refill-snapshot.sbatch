@@ -8,6 +8,8 @@
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=2G
 #SBATCH --time=2-00:00:00
+#SBATCH --requeue
+#SBATCH --signal=B:USR1@300
 #SBATCH --output=experiments/outputs/reasoning_eval/setup/%x-%j.log
 
 set -euo pipefail
@@ -21,6 +23,8 @@ LAUNCHER="${REPO_ROOT}/experiments/scripts/reasoning_eval/submit-staleness-sweep
 SNAPSHOT_ARM_MAX_STEPS="${SNAPSHOT_ARM_MAX_STEPS:-}"
 EXPECTED_CHECKPOINTS="${EXPECTED_CHECKPOINTS:-510}"
 POLL_SECONDS="${POLL_SECONDS:-30}"
+DYNAMIC_QUIESCENT_SCANS="${DYNAMIC_QUIESCENT_SCANS:-12}"
+CONTROLLER_DRY_RUN="${CONTROLLER_DRY_RUN:-0}"
 EVAL_QOS="${EVAL_QOS:-normal}"
 BATCH_PARTITION="${BATCH_PARTITION:-batch_short}"
 BATCH_WALL="${BATCH_WALL:-02:00:00}"
@@ -42,7 +46,8 @@ fi
 TRUST_PINNED_SNAPSHOT="${TRUST_PINNED_SNAPSHOT:-${default_trust_pinned_snapshot}}"
 
 for integer_value in \
-    "${EXPECTED_CHECKPOINTS}" "${POLL_SECONDS}" "${SQUEUE_TIMEOUT_SECONDS}" \
+    "${EXPECTED_CHECKPOINTS}" "${POLL_SECONDS}" "${DYNAMIC_QUIESCENT_SCANS}" \
+    "${SQUEUE_TIMEOUT_SECONDS}" \
     "${PROMOTION_WAIT_ATTEMPTS}" "${PROMOTION_WAIT_SECONDS}"; do
     [[ "${integer_value}" =~ ^[1-9][0-9]*$ ]] || {
         echo "controller integer controls must be positive: ${integer_value}" >&2
@@ -51,7 +56,8 @@ for integer_value in \
 done
 for integer_value in \
     "${BATCH_INFLIGHT_TARGET}" "${REGULAR_INFLIGHT_TARGET}" \
-    "${INTERACTIVE_INFLIGHT_TARGET}" "${TRUST_PINNED_SNAPSHOT}"; do
+    "${INTERACTIVE_INFLIGHT_TARGET}" "${TRUST_PINNED_SNAPSHOT}" \
+    "${CONTROLLER_DRY_RUN}"; do
     [[ "${integer_value}" =~ ^[0-9]+$ ]] || {
         echo "controller queue targets must be nonnegative: ${integer_value}" >&2
         exit 2
@@ -59,6 +65,10 @@ for integer_value in \
 done
 (( TRUST_PINNED_SNAPSHOT <= 1 )) || {
     echo "TRUST_PINNED_SNAPSHOT must be 0 or 1" >&2
+    exit 2
+}
+(( CONTROLLER_DRY_RUN <= 1 )) || {
+    echo "CONTROLLER_DRY_RUN must be 0 or 1" >&2
     exit 2
 }
 if (( TRUST_PINNED_SNAPSHOT == 1 )) && [[ -z "${SNAPSHOT_ARM_MAX_STEPS}" ]]; then
@@ -72,6 +82,13 @@ fi
     exit 2
 }
 [[ -x "${LAUNCHER}" ]] || { echo "launcher is not executable: ${LAUNCHER}" >&2; exit 3; }
+
+requeue_controller() {
+    echo "controller wall time is nearly exhausted; requeueing Slurm job ${SLURM_JOB_ID}"
+    scontrol requeue "${SLURM_JOB_ID}"
+    exit 0
+}
+trap requeue_controller USR1
 
 run_launcher() {
     local partition="$1"
@@ -122,23 +139,51 @@ cancel_pending_job_for_reassignment() {
     return 1
 }
 
+last_available_count=-1
+quiescent_scan_count=0
 while true; do
     scan_output="$(run_launcher "${BATCH_PARTITION}" "${BATCH_WALL}")"
     printf '%s\n' "${scan_output}"
     available_count="$(extract_status_count "${scan_output}" available)"
     complete_count="$(extract_status_count "${scan_output}" complete)"
+    active_count="$(extract_status_count "${scan_output}" active)"
     pending_count="$(extract_status_count "${scan_output}" pending)"
-    [[ -n "${available_count}" && -n "${complete_count}" && -n "${pending_count}" ]] || {
+    [[ -n "${available_count}" && -n "${complete_count}" \
+        && -n "${active_count}" && -n "${pending_count}" ]] || {
         echo "could not parse launcher status" >&2
         exit 4
     }
-    if [[ -n "${SNAPSHOT_ARM_MAX_STEPS}" ]] \
-        && (( available_count != EXPECTED_CHECKPOINTS )); then
-        echo "snapshot availability changed: expected=${EXPECTED_CHECKPOINTS} actual=${available_count}" >&2
-        exit 5
+    if [[ -n "${SNAPSHOT_ARM_MAX_STEPS}" ]]; then
+        if (( available_count != EXPECTED_CHECKPOINTS )); then
+            echo "snapshot availability changed: expected=${EXPECTED_CHECKPOINTS} actual=${available_count}" >&2
+            exit 5
+        fi
+        if (( complete_count == EXPECTED_CHECKPOINTS )); then
+            echo "all ${EXPECTED_CHECKPOINTS} pinned checkpoint evaluations are complete"
+            exit 0
+        fi
+    else
+        if (( available_count > 0 && complete_count == available_count \
+            && active_count == 0 && pending_count == 0 )); then
+            if (( available_count == last_available_count )); then
+                ((quiescent_scan_count += 1))
+            else
+                quiescent_scan_count=1
+            fi
+            echo "all ${available_count} currently available evaluations are complete; " \
+                "quiescent scan ${quiescent_scan_count}/${DYNAMIC_QUIESCENT_SCANS}"
+            if (( quiescent_scan_count >= DYNAMIC_QUIESCENT_SCANS )); then
+                echo "available checkpoint set remained complete and unchanged; controller is done"
+                exit 0
+            fi
+        else
+            quiescent_scan_count=0
+        fi
+        last_available_count="${available_count}"
     fi
-    if (( complete_count == EXPECTED_CHECKPOINTS )); then
-        echo "all ${EXPECTED_CHECKPOINTS} checkpoint evaluations are complete"
+
+    if (( CONTROLLER_DRY_RUN == 1 )); then
+        echo "controller dry run; stopping before queue reassignment or submission"
         exit 0
     fi
 

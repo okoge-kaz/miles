@@ -66,14 +66,20 @@ running evaluations are never canceled or migrated:
 
 ```bash
 sbatch \
-  --export=ALL,TRAINING_ROOT=/path/to/checkpoints/training,RUN_NAMESPACE=sr-20260819-212906,EXPECTED_CHECKPOINTS=510,POLL_SECONDS=300,BATCH_INFLIGHT_TARGET=0,REGULAR_INFLIGHT_TARGET=490,INTERACTIVE_INFLIGHT_TARGET=20,REGULAR_WALL=04:00:00,INTERACTIVE_WALL=04:00:00,SLURM_JOB_USER="$USER",TRUST_PINNED_SNAPSHOT=0 \
+  --export=ALL,TRAINING_ROOT=/path/to/checkpoints/training,RUN_NAMESPACE=sr-20260819-212906,POLL_SECONDS=300,DYNAMIC_QUIESCENT_SCANS=12,BATCH_INFLIGHT_TARGET=0,REGULAR_INFLIGHT_TARGET=490,INTERACTIVE_INFLIGHT_TARGET=20,REGULAR_WALL=04:00:00,INTERACTIVE_WALL=04:00:00,SLURM_JOB_USER="$USER",TRUST_PINNED_SNAPSHOT=0 \
   experiments/scripts/reasoning_eval/refill-snapshot.sbatch
 ```
 
 With no `SNAPSHOT_ARM_MAX_STEPS`, the controller operates dynamically and does
-not require all checkpoints to exist at startup. Supplying an arm-max-step
-snapshot retains the fixed-snapshot availability check. Queue targets accept
-zero, which is useful when `batch_short` is unavailable or node-limited.
+not require all checkpoints to exist at startup. Once every currently available
+checkpoint is evaluated, it waits for 12 unchanged scans by default before
+declaring the accessible set complete; a newly completed export resets that
+window. Supplying an arm-max-step snapshot retains the fixed-snapshot
+availability check. Queue targets accept zero, which is useful when
+`batch_short` is unavailable or node-limited. The controller requeues itself
+five minutes before its two-day wall limit when work remains. Set
+`CONTROLLER_DRY_RUN=1` to perform exactly one read-only scan without canceling,
+reassigning, or submitting any evaluation job.
 
 ## Results and figures
 
