@@ -18,6 +18,7 @@ WANDB_PYTHON="${WANDB_PYTHON:-${ANALYSIS_PYTHON}}"
 WANDB_ENTITY="${WANDB_ENTITY:-ai-horizons}"
 WANDB_PROJECT="${WANDB_PROJECT:-async-rl-dapo-math}"
 BOOTSTRAP_SAMPLES="${BOOTSTRAP_SAMPLES:-500}"
+SKIP_WANDB_EXPORT="${SKIP_WANDB_EXPORT:-0}"
 
 if (( $# > 1 )); then
     echo "usage: experiments/scripts/reasoning_eval/show-staleness-analysis.sh [RUN_NAMESPACE]" >&2
@@ -33,6 +34,10 @@ fi
     echo "BOOTSTRAP_SAMPLES must be nonnegative" >&2
     exit 3
 }
+[[ "${SKIP_WANDB_EXPORT}" =~ ^[01]$ ]] || {
+    echo "SKIP_WANDB_EXPORT must be 0 or 1" >&2
+    exit 3
+}
 
 mkdir -p "${STALENESS_ROOT}"
 "${ANALYSIS_PYTHON}" "${REPO_ROOT}/experiments/tools/reasoning_eval/summarize_results.py" \
@@ -40,11 +45,18 @@ mkdir -p "${STALENESS_ROOT}"
     --protocol-name "${PROTOCOL_NAME}" \
     --eval-mode "${EVAL_MODE}" \
     --output-dir "${ANALYSIS_ROOT}"
-"${WANDB_PYTHON}" "${REPO_ROOT}/experiments/tools/reasoning_eval/export_wandb_history.py" \
-    --entity "${WANDB_ENTITY}" \
-    --project "${WANDB_PROJECT}" \
-    --namespace "${RUN_NAMESPACE}" \
-    --output-csv "${STALENESS_ROOT}/training-history.csv"
+if (( SKIP_WANDB_EXPORT == 0 )); then
+    "${WANDB_PYTHON}" "${REPO_ROOT}/experiments/tools/reasoning_eval/export_wandb_history.py" \
+        --entity "${WANDB_ENTITY}" \
+        --project "${WANDB_PROJECT}" \
+        --namespace "${RUN_NAMESPACE}" \
+        --output-csv "${STALENESS_ROOT}/training-history.csv"
+else
+    [[ -s "${STALENESS_ROOT}/training-history.csv" ]] || {
+        echo "cached W&B history is missing: ${STALENESS_ROOT}/training-history.csv" >&2
+        exit 4
+    }
+fi
 "${ANALYSIS_PYTHON}" "${REPO_ROOT}/experiments/tools/reasoning_eval/analyze_staleness.py" \
     --aggregate-csv "${ANALYSIS_ROOT}/aggregate-results.csv" \
     --training-history-csv "${STALENESS_ROOT}/training-history.csv" \

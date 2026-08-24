@@ -101,6 +101,12 @@ WANDB_PYTHON=/path/to/python-with-wandb \
 experiments/scripts/reasoning_eval/show-staleness-analysis.sh sr-20260819-212906
 ```
 
+The dependency-driven `finalize-staleness-analysis.sbatch` job exports W&B
+history inside `SQSH_IMAGE`, then invokes the same analysis with
+`SKIP_WANDB_EXPORT=1`. This keeps the finalizer independent of Python packages
+installed on the CPU host while still refreshing W&B immediately before the
+final figures are generated.
+
 The command resolves resumed W&B runs into one latest-write-wins training
 lineage per arm, joins evaluation step `N` to update `N`, and writes the
 following under `analysis/<protocol>/full/staleness/`:
