@@ -6,7 +6,8 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
-#SBATCH --time=7-00:00:00
+#SBATCH --mem=2G
+#SBATCH --time=2-00:00:00
 #SBATCH --output=experiments/outputs/reasoning_eval/setup/%x-%j.log
 
 set -euo pipefail
