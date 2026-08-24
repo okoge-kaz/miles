@@ -109,7 +109,16 @@ run_launcher() {
 extract_status_count() {
     local status_output="$1"
     local label="$2"
-    sed -n "s/^status:.*${label}=\([0-9][0-9]*\).*/\1/p" <<< "${status_output}"
+    awk -v label="${label}" '
+        /^status:/ {
+            for (field_index = 1; field_index <= NF; field_index++) {
+                split($field_index, field_parts, "=")
+                if (field_parts[1] == label && field_parts[2] ~ /^[0-9]+$/) {
+                    print field_parts[2]
+                }
+            }
+        }
+    ' <<< "${status_output}"
 }
 
 cancel_pending_job_for_reassignment() {
