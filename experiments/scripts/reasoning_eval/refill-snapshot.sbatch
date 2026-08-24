@@ -16,9 +16,9 @@ LAUNCHER="${REPO_ROOT}/experiments/scripts/reasoning_eval/submit-staleness-sweep
 
 : "${TRAINING_ROOT:?set TRAINING_ROOT to the checkpoint root}"
 : "${RUN_NAMESPACE:?set RUN_NAMESPACE to the training namespace}"
-: "${SNAPSHOT_ARM_MAX_STEPS:?set the arm=max_step snapshot}"
 
-EXPECTED_CHECKPOINTS="${EXPECTED_CHECKPOINTS:-130}"
+SNAPSHOT_ARM_MAX_STEPS="${SNAPSHOT_ARM_MAX_STEPS:-}"
+EXPECTED_CHECKPOINTS="${EXPECTED_CHECKPOINTS:-510}"
 POLL_SECONDS="${POLL_SECONDS:-30}"
 EVAL_QOS="${EVAL_QOS:-normal}"
 BATCH_PARTITION="${BATCH_PARTITION:-batch_short}"
@@ -33,15 +33,26 @@ INTERACTIVE_INFLIGHT_TARGET="${INTERACTIVE_INFLIGHT_TARGET:-4}"
 SQUEUE_TIMEOUT_SECONDS="${SQUEUE_TIMEOUT_SECONDS:-10}"
 PROMOTION_WAIT_ATTEMPTS="${PROMOTION_WAIT_ATTEMPTS:-15}"
 PROMOTION_WAIT_SECONDS="${PROMOTION_WAIT_SECONDS:-2}"
-TRUST_PINNED_SNAPSHOT="${TRUST_PINNED_SNAPSHOT:-1}"
+if [[ -n "${SNAPSHOT_ARM_MAX_STEPS}" ]]; then
+    default_trust_pinned_snapshot=1
+else
+    default_trust_pinned_snapshot=0
+fi
+TRUST_PINNED_SNAPSHOT="${TRUST_PINNED_SNAPSHOT:-${default_trust_pinned_snapshot}}"
 
 for integer_value in \
-    "${EXPECTED_CHECKPOINTS}" "${POLL_SECONDS}" "${BATCH_INFLIGHT_TARGET}" \
-    "${REGULAR_INFLIGHT_TARGET}" "${INTERACTIVE_INFLIGHT_TARGET}" \
-    "${SQUEUE_TIMEOUT_SECONDS}" "${PROMOTION_WAIT_ATTEMPTS}" \
-    "${PROMOTION_WAIT_SECONDS}" "${TRUST_PINNED_SNAPSHOT}"; do
+    "${EXPECTED_CHECKPOINTS}" "${POLL_SECONDS}" "${SQUEUE_TIMEOUT_SECONDS}" \
+    "${PROMOTION_WAIT_ATTEMPTS}" "${PROMOTION_WAIT_SECONDS}"; do
     [[ "${integer_value}" =~ ^[1-9][0-9]*$ ]] || {
         echo "controller integer controls must be positive: ${integer_value}" >&2
+        exit 2
+    }
+done
+for integer_value in \
+    "${BATCH_INFLIGHT_TARGET}" "${REGULAR_INFLIGHT_TARGET}" \
+    "${INTERACTIVE_INFLIGHT_TARGET}" "${TRUST_PINNED_SNAPSHOT}"; do
+    [[ "${integer_value}" =~ ^[0-9]+$ ]] || {
+        echo "controller queue targets must be nonnegative: ${integer_value}" >&2
         exit 2
     }
 done
@@ -49,6 +60,10 @@ done
     echo "TRUST_PINNED_SNAPSHOT must be 0 or 1" >&2
     exit 2
 }
+if (( TRUST_PINNED_SNAPSHOT == 1 )) && [[ -z "${SNAPSHOT_ARM_MAX_STEPS}" ]]; then
+    echo "TRUST_PINNED_SNAPSHOT=1 requires SNAPSHOT_ARM_MAX_STEPS" >&2
+    exit 2
+fi
 [[ "${INTERACTIVE_PARTITION}" != "${BATCH_PARTITION}" \
     && "${INTERACTIVE_PARTITION}" != "${REGULAR_PARTITION}" \
     && "${BATCH_PARTITION}" != "${REGULAR_PARTITION}" ]] || {
@@ -116,10 +131,11 @@ while true; do
         echo "could not parse launcher status" >&2
         exit 4
     }
-    (( available_count == EXPECTED_CHECKPOINTS )) || {
+    if [[ -n "${SNAPSHOT_ARM_MAX_STEPS}" ]] \
+        && (( available_count != EXPECTED_CHECKPOINTS )); then
         echo "snapshot availability changed: expected=${EXPECTED_CHECKPOINTS} actual=${available_count}" >&2
         exit 5
-    }
+    fi
     if (( complete_count == EXPECTED_CHECKPOINTS )); then
         echo "all ${EXPECTED_CHECKPOINTS} checkpoint evaluations are complete"
         exit 0

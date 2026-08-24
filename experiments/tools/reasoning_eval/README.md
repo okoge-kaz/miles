@@ -59,6 +59,22 @@ job interrupted between tasks resumes only unfinished task caches. Use
 the same command as jobs finish; use `--max-submissions 0` only when the Slurm
 association is allowed to queue every pending checkpoint at once.
 
+For a sweep that is still producing or publishing checkpoints, the refill
+controller can continuously validate all 510 candidates and submit newly ready
+ones. It also keeps an interactive queue populated by moving only pending jobs;
+running evaluations are never canceled or migrated:
+
+```bash
+sbatch \
+  --export=ALL,TRAINING_ROOT=/path/to/checkpoints/training,RUN_NAMESPACE=sr-20260819-212906,EXPECTED_CHECKPOINTS=510,POLL_SECONDS=300,BATCH_INFLIGHT_TARGET=0,REGULAR_INFLIGHT_TARGET=490,INTERACTIVE_INFLIGHT_TARGET=20,REGULAR_WALL=04:00:00,INTERACTIVE_WALL=04:00:00,SLURM_JOB_USER="$USER",TRUST_PINNED_SNAPSHOT=0 \
+  experiments/scripts/reasoning_eval/refill-snapshot.sbatch
+```
+
+With no `SNAPSHOT_ARM_MAX_STEPS`, the controller operates dynamically and does
+not require all checkpoints to exist at startup. Supplying an arm-max-step
+snapshot retains the fixed-snapshot availability check. Queue targets accept
+zero, which is useful when `batch_short` is unavailable or node-limited.
+
 ## Results and figures
 
 ```bash
@@ -70,6 +86,36 @@ two dependency-free SVG figures below the study's `analysis/` directory.
 `summarize_results.py` reads the NeMo Skills metric exactly from
 `metrics.json[task]["pass@1"]["symbolic_correct"]`; a macro mean is emitted only
 after AIME24/25/26 have all completed for a checkpoint.
+
+For the joined staleness, throughput, and wall-clock analysis, use a Python
+environment containing `wandb` and run:
+
+```bash
+WANDB_PYTHON=/path/to/python-with-wandb \
+experiments/scripts/reasoning_eval/show-staleness-analysis.sh sr-20260819-212906
+```
+
+The command resolves resumed W&B runs into one latest-write-wins training
+lineage per arm, joins evaluation step `N` to update `N`, and writes the
+following under `analysis/<protocol>/full/staleness/`:
+
+- the selected training history, ten-update score intervals, full correlation
+  tables, and an analysis summary;
+- AIME24, AIME25, AIME26, and macro trajectories for all 17 settings, once by
+  training step and once by active wall-clock;
+- a macro wall-clock comparison that separates max-weight-staleness panels and
+  trainer:rollout ratios;
+- figures for metrics associated with realized staleness mean/variance and for
+  realized-staleness associations with ten-update AIME improvement;
+- a reduced downstream trajectory figure only when a relationship has
+  `|r| >= 0.2` and its arm-cluster bootstrap interval excludes zero.
+
+Active wall-clock is the cumulative `perf/step_time` on the selected lineage.
+It measures training work and excludes scheduler/requeue downtime. Calendar
+elapsed time is retained separately in `training-history.csv`. Correlations are
+centered within the same update or ending checkpoint and trainer:rollout ratio,
+so they compare realized staleness across max-weight-staleness settings without
+confounding the nominal training ratio.
 
 `unpad_vocab.py` creates a job-local vLLM view when a Megatron export retains
 padded embedding rows beyond `config.json:vocab_size`. The source checkpoint is
