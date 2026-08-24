@@ -205,15 +205,20 @@ def test_wallclock_decomposition_uses_only_intervals_shared_by_all_arms():
         interval("s1-t1r7", 20, 30, 100.0),
         interval("s2-t1r7", 10, 20, 1.0),
     ]
+    colocated = interval("s0-colocated", 10, 20, 1.5)
+    colocated["staleness/total/mean"] = ""
+    intervals.append(colocated)
 
     rows = ANALYZE._wallclock_decomposition(intervals)
 
-    assert len(rows) == 2
+    assert len(rows) == 3
     assert {row["interval_count"] for row in rows} == {1}
     assert {row["common_start_step"] for row in rows} == {10}
     assert {row["common_end_step"] for row in rows} == {20}
     s1 = next(row for row in rows if row["arm"] == "s1-t1r7")
     assert s1["macro_points_per_update"] == pytest.approx(0.2)
+    colocated_row = next(row for row in rows if row["arm"] == "s0-colocated")
+    assert colocated_row["training_staleness_mean"] == 0.0
 
 
 def test_score_panel_svg_is_well_formed():
@@ -285,7 +290,7 @@ def test_wallclock_decomposition_svg_is_well_formed():
             macro_points_per_update=0.15,
             updates_per_active_hour=8.0,
             macro_points_per_active_hour=1.2,
-            training_staleness_mean=None,
+            training_staleness_mean=0.0,
         ),
     ]
 
@@ -298,7 +303,7 @@ def test_wallclock_decomposition_svg_is_well_formed():
     assert "s1-t1-r7" in svg
     assert "s=max weight staleness, t=train nodes, r=rollout nodes" in svg
     assert "Training staleness mean" in svg
-    assert "not logged" in svg
+    assert "not logged" not in svg
     assert svg.count('class="panel-frame"') == 4
     assert 'class="setting-label"' in svg
     assert ".setting-label{font-size:24px" in svg
@@ -340,6 +345,8 @@ def test_downstream_plot_bounds_only_visible_staleness_predictors():
     svg = PLOT._render_downstream_correlations(rows)
 
     assert "pre-queue/variance" in svg
+    assert 'class="correlation-label"' in svg
+    assert 'x="750.00"' in svg
     assert ">-0.08</text>" in svg
     assert ">0.08</text>" in svg
 
@@ -362,6 +369,23 @@ def test_staleness_metric_heatmap_includes_phase_and_version_predictors():
         )
         for index, predictor in enumerate(predictors)
     ]
+    excluded_outcomes = (
+        "throughput/cohort_useful_efficiency",
+        "rollout/fully_async/wasted_token_frac",
+        "perf/step_time",
+        "throughput/useful_tokens_per_second",
+    )
+    rows.extend(
+        PLOT.CorrelationRow(
+            predictor="staleness/total/mean",
+            outcome=outcome,
+            observations=20,
+            correlation=0.99,
+            ci_low=None,
+            ci_high=None,
+        )
+        for outcome in excluded_outcomes
+    )
 
     svg = PLOT._render_staleness_metric_correlations(rows)
 
@@ -371,3 +395,5 @@ def test_staleness_metric_heatmap_includes_phase_and_version_predictors():
     assert "in-queue" in svg
     assert "exact token lag" in svg
     assert "version span" in svg
+    for outcome in excluded_outcomes:
+        assert outcome not in svg

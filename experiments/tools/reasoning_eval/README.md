@@ -119,9 +119,14 @@ following under `analysis/<protocol>/full/staleness/`:
   trainer:rollout ratios;
 - a balanced-common-window, per-setting `dQ/dt = (dQ/dU) × (dU/dt)`
   decomposition separating AIME mean points per update, optimizer-update
-  throughput, and AIME mean points per hour;
+  throughput, AIME mean points per hour, and training-data staleness mean. The
+  colocated on-policy baseline is shown as zero even though it does not log the
+  async staleness namespace;
 - a correlation heatmap spanning total, pre-queue, and in-queue mean/variance,
   exact token lag, and within-sample forward-version span;
+- the heatmap excludes cohort useful efficiency, wasted-token fraction, step
+  time, and useful tokens per second because scheduling and the configured
+  staleness bound jointly determine them;
 - downstream-correlation rows for mean, variance, standard deviation, p90, and
   maximum total/pre-queue/in-queue staleness versus ten-update AIME improvement;
 - a reduced downstream trajectory figure only when a relationship has

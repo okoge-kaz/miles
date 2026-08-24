@@ -57,6 +57,17 @@ MEDIATOR_METRICS = (
     "rollout/fully_async/wasted_token_frac",
     "perf/step_time",
 )
+STALENESS_PSEUDOCORRELATION_OUTCOMES = frozenset(
+    {
+        "throughput/cohort_useful_efficiency",
+        "rollout/fully_async/wasted_token_frac",
+        "perf/step_time",
+        "throughput/useful_tokens_per_second",
+    }
+)
+STALENESS_CORRELATION_OUTCOMES = tuple(
+    metric for metric in MEDIATOR_METRICS if metric not in STALENESS_PSEUDOCORRELATION_OUTCOMES
+)
 INTERVAL_METRICS = (*STALENESS_FEATURES, *MEDIATOR_METRICS)
 
 
@@ -284,16 +295,18 @@ def _wallclock_decomposition(intervals: list[dict[str, Any]]) -> list[dict[str, 
         staleness_values = [
             _optional_float(interval.get("staleness/total/mean")) for interval in arm_intervals
         ]
-        row["training_staleness_mean"] = (
-            sum(
+        if all(value is not None for value in staleness_values):
+            row["training_staleness_mean"] = sum(
                 value * (int(interval["end_step"]) - int(interval["start_step"]))
                 for interval, value in zip(arm_intervals, staleness_values, strict=True)
                 if value is not None
-            )
-            / covered_updates
-            if all(value is not None for value in staleness_values)
-            else ""
-        )
+            ) / covered_updates
+        elif arm == "s0-colocated":
+            # Colocated execution completes generation before the only update;
+            # no intervening policy version exists, so the unlogged lag is zero.
+            row["training_staleness_mean"] = 0.0
+        else:
+            row["training_staleness_mean"] = ""
         for label in SCORE_COLUMNS:
             score_change = sum(float(interval[f"delta_{label}"]) for interval in arm_intervals)
             row[f"{label}_score_change"] = score_change
@@ -445,7 +458,7 @@ def _staleness_correlations(
     records = _per_step_records(histories)
     correlations = []
     for predictor in STALENESS_CORRELATION_FEATURES:
-        for outcome in MEDIATOR_METRICS:
+        for outcome in STALENESS_CORRELATION_OUTCOMES:
             correlations.append(
                 _fixed_effect_correlation(
                     records,

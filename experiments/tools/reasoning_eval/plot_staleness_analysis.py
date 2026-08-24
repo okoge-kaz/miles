@@ -49,6 +49,14 @@ STALENESS_CORRELATION_FEATURES = (
         ("within-sample", "version span"),
     ),
 )
+STALENESS_PSEUDOCORRELATION_OUTCOMES = frozenset(
+    {
+        "throughput/cohort_useful_efficiency",
+        "rollout/fully_async/wasted_token_frac",
+        "perf/step_time",
+        "throughput/useful_tokens_per_second",
+    }
+)
 SELECTED_ARM_COLORS = (
     "#0072B2",
     "#D55E00",
@@ -180,6 +188,7 @@ def _svg_header(width: int, height: int, title: str, subtitle: str = "") -> list
         ".grid{stroke:#ddd;stroke-width:1}.zero-line{stroke:#333;stroke-width:1.6}"
         ".panel-frame{fill:#fafbfc;stroke:#777;stroke-width:1.2}.series{fill:none;stroke-width:2.2}"
         ".tick{font-size:11px}.label{font-size:13px}.setting-label{font-size:24px;font-weight:700}"
+        ".correlation-label{font-size:18px;font-weight:600}"
         ".heatmap-light{fill:white}"
         ".panel-title{font-size:15px;font-weight:bold}"
         ".title{font-size:22px;font-weight:bold}.subtitle{font-size:13px;fill:#555}</style>",
@@ -521,7 +530,7 @@ def _render_staleness_metric_correlations(rows: list[CorrelationRow]) -> str:
         if any(lookup.get((predictor, row.outcome)) is not None for row in rows)
     )
     outcomes = sorted(
-        {row.outcome for row in rows},
+        {row.outcome for row in rows if row.outcome not in STALENESS_PSEUDOCORRELATION_OUTCOMES},
         key=lambda outcome: max(
             (abs(lookup.get((predictor, outcome)) or 0.0) for predictor, _ in predictors),
             default=0.0,
@@ -599,9 +608,9 @@ def _render_downstream_correlations(rows: list[CorrelationRow]) -> str:
         for outcome, _, _ in outcome_colors
         if (value := lookup.get((predictor, outcome))) is not None
     )
-    width, group_height = 1540, 82
+    width, group_height = 1500, 82
     height = 155 + group_height * len(STALENESS_FEATURES)
-    plot_x, plot_y, plot_width = 430.0, 105.0, 1020.0
+    plot_x, plot_y, plot_width = 220.0, 105.0, 1060.0
     plot_height = group_height * len(STALENESS_FEATURES)
     elements = _svg_header(
         width,
@@ -629,7 +638,7 @@ def _render_downstream_correlations(rows: list[CorrelationRow]) -> str:
     for group_index, predictor in enumerate(STALENESS_FEATURES):
         center_y = plot_y + (group_index + 0.5) * group_height
         elements.append(
-            f'<text class="label" x="{plot_x - 18}" y="{center_y + 4:.2f}" '
+            f'<text class="correlation-label" x="{plot_x - 22}" y="{center_y + 6:.2f}" '
             f'text-anchor="end">{html.escape(predictor.removeprefix("staleness/").replace("_", "-"))}</text>'
         )
         for outcome_index, (outcome, _, color) in enumerate(outcome_colors):
