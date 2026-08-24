@@ -29,6 +29,10 @@ PLOT = _load_module(
     "reasoning_eval_plot_staleness_test_module",
     "experiments/tools/reasoning_eval/plot_staleness_analysis.py",
 )
+VALIDATE = _load_module(
+    "reasoning_eval_validate_checkpoint_test_module",
+    "experiments/tools/reasoning_eval/validate_checkpoint.py",
+)
 
 
 def test_latest_wandb_segment_replaces_replayed_metrics_and_rebuilds_clock():
@@ -63,6 +67,20 @@ def test_latest_wandb_segment_replaces_replayed_metrics_and_rebuilds_clock():
     assert rows[1]["active_wallclock_seconds"] == 50.0
     assert rows[1]["active_wallclock_coverage"] == 1.0
     assert rows[0]["calendar_elapsed_seconds"] == 1.0
+
+
+def test_checkpoint_validator_distinguishes_permission_errors(monkeypatch, capsys, tmp_path):
+    def deny_access(_path):
+        raise PermissionError(13, "Permission denied", "model.safetensors")
+
+    monkeypatch.setattr(VALIDATE, "validate_checkpoint", deny_access)
+    monkeypatch.setattr(sys, "argv", ["validate_checkpoint.py", str(tmp_path)])
+
+    with pytest.raises(SystemExit) as error:
+        VALIDATE.main()
+
+    assert error.value.code == 2
+    assert "unreadable checkpoint" in capsys.readouterr().err
 
 
 def test_score_interval_separates_update_effect_and_throughput():

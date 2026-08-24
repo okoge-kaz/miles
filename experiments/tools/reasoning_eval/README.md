@@ -133,4 +133,5 @@ response caches into a readable `model-outputs.jsonl` artifact.
 `validate_checkpoint.py` checks every indexed tensor mapping and requires each
 safetensors shard's byte length to match the end offset in its header, so a
 launcher running alongside training does not enqueue a partially written HF
-export.
+export. The sweep status reports unreadable shards separately from structurally
+incomplete exports, so a `0600` permission issue is not mistaken for corruption.

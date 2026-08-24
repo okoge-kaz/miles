@@ -258,6 +258,7 @@ complete_count=0
 active_count=0
 missing_count=0
 incomplete_count=0
+unreadable_count=0
 
 for ((step = START_STEP; step <= END_STEP; step += STEP_INTERVAL)); do
     checkpoint_directory=$((step - 1))
@@ -275,8 +276,14 @@ for ((step = START_STEP; step <= END_STEP; step += STEP_INTERVAL)); do
                 ((missing_count += 1))
                 continue
             fi
-            if ! checkpoint_is_complete "${checkpoint_path}"; then
-                ((incomplete_count += 1))
+            checkpoint_validation_status=0
+            checkpoint_is_complete "${checkpoint_path}" || checkpoint_validation_status=$?
+            if (( checkpoint_validation_status != 0 )); then
+                if (( checkpoint_validation_status == 2 )); then
+                    ((unreadable_count += 1))
+                else
+                    ((incomplete_count += 1))
+                fi
                 continue
             fi
         fi
@@ -308,9 +315,9 @@ fi
 if (( TRUST_PINNED_SNAPSHOT == 1 )); then
     echo "checkpoint validation: trusting the previously validated pinned snapshot"
 fi
-printf 'status: available=%d complete=%d active=%d pending=%d missing=%d incomplete=%d\n' \
+printf 'status: available=%d complete=%d active=%d pending=%d missing=%d incomplete=%d unreadable=%d\n' \
     "${available_count}" "${complete_count}" "${active_count}" "${#PENDING_ARMS[@]}" \
-    "${missing_count}" "${incomplete_count}"
+    "${missing_count}" "${incomplete_count}" "${unreadable_count}"
 
 for pending_index in "${!PENDING_ARMS[@]}"; do
     (( pending_index < PRINT_LIMIT )) || break

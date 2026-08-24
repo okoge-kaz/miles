@@ -161,6 +161,9 @@ def main() -> None:
     args = _parse_args()
     try:
         info = validate_checkpoint(args.checkpoint.resolve())
+    except PermissionError as error:
+        print(f"unreadable checkpoint {args.checkpoint}: {error}", file=sys.stderr)
+        raise SystemExit(2) from error
     except (FileNotFoundError, KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as error:
         print(f"invalid checkpoint {args.checkpoint}: {error}", file=sys.stderr)
         raise SystemExit(1) from error
