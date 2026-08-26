@@ -30,6 +30,12 @@ from miles.utils.tracking_utils.ci_history import RECORD_DIR_ENV
 
 logger = logging.getLogger(__name__)
 
+_REPLAY_BUFFER_VALIDATED_CUSTOM_RM_PATHS = frozenset(
+    {
+        "experiments.src.reward_sets.instruction_following.reward",
+    }
+)
+
 
 def resolve_rollout_function_paths(args) -> tuple[str, str]:
     """The (rollout, eval) function paths the arguments select."""
@@ -66,7 +72,10 @@ def _validate_replay_buffer(args) -> None:
         ),
         (args.advantage_estimator == "grpo", "--advantage-estimator grpo"),
         (not args.use_critic, "a critic-free GRPO run"),
-        (args.custom_rm_path is None, "the built-in reward-model function"),
+        (
+            args.custom_rm_path is None or args.custom_rm_path in _REPLAY_BUFFER_VALIDATED_CUSTOM_RM_PATHS,
+            "the built-in reward-model function or a replay-validated custom reward-model function",
+        ),
         (args.custom_reward_post_process_path is None, "the built-in reward post-processing path"),
         (args.custom_convert_samples_to_train_data_path is None, "the built-in train-data conversion path"),
         (args.rollout_data_postprocess_path is None, "the built-in rollout data post-processing path"),
