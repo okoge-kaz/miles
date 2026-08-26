@@ -45,12 +45,14 @@ SUBMIT=0
 INCLUDE_COLOCATED=0
 MATCH_PARTIAL_CONCURRENCY=0
 CLEAN_CHECKPOINT=0
+RESUME_MATCHED_CHAIN=0
 declare -a REQUESTED_POINTS=()
 
 usage() {
     cat <<'EOF'
 usage: experiments/staleness_ratio_sweep.sh [--submit] [--include-colocated]
                                             [--matched-partial-concurrency]
+                                            [--resume-matched-chain]
                                             [--clean-checkpoint]
                                             [--point M:T:R ...]
 
@@ -74,8 +76,14 @@ identities, and cannot be combined with --include-colocated or
 protocol, this mode fixes TOTAL_NODES=8, PARTITION=batch, WALL=04:00:00, and
 CHAIN_JOBS=10.
 
+--resume-matched-chain resumes an existing matched-partial-concurrency
+namespace from its saved checkpoints and submits exactly nine chained jobs per
+arm. Set RUN_NAMESPACE to the original namespace. This option never removes
+checkpoints.
+
 Useful environment overrides: TOTAL_NODES, STALENESS_LEVELS, RATIOS,
 TRAINING_BUFFER_QUEUE_SIZE, CHAIN_JOBS, PARTITION, WALL, and RUN_NAMESPACE.
+--resume-matched-chain ignores CHAIN_JOBS and always uses nine.
 EOF
 }
 
@@ -91,6 +99,11 @@ while (( $# > 0 )); do
             ;;
         --matched-partial-concurrency)
             MATCH_PARTIAL_CONCURRENCY=1
+            shift
+            ;;
+        --resume-matched-chain)
+            MATCH_PARTIAL_CONCURRENCY=1
+            RESUME_MATCHED_CHAIN=1
             shift
             ;;
         --clean-checkpoint)
@@ -121,6 +134,13 @@ fi
 if (( MATCH_PARTIAL_CONCURRENCY == 1 && CLEAN_CHECKPOINT == 1 )); then
     echo "--matched-partial-concurrency requires fresh identities; do not use --clean-checkpoint" >&2
     exit 2
+fi
+if (( RESUME_MATCHED_CHAIN == 1 && RUN_NAMESPACE_WAS_EXPLICIT == 0 )); then
+    echo "--resume-matched-chain requires an explicit RUN_NAMESPACE" >&2
+    exit 2
+fi
+if (( RESUME_MATCHED_CHAIN == 1 )); then
+    CHAIN_JOBS=9
 fi
 if (( MATCH_PARTIAL_CONCURRENCY == 1 && ${#REQUESTED_POINTS[@]} > 0 )); then
     echo "--matched-partial-concurrency owns its exact five-arm grid; do not use --point" >&2
@@ -325,8 +345,10 @@ if (( MATCH_PARTIAL_CONCURRENCY == 1 )); then
     # auditable identity; the image filename pins the SGLang build commit.
     MATCHED_SQSH_IMAGE_STAT="$(stat -Lc '%d:%i:%s:%Y' -- "${MATCHED_SQSH_IMAGE_RESOLVED}")"
 
+    matched_chain_jobs=10
+    (( RESUME_MATCHED_CHAIN == 1 )) && matched_chain_jobs=9
     [[ "${TOTAL_NODES}" == 8 && "${PARTITION}" == batch \
-       && "${WALL}" == 04:00:00 && "${CHAIN_JOBS}" == 10 \
+       && "${WALL}" == 04:00:00 && "${CHAIN_JOBS}" == "${matched_chain_jobs}" \
        && "${GPUS_PER_NODE}" == 8 \
        && "${ROLLOUT_BATCH}" == 192 && "${SAMPLES_PER_PROMPT}" == 16 \
        && "${TRAINING_BUFFER_QUEUE_SIZE_VALUE}" == 1000 \
@@ -335,11 +357,12 @@ if (( MATCH_PARTIAL_CONCURRENCY == 1 )); then
        && "${ASYNC_GPUS_PER_ENGINE}" == 1 && "${ASYNC_MEM_FRACTION}" == 0.70 \
        && "${COLOCATED_GPUS_PER_ENGINE}" == 2 && "${COLOCATED_MEM_FRACTION}" == 0.65 ]] || {
         echo "matched mode requires the completed cohort protocol:" \
-             "nodes=8, partition=batch, wall=04:00:00, chains=10," \
+             "nodes=8, partition=batch, wall=04:00:00, chains=${matched_chain_jobs}," \
              "gpus/node=8, rbs=192, n=16, queue=1000, gbs=3072, tp=2, cp=1," \
              "async engine/mem=1/0.70, colocated engine/mem=2/0.65" >&2
         exit 1
     }
+    unset matched_chain_jobs
 fi
 
 [[ "${QUEUE_POLICY}" == queue-recycle ]] || {
@@ -564,7 +587,16 @@ if (( MATCH_PARTIAL_CONCURRENCY == 1 )); then
     if [[ -d "${LOG_DIR}" ]]; then
         existing_log="$(find "${LOG_DIR}" -maxdepth 1 -type f -name "*${RUN_NAMESPACE}*" -print -quit 2>/dev/null)"
     fi
-    if [[ -n "${existing_checkpoint}" || -n "${existing_log}" ]]; then
+    if (( RESUME_MATCHED_CHAIN == 1 )); then
+        [[ -n "${existing_checkpoint}" ]] || {
+            echo "matched resume checkpoint namespace not found: ${RUN_NAMESPACE}" >&2
+            exit 1
+        }
+        [[ -f "${LOG_DIR}/${RUN_NAMESPACE}.manifest.tsv" ]] || {
+            echo "matched resume manifest not found: ${LOG_DIR}/${RUN_NAMESPACE}.manifest.tsv" >&2
+            exit 1
+        }
+    elif [[ -n "${existing_checkpoint}" || -n "${existing_log}" ]]; then
         echo "matched mode refuses an existing namespace: ${RUN_NAMESPACE}" >&2
         [[ -z "${existing_checkpoint}" ]] || echo "checkpoint: ${existing_checkpoint}" >&2
         [[ -z "${existing_log}" ]] || echo "log: ${existing_log}" >&2
@@ -580,7 +612,12 @@ fi
 mkdir -p "${LOG_DIR}"
 MANIFEST_PATH=""
 if (( MATCH_PARTIAL_CONCURRENCY == 1 )); then
-    MANIFEST_PATH="${LOG_DIR}/${RUN_NAMESPACE}.manifest.tsv"
+    if (( RESUME_MATCHED_CHAIN == 1 )); then
+        resume_id="$(date -u +%Y%m%dT%H%M%SZ)-p$$"
+        MANIFEST_PATH="${LOG_DIR}/${RUN_NAMESPACE}.resume-${resume_id}.manifest.tsv"
+    else
+        MANIFEST_PATH="${LOG_DIR}/${RUN_NAMESPACE}.manifest.tsv"
+    fi
     if ! (set -o noclobber; : > "${MANIFEST_PATH}") 2>/dev/null; then
         echo "matched mode could not reserve its namespace manifest: ${MANIFEST_PATH}" >&2
         exit 1
@@ -595,6 +632,10 @@ if (( MATCH_PARTIAL_CONCURRENCY == 1 )); then
     {
         printf 'key\tvalue\n'
         printf 'namespace\t%s\n' "${RUN_NAMESPACE}"
+        printf 'resume_matched_chain\t%s\n' "${RESUME_MATCHED_CHAIN}"
+        if (( RESUME_MATCHED_CHAIN == 1 )); then
+            printf 'resume_of_manifest\t%s\n' "${LOG_DIR}/${RUN_NAMESPACE}.manifest.tsv"
+        fi
         printf 'git_head\t%s\n' "$(git -C "${REPO_ROOT}" rev-parse HEAD)"
         printf 'tracked_diff_sha256\t%s\n' "${tracked_diff_sha256}"
         printf 'runtime_repo\t%s\n' "${MATCHED_REPO_ROOT_RESOLVED}"
