@@ -13,6 +13,7 @@ import torch.distributed as dist
 from torch_memory_saver import torch_memory_saver
 
 from miles.dashboard import hooks as dashboard_hooks
+from miles.ray.train.types import TrainResultWithTiming
 from miles.ray.train_actor import TrainRayActor
 from miles.utils import train_dump_utils
 from miles.utils.argparse_utils import inplace_modify_args
@@ -359,7 +360,13 @@ class MegatronTrainRayActor(TrainRayActor):
 
     @with_logs
     @event_logger_context(
-        lambda _self, rollout_id, rollout_data_ref, witness_info=None, attempt=0, external_data=None: dict(
+        lambda _self,
+        rollout_id,
+        rollout_data_ref,
+        witness_info=None,
+        attempt=0,
+        external_data=None,
+        collect_wake_up_time=False: dict(
             rollout_id=rollout_id, attempt=attempt
         )
     )
@@ -370,11 +377,18 @@ class MegatronTrainRayActor(TrainRayActor):
         witness_info: WitnessInfo | None = None,
         attempt: int = 0,
         external_data=None,
+        collect_wake_up_time: bool = False,
     ):
         self._heartbeat.bump()
         self._last_rollout_id = rollout_id
+        local_wake_up_time = 0.0
         if self.args.offload_train and self._asleep:
+            previous_wake_up_time = (
+                Timer().log_dict().get("wake_up", 0.0) if collect_wake_up_time else 0.0
+            )
             self.wake_up()
+            if collect_wake_up_time:
+                local_wake_up_time = Timer().log_dict().get("wake_up", 0.0) - previous_wake_up_time
 
         with ExitStack() as stack:
             with timer("data_preprocess"):
@@ -384,7 +398,12 @@ class MegatronTrainRayActor(TrainRayActor):
                 stack.enter_context(store_get_result)
                 if self.args.debug_rollout_only:
                     log_rollout_data(rollout_id, self.args, rollout_data)
-                    return TrainStepOutcome.NORMAL
+                    result = TrainStepOutcome.NORMAL
+                    return (
+                        TrainResultWithTiming(result=result, local_wake_up_time=local_wake_up_time)
+                        if collect_wake_up_time
+                        else result
+                    )
 
             if self.role == "critic":
                 with timer("critic_train"):
@@ -398,7 +417,11 @@ class MegatronTrainRayActor(TrainRayActor):
                     attempt=attempt,
                 )
 
-            return result
+            return (
+                TrainResultWithTiming(result=result, local_wake_up_time=local_wake_up_time)
+                if collect_wake_up_time
+                else result
+            )
 
     @with_logs
     def train_critic(self, rollout_id: int, rollout_data: RolloutBatch) -> dict:
