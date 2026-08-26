@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 _REPLAY_BUFFER_VALIDATED_CUSTOM_RM_PATHS = frozenset(
     {
+        "experiments.src.reward_sets.code.reward",
         "experiments.src.reward_sets.instruction_following.reward",
     }
 )
