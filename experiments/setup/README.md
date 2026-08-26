@@ -56,6 +56,7 @@ datasets and was fully superseded by these manifest-driven jobs.
 | `datasets/prepare_competitive_code_validation.sbatch` | Sampled competitive-programming validation split. |
 | `datasets/prepare_performance_transfer_blends.sbatch` | Benchmark-safe competitive-code and STEM training blends. |
 | `datasets/prepare_math_code_stem_blend.sbatch` | Balanced Math/Code/STEM multi-environment blend. |
+| `datasets/prepare_math500.sbatch` | Convert the held-out MATH-500 split to canonical Miles JSONL. |
 | `datasets/prepare_tool_call_env.sbatch` | Disjoint function-call-only train/evaluation splits. |
 | `datasets/build_math_jsonl.py` | Legacy raw-math JSONL adapter used by the math preparation job. |
 | `datasets/prepare_swe_rl.sbatch` | Split pinned SWE sources by executable schema into gold-free rows plus owner-only Harbor manifests; unsupported R2E/SWE-Gym rows remain quarantined. |

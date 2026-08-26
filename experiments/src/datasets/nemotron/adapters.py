@@ -170,6 +170,28 @@ def adapt_dapo_math(row: dict[str, Any]) -> dict[str, Any] | None:
     return {"prompt": prompt, "label": label, "metadata": metadata}
 
 
+def adapt_math500(row: dict[str, Any]) -> dict[str, Any] | None:
+    problem = str(row.get("problem") or "").strip()
+    label = _answer_from_ground_truth(row.get("answer"))
+    if not problem or not label:
+        return None
+    metadata = _base_metadata(row, source="math-500", verifier="math")
+    metadata.update(
+        {
+            "eval_only": True,
+            "level": row.get("level"),
+            "record_id": row.get("unique_id"),
+            "rm_type": "math",
+            "subject": row.get("subject"),
+        }
+    )
+    return {
+        "prompt": [{"role": "user", "content": BOXED_INSTRUCTION + problem + BOXED_REMINDER}],
+        "label": label,
+        "metadata": metadata,
+    }
+
+
 def adapt_reasoning_gym(row: dict[str, Any]) -> dict[str, Any] | None:
     prompt = _chat_from_params(row)
     if not prompt and row.get("question"):
@@ -480,6 +502,7 @@ ADAPTERS = {
     "instruction-following": adapt_instruction_following,
     "knowledge-mcqa": adapt_knowledge_mcqa,
     "livecodebench": adapt_livecodebench,
+    "math500": adapt_math500,
     "reasoning-gym": adapt_reasoning_gym,
     "skywork-or1-code": adapt_skywork_or1_code,
     "skywork-or1-math": adapt_skywork_or1_math,
