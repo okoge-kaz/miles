@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=prep-domain-rl-eval
+#SBATCH --job-name=prep-code-rl-eval
 #SBATCH --account=coreai_horizon_dilations
 #SBATCH --partition=cpu
 #SBATCH --qos=cpu-normal
