@@ -2,7 +2,8 @@
 
 #SBATCH --job-name=reason-eval-images
 #SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=cpu_interactive
+#SBATCH --partition=cpu
+#SBATCH --qos=cpu-interactive
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32

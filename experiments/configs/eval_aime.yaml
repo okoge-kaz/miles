@@ -12,7 +12,10 @@ eval:
   datasets:
     - name: aime24
       path: /data/aime-2024/aime-2024.jsonl
+      rm_type: math
     - name: aime25
       path: /data/aime-2025/aime-2025.jsonl
+      rm_type: math
     - name: aime26
       path: /data/aime-2026/aime-2026.jsonl
+      rm_type: math

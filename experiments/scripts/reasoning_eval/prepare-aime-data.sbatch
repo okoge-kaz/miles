@@ -2,7 +2,8 @@
 
 #SBATCH --job-name=reason-eval-data
 #SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=cpu_interactive
+#SBATCH --partition=cpu
+#SBATCH --qos=cpu-interactive
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
@@ -25,7 +26,23 @@ NEMO_SKILLS_DATA_ROOT="${REASONING_EVAL_DATA_ROOT:-${DATASET_DIR}/evaluation}/ne
 EVALUATION_CACHE_ROOT="${REASONING_EVAL_CACHE_ROOT:-${CACHE_DIR}/reasoning_eval}"
 PREPARED_MARKER="${NEMO_SKILLS_DATA_ROOT}/_PREPARED"
 BENCHMARKS=(aime24 aime25 aime26)
+PREPARED_DATA_TOOL="${REPO_ROOT}/experiments/tools/reasoning_eval/prepared_data.py"
+MILES_EXPORT_TOOL="${REPO_ROOT}/experiments/tools/reasoning_eval/export_miles_aime.py"
+MILES_AIME_DATA_ROOT="${MILES_AIME_DATA_ROOT:-${DATASET_DIR}}"
 HOST_HF_TOKEN_PATH="${HF_TOKEN_PATH:-${HF_HOME:-${HOME}/.cache/huggingface}/token}"
+PREPARED_DATA_ARGS=(
+    --data-root "${NEMO_SKILLS_DATA_ROOT}"
+    --image "${NEMO_SKILLS_IMAGE}"
+)
+for benchmark in "${BENCHMARKS[@]}"; do
+    PREPARED_DATA_ARGS+=(--benchmark "${benchmark}")
+done
+
+export_miles_aime_data() {
+    python3 "${MILES_EXPORT_TOOL}" \
+        --source-root "${NEMO_SKILLS_DATA_ROOT}" \
+        --output-root "${MILES_AIME_DATA_ROOT}"
+}
 
 if [[ -z "${SLURM_JOB_ID:-}" ]]; then
     cd "${REPO_ROOT}"
@@ -51,8 +68,9 @@ mkdir -p "${NEMO_SKILLS_DATA_ROOT}" "${EVALUATION_CACHE_ROOT}/huggingface"
 exec 9> "${NEMO_SKILLS_DATA_ROOT}/.prepare.lock"
 flock --nonblock 9 || { echo "another AIME data preparation job is active" >&2; exit 3; }
 if [[ -f "${PREPARED_MARKER}" ]]; then
-    if grep -Fx "nemo_skills_image=${NEMO_SKILLS_IMAGE}" "${PREPARED_MARKER}" >/dev/null \
-        && grep -Fx "benchmarks=${BENCHMARKS[*]}" "${PREPARED_MARKER}" >/dev/null; then
+    if python3 "${PREPARED_DATA_TOOL}" \
+        "${PREPARED_DATA_ARGS[@]}" --marker "${PREPARED_MARKER}"; then
+        export_miles_aime_data
         echo "AIME24/25/26 data is already prepared: ${PREPARED_MARKER}"
         exit 0
     fi
@@ -77,12 +95,17 @@ srun \
         done
     ' _ "${BENCHMARKS[@]}"
 
+DATASET_PROVENANCE="$(
+    python3 "${PREPARED_DATA_TOOL}" "${PREPARED_DATA_ARGS[@]}" --print-env
+)"
 MARKER_PARTIAL="${PREPARED_MARKER}.partial-${SLURM_JOB_ID}"
 {
     printf 'nemo_skills_image=%s\n' "${NEMO_SKILLS_IMAGE}"
     printf 'benchmarks=%s\n' "${BENCHMARKS[*]}"
+    printf '%s\n' "${DATASET_PROVENANCE}"
     printf 'slurm_job_id=%s\n' "${SLURM_JOB_ID}"
     printf 'prepared_at_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } > "${MARKER_PARTIAL}"
 mv -- "${MARKER_PARTIAL}" "${PREPARED_MARKER}"
+export_miles_aime_data
 echo "AIME24/25/26 data preparation completed: ${PREPARED_MARKER}"
