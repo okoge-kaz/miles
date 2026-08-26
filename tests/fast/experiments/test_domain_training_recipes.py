@@ -12,13 +12,15 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 RECIPES = (
     "experiments/scripts/code/async/nemotron3-nano-competitive-code/qwen3-4b",
     "experiments/scripts/instruction_following/async/nemotron3-nano-ifevalg/qwen3-4b",
+    "experiments/scripts/multi_env/async/math-code-stem/qwen3-4b",
     "experiments/scripts/stem/async/nemotron3-nano-knowledge-mcqa-reasoning-gym/qwen3-4b",
 )
-RECIPE_IDS = ("code", "instruction-following", "stem")
+RECIPE_IDS = ("code", "instruction-following", "math-code-stem", "stem")
 CUSTOM_RM_PATHS = {
     RECIPES[0]: "experiments.src.reward_sets.code.reward",
     RECIPES[1]: "experiments.src.reward_sets.instruction_following.reward",
-    RECIPES[2]: "experiments.src.reward_sets.stem.reward",
+    RECIPES[2]: "experiments.src.reward_sets.math_code_stem.reward",
+    RECIPES[3]: "experiments.src.reward_sets.stem.reward",
 }
 
 
