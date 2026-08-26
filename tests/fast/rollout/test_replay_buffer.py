@@ -1265,6 +1265,37 @@ def test_dataset_fingerprint_includes_model_tokenizer_and_chat_template(tmp_path
     assert dataset_fingerprint(args, source) != initial
 
 
+@pytest.mark.parametrize(
+    ("argument", "changed_value"),
+    (
+        ("tau_max_turns", 12),
+        ("tau_user_backend", "gemini"),
+        ("tau_user_model", "gemini-2.5-flash-lite"),
+        ("tau_user_max_tokens", 256),
+        ("tau_user_temperature", 0.5),
+        ("tau_user_top_p", 0.9),
+        ("tau_user_request_timeout", 30.0),
+        ("tau_user_max_retries", 2),
+        ("tau_user_retry_backoff", 0.5),
+        ("tau_tool_call_parser", "qwen25"),
+    ),
+)
+def test_dataset_fingerprint_includes_tau_environment_configuration(
+    tmp_path: Path,
+    argument: str,
+    changed_value,
+):
+    prompt_path = tmp_path / "tau-prompts.jsonl"
+    prompt_path.write_text('{"prompt": "tau"}\n', encoding="utf-8")
+    source = Namespace(dataset=[object()])
+    args = Namespace(prompt_data=str(prompt_path))
+    initial = dataset_fingerprint(args, source)
+
+    setattr(args, argument, changed_value)
+
+    assert dataset_fingerprint(args, source) != initial
+
+
 def test_replay_buffer_retention_counts_existing_sparse_buffers(tmp_path: Path):
     state = {
         "dataset_fingerprint": "dataset-a",
