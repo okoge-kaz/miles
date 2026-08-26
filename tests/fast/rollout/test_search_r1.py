@@ -37,7 +37,7 @@ if "torch" not in sys.modules:
 
 from miles.rollout.filter_hub.dynamic_sampling_filters import check_no_aborted_and_reward_nonzero_std
 from miles.utils.types import Sample
-from experiments.src.search_r1 import retrieval_server
+from experiments.src.environments.search_r1 import retrieval_server
 
 SEARCH_R1_DIR = Path(__file__).resolve().parents[3] / "examples" / "experimental" / "search-r1"
 sys.path.insert(0, str(SEARCH_R1_DIR))

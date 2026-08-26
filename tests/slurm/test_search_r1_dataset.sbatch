@@ -12,7 +12,14 @@
 set -euo pipefail
 
 REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." &>/dev/null && pwd)}"
+SEARCH_R1_IMAGE_WAS_SET="${SQSH_IMAGE+x}"
 source "${REPO_ROOT}/experiments/env.sh"
+if [[ -z "${SEARCH_R1_IMAGE_WAS_SET}" ]]; then
+    SQSH_IMAGE="${CONTAINER_DIR}/miles-search-r1-b300-faiss-1.12.0-20260826.sqsh"
+    export SQSH_IMAGE
+fi
+unset SEARCH_R1_IMAGE_WAS_SET
+[[ -r "${SQSH_IMAGE}" ]] || { echo "missing Search-R1 image: ${SQSH_IMAGE}" >&2; exit 1; }
 
 srun \
     --container-image="${SQSH_IMAGE}" \
@@ -35,11 +42,16 @@ cleanup() {
 }
 trap cleanup EXIT
 
-pytest -q tests/fast/experiments/test_search_r1_dataset.py
+pytest -q \
+    tests/fast/experiments/test_search_r1_dataset.py \
+    tests/fast/experiments/test_search_r1.py \
+    tests/fast/rollout/test_search_r1.py
 python3 -m experiments.src.datasets.search_r1.build_eval \
     --flashrag-dir /data/flashrag-datasets --out-dir "${TEST_ROOT}/first"
 python3 -m experiments.src.datasets.search_r1.build_eval \
     --flashrag-dir /data/flashrag-datasets --out-dir "${TEST_ROOT}/second"
+python3 -m experiments.src.datasets.search_r1.build_eval \
+    --out-dir "${TEST_ROOT}/first" --validate-only
 diff -qr "${TEST_ROOT}/first" "${TEST_ROOT}/second"
 
 python3 - "${TEST_ROOT}/first" <<"PY"

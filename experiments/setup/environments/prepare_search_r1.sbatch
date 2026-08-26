@@ -118,13 +118,9 @@ EVAL_DIR="${SEARCH_DIR}/eval"
 python3 "${REPO_ROOT}/experiments/src/datasets/search_r1/build_eval.py" \
     --flashrag-dir "${FLASHRAG_DIR}" \
     --out-dir "${EVAL_DIR}"
-
-for name in nq hotpotqa triviaqa popqa 2wikimultihopqa musique bamboogle; do
-    [[ -s "${EVAL_DIR}/${name}-miles.jsonl" ]] || {
-        echo "missing converted eval set ${EVAL_DIR}/${name}-miles.jsonl"
-        exit 1
-    }
-done
+python3 "${REPO_ROOT}/experiments/src/datasets/search_r1/build_eval.py" \
+    --out-dir "${EVAL_DIR}" \
+    --validate-only
 
 echo
 echo "search-r1 assets ready:"
