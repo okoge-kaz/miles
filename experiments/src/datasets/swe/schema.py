@@ -25,6 +25,11 @@ from typing import Any
 SCHEMA_VERSION = "miles-swe-task-v1"
 _FULL_COMMIT = re.compile(r"[0-9a-fA-F]{40}")
 _R2E_STATUS = {"PASSED", "FAILED", "ERROR"}
+_PRIME_FILTERED_REBENCH_DATASET = (
+    "PrimeIntellect/SWE-rebench-V2-Filtered-Verified"
+)
+_PRIME_REBENCH_IMAGE_PREFIX = "prime/primeintellect/"
+_UPSTREAM_REBENCH_IMAGE_PREFIX = "docker.io/swerebenchv2/"
 
 
 @dataclass(frozen=True)
@@ -268,6 +273,24 @@ def _normalize_swe_rebench_v2(row: dict[str, Any], source_dataset: str) -> Norma
         raise ValueError(
             f"SWE-rebench V2 task {instance_id} requires install_config.test_cmd and log_parser"
         )
+    published_image = _required_text(row, "image_name")
+    source_image = _swe_rebench_source_image(
+        published_image,
+        source_dataset=source_dataset,
+    )
+    source_metadata = {
+        "split": _optional_text(row.get("split")) or "train",
+        "language": _optional_text(row.get("language"))
+        or _optional_text(row.get("repo_language")),
+        "interface": _optional_text(row.get("interface")),
+    }
+    if source_image != published_image:
+        source_metadata.update(
+            {
+                "published_source_image": published_image,
+                "image_reference_transform": "prime-filtered-to-upstream-dockerhub-v1",
+            }
+        )
     return NormalizedSWETask(
         instance_id=instance_id,
         source_dataset=source_dataset,
@@ -275,7 +298,7 @@ def _normalize_swe_rebench_v2(row: dict[str, Any], source_dataset: str) -> Norma
         repo=_required_text(row, "repo"),
         problem_statement=_required_text(row, "problem_statement"),
         base_commit=_required_commit(row, "base_commit"),
-        source_image=_required_text(row, "image_name"),
+        source_image=source_image,
         oracle_patch=_optional_text(row.get("patch")),
         verifier={
             "kind": "swe-rebench-v2",
@@ -283,15 +306,33 @@ def _normalize_swe_rebench_v2(row: dict[str, Any], source_dataset: str) -> Norma
             **_swebench_tests(row, instance_id),
             "install_config": install_config,
         },
-        source_metadata={
-            "split": _optional_text(row.get("split")) or "train",
-            "language": _optional_text(row.get("language"))
-            or _optional_text(row.get("repo_language")),
-            "interface": _optional_text(row.get("interface")),
-        },
+        source_metadata=source_metadata,
         eval_only=False,
         task_binding=secrets.token_hex(32),
     )
+
+
+def _swe_rebench_source_image(image: str, *, source_dataset: str) -> str:
+    """Map one pinned Prime-internal alias back to its public upstream image."""
+    if image.startswith(_PRIME_REBENCH_IMAGE_PREFIX):
+        if source_dataset != _PRIME_FILTERED_REBENCH_DATASET:
+            raise ValueError(
+                "Prime-internal SWE-ReBench image aliases are accepted only for "
+                f"the pinned {_PRIME_FILTERED_REBENCH_DATASET} source"
+            )
+        suffix = image.removeprefix(_PRIME_REBENCH_IMAGE_PREFIX)
+        if not suffix or "/" in suffix:
+            raise ValueError("Prime-internal SWE-ReBench image alias is malformed")
+        return _UPSTREAM_REBENCH_IMAGE_PREFIX + suffix
+    if (
+        source_dataset == _PRIME_FILTERED_REBENCH_DATASET
+        and not image.startswith(_UPSTREAM_REBENCH_IMAGE_PREFIX)
+    ):
+        raise ValueError(
+            "pinned Prime filtered SWE-ReBench rows must use either the documented "
+            "Prime alias or the public upstream Docker Hub reference"
+        )
+    return image
 
 
 def _swebench_tests(row: dict[str, Any], instance_id: str) -> dict[str, list[str]]:

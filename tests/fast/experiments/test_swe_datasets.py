@@ -257,6 +257,37 @@ def test_swe_rebench_v2_preserves_image_install_and_test_semantics() -> None:
     assert task.source_image.startswith("docker.io/swerebenchv2/")
 
 
+def test_prime_filtered_rebench_restores_published_upstream_image() -> None:
+    row = _swe_rebench_row()
+    row["image_name"] = "prime/primeintellect/python-markdown-markdown:1529-base"
+
+    task = normalize_swe_row(
+        row,
+        dataset_id="PrimeIntellect/SWE-rebench-V2-Filtered-Verified",
+        usage="train",
+    )
+
+    assert task.source_image == (
+        "docker.io/swerebenchv2/python-markdown-markdown:1529-base"
+    )
+    assert task.source_metadata["published_source_image"] == row["image_name"]
+    assert task.source_metadata["image_reference_transform"] == (
+        "prime-filtered-to-upstream-dockerhub-v1"
+    )
+
+
+def test_prime_internal_rebench_alias_is_rejected_for_other_sources() -> None:
+    row = _swe_rebench_row()
+    row["image_name"] = "prime/primeintellect/python-markdown-markdown:1529-base"
+
+    with pytest.raises(ValueError, match="accepted only for the pinned"):
+        normalize_swe_row(
+            row,
+            dataset_id="nebius/SWE-rebench-V2",
+            usage="train",
+        )
+
+
 def test_swe_rebench_v2_accepts_sequential_test_commands() -> None:
     row = _swe_rebench_row()
     row["install_config"] = row["install_config"] | {
