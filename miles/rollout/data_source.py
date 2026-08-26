@@ -6,12 +6,15 @@ from pathlib import Path
 
 import torch
 
+from miles.rollout.replay_buffer import decode_group, encode_group
 from miles.utils.data import Dataset
 from miles.utils.misc import load_function
 from miles.utils.processing_utils import load_processor, load_tokenizer
 from miles.utils.types import Sample
 
 logger = logging.getLogger(__name__)
+
+PARTIAL_ROLLOUT_BUFFER_KEY = "partial_rollout_buffer"
 
 
 class DataSource(abc.ABC):
@@ -168,7 +171,7 @@ class RolloutDataSource(DataSource):
 
         logger.info(f"load metadata from {path}")
         logger.info(f"load metadata: {self.metadata}")
-        state_dict = torch.load(path)
+        state_dict = torch.load(path, weights_only=False)
         self.restore_checkpoint_state(state_dict)
 
 
@@ -217,9 +220,31 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
             group = samples[i]  # type: ignore
             self.buffer.append(group)
 
+    def checkpoint_state(self) -> dict:
+        state = super().checkpoint_state()
+        if self._owns_partial_rollout_buffer():
+            state[PARTIAL_ROLLOUT_BUFFER_KEY] = [encode_group(group) for group in self.buffer]
+        return state
+
     def restore_checkpoint_state(self, state_dict: dict) -> None:
         super().restore_checkpoint_state(state_dict)
         self.buffer.clear()
+        if not self._owns_partial_rollout_buffer():
+            return
+        encoded_buffer = state_dict.get(PARTIAL_ROLLOUT_BUFFER_KEY)
+        if encoded_buffer is None:
+            logger.warning("Checkpoint has no synchronous partial-rollout buffer; resuming with an empty buffer")
+            return
+        if not isinstance(encoded_buffer, list):
+            raise RuntimeError(f"Malformed {PARTIAL_ROLLOUT_BUFFER_KEY}: expected list")
+        self.add_samples([decode_group(group) for group in encoded_buffer])
+
+    def _owns_partial_rollout_buffer(self) -> bool:
+        return (
+            getattr(self.args, "partial_rollout", False)
+            and not getattr(self.args, "fully_async", False)
+            and not getattr(self.args, "use_replay_buffer", False)
+        )
 
     def checkpoint_retry_buffer_groups(self) -> list[list[Sample]]:
         return copy.deepcopy(self.buffer)

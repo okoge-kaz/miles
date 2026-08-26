@@ -403,6 +403,14 @@ def test_staleness_histogram_reports_the_shape_not_just_moments():
     assert m["std"] == pytest.approx(variance**0.5)
 
 
+def test_shared_staleness_reducer_preserves_fully_async_legacy_api():
+    from miles.rollout.staleness_distribution import staleness_distribution_metrics
+
+    values = [0, 1, 4, fully_async.STALENESS_HISTOGRAM_MAX + 1]
+
+    assert fully_async._staleness_metrics(values) == staleness_distribution_metrics(values)
+
+
 async def test_weight_version_endpoint_is_discovered_not_assumed(monkeypatch):
     """A 404 on one endpoint name must fall through to the next.
 

@@ -696,6 +696,11 @@ def _weighted_tail_metrics(weight_by_value: dict[int, int | float]) -> dict[str,
     }
 
 
+def weighted_lag_distribution_metrics(weight_by_value: dict[int, int | float]) -> dict[str, float]:
+    """Return the shared token-weighted lag summary used by rollout modes."""
+    return _weighted_distribution_metrics(weight_by_value) | _weighted_tail_metrics(weight_by_value)
+
+
 def _add_weighted_lag_distribution(
     metrics: dict[str, float],
     *,

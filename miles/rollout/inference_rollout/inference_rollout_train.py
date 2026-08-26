@@ -11,6 +11,12 @@ from miles.rollout.base_types import RolloutFnTrainOutput
 from miles.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter
 from miles.rollout.generate_utils.prefill_logprobs import recompute_samples_rollout_logprobs_via_prefill
 from miles.rollout.inference_rollout.inference_rollout_common import GenerateState, generate_and_rm_group
+from miles.rollout.partial_rollout_telemetry import (
+    collect_partial_rollout_staleness_metrics,
+    collect_partial_rollout_work_metrics,
+    stamp_partial_rollout_start,
+)
+from miles.rollout.queue_telemetry import _iter_samples
 from miles.utils import dumper_utils
 from miles.utils.http_utils import get, post, router_worker_base_urls
 from miles.utils.misc import as_completed_async, call_agent_abort_hook, load_function
@@ -40,9 +46,7 @@ async def abort(state: GenerateState, pendings: set, rollout_id: int) -> list[li
             continue
 
         # for partial rollout, collect the partial samples into the data buffer
-        for sample in group:
-            if sample.response and "start_rollout_id" not in sample.metadata:
-                sample.metadata["start_rollout_id"] = rollout_id
+        stamp_partial_rollout_start(group, rollout_id)
         aborted_samples.append(group)
 
     if args.partial_rollout:
@@ -95,12 +99,23 @@ async def generate_rollout_async(
     pendings = set()
     data = []
     all_data = []
+    dynamic_filter_discarded = []
+    completed_surplus_discarded = []
+    generation_failed_groups = 0
+    launched_groups = 0
+    launched_trajectories = 0
+    launched_existing_response_tokens = 0
     do_print = True
     pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc="Rollout generation")
     while len(data) < target_data_size:
         while len(data) + len(pendings) < target_data_size:
             # get samples from the buffer and submit the generation requests.
             samples = data_source(args.over_sampling_batch_size)
+            launched_groups += len(samples)
+            launched_trajectories += sum(1 for group in samples for _ in _iter_samples(group))
+            launched_existing_response_tokens += sum(
+                sample.response_length for group in samples for sample in _iter_samples(group)
+            )
             pendings.update(submit_generate_tasks(state, samples))
 
         # wait for the generation to finish
@@ -112,6 +127,7 @@ async def generate_rollout_async(
                 group: list[Sample] = task.result()
             except Exception as e:
                 logger.error(f"[rollout] Task raised exception: {e!r}", exc_info=True)
+                generation_failed_groups += 1
                 continue
 
             if do_print:
@@ -126,6 +142,7 @@ async def generate_rollout_async(
             dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, group)
             if not dynamic_filter_output.keep:
                 metric_gatherer.on_dynamic_filter_drop(reason=dynamic_filter_output.reason)
+                dynamic_filter_discarded.append(group)
                 continue
 
             # add the samples to the data
@@ -133,6 +150,8 @@ async def generate_rollout_async(
             if len(data) < target_data_size:
                 data.append(group)
                 pbar.update(args.n_samples_per_prompt)
+            else:
+                completed_surplus_discarded.append(group)
 
     pbar.close()
     sample = data[-1][0][0] if isinstance(data[-1][0], list) else data[-1][0]
@@ -165,4 +184,20 @@ async def generate_rollout_async(
         sampling_params=state.sampling_params,
     )
 
-    return RolloutFnTrainOutput(samples=data, metrics=metric_gatherer.collect()), aborted_samples
+    metrics = metric_gatherer.collect()
+    if args.partial_rollout:
+        metrics.update(collect_partial_rollout_staleness_metrics(data, rollout_id))
+        metrics.update(
+            collect_partial_rollout_work_metrics(
+                launched_groups=launched_groups,
+                launched_trajectories=launched_trajectories,
+                launched_existing_response_tokens=launched_existing_response_tokens,
+                accepted=data,
+                carried=aborted_samples,
+                dynamic_filter_discarded=dynamic_filter_discarded,
+                completed_surplus_discarded=completed_surplus_discarded,
+                generation_failed_groups=generation_failed_groups,
+                rollout_id=rollout_id,
+            )
+        )
+    return RolloutFnTrainOutput(samples=data, metrics=metrics), aborted_samples

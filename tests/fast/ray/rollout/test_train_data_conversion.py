@@ -15,6 +15,7 @@ from miles.ray.rollout.train_data_conversion import (
     split_train_data_by_dp,
     split_train_data_by_dp_raw,
 )
+from miles.rollout.partial_rollout_telemetry import START_ROLLOUT_ID_KEY, collect_partial_rollout_staleness_metrics
 from miles.rollout.recycle_compute_metrics import SAMPLE_REFERENCE_VERSION_KEY, TRAIN_VERSION_KEY
 from miles.utils import object_store
 from miles.utils.types import Sample
@@ -149,6 +150,26 @@ class TestConvertSamplesToTrainData:
             custom_reward_post_process_func=None,
         )
         assert out["sample_staleness"] == [5, 3]
+
+    def test_partial_rollout_boundary_age_reaches_trainer_data(self):
+        args = make_args(
+            rewards_normalization=False,
+            log_sample_staleness_metrics=True,
+        )
+        fresh = make_sample()
+        retained = make_sample()
+        retained.metadata[START_ROLLOUT_ID_KEY] = 3
+        collect_partial_rollout_staleness_metrics([[fresh], [retained]], rollout_id=5)
+
+        out = convert_samples_to_train_data(
+            args,
+            [fresh, retained],
+            metadata={},
+            custom_convert_samples_to_train_data_func=None,
+            custom_reward_post_process_func=None,
+        )
+
+        assert out["sample_staleness"] == [0, 2]
 
     def test_sample_staleness_is_not_sent_to_trainer_when_diagnostics_are_off(self):
         args = make_args(

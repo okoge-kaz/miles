@@ -55,6 +55,20 @@ def _sample(index: int, response_length: int, loss_mask: list[int]) -> Sample:
     )
 
 
+def test_partial_shared_weighted_lag_reducer_matches_fully_async_primitives() -> None:
+    from miles.rollout.recycle_compute_metrics import (
+        _weighted_distribution_metrics,
+        _weighted_tail_metrics,
+        weighted_lag_distribution_metrics,
+    )
+
+    weights = {0: 5, 2: 3, 7: 1}
+
+    assert weighted_lag_distribution_metrics(weights) == (
+        _weighted_distribution_metrics(weights) | _weighted_tail_metrics(weights)
+    )
+
+
 def test_useful_rollout_accounting_is_an_exact_partition() -> None:
     samples = [_sample(1, 6, [1, 1, 1, 1, 1, 0]), _sample(2, 4, [1, 1, 1, 0])]
     metrics = {
