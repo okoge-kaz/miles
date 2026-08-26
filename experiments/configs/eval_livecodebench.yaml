@@ -1,0 +1,16 @@
+# LiveCodeBench release-v6 generation settings. Generated programs must be
+# scored offline with experiments.src.evaluators.livecodebench on an isolated
+# CPU worker; this config intentionally does not route code execution through
+# the in-training reward hub.
+
+eval:
+  defaults:
+    n_samples_per_eval_prompt: 1
+    max_response_len: 16384
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+
+  datasets:
+    - name: livecodebench
+      path: /data/livecodebench-lite/livecodebench-release-v6-miles-eval.jsonl
