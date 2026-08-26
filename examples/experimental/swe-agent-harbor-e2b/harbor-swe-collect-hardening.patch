@@ -1,0 +1,342 @@
+diff --git a/src/harbor/models/task/config.py b/src/harbor/models/task/config.py
+index d6a42ba..9e6ced4 100644
+--- a/src/harbor/models/task/config.py
++++ b/src/harbor/models/task/config.py
+@@ -741,6 +741,14 @@ class VerifierCollectConfig(BaseModel):
+         description="Username or UID to run the command as. None uses the "
+         "service container's default user.",
+     )
++    required: bool = Field(
++        default=False,
++        description=(
++            "Whether collection must succeed before artifacts can be trusted. "
++            "A required hook that raises or exits nonzero aborts artifact "
++            "collection and verification."
++        ),
++    )
+ 
+     @field_validator("service")
+     @classmethod
+diff --git a/src/harbor/trial/errors.py b/src/harbor/trial/errors.py
+index feac831..a77d8eb 100644
+--- a/src/harbor/trial/errors.py
++++ b/src/harbor/trial/errors.py
+@@ -15,3 +15,7 @@ class VerifierTimeoutError(asyncio.TimeoutError):
+ 
+ class EnvironmentStartTimeoutError(asyncio.TimeoutError):
+     pass
++
++
++class RequiredCollectHookError(RuntimeError):
++    """A required artifact-collection hook did not complete successfully."""
+diff --git a/src/harbor/trial/single_step.py b/src/harbor/trial/single_step.py
+index f5e234d..c245857 100644
+--- a/src/harbor/trial/single_step.py
++++ b/src/harbor/trial/single_step.py
+@@ -10,7 +10,11 @@ from harbor.models.task.verifier_mode import (
+ from harbor.models.trial.config import TrialConfig
+ from harbor.models.trial.result import TimingInfo
+ from harbor.tasks.client import TaskDownloadResult
+-from harbor.trial.errors import AgentTimeoutError, VerifierTimeoutError
++from harbor.trial.errors import (
++    AgentTimeoutError,
++    RequiredCollectHookError,
++    VerifierTimeoutError,
++)
+ from harbor.trial.hooks import TrialEvent
+ from harbor.trial.trial import Trial
+ 
+@@ -33,6 +37,7 @@ class SingleStepTrial(Trial):
+             _task_download_result=_task_download_result,
+         )
+         self._are_artifacts_collected = False
++        self._artifact_collection_failed = False
+ 
+     @override
+     async def _run(self) -> None:
+@@ -63,13 +68,20 @@ class SingleStepTrial(Trial):
+     async def _collect_artifacts(
+         self, *, stop_main_before_sidecars: bool = False
+     ) -> None:
+-        if self._are_artifacts_collected:
++        if self._are_artifacts_collected or self._artifact_collection_failed:
+             return
+ 
+-        await self._collect_artifacts_phased(
+-            artifacts_dir=self.paths.artifacts_dir,
+-            stop_main_before_sidecars=stop_main_before_sidecars,
+-        )
++        try:
++            await self._collect_artifacts_phased(
++                artifacts_dir=self.paths.artifacts_dir,
++                stop_main_before_sidecars=stop_main_before_sidecars,
++            )
++        except RequiredCollectHookError:
++            # Trial.run() invokes _recover_outputs after an exception. Do not
++            # retry a security-critical snapshot hook in that recovery path or
++            # download artifacts whose authoritative capture already failed.
++            self._artifact_collection_failed = True
++            raise
+         self._are_artifacts_collected = True
+ 
+     async def _run_agent(self) -> None:
+diff --git a/src/harbor/trial/trial.py b/src/harbor/trial/trial.py
+index aaf1a99..e640c8f 100644
+--- a/src/harbor/trial/trial.py
++++ b/src/harbor/trial/trial.py
+@@ -53,6 +53,7 @@ from harbor.trial.errors import (
+     AgentSetupTimeoutError,
+     AgentTimeoutError,
+     EnvironmentStartTimeoutError,
++    RequiredCollectHookError,
+ )
+ from harbor.trial.hooks import (
+     LogCallback,
+@@ -955,7 +956,7 @@ class Trial(ABC):
+         self,
+         hooks: Sequence[VerifierCollectConfig],
+     ) -> None:
+-        """Run collect hooks best-effort; failures never abort the trial."""
++        """Run collection hooks, failing closed when one is required."""
+         for hook in hooks:
+             self.logger.debug(
+                 f"Running collect hook in service '{hook.service}': {hook.command!r}"
+@@ -968,6 +969,12 @@ class Trial(ABC):
+                     user=hook.user,
+                 )
+                 if result.return_code != 0:
++                    if hook.required:
++                        raise RequiredCollectHookError(
++                            "Required collect hook in service "
++                            f"{hook.service!r} exited with code "
++                            f"{result.return_code}."
++                        )
+                     self.logger.warning(
+                         f"Collect hook in service '{hook.service}' exited with "
+                         f"code {result.return_code}: {hook.command!r}. "
+@@ -977,7 +984,13 @@ class Trial(ABC):
+                     self.logger.debug(
+                         f"Collect hook in service '{hook.service}' completed"
+                     )
++            except RequiredCollectHookError:
++                raise
+             except Exception as exc:
++                if hook.required:
++                    raise RequiredCollectHookError(
++                        f"Required collect hook in service {hook.service!r} failed."
++                    ) from exc
+                 self.logger.warning(
+                     f"Collect hook in service '{hook.service}' failed "
+                     f"({hook.command!r}): {exc}"
+diff --git a/tests/unit/test_single_step_trial.py b/tests/unit/test_single_step_trial.py
+index db0cd81..55d2f1d 100644
+--- a/tests/unit/test_single_step_trial.py
++++ b/tests/unit/test_single_step_trial.py
+@@ -5,7 +5,10 @@ from unittest.mock import AsyncMock, MagicMock
+ import pytest
+ 
+ from harbor.constants import MAIN_SERVICE_NAME
++from harbor.environments.base import ExecResult
++from harbor.models.task.config import VerifierCollectConfig
+ from harbor.models.trial.paths import EnvironmentPaths
++from harbor.trial.errors import RequiredCollectHookError
+ from harbor.trial.single_step import SingleStepTrial
+ 
+ 
+@@ -13,6 +16,7 @@ def _single_step_trial(tmp_path: Path) -> SingleStepTrial:
+     trial = object.__new__(SingleStepTrial)
+     trial.logger = MagicMock()
+     trial._are_artifacts_collected = False
++    trial._artifact_collection_failed = False
+     trial._artifact_handler = SimpleNamespace(
+         download_artifacts=AsyncMock(),
+         sidecar_services=lambda artifacts=None: set(),
+@@ -129,6 +133,100 @@ async def test_collect_artifacts_stops_main_before_sidecar_pass(
+     ]
+ 
+ 
++@pytest.mark.asyncio
++async def test_required_collect_hook_secures_sidecarless_snapshot_before_download(
++    tmp_path: Path,
++) -> None:
++    """A root snapshot is complete and protected before its E2B file read."""
++    trial = _single_step_trial(tmp_path)
++    hook = VerifierCollectConfig(
++        command="freeze-agent-and-snapshot",
++        user=0,
++        required=True,
++    )
++    trial.task.config.verifier.collect = [hook]
++    events: list[str] = []
++    snapshot = {
++        "data": b"agent-controlled",
++        "mode": 0o666,
++        "owner": 1000,
++    }
++
++    async def service_exec(command, *, service, timeout_sec, user):
++        assert command == "freeze-agent-and-snapshot"
++        assert service == MAIN_SERVICE_NAME
++        assert timeout_sec == 60
++        assert user == 0
++        events.append("root:freeze-uid1000")
++        snapshot.update(data=b"root-canonical", mode=0o600, owner=0)
++        events.append("root:atomic-snapshot")
++        return ExecResult(stdout="", stderr="", return_code=0)
++
++    async def download_artifacts(*args, **kwargs):
++        assert kwargs["services"] == {MAIN_SERVICE_NAME}
++        events.append("uid1000:overwrite-attempt")
++        can_write = snapshot["owner"] == 1000 or bool(snapshot["mode"] & 0o002)
++        if can_write:
++            snapshot["data"] = b"uid1000-overwrite"
++        events.append("download:root-only-snapshot")
++
++    trial._artifact_handler.download_artifacts = AsyncMock(
++        side_effect=download_artifacts
++    )
++    trial.agent_environment = SimpleNamespace(
++        service_exec=AsyncMock(side_effect=service_exec),
++    )
++
++    await trial._collect_artifacts(stop_main_before_sidecars=True)
++
++    assert snapshot["data"] == b"root-canonical"
++    assert events == [
++        "root:freeze-uid1000",
++        "root:atomic-snapshot",
++        "uid1000:overwrite-attempt",
++        "download:root-only-snapshot",
++    ]
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("failure", ["nonzero", "exception"])
++async def test_required_collect_hook_failure_skips_download_and_recovery_retry(
++    tmp_path: Path,
++    failure: str,
++) -> None:
++    trial = _single_step_trial(tmp_path)
++    trial.task.config.verifier.collect = [
++        VerifierCollectConfig(
++            command="authoritative-snapshot",
++            user=0,
++            required=True,
++        )
++    ]
++    if failure == "nonzero":
++        outcome = ExecResult(stdout="", stderr="failed", return_code=1)
++        trial.agent_environment = SimpleNamespace(
++            service_exec=AsyncMock(return_value=outcome)
++        )
++    else:
++        trial.agent_environment = SimpleNamespace(
++            service_exec=AsyncMock(side_effect=RuntimeError("transport failed"))
++        )
++
++    with pytest.raises(RequiredCollectHookError):
++        await trial._collect_artifacts(stop_main_before_sidecars=True)
++
++    assert trial._artifact_collection_failed is True
++    trial._artifact_handler.download_artifacts.assert_not_awaited()
++
++    # Trial.run() calls this recovery path after the original failure. It may
++    # still recover logs and tear down, but cannot rerun the authority hook or
++    # download an untrusted artifact.
++    await trial._recover_outputs()
++    trial.agent_environment.service_exec.assert_awaited_once()
++    trial._artifact_handler.download_artifacts.assert_not_awaited()
++    trial._stop_agent_environment.assert_awaited_once()
++
++
+ @pytest.mark.asyncio
+ async def test_install_only_runs_prepare_but_skips_run(tmp_path: Path) -> None:
+     trial = _single_step_trial(tmp_path)
+diff --git a/src/harbor/environments/e2b.py b/src/harbor/environments/e2b.py
+index c45f105..b4e9f5b 100644
+--- a/src/harbor/environments/e2b.py
++++ b/src/harbor/environments/e2b.py
+@@ -1,7 +1,8 @@
+ from __future__ import annotations
+ 
+-from typing import override
++import os
+ from pathlib import Path, PurePosixPath
++from typing import override
+ 
+ from tenacity import (
+     retry,
+@@ -252,7 +253,16 @@ class E2BEnvironment(BaseEnvironment):
+ 
+     @override
+     async def start(self, force_build: bool):
+-        if force_build or not await self._does_template_exist():
++        template_exists = await self._does_template_exist()
++        if force_build or not template_exists:
++            require_prebuilt = os.environ.get(
++                "HARBOR_E2B_REQUIRE_PREBUILT", "false"
++            ).lower() in ("1", "true", "t")
++            if require_prebuilt and not force_build:
++                raise RuntimeError(
++                    f"E2B template {self._template_name!r} is not prebuilt. "
++                    "Run the template admission step before starting trials."
++                )
+             self.logger.debug(f"Creating template {self._template_name}")
+ 
+             await self._create_template()
+diff --git a/tests/unit/environments/test_e2b.py b/tests/unit/environments/test_e2b.py
+index c8354dd..d0c3aed 100644
+--- a/tests/unit/environments/test_e2b.py
++++ b/tests/unit/environments/test_e2b.py
+@@ -227,6 +227,39 @@ async def test_apply_network_policy_passes_phase_updates(
+     sandbox.update_network.assert_awaited_once_with(expected_update)
+ 
+ 
++async def test_start_requires_prebuilt_template_in_strict_mode(temp_dir, monkeypatch):
++    monkeypatch.setenv("HARBOR_E2B_REQUIRE_PREBUILT", "true")
++    env = _make_env(temp_dir)
++    env._does_template_exist = AsyncMock(return_value=False)
++    env._create_template = AsyncMock()
++    env._create_sandbox = AsyncMock()
++
++    with pytest.raises(RuntimeError, match="is not prebuilt"):
++        await env.start(force_build=False)
++
++    env._create_template.assert_not_awaited()
++    env._create_sandbox.assert_not_awaited()
++
++
++async def test_start_uses_prebuilt_template_in_strict_mode(temp_dir, monkeypatch):
++    monkeypatch.setenv("HARBOR_E2B_REQUIRE_PREBUILT", "true")
++    env = _make_env(temp_dir)
++    env._does_template_exist = AsyncMock(return_value=True)
++    env._create_template = AsyncMock()
++
++    async def create_sandbox():
++        env._sandbox = MagicMock()
++
++    env._create_sandbox = AsyncMock(side_effect=create_sandbox)
++    env.ensure_dirs = AsyncMock()
++    env._upload_environment_dir_after_start = AsyncMock()
++
++    await env.start(force_build=False)
++
++    env._create_template.assert_not_awaited()
++    env._create_sandbox.assert_awaited_once()
++
++
+ def _mock_sandbox_returning(handle: MagicMock) -> MagicMock:
+     sandbox = MagicMock()
+     sandbox.commands.run = AsyncMock(return_value=handle)
+diff --git a/tests/unit/models/test_artifact_validation.py b/tests/unit/models/test_artifact_validation.py
+index 15d793a..7e9f813 100644
+--- a/tests/unit/models/test_artifact_validation.py
++++ b/tests/unit/models/test_artifact_validation.py
+@@ -119,6 +119,7 @@ class TestVerifierCollectConfig:
+         assert hook.service == "main"
+         assert hook.timeout_sec == 60.0
+         assert hook.user is None
++        assert hook.required is False
+ 
+     def test_sidecar_hook(self) -> None:
+         hook = VerifierCollectConfig(command="echo hi", service="db", timeout_sec=5)

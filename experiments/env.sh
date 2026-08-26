@@ -4,9 +4,14 @@
 
 # --- Slurm ------------------------------------------------------------------
 export SLURM_ACCOUNT_NAME="${SLURM_ACCOUNT_NAME:-coreai_horizon_dilations}"
-export GPU_PARTITION="${GPU_PARTITION:-batch}"       # batch 4h / batch_long 8h / batch_large_long 14d
-export CPU_PARTITION="${CPU_PARTITION:-cpu}"         # cpu 1d / cpu_long 7d
-export GPUS_PER_NODE="${GPUS_PER_NODE:-8}"           # pool0 default: H100 x8, 128 CPUs
+export GPU_PARTITION="${GPU_PARTITION:-batch}"       # batch 4h / batch_long 7d
+export GPU_QOS="${GPU_QOS:-normal}"
+export INTERACTIVE_GPU_QOS="${INTERACTIVE_GPU_QOS:-interactive}"
+export CPU_PARTITION="${CPU_PARTITION:-cpu}"         # cpu 7d
+export CPU_QOS="${CPU_QOS:-cpu-normal}"
+export INTERACTIVE_CPU_QOS="${INTERACTIVE_CPU_QOS:-cpu-interactive}"
+export GPUS_PER_NODE="${GPUS_PER_NODE:-8}"           # aws-pdx pool0: B300 x8, 192 CPUs
+export TRAINING_ATTENTION_BACKEND="${TRAINING_ATTENTION_BACKEND:-fused}"  # TE fused attention on B300
 
 # --- Workspace on lustre ----------------------------------------------------
 # Split by whether a job READS or WRITES the directory.
@@ -16,9 +21,9 @@ export GPUS_PER_NODE="${GPUS_PER_NODE:-8}"           # pool0 default: H100 x8, 1
 # byte-identical prompt file. They are world-readable and stay put.
 export SHARED_WS="${SHARED_WS:-/lustre/fsw/portfolios/coreai/users/kfujii}"
 export DATASET_DIR="${SHARED_WS}/datasets"           # prompt files, eval benchmarks
-export HF_CKPT_DIR="${HF_CKPT_DIR:-${SHARED_WS}/checkpoints/hf}"  # HuggingFace-format weights
+export HF_CKPT_DIR="${HF_CKPT_DIR:-${SHARED_WS}/checkpoints/huggingface}"  # HuggingFace-format weights
 export MEGATRON_CKPT_DIR="${MEGATRON_CKPT_DIR:-${SHARED_WS}/checkpoints/megatron}"  # torch_dist weights
-export CONTAINER_DIR="${SHARED_WS}/container"        # miles-latest.sqsh
+export CONTAINER_DIR="${CONTAINER_DIR:-${SHARED_WS}/containers}"
 
 # Written directories are per-user. Sharing them would be worse than a
 # permissions problem: CKPT_PATH is derived from the configuration, so two people
@@ -45,32 +50,11 @@ export CACHE_DIR="${WS}/cache"                       # compile / JIT caches
 export MILES_REPO="${MILES_REPO:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." &>/dev/null && pwd)}"
 
 # --- Secrets and local overrides --------------------------------------------
-# `$MILES_REPO/.env`, if present. $HOME is not mounted into the container
-# (--no-container-mount-home), so anything a job needs has to be resolved here on
-# the host and carried in by --export=ALL; .env is the one file that does that.
-# It is git-ignored (.gitignore:193) and must stay that way -- this is a checkout
-# of an open-source tree.
-#
-# Values already in the environment win, so a sweep can override a single key per
-# run without editing the file:
-#   TAU_USER_MODEL=other-model experiments/submit_training.sh ...
-#
-# See .env.example for the keys the recipes look for.
-if [[ -f "${MILES_REPO}/.env" ]]; then
-    while IFS= read -r _line || [[ -n "${_line}" ]]; do
-        _line="${_line%%$'\r'}"
-        # Skip blanks, comments, and anything that is not KEY=VALUE.
-        [[ -z "${_line}" || "${_line}" =~ ^[[:space:]]*# ]] && continue
-        [[ "${_line}" =~ ^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
-        _key="${BASH_REMATCH[2]}"
-        _val="${BASH_REMATCH[3]}"
-        # Strip one layer of matching quotes, so both KEY=v and KEY="v" work.
-        [[ "${_val}" == \"*\" || "${_val}" == \'*\' ]] && _val="${_val:1:${#_val}-2}"
-        # Already set in the environment? leave it alone.
-        [[ -n "${!_key:-}" ]] || export "${_key}=${_val}"
-    done < "${MILES_REPO}/.env"
-    unset _line _key _val
-fi
+# This script deliberately does not read `.env` (or any other repository file
+# containing credentials). Supply secrets through the process environment or a
+# scheduler-supported secret mechanism. Canonical submit wrappers pass only
+# explicit fixed-name allowlists; do not use `sbatch --export=ALL` for jobs that
+# can reach credentials. `.env.example` documents recognized names only.
 
 # Inference Hub is OpenAI-compatible, so litellm reaches it as provider "openai"
 # with the base URL overridden rather than as a gemini/anthropic provider.
@@ -86,7 +70,7 @@ export DOCKER_IMAGE="${DOCKER_IMAGE:-radixark/miles:latest}"
 # The prefill-staleness runs require SGLang's scheduler-authoritative policy
 # provenance fields, which are present in this derived image. An explicitly set
 # SQSH_IMAGE still takes precedence for historical reproduction.
-export SQSH_IMAGE="${SQSH_IMAGE:-${CONTAINER_DIR}/miles-staleness-weight-boundaries-f994b9aed.sqsh}"
+export SQSH_IMAGE="${SQSH_IMAGE:-${CONTAINER_DIR}/miles-search-r1-b300-20260815.sqsh}"
 
 # In-container paths. Keep these stable: every train.sh references them.
 #   /root/miles       miles checkout (over the image's copy)
@@ -121,8 +105,8 @@ unset _shared
 #   CUDA PTX JIT    ~/.nv/ComputeCache         <- /root/.nv, not mounted
 #
 # Left alone, every job recompiles from scratch and the inductor cache eats
-# node RAM while doing it. The values are container paths; --export=ALL carries
-# them in. A corrupt entry after a killed job shows up as a JIT/JSONDecodeError
+# node RAM while doing it. Each recipe's fixed srun export list carries only the
+# cache variables it uses. A corrupt entry after a killed job shows up as a JIT/JSONDecodeError
 # (docs/faq.md:112) — delete the directory under $CACHE_DIR and rerun.
 export TRITON_CACHE_DIR=/root/.cache/triton
 export TORCHINDUCTOR_CACHE_DIR=/root/.cache/torchinductor
@@ -144,12 +128,15 @@ mkdir -p "${CACHE_DIR}"/{triton,torchinductor,torch,nv_compute,vllm,deep_gemm}
 
 # --- Weights & Biases -------------------------------------------------------
 # $HOME is not mounted into the container (--no-container-mount-home), so the
-# key is resolved here on the host and carried in by --export=ALL. Set
-# WANDB_API_KEY yourself to override; leave everything unset to disable wandb.
+# key may be resolved here on the host, but only recipes that explicitly opt in
+# should include WANDB_API_KEY in their fixed export list. Set it yourself to
+# override; leave everything unset to disable wandb.
 # WANDB_PROJECT is deliberately NOT defaulted here. Each recipe derives it from
 # the experiment axis and the dataset (off-policy-<dataset>), which a default set
 # at this level would silently shadow. Export it yourself to override.
-if [[ -z "${WANDB_API_KEY:-}" && -f "${HOME}/.netrc" ]]; then
+if [[ "${WANDB_MODE:-online}" == offline || "${WANDB_MODE:-online}" == disabled ]]; then
+    unset WANDB_API_KEY
+elif [[ -z "${WANDB_API_KEY:-}" && -f "${HOME}/.netrc" ]]; then
     _wandb_key=$(awk '
         /^[[:space:]]*machine[[:space:]]+api\.wandb\.ai/ { f = 1; next }
         f && /^[[:space:]]*machine[[:space:]]/           { f = 0 }

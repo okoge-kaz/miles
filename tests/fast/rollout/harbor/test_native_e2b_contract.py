@@ -10,7 +10,11 @@ pytest.importorskip("e2b")
 pytest.importorskip("harbor")
 server_module = pytest.importorskip("miles_agent_server")
 
-from agent_server.trial_runner import _task_digest_matches
+from agent_server.trial_runner import (
+    _reset_runtime_task_attestations_for_tests,
+    _runtime_task_attestation_error,
+    _task_tree_attestation_matches,
+)
 from e2b import FileType
 
 from harbor.environments.base import ExecResult
@@ -29,28 +33,37 @@ from harbor.models.trial.result import AgentInfo
 from harbor.trial.trial import Trial
 
 
-def test_task_digest_binds_prompt_to_trusted_task_materialization(tmp_path: Path) -> None:
-    task_dir = tmp_path / "bound-task"
-    task_dir.mkdir()
-    digest = "a" * 64
-    (task_dir / "task.toml").write_text(
-        f'[metadata]\ntask_digest = "{digest}"\n',
-        encoding="utf-8",
+def test_e2b_task_rejects_requests_before_startup_attestation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HARBOR_ENV_TYPE", "e2b")
+    _reset_runtime_task_attestations_for_tests()
+    try:
+        assert (
+            _runtime_task_attestation_error("bound-task", "a" * 64)
+            == "TaskAttestationUnavailable"
+        )
+        assert not _task_tree_attestation_matches(
+            tmp_path / "bound-task",
+            "bound-task",
+            "a" * 64,
+        )
+    finally:
+        _reset_runtime_task_attestations_for_tests()
+
+
+def test_non_e2b_backend_preserves_native_task_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HARBOR_ENV_TYPE", "docker")
+    assert _runtime_task_attestation_error("legacy-task", None) is None
+    assert _task_tree_attestation_matches(
+        tmp_path / "legacy-task",
+        "legacy-task",
+        None,
     )
-
-    assert _task_digest_matches(task_dir, digest) is True
-    assert _task_digest_matches(task_dir, None) is False
-    assert _task_digest_matches(task_dir, "b" * 64) is False
-    assert _task_digest_matches(task_dir, "not-a-digest") is False
-
-
-def test_unbound_legacy_task_rejects_an_unexpected_prompt_digest(tmp_path: Path) -> None:
-    task_dir = tmp_path / "legacy-task"
-    task_dir.mkdir()
-    (task_dir / "task.toml").write_text("[metadata]\n", encoding="utf-8")
-
-    assert _task_digest_matches(task_dir, None) is True
-    assert _task_digest_matches(task_dir, "a" * 64) is False
 
 
 def test_e2b_server_startup_skips_local_docker_login(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -116,7 +129,11 @@ async def test_dockerfile_template_uses_task_directory_as_build_context(tmp_path
 
     constructor.assert_called_once_with(file_context_path=str(environment.environment_dir))
     template_builder.from_dockerfile.assert_called_once_with(dockerfile_content_or_path=str(environment.environment_dir / "Dockerfile"))
-    build.assert_awaited_once_with(template=template, alias=environment._template_name)
+    build.assert_awaited_once_with(
+        template=template,
+        alias=environment._template_name,
+        skip_cache=False,
+    )
 
 
 @pytest.mark.asyncio
@@ -139,7 +156,11 @@ async def test_source_image_takes_precedence_over_task_dockerfile(tmp_path: Path
     constructor.assert_called_once_with()
     template_builder.from_image.assert_called_once_with(image=source_image)
     template_builder.from_dockerfile.assert_not_called()
-    build.assert_awaited_once_with(template=template, alias=environment._template_name)
+    build.assert_awaited_once_with(
+        template=template,
+        alias=environment._template_name,
+        skip_cache=False,
+    )
 
 
 @pytest.mark.asyncio

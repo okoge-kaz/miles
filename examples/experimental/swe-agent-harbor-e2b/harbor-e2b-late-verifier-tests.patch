@@ -1,0 +1,1110 @@
+diff --git a/src/harbor/environments/e2b.py b/src/harbor/environments/e2b.py
+index 00088c1..2f109d0 100644
+--- a/src/harbor/environments/e2b.py
++++ b/src/harbor/environments/e2b.py
+@@ -1,7 +1,10 @@
+ from __future__ import annotations
+ 
++import hashlib
++import json
+ import os
+ import shlex
++import stat
+ from pathlib import Path, PurePosixPath
+ from typing import override
+ 
+@@ -67,6 +70,7 @@ except ImportError:
+ 
+ class E2BEnvironment(BaseEnvironment):
+     _UPLOAD_BATCH_SIZE = 20
++    _LATE_TESTS_MARKER = ".harbor-e2b-late-tests"
+ 
+     @staticmethod
+     def _with_no_new_privileges(command: str, user: str) -> str:
+@@ -119,10 +123,141 @@ class E2BEnvironment(BaseEnvironment):
+         self._workdir = parse_dockerfile_workdir(self._environment_definition_path)
+ 
+         self._sandbox: AsyncSandbox | None = None
+-        env_hash = self.environment_id[:SNAPSHOT_HASH_LEN]
+-        self._template_name = f"{environment_name}__{env_hash}".replace(
+-            "/", "__"
+-        ).replace(".", "-")
++        self._template_id: str | None = None
++        build_identity = {
++            "kind": (
++                "docker-image" if self.task_env_config.docker_image else "dockerfile"
++            ),
++            (
++                "docker_image"
++                if self.task_env_config.docker_image
++                else "environment_id"
++            ): self.task_env_config.docker_image or self.environment_id,
++            "effective_cpus": self._effective_cpus,
++            "effective_memory_mb": self._effective_memory_mb,
++        }
++        self._template_build_identity = hashlib.sha256(
++            json.dumps(
++                build_identity,
++                sort_keys=True,
++                separators=(",", ":"),
++            ).encode()
++        ).hexdigest()
++        marker = self.environment_dir / self._LATE_TESTS_MARKER
++        if marker.is_symlink():
++            raise ValueError("E2B late-tests marker must not be a symlink")
++        self._late_tests = marker.is_file()
++        if self._late_tests:
++            image = self.task_env_config.docker_image
++            digest = image.rpartition("@sha256:")[2] if image else ""
++            if (
++                not image
++                or len(digest) != 64
++                or any(character not in "0123456789abcdef" for character in digest)
++                or self._environment_definition_path.exists()
++            ):
++                raise ValueError(
++                    "E2B late verifier tests require an immutable docker_image "
++                    "and no Dockerfile build context"
++                )
++            identity = (
++                f"sha256:{digest}|cpus={self._effective_cpus}|"
++                f"memory={self._effective_memory_mb}"
++            )
++            env_hash = hashlib.sha256(identity.encode()).hexdigest()[:SNAPSHOT_HASH_LEN]
++            self._template_name = f"miles-swe-verifier__{env_hash}"
++        else:
++            env_hash = self.environment_id[:SNAPSHOT_HASH_LEN]
++            self._template_name = f"{environment_name}__{env_hash}".replace(
++                "/", "__"
++            ).replace(".", "-")
++
++    def _load_template_pin(self) -> None:
++        pin_path_raw = os.environ.get("HARBOR_E2B_TEMPLATE_PINS_FILE")
++        require_pin = os.environ.get(
++            "HARBOR_E2B_REQUIRE_TEMPLATE_PIN", "false"
++        ).lower() in ("1", "true", "t")
++        if not pin_path_raw:
++            if require_pin:
++                raise RuntimeError(
++                    "E2B production mode requires HARBOR_E2B_TEMPLATE_PINS_FILE"
++                )
++            return
++
++        pin_path = Path(pin_path_raw)
++        if not pin_path.is_absolute():
++            raise PermissionError("E2B template pin file path must be absolute")
++        metadata = pin_path.lstat()
++        if (
++            stat.S_ISLNK(metadata.st_mode)
++            or not stat.S_ISREG(metadata.st_mode)
++            or metadata.st_nlink != 1
++            or metadata.st_uid != os.getuid()
++            or metadata.st_mode & 0o077
++            or metadata.st_size > 2 * 1024 * 1024
++        ):
++            raise PermissionError(
++                "E2B template pin file must be a small owner-only regular file"
++            )
++
++        descriptor = os.open(pin_path, os.O_RDONLY | os.O_NOFOLLOW)
++        try:
++            opened = os.fstat(descriptor)
++            if (
++                not stat.S_ISREG(opened.st_mode)
++                or opened.st_nlink != 1
++                or opened.st_uid != os.getuid()
++                or opened.st_mode & 0o077
++                or (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino)
++            ):
++                raise PermissionError("E2B template pin file changed while opening")
++            with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
++                descriptor = -1
++                payload = json.load(handle)
++                finished = os.fstat(handle.fileno())
++            if (
++                (
++                    finished.st_dev,
++                    finished.st_ino,
++                    finished.st_size,
++                    finished.st_nlink,
++                    finished.st_uid,
++                    stat.S_IMODE(finished.st_mode),
++                )
++                != (
++                    opened.st_dev,
++                    opened.st_ino,
++                    opened.st_size,
++                    opened.st_nlink,
++                    opened.st_uid,
++                    stat.S_IMODE(opened.st_mode),
++                )
++                or finished.st_mtime_ns != opened.st_mtime_ns
++                or finished.st_ctime_ns != opened.st_ctime_ns
++            ):
++                raise PermissionError("E2B template pin file changed while reading")
++        finally:
++            if descriptor >= 0:
++                os.close(descriptor)
++
++        if not isinstance(payload, dict) or payload.get("schema_version") != 1:
++            raise ValueError("Unsupported E2B template pin schema")
++        pins = payload.get("pins")
++        pin = pins.get(self._template_name) if isinstance(pins, dict) else None
++        if not isinstance(pin, dict):
++            raise RuntimeError("No admitted E2B template pin matches this environment")
++        template_id = pin.get("template_id")
++        build_id = pin.get("build_id")
++        if (
++            not isinstance(template_id, str)
++            or not 6 <= len(template_id) <= 128
++            or not template_id.replace("-", "").replace("_", "").isalnum()
++            or not isinstance(build_id, str)
++            or not 6 <= len(build_id) <= 128
++            or not build_id.replace("-", "").replace("_", "").isalnum()
++        ):
++            raise ValueError("E2B template pin contains an invalid build identity")
++        self._template_id = template_id
+ 
+     @staticmethod
+     @override
+@@ -194,7 +329,12 @@ class E2BEnvironment(BaseEnvironment):
+         wait=wait_exponential(multiplier=1, min=1, max=10),
+         reraise=True,
+     )
+-    async def _create_template(self):
++    async def _create_template(
++        self,
++        *,
++        alias: str | None = None,
++        skip_cache: bool = False,
++    ):
+         if self.task_env_config.docker_image:
+             template = Template().from_image(
+                 image=self.task_env_config.docker_image,
+@@ -208,27 +348,36 @@ class E2BEnvironment(BaseEnvironment):
+ 
+         cpus = self._effective_cpus
+         memory_mb = self._effective_memory_mb
++        build_alias = alias or self._template_name
+         if cpus is not None and memory_mb is not None:
+-            await AsyncTemplate.build(
++            build_info = await AsyncTemplate.build(
+                 template=template,
+-                alias=self._template_name,
++                alias=build_alias,
+                 cpu_count=cpus,
+                 memory_mb=memory_mb,
++                skip_cache=skip_cache,
+             )
+         elif cpus is not None:
+-            await AsyncTemplate.build(
++            build_info = await AsyncTemplate.build(
+                 template=template,
+-                alias=self._template_name,
++                alias=build_alias,
+                 cpu_count=cpus,
++                skip_cache=skip_cache,
+             )
+         elif memory_mb is not None:
+-            await AsyncTemplate.build(
++            build_info = await AsyncTemplate.build(
+                 template=template,
+-                alias=self._template_name,
++                alias=build_alias,
+                 memory_mb=memory_mb,
++                skip_cache=skip_cache,
+             )
+         else:
+-            await AsyncTemplate.build(template=template, alias=self._template_name)
++            build_info = await AsyncTemplate.build(
++                template=template,
++                alias=build_alias,
++                skip_cache=skip_cache,
++            )
++        return build_info
+ 
+     @retry(
+         stop=stop_after_attempt(2),
+@@ -242,7 +391,7 @@ class E2BEnvironment(BaseEnvironment):
+         }
+ 
+         self._sandbox = await AsyncSandbox.create(
+-            template=self._template_name,
++            template=self._template_id or self._template_name,
+             metadata=metadata,
+             envs=self._startup_env(),
+             timeout=86_400,
+@@ -269,6 +418,25 @@ class E2BEnvironment(BaseEnvironment):
+ 
+     @override
+     async def start(self, force_build: bool):
++        self._load_template_pin()
++        require_pin = os.environ.get(
++            "HARBOR_E2B_REQUIRE_TEMPLATE_PIN", "false"
++        ).lower() in ("1", "true", "t")
++        if require_pin and force_build:
++            raise RuntimeError(
++                "Pinned E2B production mode does not allow rollout-time builds"
++            )
++        if self._template_id is not None:
++            await self._create_sandbox()
++            if not self._sandbox:
++                raise RuntimeError(
++                    "Sandbox not found but was just created. This should never happen."
++                )
++            await self.ensure_dirs(self._mount_targets(writable_only=True))
++            if not self._late_tests:
++                await self._upload_environment_dir_after_start()
++            return
++
+         template_exists = await self._does_template_exist()
+         if force_build or not template_exists:
+             require_prebuilt = os.environ.get(
+@@ -292,7 +460,8 @@ class E2BEnvironment(BaseEnvironment):
+ 
+         await self.ensure_dirs(self._mount_targets(writable_only=True))
+ 
+-        await self._upload_environment_dir_after_start()
++        if not self._late_tests:
++            await self._upload_environment_dir_after_start()
+ 
+     @retry(
+         stop=stop_after_attempt(2),
+diff --git a/src/harbor/trial/private_verifier_package.py b/src/harbor/trial/private_verifier_package.py
+new file mode 100644
+index 0000000..a7ccfb9
+--- /dev/null
++++ b/src/harbor/trial/private_verifier_package.py
+@@ -0,0 +1,212 @@
++from __future__ import annotations
++
++import contextlib
++import os
++import stat
++import tempfile
++from pathlib import Path, PurePosixPath
++
++from harbor.environments.base import BaseEnvironment
++from harbor.models.environment_type import EnvironmentType
++from harbor.models.task.config import NetworkMode
++from harbor.utils.scripts import quote_shell_arg
++
++E2B_LATE_TESTS_MARKER = ".harbor-e2b-late-tests"
++_MAX_FILES = 500
++_MAX_BYTES = 64 * 1024 * 1024
++
++
++def _validated_files(tests_dir: Path) -> tuple[list[Path], set[str]]:
++    root_metadata = tests_dir.lstat()
++    if (
++        stat.S_ISLNK(root_metadata.st_mode)
++        or not stat.S_ISDIR(root_metadata.st_mode)
++        or root_metadata.st_uid != os.getuid()
++        or root_metadata.st_mode & 0o077
++    ):
++        raise RuntimeError("late verifier package root must be a regular directory")
++    marker = tests_dir / E2B_LATE_TESTS_MARKER
++    if marker.is_symlink() or not marker.is_file():
++        raise RuntimeError("late verifier package marker must be a regular file")
++    if (tests_dir / "Dockerfile").exists():
++        raise RuntimeError("late verifier tests must not share an image build context")
++
++    files: list[Path] = []
++    entries: set[str] = set()
++    total_bytes = 0
++    for path in sorted(tests_dir.rglob("*")):
++        metadata = path.lstat()
++        if stat.S_ISLNK(metadata.st_mode) or not (
++            stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)
++        ):
++            raise RuntimeError(
++                f"late verifier package contains a symlink or special file: {path}"
++            )
++        if metadata.st_uid != os.getuid() or metadata.st_mode & 0o077:
++            raise RuntimeError(
++                "late verifier package entries must be owned by the current "
++                "user and owner-only"
++            )
++        if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink != 1:
++            raise RuntimeError("late verifier package contains a hardlinked file")
++        relative = path.relative_to(tests_dir).as_posix()
++        if "\n" in relative or "|" in relative:
++            raise RuntimeError("late verifier package contains an unsafe path")
++        entries.add(f"{'d' if stat.S_ISDIR(metadata.st_mode) else 'f'}|{relative}")
++        if not stat.S_ISREG(metadata.st_mode):
++            continue
++        files.append(path)
++        total_bytes += metadata.st_size
++        if len(files) > _MAX_FILES or total_bytes > _MAX_BYTES:
++            raise RuntimeError("late verifier package exceeds admission limits")
++    if tests_dir / "test.sh" not in files:
++        raise RuntimeError("late verifier package has no regular test.sh")
++    return files, entries
++
++
++def _read_stable_regular_file(path: Path) -> bytes:
++    before = path.lstat()
++    if (
++        not stat.S_ISREG(before.st_mode)
++        or before.st_uid != os.getuid()
++        or before.st_mode & 0o077
++        or before.st_nlink != 1
++    ):
++        raise RuntimeError("late verifier package contains an unsafe file")
++    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
++    descriptor = os.open(path, flags)
++    try:
++        opened = os.fstat(descriptor)
++        if (
++            not stat.S_ISREG(opened.st_mode)
++            or opened.st_uid != os.getuid()
++            or opened.st_mode & 0o077
++            or opened.st_nlink != 1
++            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
++        ):
++            raise RuntimeError("late verifier package changed during snapshot")
++        with os.fdopen(descriptor, "rb", closefd=False) as stream:
++            data = stream.read(_MAX_BYTES + 1)
++        after = os.fstat(descriptor)
++        if len(data) > _MAX_BYTES or (
++            opened.st_uid,
++            stat.S_IMODE(opened.st_mode),
++            opened.st_nlink,
++            opened.st_size,
++            opened.st_mtime_ns,
++            opened.st_ctime_ns,
++        ) != (
++            after.st_uid,
++            stat.S_IMODE(after.st_mode),
++            after.st_nlink,
++            after.st_size,
++            after.st_mtime_ns,
++            after.st_ctime_ns,
++        ):
++            raise RuntimeError("late verifier package changed during snapshot")
++        return data
++    finally:
++        os.close(descriptor)
++
++
++async def upload_private_verifier_package(
++    environment: BaseEnvironment,
++    tests_dir: Path,
++) -> None:
++    """Atomically install private tests after a no-network E2B sandbox starts.
++
++    Any exception is fatal to admission/trial. Callers must not run the verifier
++    after a failed upload.
++    """
++    if environment.type() != EnvironmentType.E2B:
++        raise RuntimeError("private verifier package upload requires E2B")
++    if environment.network_policy.network_mode != NetworkMode.NO_NETWORK:
++        raise RuntimeError(
++            "private verifier package upload requires a no-network sandbox"
++        )
++    files, expected_entries = _validated_files(tests_dir)
++    staging = PurePosixPath("/tests.__harbor_staging")
++    previous = PurePosixPath("/tests.__harbor_previous")
++    shell = (
++        "exec /usr/bin/env -i HOME=/ PATH=/usr/local/sbin:/usr/local/bin:"
++        "/usr/sbin:/usr/bin:/sbin:/bin /bin/bash --noprofile --norc -c "
++    )
++
++    async def root_command(script: str):
++        result = await environment.exec(
++            shell + quote_shell_arg(script, environment.os),
++            user=0,
++        )
++        if result.return_code != 0:
++            raise RuntimeError("private verifier package staging failed")
++        return result
++
++    with tempfile.TemporaryDirectory(prefix="harbor-late-tests-") as raw:
++        private_root = Path(raw)
++        snapshot_root = private_root / "snapshot"
++        readback_root = private_root / "readback"
++        snapshot_root.mkdir(mode=0o700)
++        for entry in expected_entries:
++            kind, relative = entry.split("|", 1)
++            if kind == "d":
++                (snapshot_root / relative).mkdir(parents=True, mode=0o700)
++        snapshot_files: list[tuple[Path, Path]] = []
++        snapshot_bytes = 0
++        for source_path in files:
++            relative = source_path.relative_to(tests_dir)
++            data = _read_stable_regular_file(source_path)
++            snapshot_bytes += len(data)
++            if snapshot_bytes > _MAX_BYTES:
++                raise RuntimeError("late verifier package exceeds admission limits")
++            snapshot_path = snapshot_root / relative
++            snapshot_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
++            snapshot_path.write_bytes(data)
++            snapshot_path.chmod(0o600)
++            snapshot_files.append((relative, snapshot_path))
++
++        await root_command(
++            f"rm -rf -- {staging} {previous}; mkdir -m 0700 -- {staging}"
++        )
++        try:
++            await environment.upload_dir(snapshot_root, str(staging))
++            await root_command(
++                f"chown -R 0:0 -- {staging} && find {staging} -type d "
++                "-exec chmod 0700 {} + && find "
++                f"{staging} -type f -exec chmod 0600 {{}} +"
++            )
++            listing = await root_command(
++                f"find {staging} -mindepth 1 -printf '%y|%P\\n'"
++            )
++            if set(listing.stdout.splitlines()) != expected_entries:
++                raise RuntimeError("private verifier package remote file set mismatch")
++            for relative, snapshot_path in snapshot_files:
++                readback = readback_root / relative
++                readback.parent.mkdir(parents=True, exist_ok=True)
++                await environment.download_file(
++                    str(staging / PurePosixPath(relative.as_posix())),
++                    readback,
++                )
++                if snapshot_path.read_bytes() != readback.read_bytes():
++                    raise RuntimeError(
++                        "private verifier package readback checksum mismatch"
++                    )
++            await root_command(
++                "test -d /opt && test ! -L /opt && "
++                "test \"$(stat -c '%u' /opt)\" = 0 && "
++                f"if [ -e /tests ] || [ -L /tests ]; then mv -T -- /tests {previous}; fi; "
++                f"mv -T -- {staging} /tests && chown -R 0:0 -- /tests && "
++                "find /tests -type d -exec chmod 0700 {} + && "
++                "find /tests -type f -exec chmod 0600 {} + && "
++                f"rm -rf -- {previous} && "
++                "if [ -L /opt/miles-swe ] || [ -f /opt/miles-swe ]; then "
++                "rm -f -- /opt/miles-swe; fi && "
++                "mkdir -p -m 0755 -- /opt/miles-swe && "
++                "chown 0:0 -- /opt/miles-swe && chmod 0755 /opt/miles-swe && "
++                "rm -rf -- /opt/miles-swe/collected && "
++                "mkdir -p -m 0700 -- /opt/miles-swe/collected && "
++                "chown 0:0 -- /opt/miles-swe/collected"
++            )
++        except Exception:
++            with contextlib.suppress(Exception):
++                await root_command(f"rm -rf -- {staging} {previous}")
++            raise
+diff --git a/src/harbor/trial/trial.py b/src/harbor/trial/trial.py
+index e640c8f..8199404 100644
+--- a/src/harbor/trial/trial.py
++++ b/src/harbor/trial/trial.py
+@@ -3,6 +3,9 @@ import asyncio
+ import contextlib
+ import hashlib
+ import logging
++import os
++import stat
++import tempfile
+ import traceback
+ from abc import ABC, abstractmethod
+ from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
+@@ -14,6 +17,7 @@ from harbor.agents.factory import AgentFactory
+ from harbor.constants import MAIN_SERVICE_NAME
+ from harbor.environments.base import BaseEnvironment, OutputStream
+ from harbor.environments.factory import EnvironmentFactory
++from harbor.models.environment_type import EnvironmentType
+ from harbor.models.agent.context import AgentContext
+ from harbor.models.agent.name import AgentName
+ from harbor.models.job.lock import TrialLock, build_trial_lock
+@@ -38,6 +42,10 @@ from harbor.models.trial.config import (
+     TrialConfig,
+ )
+ from harbor.trial.network_policy import TrialNetworkPlan, resolve_trial_network_plan
++from harbor.trial.private_verifier_package import (
++    E2B_LATE_TESTS_MARKER,
++    upload_private_verifier_package,
++)
+ from harbor.models.trial.paths import EnvironmentPaths, TrialPaths
+ from harbor.models.trial.result import (
+     ExceptionInfo,
+@@ -586,6 +594,14 @@ class Trial(ABC):
+ 
+                 await target_env.empty_dirs([env_paths.verifier_dir], chmod=True)
+ 
++                late_tests = self._late_e2b_tests_dir(step_cfg)
++                if late_tests is not None:
++                    if target_env.type() != EnvironmentType.E2B:
++                        raise RuntimeError(
++                            "late verifier-test upload is only implemented for E2B"
++                        )
++                    await self._upload_late_e2b_tests(target_env, late_tests)
++
+                 await self._artifact_handler.upload_artifacts(
+                     target_env,
+                     artifacts_dir=artifacts_dir,
+@@ -593,6 +609,11 @@ class Trial(ABC):
+                     target_artifacts_dir=env_paths.artifacts_dir,
+                     artifacts=artifacts,
+                 )
++                if late_tests is not None:
++                    await self._verify_late_e2b_model_patch(
++                        target_env,
++                        artifacts_dir,
++                    )
+ 
+                 verifier = VerifierFactory.create_verifier_from_config(
+                     self.config.verifier,
+@@ -603,6 +624,8 @@ class Trial(ABC):
+                     logger=self.logger,
+                     verifier_env=env,
+                     step_name=step_cfg.name if step_cfg is not None else None,
++                    # Late E2B packages were already uploaded atomically above;
++                    # legacy separate images still bake their verifier package.
+                     skip_tests_upload=True,
+                 )
+ 
+@@ -624,6 +647,109 @@ class Trial(ABC):
+                             verifier.verify(), timeout=timeout_sec
+                         )
+ 
++    def _late_e2b_tests_dir(self, step_cfg: StepConfig | None) -> Path | None:
++        tests_dir = self._verifier_env_build_context(step_cfg)
++        marker = tests_dir / E2B_LATE_TESTS_MARKER
++        if marker.is_symlink():
++            raise RuntimeError("late verifier-test marker must not be a symlink")
++        if not marker.exists():
++            return None
++        if not marker.is_file():
++            raise RuntimeError("late verifier-test marker must be a regular file")
++        if (tests_dir / "Dockerfile").exists():
++            raise RuntimeError(
++                "late verifier tests must not share an image build context"
++            )
++        return tests_dir
++
++    async def _upload_late_e2b_tests(
++        self,
++        environment: BaseEnvironment,
++        tests_dir: Path,
++    ) -> None:
++        """Upload private tests after no-network start and verify every byte."""
++        await upload_private_verifier_package(environment, tests_dir)
++
++    async def _verify_late_e2b_model_patch(
++        self,
++        environment: BaseEnvironment,
++        artifacts_dir: Path,
++    ) -> None:
++        host_patch = artifacts_dir / "model.patch"
++        try:
++            metadata = host_patch.lstat()
++        except FileNotFoundError as exc:
++            raise RuntimeError("required model.patch was not collected") from exc
++        if (
++            not stat.S_ISREG(metadata.st_mode)
++            or stat.S_ISLNK(metadata.st_mode)
++            or metadata.st_nlink != 1
++            or metadata.st_uid != os.getuid()
++            or metadata.st_mode & 0o077
++            or metadata.st_size > 16 * 1024 * 1024
++        ):
++            raise RuntimeError("required model.patch host artifact is unsafe")
++        flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
++        descriptor = os.open(host_patch, flags)
++        try:
++            opened = os.fstat(descriptor)
++            if (
++                not stat.S_ISREG(opened.st_mode)
++                or opened.st_nlink != 1
++                or opened.st_uid != os.getuid()
++                or opened.st_mode & 0o077
++                or opened.st_size > 16 * 1024 * 1024
++                or (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino)
++            ):
++                raise RuntimeError("required model.patch host artifact is unsafe")
++            with os.fdopen(descriptor, "rb", closefd=False) as stream:
++                host_patch_bytes = stream.read(16 * 1024 * 1024 + 1)
++            finished = os.fstat(descriptor)
++            if len(host_patch_bytes) > 16 * 1024 * 1024 or (
++                finished.st_dev,
++                finished.st_ino,
++                finished.st_size,
++                finished.st_mtime_ns,
++                finished.st_ctime_ns,
++                finished.st_nlink,
++                finished.st_uid,
++                stat.S_IMODE(finished.st_mode),
++            ) != (
++                opened.st_dev,
++                opened.st_ino,
++                opened.st_size,
++                opened.st_mtime_ns,
++                opened.st_ctime_ns,
++                opened.st_nlink,
++                opened.st_uid,
++                stat.S_IMODE(opened.st_mode),
++            ):
++                raise RuntimeError("required model.patch changed while reading")
++        finally:
++            os.close(descriptor)
++        command = (
++            "exec /usr/bin/env -i HOME=/ PATH=/usr/local/sbin:/usr/local/bin:"
++            "/usr/sbin:/usr/bin:/sbin:/bin /bin/bash --noprofile --norc -c "
++            + quote_shell_arg(
++                "test -f /opt/miles-swe/collected/model.patch && "
++                "test ! -L /opt/miles-swe/collected/model.patch && "
++                "chown 0:0 /opt/miles-swe/collected/model.patch && "
++                "chmod 0600 /opt/miles-swe/collected/model.patch",
++                environment.os,
++            )
++        )
++        result = await environment.exec(command, user=0)
++        if result.return_code != 0:
++            raise RuntimeError("required model.patch remote artifact is unsafe")
++        with tempfile.TemporaryDirectory(prefix="harbor-model-patch-") as raw:
++            readback = Path(raw) / "model.patch"
++            await environment.download_file(
++                "/opt/miles-swe/collected/model.patch",
++                readback,
++            )
++            if host_patch_bytes != readback.read_bytes():
++                raise RuntimeError("required model.patch readback checksum mismatch")
++
+     @contextlib.asynccontextmanager
+     async def _separate_verifier_env(
+         self,
+diff --git a/tests/unit/environments/test_e2b.py b/tests/unit/environments/test_e2b.py
+index abe5f68..fc66c70 100644
+--- a/tests/unit/environments/test_e2b.py
++++ b/tests/unit/environments/test_e2b.py
+@@ -1,6 +1,7 @@
+ """Unit tests for E2B network policy handling."""
+ 
+ import os
++import json
+ import subprocess
+ from pathlib import Path
+ from unittest.mock import AsyncMock, MagicMock, patch
+@@ -24,10 +25,19 @@ def _make_env(
+     *,
+     task_env: dict[str, str] | None = None,
+     persistent_env: dict[str, str] | None = None,
++    docker_image: str | None = None,
++    late_tests: bool = False,
++    cpus: int | None = None,
++    memory_mb: int | None = None,
++    environment_name: str = "test-task",
+ ) -> E2BEnvironment:
+     env_dir = temp_dir / "environment"
+     env_dir.mkdir(exist_ok=True)
+-    (env_dir / "Dockerfile").write_text("FROM ubuntu:22.04\n")
++    if late_tests:
++        (env_dir / E2BEnvironment._LATE_TESTS_MARKER).write_text("late\n")
++        (env_dir / "hidden.txt").write_text("private verifier bytes\n")
++    else:
++        (env_dir / "Dockerfile").write_text("FROM ubuntu:22.04\n")
+ 
+     trial_dir = temp_dir / "trial"
+     trial_dir.mkdir(exist_ok=True)
+@@ -36,10 +46,15 @@ def _make_env(
+ 
+     return E2BEnvironment(
+         environment_dir=env_dir,
+-        environment_name="test-task",
++        environment_name=environment_name,
+         session_id="session",
+         trial_paths=trial_paths,
+-        task_env_config=EnvironmentConfig(env=task_env or {}),
++        task_env_config=EnvironmentConfig(
++            env=task_env or {},
++            docker_image=docker_image,
++            cpus=cpus,
++            memory_mb=memory_mb,
++        ),
+         persistent_env=persistent_env,
+         network_policy=network_policy or NetworkPolicy(network_mode=NetworkMode.PUBLIC),
+     )
+@@ -262,6 +277,171 @@ async def test_start_uses_prebuilt_template_in_strict_mode(temp_dir, monkeypatch
+     env._create_sandbox.assert_awaited_once()
+ 
+ 
++async def test_pinned_template_id_bypasses_mutable_alias(
++    temp_dir,
++    monkeypatch,
++):
++    env = _make_env(temp_dir)
++    pins = temp_dir / "template-pins.json"
++    pins.write_text(
++        json.dumps(
++            {
++                "schema_version": 1,
++                "pins": {
++                    env._template_name: {
++                        "template_id": "template-id-123",
++                        "build_id": "build-id-456",
++                    }
++                },
++            }
++        ),
++        encoding="utf-8",
++    )
++    pins.chmod(0o600)
++    monkeypatch.setenv("HARBOR_E2B_TEMPLATE_PINS_FILE", str(pins))
++    monkeypatch.setenv("HARBOR_E2B_REQUIRE_TEMPLATE_PIN", "true")
++    env._does_template_exist = AsyncMock(side_effect=AssertionError("alias lookup"))
++    env._create_template = AsyncMock(side_effect=AssertionError("rollout build"))
++
++    sandbox = MagicMock()
++    with patch(
++        "harbor.environments.e2b.AsyncSandbox.create",
++        new=AsyncMock(return_value=sandbox),
++    ) as create:
++        env.ensure_dirs = AsyncMock()
++        env._upload_environment_dir_after_start = AsyncMock()
++        await env.start(force_build=False)
++
++    assert create.await_args.kwargs["template"] == "template-id-123"
++    env._does_template_exist.assert_not_awaited()
++    env._create_template.assert_not_awaited()
++
++
++async def test_pinned_template_mode_rejects_rollout_build(temp_dir, monkeypatch):
++    monkeypatch.setenv("HARBOR_E2B_REQUIRE_TEMPLATE_PIN", "true")
++    env = _make_env(temp_dir)
++
++    with pytest.raises(RuntimeError, match="requires HARBOR_E2B_TEMPLATE_PINS_FILE"):
++        await env.start(force_build=True)
++
++
++def test_template_pin_file_must_be_owner_only(temp_dir, monkeypatch):
++    env = _make_env(temp_dir)
++    pins = temp_dir / "template-pins.json"
++    pins.write_text("{}", encoding="utf-8")
++    pins.chmod(0o644)
++    monkeypatch.setenv("HARBOR_E2B_TEMPLATE_PINS_FILE", str(pins))
++
++    with pytest.raises(PermissionError, match="owner-only regular file"):
++        env._load_template_pin()
++
++
++def test_template_pin_file_must_not_be_hardlinked(temp_dir, monkeypatch):
++    env = _make_env(temp_dir)
++    pins = temp_dir / "template-pins.json"
++    pins.write_text("{}", encoding="utf-8")
++    pins.chmod(0o600)
++    os.link(pins, temp_dir / "template-pins-copy.json")
++    monkeypatch.setenv("HARBOR_E2B_TEMPLATE_PINS_FILE", str(pins))
++
++    with pytest.raises(PermissionError, match="owner-only regular file"):
++        env._load_template_pin()
++
++
++def test_late_test_template_alias_depends_only_on_image_and_resources(temp_dir):
++    image = "registry.example/repo@sha256:" + "a" * 64
++    first_root = temp_dir / "first"
++    second_root = temp_dir / "second"
++    first_root.mkdir()
++    second_root.mkdir()
++    first = _make_env(
++        first_root,
++        docker_image=image,
++        late_tests=True,
++    )
++    second = _make_env(
++        second_root,
++        docker_image="mirror.example/alias@sha256:" + "a" * 64,
++        late_tests=True,
++    )
++    (second.environment_dir / "hidden.txt").write_text("different hidden bytes\n")
++
++    assert first._template_name == second._template_name
++    assert "test-task" not in first._template_name
++
++
++def test_template_build_identity_uses_source_and_effective_resources(temp_dir):
++    image = "registry.example/repo@sha256:" + "c" * 64
++    roots = [temp_dir / name for name in ("first", "second", "third")]
++    for root in roots:
++        root.mkdir()
++    first = _make_env(
++        roots[0],
++        docker_image=image,
++        cpus=2,
++        memory_mb=4096,
++        environment_name="first-task",
++    )
++    second = _make_env(
++        roots[1],
++        docker_image=image,
++        cpus=2,
++        memory_mb=4096,
++        environment_name="second-task",
++    )
++    third = _make_env(
++        roots[2],
++        docker_image=image,
++        cpus=4,
++        memory_mb=4096,
++        environment_name="third-task",
++    )
++
++    assert first._template_name != second._template_name
++    assert first._template_build_identity == second._template_build_identity
++    assert first._template_build_identity != third._template_build_identity
++
++
++async def test_late_tests_are_not_uploaded_as_startup_environment(temp_dir):
++    image = "registry.example/repo@sha256:" + "b" * 64
++    env = _make_env(temp_dir, docker_image=image, late_tests=True)
++    env._does_template_exist = AsyncMock(return_value=True)
++
++    async def create_sandbox():
++        env._sandbox = MagicMock()
++
++    env._create_sandbox = AsyncMock(side_effect=create_sandbox)
++    env.ensure_dirs = AsyncMock()
++    env._upload_environment_dir_after_start = AsyncMock()
++
++    await env.start(force_build=False)
++
++    env._upload_environment_dir_after_start.assert_not_awaited()
++
++
++async def test_late_test_template_uses_direct_image_without_file_context(temp_dir):
++    image = "registry.example/repo@sha256:" + "c" * 64
++    env = _make_env(temp_dir, docker_image=image, late_tests=True)
++    template_instance = MagicMock()
++    direct_image_template = MagicMock()
++    template_instance.from_image.return_value = direct_image_template
++
++    with (
++        patch(
++            "harbor.environments.e2b.Template", return_value=template_instance
++        ) as ctor,
++        patch(
++            "harbor.environments.e2b.AsyncTemplate.build",
++            new=AsyncMock(),
++        ) as build,
++    ):
++        await env._create_template()
++
++    ctor.assert_called_once_with()
++    template_instance.from_image.assert_called_once_with(image=image)
++    assert build.await_args.kwargs["template"] is direct_image_template
++
++
+ def _mock_sandbox_returning(handle: MagicMock) -> MagicMock:
+     sandbox = MagicMock()
+     sandbox.commands.run = AsyncMock(return_value=handle)
+diff --git a/tests/unit/test_trial_verifier_artifact_transfer.py b/tests/unit/test_trial_verifier_artifact_transfer.py
+index 2df5f4b..a617251 100644
+--- a/tests/unit/test_trial_verifier_artifact_transfer.py
++++ b/tests/unit/test_trial_verifier_artifact_transfer.py
+@@ -1,11 +1,16 @@
+ """Trial-level tests for artifact upload into verifier envs."""
+ 
+ import contextlib
++import os
+ import tempfile
+ from pathlib import Path
+ from unittest.mock import AsyncMock, MagicMock, patch
+ 
++import pytest
++
+ from harbor.environments.base import ExecResult
++from harbor.models.environment_type import EnvironmentType
++from harbor.models.task.config import NetworkMode, NetworkPolicy
+ from harbor.models.trial.config import TaskConfig as TrialTaskConfig
+ from harbor.models.trial.config import (
+     AgentConfig,
+@@ -14,6 +19,7 @@ from harbor.models.trial.config import (
+     VerifierConfig,
+ )
+ from harbor.models.trial.result import AgentInfo
++from harbor.trial.private_verifier_package import upload_private_verifier_package
+ from harbor.trial.trial import Trial
+ 
+ 
+@@ -21,6 +27,11 @@ def _convention_host_dir(artifacts_dir: Path) -> Path:
+     return artifacts_dir / "logs" / "artifacts"
+ 
+ 
++def _seal_private_package(tests_dir: Path) -> None:
++    for path in [tests_dir, *tests_dir.rglob("*")]:
++        path.chmod(0o700 if path.is_dir() else 0o600)
++
++
+ def _task_with_configured_artifacts(
+     tmp: Path,
+     artifacts: list[str] | str | None = None,
+@@ -72,6 +83,8 @@ def _make_env(mounted: bool, *, docker_compose: bool = True) -> AsyncMock:
+     env.is_dir = AsyncMock(return_value=False)
+     env.service_is_dir = AsyncMock(return_value=False)
+     env.validate_network_policy_support = MagicMock()
++    env.type = MagicMock(return_value=EnvironmentType.E2B)
++    env.network_policy = NetworkPolicy(network_mode=NetworkMode.NO_NETWORK)
+     env.reset_dirs.return_value = None
+     env.empty_dirs.return_value = None
+     env.ensure_dirs.return_value = None
+@@ -158,6 +171,167 @@ async def _run(task_dir, trials_dir, agent_env, verifier_env):
+ 
+ 
+ class TestVerifierArtifactUpload:
++    async def test_late_e2b_tests_are_read_back_before_atomic_replace(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            tests_dir = Path(tmp) / "tests"
++            tests_dir.mkdir()
++            (tests_dir / "test.sh").write_text("#!/bin/bash\nexit 0\n")
++            (tests_dir / ".harbor-e2b-late-tests").write_text("late\n")
++            hidden = tests_dir / "expected.json"
++            hidden.write_text('{"hidden":"sentinel"}\n')
++            _seal_private_package(tests_dir)
++            verifier_env = _make_env(mounted=False)
++            uploaded: dict[str, bytes] = {}
++            events: list[str] = []
++
++            async def upload_dir(source_dir, target_dir):
++                events.append("upload")
++                for path in Path(source_dir).rglob("*"):
++                    if path.is_file():
++                        relative = path.relative_to(source_dir).as_posix()
++                        uploaded[f"{target_dir}/{relative}"] = path.read_bytes()
++
++            async def download_file(source_path, target_path):
++                events.append(f"read:{Path(source_path).name}")
++                Path(target_path).write_bytes(uploaded[source_path])
++
++            async def execute(command, **kwargs):
++                events.append(
++                    "replace"
++                    if "mv -T -- /tests.__harbor_staging /tests" in command
++                    else "prepare"
++                )
++                stdout = ""
++                if "find /tests.__harbor_staging -mindepth 1" in command:
++                    stdout = "\n".join(
++                        f"f|{path.relative_to(tests_dir).as_posix()}"
++                        for path in sorted(tests_dir.iterdir())
++                    )
++                return ExecResult(stdout=stdout, stderr="", return_code=0)
++
++            verifier_env.upload_dir.side_effect = upload_dir
++            verifier_env.download_file.side_effect = download_file
++            verifier_env.exec.side_effect = execute
++
++            await upload_private_verifier_package(verifier_env, tests_dir)
++
++            assert events.index("upload") < events.index("read:expected.json")
++            assert events.index("read:expected.json") < events.index("replace")
++
++    async def test_late_e2b_test_readback_mismatch_fails_closed(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            tests_dir = Path(tmp) / "tests"
++            tests_dir.mkdir()
++            (tests_dir / "test.sh").write_text("#!/bin/bash\nexit 0\n")
++            (tests_dir / ".harbor-e2b-late-tests").write_text("late\n")
++            _seal_private_package(tests_dir)
++            verifier_env = _make_env(mounted=False)
++
++            async def execute(command, **kwargs):
++                stdout = ""
++                if "find /tests.__harbor_staging -mindepth 1" in command:
++                    stdout = "\n".join(
++                        f"f|{path.relative_to(tests_dir).as_posix()}"
++                        for path in sorted(tests_dir.iterdir())
++                    )
++                return ExecResult(stdout=stdout, stderr="", return_code=0)
++
++            async def corrupt_download(source_path, target_path):
++                Path(target_path).write_bytes(b"corrupt")
++
++            verifier_env.exec.side_effect = execute
++            verifier_env.download_file.side_effect = corrupt_download
++
++            with pytest.raises(RuntimeError, match="checksum mismatch"):
++                await upload_private_verifier_package(verifier_env, tests_dir)
++
++            assert not any(
++                "mv -T -- /tests.__harbor_staging /tests" in call.args[0]
++                for call in verifier_env.exec.await_args_list
++            )
++
++    async def test_late_e2b_remote_special_entry_fails_before_replace(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            tests_dir = Path(tmp) / "tests"
++            tests_dir.mkdir()
++            (tests_dir / "test.sh").write_text("#!/bin/bash\nexit 0\n")
++            (tests_dir / ".harbor-e2b-late-tests").write_text("late\n")
++            _seal_private_package(tests_dir)
++            verifier_env = _make_env(mounted=False)
++
++            async def execute(command, **kwargs):
++                stdout = ""
++                if "find /tests.__harbor_staging -mindepth 1" in command:
++                    stdout = "l|test.sh\nf|.harbor-e2b-late-tests"
++                return ExecResult(stdout=stdout, stderr="", return_code=0)
++
++            verifier_env.exec.side_effect = execute
++
++            with pytest.raises(RuntimeError, match="remote file set mismatch"):
++                await upload_private_verifier_package(verifier_env, tests_dir)
++
++            assert not any(
++                "mv -T -- /tests.__harbor_staging /tests" in call.args[0]
++                for call in verifier_env.exec.await_args_list
++            )
++
++    async def test_late_e2b_test_package_rejects_symlink_and_special_file(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            tests_dir = Path(tmp) / "tests"
++            tests_dir.mkdir()
++            (tests_dir / "test.sh").write_text("#!/bin/bash\nexit 0\n")
++            (tests_dir / ".harbor-e2b-late-tests").write_text("late\n")
++            _seal_private_package(tests_dir)
++            (tests_dir / "link").symlink_to("test.sh")
++            verifier_env = _make_env(mounted=False)
++
++            with pytest.raises(RuntimeError, match="symlink or special"):
++                await upload_private_verifier_package(verifier_env, tests_dir)
++            verifier_env.upload_dir.assert_not_awaited()
++
++            (tests_dir / "link").unlink()
++            os.mkfifo(tests_dir / "fifo")
++            with pytest.raises(RuntimeError, match="symlink or special"):
++                await upload_private_verifier_package(verifier_env, tests_dir)
++
++    async def test_late_e2b_test_package_rejects_hardlink_and_open_mode(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            tests_dir = Path(tmp) / "tests"
++            tests_dir.mkdir()
++            test_script = tests_dir / "test.sh"
++            test_script.write_text("#!/bin/bash\nexit 0\n")
++            marker = tests_dir / ".harbor-e2b-late-tests"
++            marker.write_text("late\n")
++            _seal_private_package(tests_dir)
++            verifier_env = _make_env(mounted=False)
++
++            hardlink = tests_dir / "test-hardlink.sh"
++            os.link(test_script, hardlink)
++            with pytest.raises(RuntimeError, match="hardlinked"):
++                await upload_private_verifier_package(verifier_env, tests_dir)
++            verifier_env.upload_dir.assert_not_awaited()
++
++            hardlink.unlink()
++            marker.chmod(0o644)
++            with pytest.raises(RuntimeError, match="owner-only"):
++                await upload_private_verifier_package(verifier_env, tests_dir)
++
++    async def test_late_e2b_model_patch_rejects_hardlink(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            artifacts_dir = Path(tmp) / "artifacts"
++            artifacts_dir.mkdir(mode=0o700)
++            model_patch = artifacts_dir / "model.patch"
++            model_patch.write_text("diff --git a/a.py b/a.py\n", encoding="utf-8")
++            model_patch.chmod(0o600)
++            os.link(model_patch, artifacts_dir / "model-copy.patch")
++            verifier_env = _make_env(mounted=False)
++
++            with pytest.raises(RuntimeError, match="host artifact is unsafe"):
++                await Trial._verify_late_e2b_model_patch(
++                    MagicMock(), verifier_env, artifacts_dir
++                )
++            verifier_env.exec.assert_not_awaited()
++
+     async def test_shared_verifier_does_not_upload_artifacts(self):
+         with tempfile.TemporaryDirectory() as tmp:
+             task_dir = _task_with_configured_artifacts(Path(tmp), separate=False)

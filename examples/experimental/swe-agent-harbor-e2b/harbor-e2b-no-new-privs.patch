@@ -1,0 +1,141 @@
+diff --git a/src/harbor/environments/e2b.py b/src/harbor/environments/e2b.py
+index b4e9f5b..00088c1 100644
+--- a/src/harbor/environments/e2b.py
++++ b/src/harbor/environments/e2b.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import os
++import shlex
+ from pathlib import Path, PurePosixPath
+ from typing import override
+ 
+@@ -67,6 +68,21 @@ except ImportError:
+ class E2BEnvironment(BaseEnvironment):
+     _UPLOAD_BATCH_SIZE = 20
+ 
++    @staticmethod
++    def _with_no_new_privileges(command: str, user: str) -> str:
++        configured = {
++            value.strip()
++            for value in os.environ.get("HARBOR_E2B_NO_NEW_PRIVS_USERS", "").split(",")
++            if value.strip()
++        }
++        if user not in configured:
++            return command
++        return (
++            "exec /usr/bin/env -u BASH_ENV -u ENV -u LD_PRELOAD "
++            "-u LD_LIBRARY_PATH /usr/bin/setpriv --no-new-privs -- "
++            f"/bin/bash --noprofile --norc -c {shlex.quote(command)}"
++        )
++
+     @classmethod
+     @override
+     def preflight(cls) -> None:
+@@ -463,7 +479,7 @@ class E2BEnvironment(BaseEnvironment):
+             raise RuntimeError("Sandbox not found. Please start the environment first.")
+ 
+         return await self._sandbox.commands.run(
+-            cmd=command,
++            cmd=self._with_no_new_privileges(command, user),
+             background=True,
+             cwd=cwd,
+             envs=env,
+diff --git a/tests/unit/environments/test_e2b.py b/tests/unit/environments/test_e2b.py
+index d0c3aed..abe5f68 100644
+--- a/tests/unit/environments/test_e2b.py
++++ b/tests/unit/environments/test_e2b.py
+@@ -1,5 +1,7 @@
+ """Unit tests for E2B network policy handling."""
+ 
++import os
++import subprocess
+ from pathlib import Path
+ from unittest.mock import AsyncMock, MagicMock, patch
+ 
+@@ -296,6 +298,85 @@ async def test_exec_returns_result_on_nonzero_exit(temp_dir):
+     env._sandbox.commands.run.assert_awaited_once()
+ 
+ 
++async def test_exec_opt_in_no_new_privileges_preserves_dispatch_semantics(
++    temp_dir, monkeypatch
++):
++    monkeypatch.setenv("HARBOR_E2B_NO_NEW_PRIVS_USERS", "1000, 2000")
++    env = _make_env(temp_dir)
++    handle = MagicMock()
++    handle.wait = AsyncMock(return_value=MagicMock(stdout="ok", stderr="", exit_code=0))
++    env._sandbox = _mock_sandbox_returning(handle)
++    command = "printf '%s\\n' \"$VALUE\"; touch 'file with spaces'"
++
++    await env.exec(
++        command,
++        cwd="/work tree",
++        env={"VALUE": "literal value"},
++        timeout_sec=17,
++        user=1000,
++    )
++
++    env._sandbox.commands.run.assert_awaited_once_with(
++        cmd=(
++            "exec /usr/bin/env -u BASH_ENV -u ENV -u LD_PRELOAD "
++            "-u LD_LIBRARY_PATH /usr/bin/setpriv --no-new-privs -- "
++            "/bin/bash --noprofile --norc -c "
++            "'printf '\"'\"'%s\\n'\"'\"' \"$VALUE\"; touch '\"'\"'file with spaces'\"'\"''"
++        ),
++        background=True,
++        cwd="/work tree",
++        envs={"VALUE": "literal value"},
++        timeout=17,
++        user="1000",
++    )
++
++
++async def test_exec_no_new_privileges_never_wraps_unlisted_root(temp_dir, monkeypatch):
++    monkeypatch.setenv("HARBOR_E2B_NO_NEW_PRIVS_USERS", "1000")
++    env = _make_env(temp_dir)
++    handle = MagicMock()
++    handle.wait = AsyncMock(return_value=MagicMock(stdout="ok", stderr="", exit_code=0))
++    env._sandbox = _mock_sandbox_returning(handle)
++
++    await env.exec("collect-root-artifact", user=0)
++
++    assert env._sandbox.commands.run.await_args.kwargs["cmd"] == "collect-root-artifact"
++    assert env._sandbox.commands.run.await_args.kwargs["user"] == "0"
++
++
++def test_no_new_privileges_wrapper_ignores_shell_startup_environment(monkeypatch):
++    monkeypatch.setenv("HARBOR_E2B_NO_NEW_PRIVS_USERS", "1000")
++
++    wrapped = E2BEnvironment._with_no_new_privileges("printf safe", "1000")
++
++    assert "/bin/bash --noprofile --norc -c 'printf safe'" in wrapped
++    assert "-u BASH_ENV -u ENV" in wrapped
++    assert "-lc" not in wrapped
++
++
++def test_no_new_privileges_wrapper_does_not_execute_bash_env(temp_dir, monkeypatch):
++    monkeypatch.setenv("HARBOR_E2B_NO_NEW_PRIVS_USERS", "1000")
++    sentinel = temp_dir / "bash-env-ran"
++    bash_env = temp_dir / "bash-env"
++    bash_env.write_text(f"touch -- {sentinel}\n", encoding="utf-8")
++    wrapped = E2BEnvironment._with_no_new_privileges("printf safe", "1000")
++    child_env = os.environ.copy()
++    child_env["BASH_ENV"] = str(bash_env)
++    child_env["ENV"] = str(bash_env)
++
++    result = subprocess.run(
++        ["/bin/sh", "-c", wrapped],
++        check=False,
++        capture_output=True,
++        env=child_env,
++        text=True,
++    )
++
++    assert result.returncode == 0, result.stderr
++    assert result.stdout == "safe"
++    assert not sentinel.exists()
++
++
+ async def test_exec_retries_connection_error_then_succeeds(temp_dir, monkeypatch):
+     # A connection-establishment failure proves the command never ran: replay
+     # is safe. Patch the retry sleep so the test does not actually wait.

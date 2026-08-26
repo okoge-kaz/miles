@@ -644,6 +644,28 @@ class TestAgentMetadata:
             assert s.metadata.get("instance_id") == "test-123"
             assert "reward" not in s.metadata
 
+    def test_explicit_agent_abort_discards_recorded_policy_calls(self, variant, generation_env):
+        from miles.rollout.generate_hub.agentic_types import AgentFunctionOutput
+        from miles.utils.test_utils import mock_tools
+
+        generation_env.mock_server.process_fn = TwoTurnStub.process_fn
+        mock_tools.AGENTIC_RETURN_METADATA = AgentFunctionOutput.abort(
+            {"exit_status": "AgentError"}
+        )
+        try:
+            result = _run_generate(
+                variant,
+                generation_env,
+                make_sample(prompt=TwoTurnStub.PROMPT),
+            )
+        finally:
+            mock_tools.AGENTIC_RETURN_METADATA = None
+
+        samples = listify(result.sample)
+        assert samples
+        assert all(sample.status == Sample.Status.ABORTED for sample in samples)
+        assert all(sample.metadata["exit_status"] == "AgentError" for sample in samples)
+
     def test_session_server_identity_forwarded_to_agent_metadata(self, variant, generation_env):
         from miles.utils.test_utils import mock_tools
 

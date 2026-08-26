@@ -8,25 +8,47 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --time=04:00:00
 #SBATCH --output=experiments/outputs/download/%x-%j.log
+#SBATCH --export=NIL
 
 # Normalize one pinned SWE source into gold-free Miles rows and owner-only task
 # manifests.  Schema-normalized candidates remain under a clearly marked
-# not-admitted directory until image/runtime admission succeeds. Unsupported
-# schemas remain owner-only under /data/miles-swe/private/unadmitted.
+# not-admitted directory until OCI locking and live semantic E2B admission both
+# succeed. Schema normalization alone never makes ReBench, R2E, or SWE-Gym
+# eligible for RL. Unsupported schemas remain owner-only under
+# /data/miles-swe/private/unadmitted.
 
 set -euo pipefail
 
 REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+USER="$(id -un)"
+export PATH USER
+: "${MILES_SWE_FIXED_EXPORTS:?submit with submit_prepare_swe_rl.sh}"
+[[ "${MILES_SWE_FIXED_EXPORTS}" == 1 ]] || {
+    echo "MILES_SWE_FIXED_EXPORTS must be 1" >&2
+    exit 2
+}
+[[ -z "${MILES_SWE_UNRELATED_ENV_SENTINEL+x}" ]] || {
+    echo "Unapproved submission environment reached SWE preparation" >&2
+    exit 2
+}
 source "${REPO_ROOT}/experiments/env.sh"
+DOTENV_MASK="${REPO_ROOT}/experiments/common/dotenv.disabled"
+[[ -f "${DOTENV_MASK}" && ! -L "${DOTENV_MASK}" ]] || {
+    echo "tracked dotenv mask is missing or unsafe" >&2
+    exit 2
+}
+SWE_CONTAINER_MOUNTS="${CONTAINER_MOUNTS},${DOTENV_MASK}:/root/miles/.env:ro"
 : "${SWE_SOURCE:?set SWE_SOURCE to a selector from download_swe_datasets.sbatch}"
-export SWE_SOURCE
+export PYTHON_DOTENV_DISABLED=1 PYTHONDONTWRITEBYTECODE=1
+export SWE_SOURCE WANDB_DISABLED=true WANDB_MODE=offline
 
 srun \
     --container-image="${SQSH_IMAGE}" \
-    --container-mounts="${CONTAINER_MOUNTS}" \
+    --container-mounts="${SWE_CONTAINER_MOUNTS}" \
     --container-writable \
     --no-container-mount-home \
-    --export=ALL \
+    --export=PATH,PYTHON_DOTENV_DISABLED,PYTHONDONTWRITEBYTECODE,SWE_SOURCE,WANDB_DISABLED,WANDB_MODE \
     env -u BASH_ENV -u ENV bash --noprofile --norc -c '
 set -euo pipefail
 umask 077
@@ -94,6 +116,7 @@ prepare_split() {
     else
         chmod 0600 "${output}"
         echo "prepared schema-normalized, environment-not-admitted candidate ${name}: ${output}"
+        echo "live OCI + E2B semantic admission and an admitted-task join are required before RL"
     fi
 }
 

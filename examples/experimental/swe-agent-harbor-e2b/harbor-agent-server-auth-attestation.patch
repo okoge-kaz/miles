@@ -1,0 +1,2632 @@
+diff --git a/agent_server/models.py b/agent_server/models.py
+index 180cb7eb63e70d9d16c9eaaf6b9019a4a0bf4287..7682b3e40a865e3641076e926e3dc338ae96689d 100644
+--- a/agent_server/models.py
++++ b/agent_server/models.py
+@@ -17,6 +17,8 @@ class RunRequest(BaseModel):
+     max_seq_len: int | None = None
+     session_server_id: str | None = None
+     session_server_instance_id: str | None = None
++    client_id: str | None = None
++    request_id: str | None = None
+     model_config = {"extra": "allow"}
+ 
+ 
+@@ -30,6 +32,9 @@ class RunResponse(BaseModel):
+ class FlushRequest(BaseModel):
+     session_server_id: str | None = None
+     session_server_instance_id: str | None = None
++    instance_id: str | None = None
++    client_id: str | None = None
++    request_id: str | None = None
+ 
+ 
+ class FlushAllRequest(BaseModel):
+diff --git a/agent_server/trial_runner.py b/agent_server/trial_runner.py
+index 4011845b9451cc0f9ffa8bcf94003298c7f493c8..a0598d2e18c6eae242ad06670fe1a3858f040598 100644
+--- a/agent_server/trial_runner.py
++++ b/agent_server/trial_runner.py
+@@ -7,15 +7,22 @@ which heartbeat-tracked tasks are live (so flush can cancel them).
+ """
+ 
+ import asyncio
++import ctypes
++import hashlib
+ import hmac
+ import json
+ import logging
++import math
+ import os
+ import re
++import stat
+ import sys
+-import tomllib
++import threading
+ import traceback
++from collections.abc import Mapping
++from dataclasses import dataclass
+ from pathlib import Path
++from types import MappingProxyType
+ from typing import Any
+ 
+ from agent_server.docker_ops import _compose_project_name
+@@ -42,6 +49,109 @@ _CLAUDE_CODE_AGENT = "claude-code"
+ 
+ _SAFE_INSTANCE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+ _SAFE_TASK_DIGEST = re.compile(r"^[0-9a-f]{64}$")
++_MAX_TEMPLATE_PINS_BYTES = 64 * 1024 * 1024
++_TRIAL_WALL_TIMEOUT_SECONDS = 12_600.0
++_INOTIFY_EVENT_BUFFER_BYTES = 64 * 1024
++_INOTIFY_MUTATION_MASK = (
++    0x00000002  # IN_MODIFY
++    | 0x00000004  # IN_ATTRIB
++    | 0x00000008  # IN_CLOSE_WRITE
++    | 0x00000040  # IN_MOVED_FROM
++    | 0x00000080  # IN_MOVED_TO
++    | 0x00000100  # IN_CREATE
++    | 0x00000200  # IN_DELETE
++    | 0x00000400  # IN_DELETE_SELF
++    | 0x00000800  # IN_MOVE_SELF
++    | 0x00002000  # IN_UNMOUNT
++    | 0x01000000  # IN_ONLYDIR
++    | 0x02000000  # IN_DONT_FOLLOW
++    | 0x04000000  # IN_EXCL_UNLINK
++)
++
++
++@dataclass(frozen=True)
++class _OpenPathAttestation:
++    path: Path
++    descriptor: int
++    fingerprint: tuple[int, ...]
++
++
++@dataclass(frozen=True)
++class _RuntimeTaskAttestation:
++    path: _OpenPathAttestation
++    task_digest: str
++    task_tree_sha256: str
++
++
++@dataclass(frozen=True)
++class _RuntimeTaskAttestationCache:
++    pin_file: _OpenPathAttestation
++    tasks_root: _OpenPathAttestation
++    tasks: Mapping[str, _RuntimeTaskAttestation]
++    task_count: int
++    task_set_sha256: str
++    task_binding_sha256: str
++    task_runtime_sha256: str
++    mutation_watch_descriptor: int
++
++
++_runtime_attestation_lock = threading.RLock()
++_runtime_attestation_cache: _RuntimeTaskAttestationCache | None = None
++_runtime_attestation_invalid_reason = "not initialized"
++_inotify_api_cache: tuple[Any, Any] | None = None
++
++# The per-trial process is a trusted provider controller, not an authorization
++# boundary. It needs the E2B SDK credential in order to create and manage the
++# remote sandbox, but it must never inherit the HTTP server's run/admin bearer
++# masters (or arbitrary scheduler-shell state). Model-controlled commands run
++# inside E2B and receive only task/persistent command env from BaseEnvironment.
++_TRIAL_WORKER_ENV_ALLOWLIST = frozenset(
++    {
++        "AGENT_MAX_INPUT_TOKENS",
++        "AGENT_MAX_OUTPUT_TOKENS",
++        "E2B_ACCESS_TOKEN",
++        "E2B_API_KEY",
++        "E2B_API_URL",
++        "E2B_DOMAIN",
++        "E2B_SANDBOX_URL",
++        "HARBOR_AGENT_ALLOWED_HOSTS",
++        "HARBOR_AGENT_MAX_ITERATIONS",
++        "HARBOR_E2B_NO_NEW_PRIVS_USERS",
++        "HARBOR_E2B_REQUIRE_PREBUILT",
++        "HARBOR_E2B_REQUIRE_TEMPLATE_PIN",
++        "HARBOR_E2B_TEMPLATE_PINS_FILE",
++        "HARBOR_ENV_BUILD_TIMEOUT_MULTIPLIER",
++        "HARBOR_ENV_TYPE",
++        "HARBOR_KEEP_SANDBOX",
++        "HARBOR_MAX_SEQ_LEN",
++        "HARBOR_RESPONSE_LENGTH_POLICY",
++        "HARBOR_TASKS_DIR",
++        "HARBOR_TERMINUS_2_ENABLE_SUMMARIZE",
++        "HARBOR_TERMINUS_2_LINEAR_HISTORY",
++        "HARBOR_TIMEOUT_MULTIPLIER",
++        "HARBOR_TRIAL_WALL_TIMEOUT_SEC",
++        "HARBOR_VERIFIER_TIMEOUT_SEC",
++        "HOME",
++        "LANG",
++        "LC_ALL",
++        "LOGNAME",
++        "PATH",
++        "PYTHONPATH",
++        "PYTHON_DOTENV_DISABLED",
++        "PYTHONDONTWRITEBYTECODE",
++        "TERM",
++        "TMPDIR",
++        "TZ",
++        "USER",
++        "WANDB_DISABLED",
++        "WANDB_MODE",
++        "XDG_CACHE_HOME",
++        "XDG_CONFIG_HOME",
++        "XDG_DATA_HOME",
++        "XDG_RUNTIME_DIR",
++        "XDG_STATE_HOME",
++    }
++)
+ 
+ 
+ def _allowed_hosts(var: str) -> list[str]:
+@@ -52,30 +162,513 @@ def _env_flag(var: str) -> bool:
+     return os.getenv(var, "false").lower() in ("1", "true", "t")
+ 
+ 
+-def _trusted_task_digest(task_path: Path) -> str | None:
+-    """Read a Miles task binding from trusted Harbor task metadata."""
+-    config_path = task_path / "task.toml"
++def _path_fingerprint(metadata: os.stat_result) -> tuple[int, ...]:
++    return (
++        metadata.st_dev,
++        metadata.st_ino,
++        metadata.st_size,
++        metadata.st_mtime_ns,
++        metadata.st_ctime_ns,
++        metadata.st_nlink,
++        metadata.st_uid,
++        metadata.st_mode,
++    )
++
++
++def _open_attested_path(
++    path: Path,
++    *,
++    directory: bool,
++    allowed_modes: set[int],
++    maximum_size: int | None = None,
++) -> _OpenPathAttestation:
++    before = path.lstat()
++    expected_type = stat.S_ISDIR if directory else stat.S_ISREG
++    if (
++        stat.S_ISLNK(before.st_mode)
++        or not expected_type(before.st_mode)
++        or (not directory and before.st_nlink != 1)
++        or before.st_uid != os.getuid()
++        or before.st_mode & 0o077
++        or stat.S_IMODE(before.st_mode) not in allowed_modes
++        or (maximum_size is not None and before.st_size > maximum_size)
++    ):
++        raise PermissionError("runtime task attestation path is unsafe")
++    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
++    if directory:
++        flags |= getattr(os, "O_DIRECTORY", 0)
++    descriptor = os.open(path, flags)
++    try:
++        opened = os.fstat(descriptor)
++        if (
++            not expected_type(opened.st_mode)
++            or (not directory and opened.st_nlink != 1)
++            or opened.st_uid != os.getuid()
++            or opened.st_mode & 0o077
++            or stat.S_IMODE(opened.st_mode) not in allowed_modes
++            or (maximum_size is not None and opened.st_size > maximum_size)
++            or _path_fingerprint(opened) != _path_fingerprint(before)
++        ):
++            raise PermissionError("runtime task attestation changed before open")
++        return _OpenPathAttestation(
++            path=path,
++            descriptor=descriptor,
++            fingerprint=_path_fingerprint(opened),
++        )
++    except Exception:
++        os.close(descriptor)
++        raise
++
++
++def _attested_path_is_stable(attestation: _OpenPathAttestation) -> bool:
++    try:
++        descriptor_metadata = os.fstat(attestation.descriptor)
++        path_metadata = attestation.path.lstat()
++    except OSError:
++        return False
++    return (
++        _path_fingerprint(descriptor_metadata) == attestation.fingerprint
++        and _path_fingerprint(path_metadata) == attestation.fingerprint
++    )
++
++
++def _close_open_path(attestation: _OpenPathAttestation) -> None:
++    try:
++        os.close(attestation.descriptor)
++    except OSError:
++        pass
++
++
++def _validate_template_pins(pins: Any) -> None:
++    if not isinstance(pins, dict):
++        raise ValueError("runtime template pins are missing")
++    for alias, pin in pins.items():
++        if (
++            not isinstance(alias, str)
++            or not 1 <= len(alias) <= 512
++            or any(character in alias for character in "\x00\r\n")
++            or not isinstance(pin, dict)
++            or set(pin) != {"template_id", "build_id"}
++        ):
++            raise ValueError("runtime template pin is invalid")
++        for field in ("template_id", "build_id"):
++            value = pin[field]
++            if (
++                not isinstance(value, str)
++                or not 6 <= len(value) <= 128
++                or not value.replace("-", "").replace("_", "").isalnum()
++            ):
++                raise ValueError("runtime template pin has an invalid build identity")
++
++
++def _validate_task_attestation_entries(tasks: Any) -> dict[str, dict[str, str]]:
++    if not isinstance(tasks, dict) or not tasks:
++        raise ValueError("runtime task attestations are missing")
++    validated: dict[str, dict[str, str]] = {}
++    for instance_id, entry in tasks.items():
++        if (
++            not isinstance(instance_id, str)
++            or _SAFE_INSTANCE_ID.fullmatch(instance_id) is None
++            or not isinstance(entry, dict)
++            or set(entry) != {"task_digest", "task_tree_sha256"}
++        ):
++            raise ValueError("runtime task attestation entry is invalid")
++        task_digest = entry["task_digest"]
++        task_tree_sha256 = entry["task_tree_sha256"]
++        if (
++            not isinstance(task_digest, str)
++            or _SAFE_TASK_DIGEST.fullmatch(task_digest) is None
++            or not isinstance(task_tree_sha256, str)
++            or _SAFE_TASK_DIGEST.fullmatch(task_tree_sha256) is None
++        ):
++            raise ValueError("runtime task attestation digest is invalid")
++        validated[instance_id] = {
++            "task_digest": task_digest,
++            "task_tree_sha256": task_tree_sha256,
++        }
++    return validated
++
++
++def _task_set_sha256(task_ids: set[str]) -> str:
++    rendered = json.dumps(
++        sorted(task_ids),
++        ensure_ascii=False,
++        sort_keys=True,
++        separators=(",", ":"),
++    )
++    return hashlib.sha256(rendered.encode("utf-8")).hexdigest()
++
++
++def _task_binding_sha256(tasks: dict[str, dict[str, str]]) -> str:
++    rendered = json.dumps(
++        [
++            [instance_id, tasks[instance_id]["task_digest"]]
++            for instance_id in sorted(tasks)
++        ],
++        ensure_ascii=False,
++        sort_keys=True,
++        separators=(",", ":"),
++    )
++    return hashlib.sha256(rendered.encode("utf-8")).hexdigest()
++
++
++def _task_runtime_sha256(tasks: dict[str, dict[str, str]]) -> str:
++    rendered = json.dumps(
++        [
++            [
++                instance_id,
++                tasks[instance_id]["task_digest"],
++                tasks[instance_id]["task_tree_sha256"],
++            ]
++            for instance_id in sorted(tasks)
++        ],
++        ensure_ascii=False,
++        sort_keys=True,
++        separators=(",", ":"),
++    )
++    return hashlib.sha256(rendered.encode("utf-8")).hexdigest()
++
++
++def _read_runtime_task_attestations() -> tuple[
++    dict[str, dict[str, str]],
++    _OpenPathAttestation,
++]:
++    raw_path = os.getenv("HARBOR_E2B_TEMPLATE_PINS_FILE")
++    if not raw_path:
++        raise RuntimeError("runtime task attestation file is not configured")
++    path = Path(raw_path)
++    if not path.is_absolute():
++        raise PermissionError("runtime task attestation file must be absolute")
++    opened_path = _open_attested_path(
++        path,
++        directory=False,
++        allowed_modes={0o400, 0o600},
++        maximum_size=_MAX_TEMPLATE_PINS_BYTES,
++    )
++    try:
++        with os.fdopen(opened_path.descriptor, "rb", closefd=False) as handle:
++            encoded = handle.read(_MAX_TEMPLATE_PINS_BYTES + 1)
++        if (
++            len(encoded) > _MAX_TEMPLATE_PINS_BYTES
++            or not _attested_path_is_stable(opened_path)
++        ):
++            raise RuntimeError("runtime task attestation changed while reading")
++        payload = json.loads(encoded)
++        if (
++            not isinstance(payload, dict)
++            or set(payload)
++            != {
++                "schema_version",
++                "pins",
++                "tasks",
++                "task_count",
++                "task_set_sha256",
++                "task_binding_sha256",
++                "task_runtime_sha256",
++            }
++            or payload.get("schema_version") != 2
++        ):
++            raise ValueError("runtime task attestation schema is unsupported")
++        _validate_template_pins(payload["pins"])
++        tasks = _validate_task_attestation_entries(payload["tasks"])
++        task_count = payload["task_count"]
++        task_set_sha256 = payload["task_set_sha256"]
++        task_binding_sha256 = payload["task_binding_sha256"]
++        task_runtime_sha256 = payload["task_runtime_sha256"]
++        if (
++            isinstance(task_count, bool)
++            or not isinstance(task_count, int)
++            or task_count != len(tasks)
++            or not isinstance(task_set_sha256, str)
++            or _SAFE_TASK_DIGEST.fullmatch(task_set_sha256) is None
++            or not hmac.compare_digest(
++                task_set_sha256,
++                _task_set_sha256(set(tasks)),
++            )
++            or not isinstance(task_binding_sha256, str)
++            or _SAFE_TASK_DIGEST.fullmatch(task_binding_sha256) is None
++            or not hmac.compare_digest(
++                task_binding_sha256,
++                _task_binding_sha256(tasks),
++            )
++            or not isinstance(task_runtime_sha256, str)
++            or _SAFE_TASK_DIGEST.fullmatch(task_runtime_sha256) is None
++            or not hmac.compare_digest(
++                task_runtime_sha256,
++                _task_runtime_sha256(tasks),
++            )
++        ):
++            raise ValueError("runtime task-set binding is invalid")
++        return tasks, opened_path
++    except Exception:
++        _close_open_path(opened_path)
++        raise
++
++
++def _inotify_api() -> tuple[Any, Any]:
++    global _inotify_api_cache
++    if _inotify_api_cache is not None:
++        return _inotify_api_cache
++    libc = ctypes.CDLL(None, use_errno=True)
++    try:
++        init = libc.inotify_init1
++        add_watch = libc.inotify_add_watch
++    except AttributeError as exc:
++        raise RuntimeError("runtime task attestation requires Linux inotify") from exc
++    init.argtypes = [ctypes.c_int]
++    init.restype = ctypes.c_int
++    add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
++    add_watch.restype = ctypes.c_int
++    _inotify_api_cache = (init, add_watch)
++    return _inotify_api_cache
++
++
++def _create_mutation_watch() -> int:
++    init, _add_watch = _inotify_api()
++    descriptor = init(os.O_CLOEXEC | os.O_NONBLOCK)
++    if descriptor < 0:
++        error = ctypes.get_errno()
++        raise OSError(error, os.strerror(error))
++    return descriptor
++
++
++def _add_mutation_watch(descriptor: int, path: Path) -> None:
++    _init, add_watch = _inotify_api()
++    watch = add_watch(
++        descriptor,
++        os.fsencode(path),
++        _INOTIFY_MUTATION_MASK,
++    )
++    if watch < 0:
++        error = ctypes.get_errno()
++        raise OSError(error, f"cannot watch sealed task directory: {os.strerror(error)}")
++
++
++def _watch_task_tree_directories(descriptor: int, task_path: Path) -> None:
++    _add_mutation_watch(descriptor, task_path)
++    for candidate in sorted(task_path.rglob("*")):
++        metadata = candidate.lstat()
++        if stat.S_ISDIR(metadata.st_mode):
++            _add_mutation_watch(descriptor, candidate)
++
++
++def _mutation_watch_has_events(descriptor: int) -> bool:
++    try:
++        return bool(os.read(descriptor, _INOTIFY_EVENT_BUFFER_BYTES))
++    except BlockingIOError:
++        return False
++    except OSError:
++        return True
++
++
++def _hash_task_tree(task_path: Path) -> str:
++    from experiments.src.environments.swe.materialize import _task_tree_sha256
++
++    return _task_tree_sha256(task_path)
++
++
++def _close_runtime_attestation_cache(
++    cache: _RuntimeTaskAttestationCache,
++) -> None:
++    for task in cache.tasks.values():
++        _close_open_path(task.path)
++    _close_open_path(cache.tasks_root)
++    _close_open_path(cache.pin_file)
+     try:
+-        config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+-    except (OSError, tomllib.TOMLDecodeError) as exc:
+-        raise ValueError(f"Cannot read trusted task config: {config_path}") from exc
+-    metadata = config.get("metadata") or {}
+-    digest = metadata.get("task_digest") if isinstance(metadata, dict) else None
+-    if digest is None:
++        os.close(cache.mutation_watch_descriptor)
++    except OSError:
++        pass
++
++
++def _initialize_runtime_task_attestations() -> None:
++    """Load and hash every selected task exactly once before serving traffic."""
++
++    global _runtime_attestation_cache, _runtime_attestation_invalid_reason
++    if os.getenv("HARBOR_ENV_TYPE", "docker").lower() != "e2b":
++        return
++    with _runtime_attestation_lock:
++        if _runtime_attestation_cache is not None:
++            return
++        if _runtime_attestation_invalid_reason != "not initialized":
++            raise RuntimeError("runtime task attestation cache is invalid")
++
++        pin_file: _OpenPathAttestation | None = None
++        tasks_root: _OpenPathAttestation | None = None
++        task_entries: dict[str, _RuntimeTaskAttestation] = {}
++        mutation_watch_descriptor = -1
++        try:
++            task_attestations, pin_file = _read_runtime_task_attestations()
++            tasks_root_path = Path(
++                os.getenv("HARBOR_TASKS_DIR", "/root/harbor_tasks")
++            )
++            if not tasks_root_path.is_absolute():
++                raise PermissionError("HARBOR_TASKS_DIR must be absolute")
++            tasks_root = _open_attested_path(
++                tasks_root_path,
++                directory=True,
++                allowed_modes={0o500, 0o700},
++            )
++            mutation_watch_descriptor = _create_mutation_watch()
++            _add_mutation_watch(mutation_watch_descriptor, tasks_root_path)
++
++            for instance_id, expected in sorted(task_attestations.items()):
++                task_path = tasks_root_path / instance_id
++                task_path_attestation = _open_attested_path(
++                    task_path,
++                    directory=True,
++                    allowed_modes={0o500},
++                )
++                try:
++                    _watch_task_tree_directories(
++                        mutation_watch_descriptor,
++                        task_path,
++                    )
++                    actual_tree = _hash_task_tree(task_path)
++                    if not hmac.compare_digest(
++                        expected["task_tree_sha256"],
++                        actual_tree,
++                    ) or not _attested_path_is_stable(task_path_attestation):
++                        raise RuntimeError("runtime task tree attestation mismatch")
++                    task_entries[instance_id] = _RuntimeTaskAttestation(
++                        path=task_path_attestation,
++                        task_digest=expected["task_digest"],
++                        task_tree_sha256=expected["task_tree_sha256"],
++                    )
++                except Exception:
++                    _close_open_path(task_path_attestation)
++                    raise
++
++            if (
++                _mutation_watch_has_events(mutation_watch_descriptor)
++                or not _attested_path_is_stable(pin_file)
++                or not _attested_path_is_stable(tasks_root)
++            ):
++                raise RuntimeError("runtime task attestations changed during startup")
++            _runtime_attestation_cache = _RuntimeTaskAttestationCache(
++                pin_file=pin_file,
++                tasks_root=tasks_root,
++                tasks=MappingProxyType(dict(task_entries)),
++                task_count=len(task_entries),
++                task_set_sha256=_task_set_sha256(set(task_entries)),
++                task_binding_sha256=_task_binding_sha256(task_attestations),
++                task_runtime_sha256=_task_runtime_sha256(task_attestations),
++                mutation_watch_descriptor=mutation_watch_descriptor,
++            )
++            _runtime_attestation_invalid_reason = ""
++        except Exception:
++            for task in task_entries.values():
++                _close_open_path(task.path)
++            if tasks_root is not None:
++                _close_open_path(tasks_root)
++            if pin_file is not None:
++                _close_open_path(pin_file)
++            if mutation_watch_descriptor >= 0:
++                os.close(mutation_watch_descriptor)
++            _runtime_attestation_invalid_reason = "initialization failed"
++            raise
++
++
++def _invalidate_runtime_task_attestations_locked(reason: str) -> None:
++    global _runtime_attestation_cache, _runtime_attestation_invalid_reason
++    cache = _runtime_attestation_cache
++    _runtime_attestation_cache = None
++    _runtime_attestation_invalid_reason = reason
++    if cache is not None:
++        _close_runtime_attestation_cache(cache)
++
++
++def _runtime_cache_is_stable_locked(
++    cache: _RuntimeTaskAttestationCache,
++    task: _RuntimeTaskAttestation | None = None,
++) -> bool:
++    if (
++        _mutation_watch_has_events(cache.mutation_watch_descriptor)
++        or not _attested_path_is_stable(cache.pin_file)
++        or not _attested_path_is_stable(cache.tasks_root)
++        or (task is not None and not _attested_path_is_stable(task.path))
++    ):
++        _invalidate_runtime_task_attestations_locked("sealed task tree changed")
++        return False
++    return True
++
++
++def _runtime_task_attestation_error(
++    instance_id: str,
++    requested_digest: str | None,
++) -> str | None:
++    """Validate one request against the startup cache in constant time."""
++
++    if os.getenv("HARBOR_ENV_TYPE", "docker").lower() != "e2b":
++        return None
++    with _runtime_attestation_lock:
++        cache = _runtime_attestation_cache
++        if cache is None or not _runtime_cache_is_stable_locked(cache):
++            return "TaskAttestationUnavailable"
++        task = cache.tasks.get(instance_id)
++        if task is None:
++            return "TaskTreeAttestationMismatch"
++        if (
++            requested_digest is None
++            or _SAFE_TASK_DIGEST.fullmatch(requested_digest) is None
++            or not hmac.compare_digest(task.task_digest, requested_digest)
++        ):
++            return "TaskDigestMismatch"
++        if not _runtime_cache_is_stable_locked(cache, task):
++            return "TaskAttestationUnavailable"
++        return None
++
++
++def _runtime_task_attestations_ready() -> bool:
++    if os.getenv("HARBOR_ENV_TYPE", "docker").lower() != "e2b":
++        return True
++    with _runtime_attestation_lock:
++        cache = _runtime_attestation_cache
++        return cache is not None and _runtime_cache_is_stable_locked(cache)
++
++
++def _runtime_task_set_binding() -> tuple[str, str, str, int] | None:
++    """Return the startup-bound task-set identity while the cache is stable."""
++
++    if os.getenv("HARBOR_ENV_TYPE", "docker").lower() != "e2b":
+         return None
+-    if not isinstance(digest, str) or _SAFE_TASK_DIGEST.fullmatch(digest) is None:
+-        raise ValueError(f"Invalid trusted task_digest in {config_path}")
+-    return digest
++    with _runtime_attestation_lock:
++        cache = _runtime_attestation_cache
++        if cache is None or not _runtime_cache_is_stable_locked(cache):
++            return None
++        return (
++            cache.task_set_sha256,
++            cache.task_binding_sha256,
++            cache.task_runtime_sha256,
++            cache.task_count,
++        )
++
++
++def _shutdown_runtime_task_attestations() -> None:
++    global _runtime_attestation_cache, _runtime_attestation_invalid_reason
++    with _runtime_attestation_lock:
++        if _runtime_attestation_cache is not None:
++            _close_runtime_attestation_cache(_runtime_attestation_cache)
++        _runtime_attestation_cache = None
++        _runtime_attestation_invalid_reason = "not initialized"
+ 
+ 
+-def _task_digest_matches(task_path: Path, requested_digest: str | None) -> bool:
+-    """Bind a Miles prompt row to the exact trusted task materialization."""
+-    trusted_digest = _trusted_task_digest(task_path)
+-    if trusted_digest is None:
+-        return requested_digest is None
+-    if requested_digest is None or _SAFE_TASK_DIGEST.fullmatch(requested_digest) is None:
++def _reset_runtime_task_attestations_for_tests() -> None:
++    _shutdown_runtime_task_attestations()
++
++
++def _task_tree_attestation_matches(
++    task_path: Path,
++    instance_id: str,
++    requested_digest: str | None,
++) -> bool:
++    if _runtime_task_attestation_error(instance_id, requested_digest) is not None:
+         return False
+-    return hmac.compare_digest(trusted_digest, requested_digest)
++    if os.getenv("HARBOR_ENV_TYPE", "docker").lower() != "e2b":
++        return True
++    with _runtime_attestation_lock:
++        cache = _runtime_attestation_cache
++        task = cache.tasks.get(instance_id) if cache is not None else None
++        return task is not None and task.path.path == task_path
+ 
+ 
+ def _agent_connection_config(
+@@ -244,10 +837,11 @@ async def _run_trial(request: RunRequest) -> dict[str, Any]:
+             logger.error(f"Task directory not found: {task_path}")
+             return _error_response("TaskNotFound")
+ 
++        # The authenticated parent server validates task ID, digest, the sealed
++        # tree fingerprint, and the startup-cached tree hash before spawning this
++        # private worker. Re-reading the potentially 64 MiB pin set or hashing
++        # the tree again here would make every rollout linear in shard size.
+         task_path = Path(task_path)
+-        if not _task_digest_matches(task_path, request.task_digest):
+-            logger.error("Task digest mismatch for instance_id=%r", raw_id)
+-            return _error_response("TaskDigestMismatch")
+ 
+         agent_kwargs, agent_env = _agent_connection_config(request)
+ 
+@@ -327,6 +921,36 @@ async def _run_trial(request: RunRequest) -> dict[str, Any]:
+ _WORKER_RESULT_MARKER = "[trial_worker] RESULT "
+ 
+ 
++def _trial_worker_environment() -> dict[str, str]:
++    """Return the exact provider-controller environment for a trial child."""
++
++    return {
++        name: value
++        for name, value in os.environ.items()
++        if name in _TRIAL_WORKER_ENV_ALLOWLIST
++    }
++
++
++def _trial_wall_timeout_seconds() -> float:
++    """Return the fixed end-to-end production trial deadline."""
++
++    raw = os.getenv(
++        "HARBOR_TRIAL_WALL_TIMEOUT_SEC",
++        str(int(_TRIAL_WALL_TIMEOUT_SECONDS)),
++    )
++    try:
++        seconds = float(raw)
++    except ValueError as exc:
++        raise ValueError(
++            "HARBOR_TRIAL_WALL_TIMEOUT_SEC must be exactly 12600 seconds"
++        ) from exc
++    if not math.isfinite(seconds) or seconds != _TRIAL_WALL_TIMEOUT_SECONDS:
++        raise ValueError(
++            "HARBOR_TRIAL_WALL_TIMEOUT_SEC must be exactly 12600 seconds"
++        )
++    return seconds
++
++
+ async def run_trial_in_subprocess(request: RunRequest) -> dict[str, Any]:
+     """Run one trial in a SEPARATE process, regardless of env type.
+ 
+@@ -347,12 +971,22 @@ async def run_trial_in_subprocess(request: RunRequest) -> dict[str, Any]:
+     proc = await asyncio.create_subprocess_exec(
+         sys.executable, "-m", "agent_server.trial_runner",
+         cwd=str(harbor_root),
++        env=_trial_worker_environment(),
+         stdin=asyncio.subprocess.PIPE,
+         stdout=asyncio.subprocess.PIPE,
+         stderr=asyncio.subprocess.PIPE,
+     )
+     try:
+-        out, err = await proc.communicate(blob.encode())
++        out, err = await asyncio.wait_for(
++            proc.communicate(blob.encode()),
++            timeout=_trial_wall_timeout_seconds(),
++        )
++    except TimeoutError:
++        # The client deadline is deliberately longer than this server-owned
++        # wall clock, so Harbor gets one bounded cleanup opportunity before the
++        # request returns an ungraded infrastructure outcome.
++        await stop_harbor_trial_worker(proc)
++        return _error_response("TrialWallTimeout")
+     except asyncio.CancelledError:
+         # Give Harbor's shielded environment cleanup a bounded chance to stop
+         # remote sandboxes before falling back to a hard process kill.
+diff --git a/miles_agent_server.py b/miles_agent_server.py
+index c173b59edb9debe612dd26f5bb10725c0a045844..f1b1448fe56fe0952e39091b206e22a4d8713ba1 100644
+--- a/miles_agent_server.py
++++ b/miles_agent_server.py
+@@ -26,6 +26,7 @@ import argparse
+ import asyncio
+ import hmac
+ import logging
++import time
+ import uuid
+ from collections.abc import AsyncIterator
+ from contextlib import asynccontextmanager
+@@ -39,7 +40,6 @@ from fastapi import FastAPI, Header, HTTPException, Request
+ from agent_server.background import (
+     _docker_prune_loop,
+     _flush,
+-    _flush_by_session_server_id,
+     _health_checker_loop,
+ )
+ from agent_server.docker_ops import _check_docker_login, _prune_docker
+@@ -59,27 +59,50 @@ from agent_server.state import _state
+ from agent_server.teardown import _cancel_all_inflight, _kill_trial_containers
+ from agent_server.trial_runner import (
+     _discard_active_task,
++    _initialize_runtime_task_attestations,
+     _register_active_task,
++    _runtime_task_attestation_error,
++    _runtime_task_attestations_ready,
++    _runtime_task_set_binding,
++    _shutdown_runtime_task_attestations,
+     run_trial_in_subprocess,
+ )
++from miles.rollout.harbor.auth import (
++    derive_harbor_cancel_bearer,
++    derive_harbor_drain_bearer,
++    derive_harbor_flush_bearer,
++    derive_harbor_health_bearer,
++    derive_harbor_run_bearer,
++)
+ from miles.rollout.harbor.environment_config import environment_uses_local_docker
+-from server_dashboard.dashboard import create_dashboard_app
+-from server_dashboard.request_logger import RequestLogger
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+-_ADMIN_SECRET = os.getenv("HARBOR_ADMIN_SECRET")
++_MIN_SECRET_LENGTH = 32
++_MAX_SECRET_LENGTH = 4096
++_CANCELLATION_TOMBSTONE_TTL_SECONDS = 13_200.0
++_MAX_CANCELLATION_TOMBSTONES = 65_536
+ 
+ 
+-_request_logger: RequestLogger | None = None
++_request_logger: Any | None = None
++_client_tasks: dict[str, set[asyncio.Task[Any]]] = {}
++_scoped_tasks: dict[
++    tuple[str, str, str | None, str],
++    set[asyncio.Task[Any]],
++] = {}
++_cancelled_scopes: dict[tuple[str, str, str | None, str], float] = {}
++_draining_clients: dict[str, float] = {}
+ 
+ 
+ @asynccontextmanager
+ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
++    _required_process_secret("HARBOR_RUN_SECRET")
++    _required_process_secret("HARBOR_ADMIN_SECRET")
+     max_concurrent = int(
+         os.getenv("AGENT_MAX_CONCURRENT", os.getenv("SWE_AGENT_MAX_CONCURRENT", "8"))
+     )
++    _initialize_runtime_task_attestations()
+     _state.semaphore = asyncio.Semaphore(max_concurrent)
+     logger.info(f"Initialized semaphore with max_concurrent={max_concurrent}")
+     checker_task = asyncio.create_task(_health_checker_loop())
+@@ -100,6 +123,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+                 await prune_task
+             except asyncio.CancelledError:
+                 pass
++        _shutdown_runtime_task_attestations()
++        _client_tasks.clear()
++        _scoped_tasks.clear()
++        _cancelled_scopes.clear()
++        _draining_clients.clear()
+ 
+ 
+ app = FastAPI(title="Agent Environment Server (Harbor)", lifespan=_lifespan)
+@@ -112,15 +140,146 @@ def get_semaphore() -> asyncio.Semaphore:
+     return _state.semaphore
+ 
+ 
++def _register_scoped_task(
++    *,
++    client_id: str,
++    session_server_instance_id: str | None,
++    instance_id: str,
++    request_id: str,
++    task: asyncio.Task[Any],
++) -> bool:
++    now = time.monotonic()
++    key = (client_id, request_id, session_server_instance_id, instance_id)
++    if (
++        _cancellation_tombstone_is_live(_cancelled_scopes, key, now)
++        or _cancellation_tombstone_is_live(
++            _draining_clients,
++            client_id,
++            now,
++        )
++    ):
++        task.cancel()
++        return False
++    _client_tasks.setdefault(client_id, set()).add(task)
++    _scoped_tasks.setdefault(key, set()).add(task)
++    return True
++
++
++def _discard_scoped_task(
++    *,
++    client_id: str,
++    session_server_instance_id: str | None,
++    instance_id: str,
++    request_id: str,
++    task: asyncio.Task[Any],
++) -> None:
++    client_tasks = _client_tasks.get(client_id)
++    if client_tasks is not None:
++        client_tasks.discard(task)
++        if not client_tasks:
++            _client_tasks.pop(client_id, None)
++    key = (client_id, request_id, session_server_instance_id, instance_id)
++    scoped_tasks = _scoped_tasks.get(key)
++    if scoped_tasks is not None:
++        scoped_tasks.discard(task)
++        if not scoped_tasks:
++            _scoped_tasks.pop(key, None)
++
++
++def _cancel_tasks(tasks: set[asyncio.Task[Any]]) -> int:
++    return sum(1 for task in tuple(tasks) if not task.done() and task.cancel())
++
++
++def _cancel_scoped_tasks(
++    *,
++    client_id: str,
++    session_server_instance_id: str | None,
++    instance_id: str,
++    request_id: str,
++) -> int:
++    key = (client_id, request_id, session_server_instance_id, instance_id)
++    _record_cancellation_tombstone(_cancelled_scopes, key)
++    return _cancel_tasks(_scoped_tasks.get(key, set()))
++
++
++def _drain_client_tasks(client_id: str) -> int:
++    _record_cancellation_tombstone(_draining_clients, client_id)
++    return _cancel_tasks(_client_tasks.get(client_id, set()))
++
++
++def _record_cancellation_tombstone(
++    tombstones: dict[Any, float],
++    key: Any,
++) -> None:
++    now = time.monotonic()
++    if key not in tombstones and (
++        len(_cancelled_scopes) + len(_draining_clients)
++        >= _MAX_CANCELLATION_TOMBSTONES
++    ):
++        _prune_cancellation_tombstones(now)
++        if (
++            len(_cancelled_scopes) + len(_draining_clients)
++            >= _MAX_CANCELLATION_TOMBSTONES
++        ):
++            raise RuntimeError("cancellation tombstone capacity is exhausted")
++    tombstones[key] = now + _CANCELLATION_TOMBSTONE_TTL_SECONDS
++
++
++def _cancellation_tombstone_is_live(
++    tombstones: dict[Any, float],
++    key: Any,
++    now: float,
++) -> bool:
++    deadline = tombstones.get(key)
++    if deadline is None:
++        return False
++    if deadline <= now:
++        tombstones.pop(key, None)
++        return False
++    return True
++
++
++def _prune_cancellation_tombstones(now: float) -> None:
++    for tombstones in (_cancelled_scopes, _draining_clients):
++        expired = [key for key, deadline in tombstones.items() if deadline <= now]
++        for key in expired:
++            tombstones.pop(key, None)
++
++
+ @app.post("/run")
+-async def run_instance(request: RunRequest, raw_request: Request) -> RunResponse:
++async def run_instance(
++    request: RunRequest,
++    raw_request: Request,
++    authorization: str | None = Header(None),
++) -> RunResponse:
+     """Run an agent on a single task instance via Harbor."""
++    if request.client_id is None or request.request_id is None:
++        raise HTTPException(
++            status_code=400,
++            detail="client_id and request_id are required",
++        )
++    _require_run_secret(
++        authorization,
++        instance_id=request.instance_id,
++        session_server_instance_id=request.session_server_instance_id,
++        client_id=request.client_id,
++        request_id=request.request_id,
++    )
++    attestation_error = _runtime_task_attestation_error(
++        request.instance_id,
++        request.task_digest,
++    )
++    if attestation_error is not None:
++        logger.error("Runtime task attestation rejected a /run request")
++        return RunResponse(**_error_response(attestation_error))
+     client_host = raw_request.client.host if raw_request.client else "unknown"
+     client_port = str(raw_request.client.port) if raw_request.client else "unknown"
+     sid = request.session_server_id
+     tracking_key = None
+     heartbeat_target = None
+     expected_instance_id = request.session_server_instance_id
++    client_id = request.client_id
++    request_id = request.request_id
+     if sid is not None:
+         try:
+             sid = await _validate_session_server_id(sid, request.base_url)
+@@ -162,18 +321,20 @@ async def run_instance(request: RunRequest, raw_request: Request) -> RunResponse
+             )
+             return RunResponse(**_error_response("InvalidSessionServerId"))
+ 
++    assert request_id is not None
++    try:
++        client_id = _normalize_session_server_instance_id(client_id)
++    except ValueError as exc:
++        logger.warning("Rejected invalid client_id: %s", exc)
++        return RunResponse(**_error_response("InvalidClientId"))
++
+     if expected_instance_id is not None or heartbeat_target is not None:
+         tracking_key = expected_instance_id or heartbeat_target
+-    payload = request.model_dump()
+-    payload["session_server_id"] = sid
+-    payload["session_server_instance_id"] = expected_instance_id
+-    log_payload = {**payload, "api_key": "[REDACTED]"}
+     logger.info(
+-        f"Running instance: {request.instance_id} | "
+-        f"from={client_host}:{client_port} | "
+-        f"session_server={sid} | "
+-        f"session_server_instance_id={expected_instance_id} | "
+-        f"payload={log_payload}"
++        "Running instance %s from %s:%s",
++        request.instance_id,
++        client_host,
++        client_port,
+     )
+ 
+     pending_entry = None
+@@ -183,14 +344,15 @@ async def run_instance(request: RunRequest, raw_request: Request) -> RunResponse
+             instance_id=request.instance_id,
+             requester_hostname=client_host,
+             requester_port=client_port,
+-            base_url=request.base_url,
++            # The session endpoint can encode private routing state. It is
++            # needed in-memory for the trial but must never enter dashboard
++            # logs or replay metadata.
++            base_url="",
+             model=request.model,
+             agent_name=request.agent_name,
+         )
+ 
+     current_task = asyncio.current_task()
+-    if current_task is not None:
+-        _state.inflight_tasks.add(current_task)
+     if tracking_key and heartbeat_target and current_task:
+         try:
+             _register_active_task(
+@@ -209,6 +371,15 @@ async def run_instance(request: RunRequest, raw_request: Request) -> RunResponse
+                 exc,
+             )
+             return RunResponse(**_error_response("InvalidSessionServerId"))
++    if current_task is not None:
++        _state.inflight_tasks.add(current_task)
++        _register_scoped_task(
++            client_id=client_id,
++            session_server_instance_id=expected_instance_id,
++            instance_id=request.instance_id,
++            request_id=request_id,
++            task=current_task,
++        )
+     try:
+         async with get_semaphore():
+             result = await run_trial_in_subprocess(request)
+@@ -223,6 +394,13 @@ async def run_instance(request: RunRequest, raw_request: Request) -> RunResponse
+     finally:
+         if current_task is not None:
+             _state.inflight_tasks.discard(current_task)
++            _discard_scoped_task(
++                client_id=client_id,
++                session_server_instance_id=expected_instance_id,
++                instance_id=request.instance_id,
++                request_id=request_id,
++                task=current_task,
++            )
+         if tracking_key and current_task:
+             _discard_active_task(tracking_key, current_task)
+ 
+@@ -254,46 +432,281 @@ async def run_instance(request: RunRequest, raw_request: Request) -> RunResponse
+ 
+ 
+ @app.get("/health")
+-async def health():
+-    return {"status": "ok"}
++async def health(authorization: str | None = Header(None)):
++    _require_health_secret(authorization)
++    ready = _runtime_task_attestations_ready()
++    task_set = _runtime_task_set_binding() if ready else None
++    return {
++        "status": "ok" if ready else "degraded",
++        "ready": ready,
++        "task_set_sha256": task_set[0] if task_set is not None else None,
++        "task_binding_sha256": task_set[1] if task_set is not None else None,
++        "task_runtime_sha256": task_set[2] if task_set is not None else None,
++        "task_count": task_set[3] if task_set is not None else 0,
++    }
++
++
++def _required_process_secret(setting: str) -> str:
++    secret = os.getenv(setting)
++    if (
++        secret is None
++        or not (_MIN_SECRET_LENGTH <= len(secret) <= _MAX_SECRET_LENGTH)
++        or "\r" in secret
++        or "\n" in secret
++    ):
++        raise RuntimeError(f"{setting} is missing or invalid")
++    return secret
++
++
++def _require_bearer_secret(authorization: str | None, *, setting: str) -> None:
++    try:
++        secret = _required_process_secret(setting)
++    except RuntimeError as exc:
++        raise HTTPException(
++            status_code=503,
++            detail="Server authentication is not configured",
++        ) from exc
++    if not hmac.compare_digest(authorization or "", f"Bearer {secret}"):
++        raise HTTPException(
++            status_code=401,
++            detail="Invalid or missing bearer token",
++            headers={"WWW-Authenticate": "Bearer"},
++        )
+ 
+ 
+ def _require_admin_secret(authorization: str | None) -> None:
+-    if not _ADMIN_SECRET:
+-        return
+-    if not hmac.compare_digest(authorization or "", f"Bearer {_ADMIN_SECRET}"):
+-        raise HTTPException(status_code=403, detail="Invalid or missing admin secret")
++    _require_bearer_secret(authorization, setting="HARBOR_ADMIN_SECRET")
++
++
++def _require_run_secret(
++    authorization: str | None,
++    *,
++    instance_id: str,
++    session_server_instance_id: str | None,
++    client_id: str | None,
++    request_id: str | None,
++) -> None:
++    try:
++        master_secret = _required_process_secret("HARBOR_RUN_SECRET")
++        expected = derive_harbor_run_bearer(
++            master_secret,
++            instance_id=instance_id,
++            session_server_instance_id=session_server_instance_id,
++            client_id=client_id,
++            request_id=request_id,
++        )
++    except RuntimeError as exc:
++        raise HTTPException(
++            status_code=503,
++            detail="Server authentication is not configured",
++        ) from exc
++    except ValueError as exc:
++        raise HTTPException(
++            status_code=400,
++            detail="Invalid run authentication binding",
++        ) from exc
++    if not hmac.compare_digest(authorization or "", f"Bearer {expected}"):
++        raise HTTPException(
++            status_code=401,
++            detail="Invalid or missing bearer token",
++            headers={"WWW-Authenticate": "Bearer"},
++        )
++
++
++def _require_cancel_secret(
++    authorization: str | None,
++    *,
++    instance_id: str,
++    session_server_instance_id: str | None,
++    client_id: str,
++    request_id: str,
++) -> None:
++    try:
++        master_secret = _required_process_secret("HARBOR_RUN_SECRET")
++        expected = derive_harbor_cancel_bearer(
++            master_secret,
++            instance_id=instance_id,
++            session_server_instance_id=session_server_instance_id,
++            client_id=client_id,
++            request_id=request_id,
++        )
++    except RuntimeError as exc:
++        raise HTTPException(
++            status_code=503,
++            detail="Server authentication is not configured",
++        ) from exc
++    except ValueError as exc:
++        raise HTTPException(
++            status_code=400,
++            detail="Invalid cancel authentication binding",
++        ) from exc
++    if not hmac.compare_digest(authorization or "", f"Bearer {expected}"):
++        raise HTTPException(
++            status_code=401,
++            detail="Invalid or missing bearer token",
++            headers={"WWW-Authenticate": "Bearer"},
++        )
++
++
++def _require_drain_secret(
++    authorization: str | None,
++    *,
++    client_id: str,
++) -> None:
++    try:
++        master_secret = _required_process_secret("HARBOR_RUN_SECRET")
++        expected = derive_harbor_drain_bearer(
++            master_secret,
++            client_id=client_id,
++        )
++    except RuntimeError as exc:
++        raise HTTPException(
++            status_code=503,
++            detail="Server authentication is not configured",
++        ) from exc
++    except ValueError as exc:
++        raise HTTPException(
++            status_code=400,
++            detail="Invalid drain authentication binding",
++        ) from exc
++    if not hmac.compare_digest(authorization or "", f"Bearer {expected}"):
++        raise HTTPException(
++            status_code=401,
++            detail="Invalid or missing bearer token",
++            headers={"WWW-Authenticate": "Bearer"},
++        )
++
++
++def _require_flush_secret(
++    authorization: str | None,
++    *,
++    session_server_instance_id: str,
++) -> None:
++    try:
++        master_secret = _required_process_secret("HARBOR_RUN_SECRET")
++    except RuntimeError as exc:
++        raise HTTPException(
++            status_code=503,
++            detail="Server authentication is not configured",
++        ) from exc
++    try:
++        expected = derive_harbor_flush_bearer(
++            master_secret,
++            session_server_instance_id=session_server_instance_id,
++        )
++    except ValueError as exc:
++        raise HTTPException(
++            status_code=400,
++            detail="Invalid flush authentication binding",
++        ) from exc
++    if not hmac.compare_digest(authorization or "", f"Bearer {expected}"):
++        raise HTTPException(
++            status_code=401,
++            detail="Invalid or missing bearer token",
++            headers={"WWW-Authenticate": "Bearer"},
++        )
++
++
++def _require_health_secret(authorization: str | None) -> None:
++    try:
++        master_secret = _required_process_secret("HARBOR_RUN_SECRET")
++    except RuntimeError as exc:
++        raise HTTPException(
++            status_code=503,
++            detail="Server authentication is not configured",
++        ) from exc
++    expected = derive_harbor_health_bearer(master_secret)
++    if not hmac.compare_digest(authorization or "", f"Bearer {expected}"):
++        raise HTTPException(
++            status_code=401,
++            detail="Invalid or missing bearer token",
++            headers={"WWW-Authenticate": "Bearer"},
++        )
+ 
+ 
+ @app.post("/flush")
+ async def flush_endpoint(
+     request: FlushRequest, authorization: str | None = Header(None)
+ ):
+-    """Cancel all in-flight trials for a given session server (admin only)."""
+-    _require_admin_secret(authorization)
+-    if request.session_server_instance_id is not None:
+-        try:
+-            tracking_key = _normalize_session_server_instance_id(
+-                request.session_server_instance_id
+-            )
+-        except ValueError as exc:
+-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+-        cancelled = _flush(tracking_key)
+-        return {
+-            "session_server_instance_id": tracking_key,
+-            "session_server_id": request.session_server_id,
+-            "cancelled": cancelled,
+-        }
+-    if request.session_server_id is None:
++    """Cancel trials bound to the caller's opaque session-instance nonce."""
++    if request.session_server_instance_id is None:
+         raise HTTPException(
+             status_code=400,
+-            detail="session_server_id or session_server_instance_id is required",
++            detail="session_server_instance_id is required",
+         )
+     try:
+-        cancelled = _flush_by_session_server_id(request.session_server_id)
++        tracking_key = _normalize_session_server_instance_id(
++            request.session_server_instance_id
++        )
+     except ValueError as exc:
+         raise HTTPException(status_code=400, detail=str(exc)) from exc
+-    return {"session_server_id": request.session_server_id, "cancelled": cancelled}
++    _require_flush_secret(
++        authorization,
++        session_server_instance_id=tracking_key,
++    )
++    cancelled = _flush(tracking_key)
++    return {
++        "session_server_instance_id": tracking_key,
++        "cancelled": cancelled,
++    }
++
++
++@app.post("/cancel")
++async def cancel_endpoint(
++    request: FlushRequest,
++    authorization: str | None = Header(None),
++):
++    """Cancel only one task within one authenticated client/session scope."""
++    if (
++        request.instance_id is None
++        or request.client_id is None
++        or request.request_id is None
++    ):
++        raise HTTPException(
++            status_code=400,
++            detail="instance_id, client_id, and request_id are required",
++        )
++    try:
++        client_id = _normalize_session_server_instance_id(request.client_id)
++        session_id = (
++            _normalize_session_server_instance_id(
++                request.session_server_instance_id,
++            )
++            if request.session_server_instance_id is not None
++            else None
++        )
++    except ValueError as exc:
++        raise HTTPException(status_code=400, detail=str(exc)) from exc
++    _require_cancel_secret(
++        authorization,
++        instance_id=request.instance_id,
++        session_server_instance_id=session_id,
++        client_id=client_id,
++        request_id=request.request_id,
++    )
++    cancelled = _cancel_scoped_tasks(
++        client_id=client_id,
++        session_server_instance_id=session_id,
++        instance_id=request.instance_id,
++        request_id=request.request_id,
++    )
++    return {"cancelled": cancelled}
++
++
++@app.post("/drain")
++async def drain_endpoint(
++    request: FlushRequest,
++    authorization: str | None = Header(None),
++):
++    """Cancel every active task owned by one authenticated job/client."""
++    if request.client_id is None:
++        raise HTTPException(status_code=400, detail="client_id is required")
++    try:
++        client_id = _normalize_session_server_instance_id(request.client_id)
++    except ValueError as exc:
++        raise HTTPException(status_code=400, detail=str(exc)) from exc
++    _require_drain_secret(authorization, client_id=client_id)
++    return {"cancelled": _drain_client_tasks(client_id)}
+ 
+ 
+ @app.get("/clients")
+@@ -380,14 +793,19 @@ def main():
+     parser.add_argument(
+         "--dashboard-port",
+         type=int,
+-        default=8081,
++        default=0,
+         help=(
+-            "Port for the standalone dashboard server (default: 8081). "
+-            "Set to 0 to disable and mount at /dashboard on the main server instead."
++            "Dashboard port; authenticated Miles deployments require 0 "
++            "and expose no dashboard routes."
+         ),
+     )
+     args = parser.parse_args()
+ 
++    if args.dashboard_port:
++        raise RuntimeError(
++            "The authenticated Miles server disables the unauthenticated dashboard"
++        )
++
+     # Cloud environments build and run remotely, so no local Docker login is needed.
+     if environment_uses_local_docker():
+         _check_docker_login()
+@@ -418,31 +836,8 @@ def main():
+ 
+     os.environ.setdefault("MSWEA_API_KEY", "dummy")
+ 
+-    # ── Dashboard integration ──────────────────────────────────────────
+-    log_path = args.dashboard_log_path or os.getenv("DASHBOARD_LOG_PATH") or None
+-    _request_logger = RequestLogger(log_path=log_path)
+-    logger.info(f"Dashboard log: {_request_logger.log_path}")
+-    logger.info(f"Session ID:    {_request_logger.session_id}")
+-
+-    dashboard_app = create_dashboard_app(log_path=_request_logger.log_path)
+-
+-    if args.dashboard_port:
+-        # Run dashboard in a separate process so it isn't blocked by
+-        # agent work on the main server's event loop.
+-        import multiprocessing
+-
+-        def _run_dashboard():
+-            uvicorn.run(dashboard_app, host="0.0.0.0", port=args.dashboard_port)
+-
+-        _dashboard_proc = multiprocessing.Process(
+-            target=_run_dashboard,
+-            daemon=True,
+-        )
+-        _dashboard_proc.start()
+-        logger.info(f"Dashboard running at http://0.0.0.0:{args.dashboard_port}/")
+-    else:
+-        app.mount("/dashboard", dashboard_app)
+-        logger.info(f"Dashboard mounted at http://{args.host}:{args.port}/dashboard/")
++    _request_logger = None
++    logger.info("Dashboard routes are disabled")
+ 
+     uvicorn.run(app, host=args.host, port=args.port)
+ 
+diff --git a/src/harbor/environments/e2b.py b/src/harbor/environments/e2b.py
+index 2f109d070f7076e8d6bfce3fb82c5b527b67262c..51877234ccbc96637f32f25a4b825f7c32ec8ef7 100644
+--- a/src/harbor/environments/e2b.py
++++ b/src/harbor/environments/e2b.py
+@@ -68,6 +68,9 @@ except ImportError:
+     _DISPATCH_RETRYABLE: tuple[type[BaseException], ...] = ()
+ 
+ 
++_MAX_TEMPLATE_PINS_BYTES = 64 * 1024 * 1024
++
++
+ class E2BEnvironment(BaseEnvironment):
+     _UPLOAD_BATCH_SIZE = 20
+     _LATE_TESTS_MARKER = ".harbor-e2b-late-tests"
+@@ -194,10 +197,10 @@ class E2BEnvironment(BaseEnvironment):
+             or metadata.st_nlink != 1
+             or metadata.st_uid != os.getuid()
+             or metadata.st_mode & 0o077
+-            or metadata.st_size > 2 * 1024 * 1024
++            or metadata.st_size > _MAX_TEMPLATE_PINS_BYTES
+         ):
+             raise PermissionError(
+-                "E2B template pin file must be a small owner-only regular file"
++                "E2B template pin file must be a bounded owner-only regular file"
+             )
+ 
+         descriptor = os.open(pin_path, os.O_RDONLY | os.O_NOFOLLOW)
+@@ -208,15 +211,17 @@ class E2BEnvironment(BaseEnvironment):
+                 or opened.st_nlink != 1
+                 or opened.st_uid != os.getuid()
+                 or opened.st_mode & 0o077
++                or opened.st_size > _MAX_TEMPLATE_PINS_BYTES
+                 or (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino)
+             ):
+                 raise PermissionError("E2B template pin file changed while opening")
+-            with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+-                descriptor = -1
+-                payload = json.load(handle)
+-                finished = os.fstat(handle.fileno())
++            with os.fdopen(descriptor, "rb", closefd=False) as handle:
++                encoded = handle.read(_MAX_TEMPLATE_PINS_BYTES + 1)
++            finished = os.fstat(descriptor)
++            path_finished = pin_path.lstat()
+             if (
+-                (
++                len(encoded) > _MAX_TEMPLATE_PINS_BYTES
++                or (
+                     finished.st_dev,
+                     finished.st_ino,
+                     finished.st_size,
+@@ -234,13 +239,32 @@ class E2BEnvironment(BaseEnvironment):
+                 )
+                 or finished.st_mtime_ns != opened.st_mtime_ns
+                 or finished.st_ctime_ns != opened.st_ctime_ns
++                or (
++                    path_finished.st_dev,
++                    path_finished.st_ino,
++                    path_finished.st_size,
++                    path_finished.st_nlink,
++                    path_finished.st_uid,
++                    stat.S_IMODE(path_finished.st_mode),
++                )
++                != (
++                    opened.st_dev,
++                    opened.st_ino,
++                    opened.st_size,
++                    opened.st_nlink,
++                    opened.st_uid,
++                    stat.S_IMODE(opened.st_mode),
++                )
++                or path_finished.st_mtime_ns != opened.st_mtime_ns
++                or path_finished.st_ctime_ns != opened.st_ctime_ns
+             ):
+                 raise PermissionError("E2B template pin file changed while reading")
+         finally:
+             if descriptor >= 0:
+                 os.close(descriptor)
+ 
+-        if not isinstance(payload, dict) or payload.get("schema_version") != 1:
++        payload = json.loads(encoded)
++        if not isinstance(payload, dict) or payload.get("schema_version") != 2:
+             raise ValueError("Unsupported E2B template pin schema")
+         pins = payload.get("pins")
+         pin = pins.get(self._template_name) if isinstance(pins, dict) else None
+diff --git a/tests/unit/environments/test_e2b.py b/tests/unit/environments/test_e2b.py
+index fc66c7001f15d55f0f31efcc95b81b1c7ef94ce8..1d6ddde40a1ae28a06e4065caff6af9b08f674e3 100644
+--- a/tests/unit/environments/test_e2b.py
++++ b/tests/unit/environments/test_e2b.py
+@@ -155,6 +155,23 @@ async def test_create_sandbox_passes_startup_environment(temp_dir):
+     }
+ 
+ 
++async def test_host_provider_credentials_are_not_forwarded_to_sandbox(
++    temp_dir,
++    monkeypatch,
++):
++    provider_secret = "provider-secret-that-stays-on-the-host"
++    monkeypatch.setenv("E2B_API_KEY", provider_secret)
++    env = _make_env(temp_dir)
++
++    with patch(
++        "harbor.environments.e2b.AsyncSandbox.create", new=AsyncMock()
++    ) as create:
++        await env._create_sandbox()
++
++    assert create.await_args.kwargs["envs"] == {}
++    assert provider_secret not in repr(create.await_args.kwargs["envs"])
++
++
+ async def test_create_sandbox_disables_internet_for_no_network(temp_dir):
+     env = _make_env(
+         temp_dir,
+@@ -286,13 +303,14 @@ async def test_pinned_template_id_bypasses_mutable_alias(
+     pins.write_text(
+         json.dumps(
+             {
+-                "schema_version": 1,
++                "schema_version": 2,
+                 "pins": {
+                     env._template_name: {
+                         "template_id": "template-id-123",
+                         "build_id": "build-id-456",
+                     }
+                 },
++                "tasks": {},
+             }
+         ),
+         encoding="utf-8",
+@@ -348,6 +366,67 @@ def test_template_pin_file_must_not_be_hardlinked(temp_dir, monkeypatch):
+         env._load_template_pin()
+ 
+ 
++def test_template_pin_file_accepts_realistic_payload_larger_than_two_mib(
++    temp_dir,
++    monkeypatch,
++):
++    env = _make_env(temp_dir)
++    pins_payload = {
++        env._template_name: {
++            "template_id": "template-id-123",
++            "build_id": "build-id-456",
++        }
++    }
++    tasks = {}
++    for index in range(5_000):
++        task_id = f"repository_with_realistic_name__task_{index:05d}_" + "x" * 48
++        pins_payload[f"{task_id}__agent_abcdefghijkl"] = {
++            "template_id": f"template-{index:05d}-" + "a" * 32,
++            "build_id": f"build-{index:05d}-" + "b" * 32,
++        }
++        pins_payload[f"miles-swe-verifier__{index:012x}"] = {
++            "template_id": f"template-v-{index:05d}-" + "c" * 30,
++            "build_id": f"build-v-{index:05d}-" + "d" * 30,
++        }
++        tasks[task_id] = {
++            "task_digest": "e" * 64,
++            "task_tree_sha256": "f" * 64,
++        }
++    encoded = json.dumps(
++        {
++            "schema_version": 2,
++            "pins": pins_payload,
++            "tasks": tasks,
++        },
++        sort_keys=True,
++    )
++    assert 2 * 1024 * 1024 < len(encoded.encode()) < 64 * 1024 * 1024
++    pins = temp_dir / "template-pins.json"
++    pins.write_text(encoded, encoding="utf-8")
++    pins.chmod(0o600)
++    monkeypatch.setenv("HARBOR_E2B_TEMPLATE_PINS_FILE", str(pins))
++
++    env._load_template_pin()
++
++    assert env._template_id == "template-id-123"
++
++
++def test_template_pin_file_rejects_payload_larger_than_explicit_cap(
++    temp_dir,
++    monkeypatch,
++):
++    env = _make_env(temp_dir)
++    pins = temp_dir / "template-pins.json"
++    with pins.open("wb") as handle:
++        handle.seek(64 * 1024 * 1024)
++        handle.write(b"\n")
++    pins.chmod(0o600)
++    monkeypatch.setenv("HARBOR_E2B_TEMPLATE_PINS_FILE", str(pins))
++
++    with pytest.raises(PermissionError, match="bounded owner-only regular file"):
++        env._load_template_pin()
++
++
+ def test_late_test_template_alias_depends_only_on_image_and_resources(temp_dir):
+     image = "registry.example/repo@sha256:" + "a" * 64
+     first_root = temp_dir / "first"
+diff --git a/tests/unit/test_miles_agent_server_results.py b/tests/unit/test_miles_agent_server_results.py
+index 422203e0b2ad83fe4e2505ba1facb9ccb1ddd658..830ff35dfdae1fba9b0e88e998face8389e8ce0d 100644
+--- a/tests/unit/test_miles_agent_server_results.py
++++ b/tests/unit/test_miles_agent_server_results.py
+@@ -1,7 +1,26 @@
++import asyncio
++import importlib.util
++import logging
++import sys
++from concurrent.futures import ThreadPoolExecutor
+ from datetime import datetime, timedelta
++from pathlib import Path
+ from types import SimpleNamespace
++from unittest.mock import AsyncMock, MagicMock
++from uuid import uuid4
+ 
+-from agent_server import results
++import pytest
++import httpx
++from fastapi import HTTPException
++
++from agent_server import results, trial_runner
++from miles.rollout.harbor.auth import (
++    derive_harbor_cancel_bearer,
++    derive_harbor_drain_bearer,
++    derive_harbor_flush_bearer,
++    derive_harbor_health_bearer,
++    derive_harbor_run_bearer,
++)
+ 
+ 
+ def _result(**kwargs):
+@@ -261,3 +280,955 @@ class TestErrorResponse:
+             "agent_metrics": {},
+             "eval_report": {},
+         }
++
++
++class TestTrialWorkerEnvironment:
++    def test_trial_child_keeps_provider_key_but_drops_server_secrets(
++        self,
++        monkeypatch,
++    ):
++        run_secret = "run-secret-" + "r" * 32
++        admin_secret = "admin-secret-" + "a" * 32
++        provider_secret = "provider-secret-" + "e" * 32
++        unrelated_secret = "unrelated-secret-" + "u" * 32
++        monkeypatch.setenv("HARBOR_RUN_SECRET", run_secret)
++        monkeypatch.setenv("HARBOR_ADMIN_SECRET", admin_secret)
++        monkeypatch.setenv("E2B_API_KEY", provider_secret)
++        monkeypatch.setenv("HARBOR_TIMEOUT_MULTIPLIER", "1")
++        monkeypatch.setenv("HARBOR_TRIAL_WALL_TIMEOUT_SEC", "12600")
++        monkeypatch.setenv("HARBOR_VERIFIER_TIMEOUT_SEC", "2100")
++        monkeypatch.setenv("HARBOR_ENV_BUILD_TIMEOUT_MULTIPLIER", "1")
++        monkeypatch.setenv("UNRELATED_CLOUD_SECRET", unrelated_secret)
++        process = SimpleNamespace(
++            communicate=AsyncMock(
++                return_value=(
++                    (
++                        trial_runner._WORKER_RESULT_MARKER
++                        + '{"reward": 0.0, "exit_status": "Submitted"}'
++                    ).encode(),
++                    b"",
++                )
++            ),
++            returncode=0,
++        )
++        create = AsyncMock(return_value=process)
++        monkeypatch.setattr(
++            trial_runner.asyncio,
++            "create_subprocess_exec",
++            create,
++        )
++
++        result = asyncio.run(
++            trial_runner.run_trial_in_subprocess(
++                trial_runner.RunRequest(**_run_payload())
++            )
++        )
++
++        assert result["exit_status"] == "Submitted"
++        child_env = create.await_args.kwargs["env"]
++        assert child_env["E2B_API_KEY"] == provider_secret
++        assert child_env["HARBOR_TIMEOUT_MULTIPLIER"] == "1"
++        assert child_env["HARBOR_TRIAL_WALL_TIMEOUT_SEC"] == "12600"
++        assert child_env["HARBOR_VERIFIER_TIMEOUT_SEC"] == "2100"
++        assert child_env["HARBOR_ENV_BUILD_TIMEOUT_MULTIPLIER"] == "1"
++        assert "HARBOR_RUN_SECRET" not in child_env
++        assert "HARBOR_ADMIN_SECRET" not in child_env
++        assert "UNRELATED_CLOUD_SECRET" not in child_env
++        rendered = repr(create.await_args)
++        assert run_secret not in rendered
++        assert admin_secret not in rendered
++        assert unrelated_secret not in rendered
++
++    @pytest.mark.parametrize("configured", ["0", "12599", "12601", "nan", "inf", "bad"])
++    def test_trial_wall_timeout_rejects_every_noncanonical_value(
++        self,
++        monkeypatch,
++        configured,
++    ):
++        monkeypatch.setenv("HARBOR_TRIAL_WALL_TIMEOUT_SEC", configured)
++
++        with pytest.raises(ValueError, match="must be exactly 12600 seconds"):
++            trial_runner._trial_wall_timeout_seconds()
++
++    def test_trial_wall_timeout_cleans_up_and_returns_ungraded_result(
++        self,
++        monkeypatch,
++    ):
++        monkeypatch.setenv("HARBOR_TRIAL_WALL_TIMEOUT_SEC", "12600")
++        process = SimpleNamespace(
++            communicate=MagicMock(),
++            returncode=None,
++        )
++
++        async def communicate(_payload):
++            await asyncio.Future()
++
++        async def expire(awaitable, *, timeout):
++            assert timeout == 12_600.0
++            awaitable.close()
++            raise TimeoutError
++
++        process.communicate.side_effect = communicate
++        create = AsyncMock(return_value=process)
++        stop = AsyncMock()
++        monkeypatch.setattr(
++            trial_runner.asyncio,
++            "create_subprocess_exec",
++            create,
++        )
++        monkeypatch.setattr(trial_runner.asyncio, "wait_for", expire)
++        monkeypatch.setattr(trial_runner, "stop_harbor_trial_worker", stop)
++
++        result = asyncio.run(
++            trial_runner.run_trial_in_subprocess(
++                trial_runner.RunRequest(**_run_payload())
++            )
++        )
++
++        assert result == {
++            "reward": 0.0,
++            "exit_status": "TrialWallTimeout",
++            "agent_metrics": {},
++            "eval_report": {},
++        }
++        stop.assert_awaited_once_with(process)
++
++
++def _load_authenticated_server(monkeypatch):
++    monkeypatch.setenv("HARBOR_ENV_TYPE", "e2b")
++    monkeypatch.setenv("HARBOR_RUN_SECRET", "r" * 32)
++    monkeypatch.setenv("HARBOR_ADMIN_SECRET", "a" * 32)
++    module_path = Path(__file__).resolve().parents[2] / "miles_agent_server.py"
++    module_name = f"harbor_private_authenticated_server_{uuid4().hex}"
++    spec = importlib.util.spec_from_file_location(module_name, module_path)
++    assert spec is not None and spec.loader is not None
++    module = importlib.util.module_from_spec(spec)
++    sys.modules[module_name] = module
++    spec.loader.exec_module(module)
++    monkeypatch.setattr(
++        module,
++        "_initialize_runtime_task_attestations",
++        MagicMock(),
++    )
++    monkeypatch.setattr(
++        module,
++        "_shutdown_runtime_task_attestations",
++        MagicMock(),
++    )
++    monkeypatch.setattr(
++        module,
++        "_runtime_task_attestation_error",
++        MagicMock(return_value=None),
++    )
++    monkeypatch.setattr(
++        module,
++        "_runtime_task_attestations_ready",
++        MagicMock(return_value=True),
++    )
++    monkeypatch.setattr(
++        module,
++        "_runtime_task_set_binding",
++        MagicMock(return_value=("e" * 64, "f" * 64, "1" * 64, 1)),
++    )
++    return module
++
++
++def _run_payload() -> dict[str, object]:
++    return {
++        "base_url": "http://private-session.internal:30000/v1",
++        "model": "openai/model",
++        "instance_id": "task-1",
++        "task_digest": "d" * 64,
++        "agent_name": "terminus-2",
++        "client_id": "client-1",
++        "request_id": "1" * 32,
++    }
++
++
++def _raw_request() -> SimpleNamespace:
++    return SimpleNamespace(client=SimpleNamespace(host="127.0.0.1", port=12345))
++
++
++def _run_authorization(payload: dict[str, object]) -> str:
++    return "Bearer " + derive_harbor_run_bearer(
++        "r" * 32,
++        instance_id=str(payload["instance_id"]),
++        session_server_instance_id=payload.get("session_server_instance_id"),
++        client_id=payload.get("client_id"),
++        request_id=payload.get("request_id"),
++    )
++
++
++def _flush_authorization(session_server_instance_id: str) -> str:
++    return "Bearer " + derive_harbor_flush_bearer(
++        "r" * 32,
++        session_server_instance_id=session_server_instance_id,
++    )
++
++
++def _cancel_authorization(
++    *,
++    client_id: str,
++    instance_id: str,
++    session_server_instance_id: str | None,
++    request_id: str,
++) -> str:
++    return "Bearer " + derive_harbor_cancel_bearer(
++        "r" * 32,
++        client_id=client_id,
++        request_id=request_id,
++        instance_id=instance_id,
++        session_server_instance_id=session_server_instance_id,
++    )
++
++
++def _drain_authorization(client_id: str) -> str:
++    return "Bearer " + derive_harbor_drain_bearer(
++        "r" * 32,
++        client_id=client_id,
++    )
++
++
++class TestServerAuthentication:
++    def test_run_requires_safe_client_and_request_nonce_before_dispatch(
++        self,
++        monkeypatch,
++    ):
++        module = _load_authenticated_server(monkeypatch)
++        dispatch = AsyncMock()
++        monkeypatch.setattr(module, "run_trial_in_subprocess", dispatch)
++        cases = (
++            {"client_id": None, "request_id": None},
++            {"client_id": "client-1", "request_id": None},
++            {"client_id": None, "request_id": "1" * 32},
++            {"client_id": "../unsafe", "request_id": "1" * 32},
++            {"client_id": "client-1", "request_id": "not-a-nonce"},
++        )
++
++        for overrides in cases:
++            payload = {**_run_payload(), **overrides}
++            with pytest.raises(HTTPException) as raised:
++                asyncio.run(
++                    module.run_instance(
++                        module.RunRequest(**payload),
++                        _raw_request(),
++                        f"Bearer {'x' * 64}",
++                    )
++                )
++            assert raised.value.status_code == 400
++        dispatch.assert_not_awaited()
++
++    def test_run_rejects_missing_and_wrong_bearer_before_dispatch(self, monkeypatch):
++        module = _load_authenticated_server(monkeypatch)
++        dispatch = AsyncMock()
++        monkeypatch.setattr(module, "run_trial_in_subprocess", dispatch)
++        request = module.RunRequest(**_run_payload())
++
++        for authorization in (None, f"Bearer {'x' * 64}"):
++            with pytest.raises(HTTPException) as raised:
++                asyncio.run(
++                    module.run_instance(request, _raw_request(), authorization)
++                )
++            assert raised.value.status_code == 401
++            assert raised.value.headers == {"WWW-Authenticate": "Bearer"}
++        dispatch.assert_not_awaited()
++
++    def test_run_rejects_same_session_bearer_captured_from_another_task(
++        self,
++        monkeypatch,
++    ):
++        module = _load_authenticated_server(monkeypatch)
++        dispatch = AsyncMock()
++        monkeypatch.setattr(module, "run_trial_in_subprocess", dispatch)
++        payload = {
++            **_run_payload(),
++            "session_server_instance_id": "session-1",
++        }
++        captured = _run_authorization(
++            {
++                **payload,
++                "instance_id": "task-2",
++            }
++        )
++
++        with pytest.raises(HTTPException) as raised:
++            asyncio.run(
++                module.run_instance(
++                    module.RunRequest(**payload),
++                    _raw_request(),
++                    captured,
++                )
++            )
++
++        assert raised.value.status_code == 401
++        dispatch.assert_not_awaited()
++
++    def test_run_bearer_is_also_bound_to_client(self, monkeypatch):
++        module = _load_authenticated_server(monkeypatch)
++        dispatch = AsyncMock()
++        monkeypatch.setattr(module, "run_trial_in_subprocess", dispatch)
++        payload = {
++            **_run_payload(),
++            "session_server_instance_id": "session-1",
++            "client_id": "client-1",
++            "request_id": "1" * 32,
++        }
++        captured = _run_authorization({**payload, "client_id": "client-2"})
++
++        with pytest.raises(HTTPException) as raised:
++            asyncio.run(
++                module.run_instance(
++                    module.RunRequest(**payload),
++                    _raw_request(),
++                    captured,
++                )
++            )
++
++        assert raised.value.status_code == 401
++        dispatch.assert_not_awaited()
++
++    def test_run_bearer_is_bound_to_one_request_nonce(self, monkeypatch):
++        module = _load_authenticated_server(monkeypatch)
++        dispatch = AsyncMock()
++        monkeypatch.setattr(module, "run_trial_in_subprocess", dispatch)
++        payload = {
++            **_run_payload(),
++            "session_server_instance_id": "session-1",
++            "client_id": "client-1",
++            "request_id": "1" * 32,
++        }
++
++        with pytest.raises(HTTPException) as raised:
++            asyncio.run(
++                module.run_instance(
++                    module.RunRequest(**payload),
++                    _raw_request(),
++                    _run_authorization({**payload, "request_id": "2" * 32}),
++                )
++            )
++
++        assert raised.value.status_code == 401
++        dispatch.assert_not_awaited()
++
++    def test_run_rejects_unsafe_authentication_binding_before_dispatch(
++        self,
++        monkeypatch,
++    ):
++        module = _load_authenticated_server(monkeypatch)
++        dispatch = AsyncMock()
++        monkeypatch.setattr(module, "run_trial_in_subprocess", dispatch)
++        payload = {**_run_payload(), "instance_id": "../unsafe"}
++
++        with pytest.raises(HTTPException) as raised:
++            asyncio.run(
++                module.run_instance(
++                    module.RunRequest(**payload),
++                    _raw_request(),
++                    f"Bearer {'x' * 64}",
++                )
++            )
++
++        assert raised.value.status_code == 400
++        dispatch.assert_not_awaited()
++
++    def test_run_accepts_exact_bearer_and_redacts_sensitive_request_fields(
++        self,
++        monkeypatch,
++        caplog,
++    ):
++        module = _load_authenticated_server(monkeypatch)
++        result = {
++            "reward": 1.0,
++            "exit_status": "Submitted",
++            "agent_metrics": {},
++            "eval_report": {"reward": 1.0},
++        }
++        dispatch = AsyncMock(return_value=result)
++        monkeypatch.setattr(module, "run_trial_in_subprocess", dispatch)
++        payload = _run_payload()
++        module._state.semaphore = asyncio.Semaphore(1)
++
++        with caplog.at_level(logging.INFO, logger=module.logger.name):
++            response = asyncio.run(
++                module.run_instance(
++                    module.RunRequest(**payload),
++                    _raw_request(),
++                    _run_authorization(payload),
++                )
++            )
++
++        assert response.exit_status == "Submitted"
++        dispatch.assert_awaited_once()
++        assert str(payload["base_url"]) not in caplog.text
++        assert str(payload["task_digest"]) not in caplog.text
++        assert "payload=" not in caplog.text
++        assert "r" * 32 not in caplog.text
++
++    def test_admin_routes_require_a_distinct_exact_bearer(self, monkeypatch):
++        module = _load_authenticated_server(monkeypatch)
++
++        with pytest.raises(HTTPException) as raised:
++            asyncio.run(module.clients_endpoint(f"Bearer {'r' * 32}"))
++        assert raised.value.status_code == 401
++        assert asyncio.run(module.clients_endpoint(f"Bearer {'a' * 32}")) == {}
++
++    def test_health_requires_distinct_derived_bearer(self, monkeypatch):
++        module = _load_authenticated_server(monkeypatch)
++        health = "Bearer " + derive_harbor_health_bearer("r" * 32)
++        task_run = _run_authorization(_run_payload())
++
++        for wrong_token in (None, f"Bearer {'r' * 32}", task_run):
++            with pytest.raises(HTTPException) as raised:
++                asyncio.run(module.health(wrong_token))
++            assert raised.value.status_code == 401
++
++        assert asyncio.run(module.health(health)) == {
++            "status": "ok",
++            "ready": True,
++            "task_set_sha256": "e" * 64,
++            "task_binding_sha256": "f" * 64,
++            "task_runtime_sha256": "1" * 64,
++            "task_count": 1,
++        }
++
++    def test_invalidated_attestation_rejects_run_and_degrades_health(
++        self,
++        monkeypatch,
++    ):
++        module = _load_authenticated_server(monkeypatch)
++        dispatch = AsyncMock()
++        monkeypatch.setattr(module, "run_trial_in_subprocess", dispatch)
++        module._runtime_task_attestation_error.return_value = (
++            "TaskAttestationUnavailable"
++        )
++        module._runtime_task_attestations_ready.return_value = False
++        payload = _run_payload()
++
++        response = asyncio.run(
++            module.run_instance(
++                module.RunRequest(**payload),
++                _raw_request(),
++                _run_authorization(payload),
++            )
++        )
++
++        assert response.exit_status == "TaskAttestationUnavailable"
++        dispatch.assert_not_awaited()
++        health = "Bearer " + derive_harbor_health_bearer("r" * 32)
++        assert asyncio.run(module.health(health)) == {
++            "status": "degraded",
++            "ready": False,
++            "task_set_sha256": None,
++            "task_binding_sha256": None,
++            "task_runtime_sha256": None,
++            "task_count": 0,
++        }
++
++    def test_session_flush_uses_distinct_session_bearer(self, monkeypatch):
++        module = _load_authenticated_server(monkeypatch)
++        request = module.FlushRequest(session_server_instance_id="session-1")
++        session_one = _flush_authorization("session-1")
++        session_two = _flush_authorization("session-2")
++        task_run = _run_authorization(
++            {
++                **_run_payload(),
++                "session_server_instance_id": "session-1",
++            }
++        )
++
++        for wrong_token in (f"Bearer {'a' * 32}", session_two, task_run):
++            with pytest.raises(HTTPException) as raised:
++                asyncio.run(module.flush_endpoint(request, wrong_token))
++            assert raised.value.status_code == 401
++        response = asyncio.run(module.flush_endpoint(request, session_one))
++        assert response["cancelled"] == 0
++
++        with pytest.raises(HTTPException) as raised:
++            asyncio.run(
++                module.flush_endpoint(
++                    module.FlushRequest(session_server_id="predictable-host:30000"),
++                    session_one,
++                )
++            )
++        assert raised.value.status_code == 400
++        assert raised.value.detail == "session_server_instance_id is required"
++
++    def test_cancel_is_bound_to_exact_client_session_and_task(self, monkeypatch):
++        module = _load_authenticated_server(monkeypatch)
++
++        async def scenario() -> None:
++            gate = asyncio.Event()
++            selected = asyncio.create_task(gate.wait())
++            other_task = asyncio.create_task(gate.wait())
++            other_client = asyncio.create_task(gate.wait())
++            module._register_scoped_task(
++                client_id="client-1",
++                session_server_instance_id="session-1",
++                instance_id="task-1",
++                request_id="1" * 32,
++                task=selected,
++            )
++            module._register_scoped_task(
++                client_id="client-1",
++                session_server_instance_id="session-1",
++                instance_id="task-1",
++                request_id="2" * 32,
++                task=other_task,
++            )
++            module._register_scoped_task(
++                client_id="client-2",
++                session_server_instance_id="session-1",
++                instance_id="task-1",
++                request_id="1" * 32,
++                task=other_client,
++            )
++            request = module.FlushRequest(
++                client_id="client-1",
++                session_server_instance_id="session-1",
++                instance_id="task-1",
++                request_id="1" * 32,
++            )
++            wrong = _cancel_authorization(
++                client_id="client-1",
++                session_server_instance_id="session-1",
++                instance_id="task-1",
++                request_id="2" * 32,
++            )
++            with pytest.raises(HTTPException) as raised:
++                await module.cancel_endpoint(request, wrong)
++            assert raised.value.status_code == 401
++
++            response = await module.cancel_endpoint(
++                request,
++                _cancel_authorization(
++                    client_id="client-1",
++                    session_server_instance_id="session-1",
++                    instance_id="task-1",
++                    request_id="1" * 32,
++                ),
++            )
++            await asyncio.sleep(0)
++            assert response == {"cancelled": 1}
++            assert selected.cancelled()
++            assert not other_task.done()
++            assert not other_client.done()
++            other_task.cancel()
++            other_client.cancel()
++            await asyncio.gather(other_task, other_client, return_exceptions=True)
++
++        asyncio.run(scenario())
++
++    def test_drain_cancels_only_one_client_inventory(self, monkeypatch):
++        module = _load_authenticated_server(monkeypatch)
++
++        async def scenario() -> None:
++            gate = asyncio.Event()
++            first = asyncio.create_task(gate.wait())
++            second = asyncio.create_task(gate.wait())
++            unrelated = asyncio.create_task(gate.wait())
++            for task, session, instance, request_id in (
++                (first, "session-1", "task-1", "1" * 32),
++                (second, "session-2", "task-2", "2" * 32),
++            ):
++                module._register_scoped_task(
++                    client_id="client-1",
++                    session_server_instance_id=session,
++                    instance_id=instance,
++                    request_id=request_id,
++                    task=task,
++                )
++            module._register_scoped_task(
++                client_id="client-2",
++                session_server_instance_id="session-1",
++                instance_id="task-1",
++                request_id="3" * 32,
++                task=unrelated,
++            )
++            request = module.FlushRequest(client_id="client-1")
++            with pytest.raises(HTTPException) as raised:
++                await module.drain_endpoint(
++                    request,
++                    _drain_authorization("client-2"),
++                )
++            assert raised.value.status_code == 401
++
++            response = await module.drain_endpoint(
++                request,
++                _drain_authorization("client-1"),
++            )
++            await asyncio.sleep(0)
++            assert response == {"cancelled": 2}
++            assert first.cancelled() and second.cancelled()
++            assert not unrelated.done()
++            unrelated.cancel()
++            await asyncio.gather(unrelated, return_exceptions=True)
++
++        asyncio.run(scenario())
++
++    def test_cancel_tombstone_closes_cancel_before_registration_race(
++        self,
++        monkeypatch,
++    ):
++        module = _load_authenticated_server(monkeypatch)
++
++        async def scenario() -> None:
++            response = await module.cancel_endpoint(
++                module.FlushRequest(
++                    client_id="client-1",
++                    session_server_instance_id="session-1",
++                    instance_id="task-1",
++                    request_id="1" * 32,
++                ),
++                _cancel_authorization(
++                    client_id="client-1",
++                    session_server_instance_id="session-1",
++                    instance_id="task-1",
++                    request_id="1" * 32,
++                ),
++            )
++            assert response == {"cancelled": 0}
++
++            gate = asyncio.Event()
++            cancelled = asyncio.create_task(gate.wait())
++            sibling = asyncio.create_task(gate.wait())
++            assert not module._register_scoped_task(
++                client_id="client-1",
++                session_server_instance_id="session-1",
++                instance_id="task-1",
++                request_id="1" * 32,
++                task=cancelled,
++            )
++            assert module._register_scoped_task(
++                client_id="client-1",
++                session_server_instance_id="session-1",
++                instance_id="task-1",
++                request_id="2" * 32,
++                task=sibling,
++            )
++            await asyncio.sleep(0)
++            assert cancelled.cancelled()
++            assert not sibling.done()
++            sibling.cancel()
++            await asyncio.gather(sibling, return_exceptions=True)
++
++        asyncio.run(scenario())
++
++    def test_server_startup_fails_when_either_secret_is_missing(self, monkeypatch):
++        module = _load_authenticated_server(monkeypatch)
++        monkeypatch.delenv("HARBOR_ADMIN_SECRET")
++
++        async def start_server() -> None:
++            async with module._lifespan(module.app):
++                pass
++
++        with pytest.raises(RuntimeError, match="HARBOR_ADMIN_SECRET"):
++            asyncio.run(start_server())
++
++    def test_server_lifespan_initializes_and_closes_attestation_cache(
++        self,
++        monkeypatch,
++    ):
++        module = _load_authenticated_server(monkeypatch)
++
++        async def start_server() -> None:
++            async with module._lifespan(module.app):
++                module._initialize_runtime_task_attestations.assert_called_once_with()
++
++        asyncio.run(start_server())
++
++        module._shutdown_runtime_task_attestations.assert_called_once_with()
++
++    def test_zero_dashboard_port_exposes_no_dashboard_application(
++        self,
++        monkeypatch,
++        tmp_path,
++    ):
++        module = _load_authenticated_server(monkeypatch)
++        run_server = MagicMock()
++        monkeypatch.setattr(module.uvicorn, "run", run_server)
++        monkeypatch.setattr(
++            sys,
++            "argv",
++            [
++                "miles_agent_server.py",
++                "--host",
++                "127.0.0.1",
++                "--port",
++                "11000",
++                "--dashboard-port",
++                "0",
++                "--dashboard-log-path",
++                str(tmp_path / "requests.jsonl"),
++                "--trials-dir",
++                str(tmp_path / "trials"),
++            ],
++        )
++
++        module.main()
++
++        run_server.assert_called_once_with(module.app, host="127.0.0.1", port=11000)
++        assert module._request_logger is None
++        assert all(
++            not getattr(route, "path", "").startswith("/dashboard")
++            for route in module.app.routes
++        )
++
++        async def dashboard_statuses() -> list[int]:
++            transport = httpx.ASGITransport(app=module.app)
++            async with httpx.AsyncClient(
++                transport=transport,
++                base_url="http://test-server",
++            ) as client:
++                return [
++                    (await client.get(path)).status_code
++                    for path in (
++                        "/dashboard",
++                        "/dashboard/",
++                        "/dashboard/api/entries",
++                    )
++                ]
++
++        assert asyncio.run(dashboard_statuses()) == [404, 404, 404]
++
++    def test_nonzero_dashboard_port_fails_closed(self, monkeypatch, tmp_path):
++        module = _load_authenticated_server(monkeypatch)
++        monkeypatch.setattr(module.uvicorn, "run", MagicMock())
++        monkeypatch.setattr(
++            sys,
++            "argv",
++            [
++                "miles_agent_server.py",
++                "--dashboard-port",
++                "8081",
++                "--dashboard-log-path",
++                str(tmp_path / "requests.jsonl"),
++                "--trials-dir",
++                str(tmp_path / "trials"),
++            ],
++        )
++
++        with pytest.raises(RuntimeError, match="unauthenticated dashboard"):
++            module.main()
++
++
++def _write_task_attestation(tmp_path, monkeypatch):
++    from experiments.src.environments.swe.materialize import _task_tree_sha256
++
++    trial_runner._reset_runtime_task_attestations_for_tests()
++    tmp_path.chmod(0o700)
++    task = tmp_path / "task-1"
++    task.mkdir(mode=0o700)
++    instruction = task / "instruction.md"
++    instruction.write_text("Fix it.\n", encoding="utf-8")
++    instruction.chmod(0o400)
++    task.chmod(0o500)
++    digest = "d" * 64
++    pins = tmp_path / "template-pins.json"
++    pins.write_text(
++        __import__("json").dumps(
++            {
++                "schema_version": 2,
++                "pins": {
++                    "task-1__agent": {
++                        "template_id": "template-agent",
++                        "build_id": "build-agent",
++                    }
++                },
++                "tasks": {
++                    "task-1": {
++                        "task_digest": digest,
++                        "task_tree_sha256": _task_tree_sha256(task),
++                    }
++                },
++                "task_count": 1,
++                "task_set_sha256": trial_runner._task_set_sha256({"task-1"}),
++                "task_binding_sha256": trial_runner._task_binding_sha256(
++                    {
++                        "task-1": {
++                            "task_digest": digest,
++                            "task_tree_sha256": _task_tree_sha256(task),
++                        }
++                    }
++                ),
++                "task_runtime_sha256": trial_runner._task_runtime_sha256(
++                    {
++                        "task-1": {
++                            "task_digest": digest,
++                            "task_tree_sha256": _task_tree_sha256(task),
++                        }
++                    }
++                ),
++            }
++        ),
++        encoding="utf-8",
++    )
++    pins.chmod(0o600)
++    monkeypatch.setenv("HARBOR_ENV_TYPE", "e2b")
++    monkeypatch.setenv("HARBOR_E2B_TEMPLATE_PINS_FILE", str(pins))
++    monkeypatch.setenv("HARBOR_TASKS_DIR", str(tmp_path))
++    return task, instruction, pins, digest
++
++
++class TestRuntimeTaskTreeAttestation:
++    def test_runtime_attestation_rejects_stale_task_binding_digest(
++        self,
++        tmp_path,
++        monkeypatch,
++    ):
++        _task, _instruction, pins, _digest = _write_task_attestation(
++            tmp_path,
++            monkeypatch,
++        )
++        payload = __import__("json").loads(pins.read_text(encoding="utf-8"))
++        payload["task_binding_sha256"] = "0" * 64
++        pins.write_text(__import__("json").dumps(payload), encoding="utf-8")
++        pins.chmod(0o600)
++
++        try:
++            with pytest.raises(ValueError, match="task-set binding is invalid"):
++                trial_runner._initialize_runtime_task_attestations()
++        finally:
++            trial_runner._reset_runtime_task_attestations_for_tests()
++
++    def test_runtime_attestation_rejects_stale_task_runtime_digest(
++        self,
++        tmp_path,
++        monkeypatch,
++    ):
++        _task, _instruction, pins, _digest = _write_task_attestation(
++            tmp_path,
++            monkeypatch,
++        )
++        payload = __import__("json").loads(pins.read_text(encoding="utf-8"))
++        payload["task_runtime_sha256"] = "0" * 64
++        pins.write_text(__import__("json").dumps(payload), encoding="utf-8")
++        pins.chmod(0o600)
++
++        try:
++            with pytest.raises(ValueError, match="task-set binding is invalid"):
++                trial_runner._initialize_runtime_task_attestations()
++        finally:
++            trial_runner._reset_runtime_task_attestations_for_tests()
++
++    def test_sealed_admitted_tree_matches_and_content_change_is_rejected(
++        self,
++        tmp_path,
++        monkeypatch,
++    ):
++        task, instruction, _pins, digest = _write_task_attestation(
++            tmp_path,
++            monkeypatch,
++        )
++
++        try:
++            trial_runner._initialize_runtime_task_attestations()
++            assert trial_runner._task_tree_attestation_matches(
++                task,
++                "task-1",
++                digest,
++            )
++            instruction.chmod(0o600)
++            instruction.write_text("tampered\n", encoding="utf-8")
++            instruction.chmod(0o400)
++            assert not trial_runner._task_tree_attestation_matches(
++                task,
++                "task-1",
++                digest,
++            )
++            assert not trial_runner._runtime_task_attestations_ready()
++        finally:
++            trial_runner._reset_runtime_task_attestations_for_tests()
++
++    def test_runtime_attestation_rejects_hardlinked_pin_file(
++        self,
++        tmp_path,
++        monkeypatch,
++    ):
++        task, _instruction, pins, _digest = _write_task_attestation(
++            tmp_path,
++            monkeypatch,
++        )
++        (tmp_path / "template-pins-copy.json").hardlink_to(pins)
++
++        try:
++            with pytest.raises(PermissionError, match="attestation path is unsafe"):
++                trial_runner._initialize_runtime_task_attestations()
++        finally:
++            trial_runner._reset_runtime_task_attestations_for_tests()
++
++    def test_concurrent_startup_loads_and_hashes_each_task_once(
++        self,
++        tmp_path,
++        monkeypatch,
++    ):
++        task, _instruction, _pins, digest = _write_task_attestation(
++            tmp_path,
++            monkeypatch,
++        )
++        read = MagicMock(wraps=trial_runner._read_runtime_task_attestations)
++        tree_hash = MagicMock(wraps=trial_runner._hash_task_tree)
++        monkeypatch.setattr(trial_runner, "_read_runtime_task_attestations", read)
++        monkeypatch.setattr(trial_runner, "_hash_task_tree", tree_hash)
++
++        try:
++            with ThreadPoolExecutor(max_workers=16) as executor:
++                list(
++                    executor.map(
++                        lambda _: trial_runner._initialize_runtime_task_attestations(),
++                        range(32),
++                    )
++                )
++            with ThreadPoolExecutor(max_workers=16) as executor:
++                matches = list(
++                    executor.map(
++                        lambda _: trial_runner._task_tree_attestation_matches(
++                            task,
++                            "task-1",
++                            digest,
++                        ),
++                        range(64),
++                    )
++                )
++
++            assert all(matches)
++            assert read.call_count == 1
++            assert tree_hash.call_count == 1
++        finally:
++            trial_runner._reset_runtime_task_attestations_for_tests()
++
++    def test_concurrent_mutation_invalidates_all_future_requests(
++        self,
++        tmp_path,
++        monkeypatch,
++    ):
++        task, instruction, _pins, digest = _write_task_attestation(
++            tmp_path,
++            monkeypatch,
++        )
++        trial_runner._initialize_runtime_task_attestations()
++
++        def mutate() -> None:
++            instruction.chmod(0o600)
++            instruction.write_text("raced mutation\n", encoding="utf-8")
++            instruction.chmod(0o400)
++
++        try:
++            with ThreadPoolExecutor(max_workers=2) as executor:
++                validation = executor.submit(
++                    trial_runner._task_tree_attestation_matches,
++                    task,
++                    "task-1",
++                    digest,
++                )
++                mutation = executor.submit(mutate)
++                validation.result()
++                mutation.result()
++
++            assert not trial_runner._task_tree_attestation_matches(
++                task,
++                "task-1",
++                digest,
++            )
++            assert not trial_runner._runtime_task_attestations_ready()
++        finally:
++            trial_runner._reset_runtime_task_attestations_for_tests()
