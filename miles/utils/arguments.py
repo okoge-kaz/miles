@@ -12,6 +12,7 @@ from miles.backends.sglang_utils.arguments import add_sglang_arguments
 from miles.backends.sglang_utils.arguments import validate_args as sglang_validate_args
 from miles.dashboard.args import add_dashboard_arguments, validate_dashboard_args
 from miles.rollout.queue_policy import (
+    DEFAULT_TRAINING_BUFFER_QUEUE_SIZE,
     FULLY_ASYNC_QUEUE_POLICIES,
     validate_fully_async_queue_args,
 )
@@ -739,6 +740,17 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "queue-drop capacity q in training batches: capacity_groups = "
                     "q * rollout_batch_size. Must be at least 1. Other policies require 1."
+                ),
+            )
+            parser.add_argument(
+                "--training-buffer-queue-size",
+                type=int,
+                default=DEFAULT_TRAINING_BUFFER_QUEUE_SIZE,
+                help=(
+                    "Maximum number of completed prompt groups buffered by fully-async queue-recycle "
+                    "and queue-max before rollout production is backpressured. Defaults to 1000. "
+                    "queue-max raises an undersized value to rollout_batch_size so it can collect one "
+                    "complete training batch. queue-drop instead uses --fully-async-queue-factor."
                 ),
             )
             parser.add_argument(

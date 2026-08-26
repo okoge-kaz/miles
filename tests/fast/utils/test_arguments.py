@@ -27,6 +27,7 @@ def _replay_buffer_args(**overrides) -> SimpleNamespace:
         "fully_async": True,
         "fully_async_queue_type": "queue-recycle",
         "fully_async_queue_factor": 1,
+        "training_buffer_queue_size": 1000,
         "max_weight_staleness": None,
         "staleness_reference": "completion",
         "use_replay_buffer": True,
@@ -167,6 +168,17 @@ def test_replay_buffer_cli_is_opt_in_with_rollout_as_the_default_type():
     inflight = parser.parse_args(["--use-replay-buffer", "--replay-buffer-type", "inflight"] + REQUIRED_ARGS)
     assert inflight.use_replay_buffer
     assert inflight.replay_buffer_type == "inflight"
+
+
+def test_training_buffer_queue_size_cli_defaults_to_legacy_capacity_and_accepts_override():
+    parser = argparse.ArgumentParser()
+    get_miles_extra_args_provider()(parser)
+
+    defaults = parser.parse_args(REQUIRED_ARGS)
+    configured = parser.parse_args(["--training-buffer-queue-size", "5760"] + REQUIRED_ARGS)
+
+    assert defaults.training_buffer_queue_size == 1000
+    assert configured.training_buffer_queue_size == 5760
 
 
 def test_zero_reward_on_truncated_cli_is_opt_in():

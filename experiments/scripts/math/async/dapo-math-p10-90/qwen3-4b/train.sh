@@ -31,6 +31,7 @@ fi
 ROLLOUT_ARGS=(
    --fully-async
    --fully-async-queue-type "${QUEUE_TYPE}"
+   --training-buffer-queue-size "${TRAINING_BUFFER_QUEUE_SIZE}"
    --prompt-data "${PROMPT_DATA}"
    --input-key prompt
    --label-key label

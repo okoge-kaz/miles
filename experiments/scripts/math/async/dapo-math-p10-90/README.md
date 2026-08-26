@@ -354,6 +354,36 @@ NUM_STEPS_PER_ROLLOUT × PAUSE_GENERATION_MODE × …` は入れ子探索では�
 | RL algorithm | DAPO(GRPO), VCPO, CISPO, … | **A（未定）** | off-policy に有効と報告のあるものを一通り。**clip low/high と `--use-tis` はアルゴリズムの一部**として、ここで一緒に決める |
 | `LR` | **1e-7, 1e-6, 5e-6** | **3** | 低 / コンセンサス / 上限付近。1e-6 は DAPO と Nemotron 系 GRPO の既定値。5e-6 は公開されたチューニング範囲 {5e-6, 1e-6, 5e-5} の上側で、**試されて 1e-6 に負けた値**なので「発散する」ではなく「訓練はできるが劣る」ことが分かっている高値。最適 LR が off-policy 度合いとともに動くなら、その交互作用が結果 |
 
+**大きい staleness 上限では completed-group buffer も固定して広げる。** 現行の
+`ROLLOUT_BATCH_SIZE=192` に対して既定の `TRAINING_BUFFER_QUEUE_SIZE=1000` は 5.2
+training batch 分しかなく、上限 16 以上を観測する前に producer backpressure が
+かかる。各上限を収容する名目上の最小値 `M × 192` と、2 batch の余裕を持たせた値は
+次の通り。
+
+| `MAX_WEIGHT_STALENESS` | 名目最小 | 2-batch margin `(M+2)×192` |
+|---:|---:|---:|
+| 16 | 3072 | 3456 |
+| 20 | 3840 | 4224 |
+| 24 | 4608 | 4992 |
+| 28 | 5376 | 5760 |
+
+比較時に queue size 自体を別の実験軸にしないため、16/20/24/28 の全 arm で共通に
+`TRAINING_BUFFER_QUEUE_SIZE=5760` を使う。これは大きい lag を**許容する**だけで発生を
+保証しない。producer surplus が持続する `t1r7` で queue が伸びるかを判定し、queue
+が浅い `t2r6` では上限だけを広げても大きい lag は期待しない。平均 response 6.4k
+token、約 8 MB/group という過去の概算では 5760 group は約 46 GB の CPU memory
+なので、実投入前に rollout manager node の余裕も確認する。
+
+2026-08-26 時点の dashboard dump の再集計もこの選択を支持する。M=4/c4096 の
+途中経過では、`t1r7` は queue start 最大 525、stale recycle 517 group、offered
+staleness 最大 6（trained sample/token 最大 4）だった。`t2r6` はそれぞれ 148、4、
+5（trained 最大 4）に留まる。完走済み M=8 cohort では、`t1r7` が 300 step 中
+272 step で queue start 1000 以上となり、sample/token 最大 8、step 内 mean 最大
+7.32 まで到達した。一方 `t2r6` は queue start 最大 744 で既定上限に一度も達せず、
+sample/token 最大 7、mean 最大 5.53 だった。したがって queue 上限を解除した効果を
+直接検証できるのは `t1r7` であり、`t2r6` では queue size 増加だけで分布が動く根拠は
+ない。
+
 **応答長軸は「公平性」ではなく、IS 補正が壊れる機構そのものを測る軸である。**
 系列レベルの importance weight は per-token 比の積なので、log 重みは T 個の
 per-token log 比の**和**になる。per-token の標準偏差を σ とすれば

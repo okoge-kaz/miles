@@ -4,7 +4,8 @@
 # TIS_CLIP_LOW, MIS_PROFILE, USE_OPSM, OPSM_DELTA, KL_LOSS_COEF, LR,
 # MAX_RESPONSE_LEN, NUM_STEPS_PER_ROLLOUT, ROLLOUT_BATCH_SIZE,
 # GLOBAL_BATCH_SIZE, N_SAMPLES_PER_PROMPT, TRAIN_SEED, ROLLOUT_SEED, and for PLACEMENT=async also
-# QUEUE_TYPE and, except for queue-drop, MAX_WEIGHT_STALENESS.
+# QUEUE_TYPE, TRAINING_BUFFER_QUEUE_SIZE, and, except for queue-drop,
+# MAX_WEIGHT_STALENESS.
 # Optionally accepts TASK_FAMILY (default: math). Sets RL_ALGORITHM,
 # POLICY_REGIME, CONFIG_TAG, RUN_NAME, CKPT_PATH.
 # Sourced by both run.sbatch and train.sh so the two cannot disagree.
@@ -35,6 +36,7 @@
 : "${OVER_SAMPLING_BATCH_SIZE:=${ROLLOUT_BATCH_SIZE}}"
 : "${MASK_OFFPOLICY_IN_PARTIAL_ROLLOUT:=0}"
 : "${ASYNC_MAX_CONCURRENT_SAMPLES:=}"
+: "${TRAINING_BUFFER_QUEUE_SIZE:=1000}"
 
 [[ "${PARTIAL_ROLLOUT}" =~ ^[01]$ ]] ||
     { echo "PARTIAL_ROLLOUT must be 0 or 1" >&2; exit 1; }
@@ -51,7 +53,8 @@ case "${PLACEMENT}" in
         # None of these flags exist on this path; a non-default value would be silently dropped.
         [[ "${MAX_WEIGHT_STALENESS:-0}" == 0 && "${PAUSE_GENERATION_MODE:-none}" == none \
            && "${STALENESS_REFERENCE:-completion}" == completion \
-           && -z "${ASYNC_MAX_CONCURRENT_SAMPLES}" ]] ||
+           && -z "${ASYNC_MAX_CONCURRENT_SAMPLES}" \
+           && "${TRAINING_BUFFER_QUEUE_SIZE}" == 1000 ]] ||
             { echo "PLACEMENT=colocated cannot carry async-only staleness/concurrency settings" >&2; exit 1; }
         MAX_WEIGHT_STALENESS=0
         QUEUE_TYPE=none
@@ -66,6 +69,8 @@ case "${PLACEMENT}" in
         : "${QUEUE_TYPE:=queue-recycle}"
         : "${QUEUE_FACTOR:=1}"
         : "${STALENESS_REFERENCE:=completion}"
+        [[ "${TRAINING_BUFFER_QUEUE_SIZE}" =~ ^[1-9][0-9]*$ ]] ||
+            { echo "TRAINING_BUFFER_QUEUE_SIZE must be an integer >= 1" >&2; exit 1; }
         [[ "${STALENESS_REFERENCE}" == completion || "${STALENESS_REFERENCE}" == submission \
            || "${STALENESS_REFERENCE}" == prefill ]] ||
             { echo "STALENESS_REFERENCE must be completion, submission, or prefill, got '${STALENESS_REFERENCE}'" >&2; exit 1; }
@@ -89,6 +94,8 @@ case "${PLACEMENT}" in
                     { echo "queue-drop cannot use MAX_WEIGHT_STALENESS" >&2; exit 1; }
                 [[ "${QUEUE_FACTOR}" =~ ^[1-9][0-9]*$ ]] ||
                     { echo "QUEUE_FACTOR must be an integer >= 1" >&2; exit 1; }
+                [[ "${TRAINING_BUFFER_QUEUE_SIZE}" == 1000 ]] ||
+                    { echo "TRAINING_BUFFER_QUEUE_SIZE is only used by queue-recycle and queue-max" >&2; exit 1; }
                 ;;
             *)
                 echo "QUEUE_TYPE must be queue-recycle, queue-max, or queue-drop, got '${QUEUE_TYPE}'" >&2
@@ -179,6 +186,10 @@ elif [[ "${PLACEMENT}" == colocated \
 fi
 if [[ "${PLACEMENT}" == async && -n "${ASYNC_MAX_CONCURRENT_SAMPLES}" ]]; then
     CONFIG_TAG="${CONFIG_TAG}-concurrency-${ASYNC_MAX_CONCURRENT_SAMPLES}"
+fi
+if [[ "${PLACEMENT}" == async && "${QUEUE_TYPE}" != queue-drop \
+      && "${TRAINING_BUFFER_QUEUE_SIZE}" -ne 1000 ]]; then
+    CONFIG_TAG="${CONFIG_TAG}-tbq${TRAINING_BUFFER_QUEUE_SIZE}"
 fi
 if [[ "${TASK_FAMILY}" == search_r1 ]]; then
     : "${SEARCH_MAX_TURNS:?}"

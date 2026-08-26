@@ -183,8 +183,9 @@ groups from the worker's output queue". A deep queue drains instantly, so
 inverse, not generation getting faster. It is an observable for queue depth.
 
 So the ordering is: production rate > consumption rate -> queue fills -> samples
-wait -> lag. The ceiling is `OUTPUT_QUEUE_MAX_GROUPS / rollout_batch_size` =
-1000/192 ~ 5, which is where R=5's 2.98 sits.
+wait -> lag. At the default, the ceiling is
+`training_buffer_queue_size / rollout_batch_size` = 1000/192 ~ 5, which is where
+R=5's 2.98 sits.
 
 **The bound closes a negative feedback loop around this.** A recycled group is
 regenerated from scratch (`_recycle` -> `reset_for_retry` -> back to the buffer),
@@ -234,10 +235,11 @@ nothing truncates:
 | 10 | 922 | 4.62 | **6** |
 | 11 | 980 | 5.05 | **6** |
 
-`OUTPUT_QUEUE_MAX_GROUPS` (1000, `fully_async_rollout.py:34`) plus the 192
-in-flight groups, over 192 consumed per step, is 6.2 — and `max_staleness` stops
-at 6 while `queue_size` sits against the cap. R=5 reaches 660-830 and max 5-6;
-R=1..3 never leave `queue_size` 0-1 and are ordered by node ratio instead.
+The configured `training_buffer_queue_size` (1000 for this historical run) plus
+the 192 in-flight groups, over 192 consumed per step, is 6.2 — and
+`max_staleness` stops at 6 while `queue_size` sits against the cap. R=5 reaches
+660-830 and max 5-6; R=1..3 never leave `queue_size` 0-1 and are ordered by node
+ratio instead.
 
 Two consequences:
 
@@ -245,12 +247,14 @@ Two consequences:
   `--max-weight-staleness`. The s=64 arms are s~6 arms; their
   `stale_groups_recycled` is 0 because the bound never gets the chance to bite.
   The ceiling scales with `--num-steps-per-rollout` (~6.2k), not with the bound.
-  Reaching further up the staleness axis means editing the constant — it is not
-  a CLI flag — or shrinking `rollout_batch_size`.
-- **A full queue is idle rollout GPUs.** `await self._output.put(...)`
-  (`fully_async_rollout.py:329`) blocks the producer, so past R=5 the extra
-  rollout nodes are throttled by backpressure rather than generating. That is
-  the same ceiling "Choosing R" reaches from the `train_wait_time` side.
+  Reaching further up the staleness axis requires increasing
+  `--training-buffer-queue-size` or shrinking `rollout_batch_size`; increasing
+  the queue permits lag but does not create it unless production stays ahead of
+  consumption.
+- **A full queue is idle rollout GPUs.** Waiting on the completed-group capacity
+  semaphore blocks the producer, so past R=5 the extra rollout nodes are
+  throttled by backpressure rather than generating. That is the same ceiling
+  "Choosing R" reaches from the `train_wait_time` side.
 
 ### Second pass: the balance per bound, at 8 nodes (2026-08-08)
 
@@ -342,10 +346,11 @@ Join `step_s` and `tok/s/gpu` with `staleness/total/mean`,
 `stale_groups_recycled`, and `wasted_token_frac` in W&B. A split that wins on
 `step_s` while recycling a third of its generation has not won.
 
-**The s=8 row is not a fourth bound level.** The output queue caps realized lag
-at `(1000 + 192)/192 ~ 6.2` at k=1 (see the queue-ceiling section above), so a
-bound of 8 can never bite: that row measures the natural lag of each split and is
-the unbounded reference, not a point on the bound axis. Expect
+**The s=8 row is not a fourth bound level.** With the queue size used by those
+runs, the output queue caps realized lag at `(1000 + 192)/192 ~ 6.2` at k=1 (see
+the queue-ceiling section above), so a bound of 8 can never bite: that row
+measures the natural lag of each split and is the unbounded reference, not a
+point on the bound axis. Expect
 `stale_groups_recycled` 0 and `staleness/bound_exceeded_sample_frac` 0 there; if
 either is non-zero, the ceiling arithmetic or the batch shape has changed and
 both notes need revisiting.

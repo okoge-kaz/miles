@@ -151,6 +151,7 @@ def _queue_args(policy: str, **overrides) -> Namespace:
     policy_args = {
         "fully_async_queue_type": policy,
         "fully_async_queue_factor": 1,
+        "training_buffer_queue_size": 1000,
     }
     if policy == "queue-max":
         policy_args |= {"max_weight_staleness": 0, "staleness_reference": "prefill"}
@@ -230,6 +231,15 @@ async def test_replay_buffer_rejects_cross_policy_and_capacity_restore(monkeypat
     )
     with pytest.raises(RuntimeError, match="missing required queue_config"):
         await restored_recycle.restore_replay_buffer_state(state_without_queue_config)
+
+    different_recycle_capacity = _make_fn(
+        monkeypatch,
+        _queue_args("queue-recycle", training_buffer_queue_size=5760),
+        _DataSource(),
+        lambda *args, **kwargs: None,
+    )
+    with pytest.raises(RuntimeError, match="queue configuration"):
+        await different_recycle_capacity.restore_replay_buffer_state(recycle_state)
 
     queue_drop = _make_fn(
         monkeypatch,
@@ -672,9 +682,9 @@ def test_restored_overfull_queue_does_not_release_capacity_early(monkeypatch):
     async def generate(state, group, sampling_params, evaluation=False):
         return _complete(group, 5)
 
-    fn = _make_fn(monkeypatch, _args(), _DataSource(), generate)
+    fn = _make_fn(monkeypatch, _args(training_buffer_queue_size=3), _DataSource(), generate)
     fn._output = asyncio.Queue()
-    for group_id in range(fully_async.OUTPUT_QUEUE_MAX_GROUPS + 2):
+    for group_id in range(fn._queue_capacity_groups() + 2):
         prompt = _prompt_group(group_id)
         fn._output.put_nowait((prompt, _complete(prompt, 5)))
     fn._output_slots = asyncio.Semaphore(0)
@@ -693,11 +703,11 @@ def test_restored_overfull_queue_does_not_release_capacity_early(monkeypatch):
 async def test_restored_overfull_queue_max_does_not_release_capacity_early(monkeypatch):
     fn = _make_fn(
         monkeypatch,
-        _queue_args("queue-max"),
+        _queue_args("queue-max", training_buffer_queue_size=3),
         _DataSource(),
         lambda *args, **kwargs: None,
     )
-    fn._policy_output = deque(_ready_item(group_id) for group_id in range(fully_async.OUTPUT_QUEUE_MAX_GROUPS + 2))
+    fn._policy_output = deque(_ready_item(group_id) for group_id in range(fn._queue_capacity_groups() + 2))
     fn._output_slots = asyncio.Semaphore(0)
 
     await fn._take_policy_groups(1)

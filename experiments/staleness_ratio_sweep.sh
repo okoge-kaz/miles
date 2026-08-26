@@ -76,7 +76,7 @@ protocol, this mode fixes TOTAL_NODES=8, PARTITION=batch, WALL=04:00:00, and
 CHAIN_JOBS=10.
 
 Useful environment overrides: TOTAL_NODES, STALENESS_LEVELS, RATIOS,
-CHAIN_JOBS, PARTITION, WALL, and RUN_NAMESPACE.
+TRAINING_BUFFER_QUEUE_SIZE, CHAIN_JOBS, PARTITION, WALL, and RUN_NAMESPACE.
 EOF
 }
 
@@ -189,6 +189,7 @@ SAMPLES_PER_PROMPT="$(recipe_or_environment N_SAMPLES_PER_PROMPT)"
 TENSOR_PARALLEL="$(recipe_or_environment TENSOR_PARALLEL_SIZE)"
 CONTEXT_PARALLEL="$(recipe_or_environment CONTEXT_PARALLEL_SIZE)"
 QUEUE_POLICY="$(recipe_or_environment QUEUE_TYPE)"
+TRAINING_BUFFER_QUEUE_SIZE_VALUE="$(recipe_or_environment TRAINING_BUFFER_QUEUE_SIZE)"
 STALENESS_REFERENCE_VALUE="$(recipe_or_environment STALENESS_REFERENCE)"
 NUM_ROLLOUT_VALUE="$(recipe_or_environment NUM_ROLLOUT)"
 NUM_STEPS_PER_ROLLOUT_VALUE="$(recipe_or_environment NUM_STEPS_PER_ROLLOUT)"
@@ -210,6 +211,10 @@ ASYNC_MAX_CONCURRENT_SAMPLES_VALUE="${ASYNC_MAX_CONCURRENT_SAMPLES:-}"
 
 [[ "${ROLLOUT_BATCH}" =~ ^[1-9][0-9]*$ && "${SAMPLES_PER_PROMPT}" =~ ^[1-9][0-9]*$ ]] || {
     echo "rollout batch and samples per prompt must be positive integers" >&2
+    exit 1
+}
+[[ "${TRAINING_BUFFER_QUEUE_SIZE_VALUE}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "TRAINING_BUFFER_QUEUE_SIZE must be a positive integer" >&2
     exit 1
 }
 if [[ -n "${ASYNC_MAX_CONCURRENT_SAMPLES_VALUE}" ]]; then
@@ -253,7 +258,8 @@ if (( MATCH_PARTIAL_CONCURRENCY == 1 )); then
         RATIO_DENOMINATOR IS_CORRECTION TIS_CLIP TIS_CLIP_LOW MIS_PROFILE M2PO_BUDGET
         USE_OPSM OPSM_DELTA LR MAX_RESPONSE_LEN NUM_ROLLOUT TRAIN_SEED ROLLOUT_SEED
         ROLLOUT_BATCH_SIZE N_SAMPLES_PER_PROMPT GLOBAL_BATCH_SIZE NUM_STEPS_PER_ROLLOUT
-        QUEUE_TYPE QUEUE_FACTOR MAX_WEIGHT_STALENESS STALENESS_REFERENCE PAUSE_GENERATION_MODE
+        QUEUE_TYPE QUEUE_FACTOR TRAINING_BUFFER_QUEUE_SIZE MAX_WEIGHT_STALENESS
+        STALENESS_REFERENCE PAUSE_GENERATION_MODE
         USE_REPLAY_BUFFER REPLAY_BUFFER_TYPE REPLAY_BUFFER_IDENTITY_TAG
         ACTOR_NUM_NODES ACTOR_GPUS_PER_NODE ROLLOUT_NUM_GPUS
         TENSOR_PARALLEL_SIZE CONTEXT_PARALLEL_SIZE EXPERT_PARALLEL_SIZE
@@ -320,13 +326,14 @@ if (( MATCH_PARTIAL_CONCURRENCY == 1 )); then
        && "${WALL}" == 04:00:00 && "${CHAIN_JOBS}" == 10 \
        && "${GPUS_PER_NODE}" == 8 \
        && "${ROLLOUT_BATCH}" == 192 && "${SAMPLES_PER_PROMPT}" == 16 \
+       && "${TRAINING_BUFFER_QUEUE_SIZE_VALUE}" == 1000 \
        && "${GLOBAL_BATCH}" == 3072 && "${TENSOR_PARALLEL}" == 2 \
        && "${CONTEXT_PARALLEL}" == 1 \
        && "${ASYNC_GPUS_PER_ENGINE}" == 1 && "${ASYNC_MEM_FRACTION}" == 0.70 \
        && "${COLOCATED_GPUS_PER_ENGINE}" == 2 && "${COLOCATED_MEM_FRACTION}" == 0.65 ]] || {
         echo "matched mode requires the completed cohort protocol:" \
              "nodes=8, partition=batch, wall=04:00:00, chains=10," \
-             "gpus/node=8, rbs=192, n=16, gbs=3072, tp=2, cp=1," \
+             "gpus/node=8, rbs=192, n=16, queue=1000, gbs=3072, tp=2, cp=1," \
              "async engine/mem=1/0.70, colocated engine/mem=2/0.65" >&2
         exit 1
     }
@@ -485,6 +492,9 @@ printf 'fixed by recipe: queue=%s, reference=%s, rollouts=%s, steps/rollout=%s, 
     "${QUEUE_POLICY}" "${STALENESS_REFERENCE_VALUE}" "${NUM_ROLLOUT_VALUE}" \
     "${NUM_STEPS_PER_ROLLOUT_VALUE}" \
     "${GLOBAL_BATCH}" "${TENSOR_PARALLEL}" "${CONTEXT_PARALLEL}"
+printf 'completed-group buffer: %s groups (%s training batches)\n' \
+    "${TRAINING_BUFFER_QUEUE_SIZE_VALUE}" \
+    "$(( TRAINING_BUFFER_QUEUE_SIZE_VALUE / ROLLOUT_BATCH ))"
 printf 'fixed safety: response=%s, zero-trunc=%s, replay=%s/%s, fused-logprobs=%s, exact-segments=%s\n' \
     "${MAX_RESPONSE_LEN_VALUE}" "${ZERO_REWARD_ON_TRUNCATED_VALUE}" \
     "${USE_REPLAY_BUFFER_VALUE}" "${REPLAY_BUFFER_TYPE_VALUE}" \
@@ -613,6 +623,7 @@ if (( MATCH_PARTIAL_CONCURRENCY == 1 )); then
         printf 'partial_over_sampling_groups\t%s\n' "${PARTIAL_OVER_SAMPLING_BATCH_SIZE}"
         printf 'partial_over_sampling_groups_effective\t%s\n' "${PARTIAL_OVER_SAMPLING_BATCH_SIZE}"
         printf 'async_max_concurrent_samples\t%s\n' "${ASYNC_MAX_CONCURRENT_SAMPLES_VALUE}"
+        printf 'training_buffer_queue_size\t%s\n' "${TRAINING_BUFFER_QUEUE_SIZE_VALUE}"
         printf 'max_weight_staleness\t4\n'
         printf 'switch_metric_contract\t%s\n' "${MATCHED_SWITCH_METRIC_CONTRACT}"
         printf 'job\tarm\tchain_index\tjob_id\tdependency\trecipe\texports_csv\n'
@@ -634,6 +645,7 @@ submit_chain() {
         "RUN_NAME=${run_name}"
         "CONFIG_TAG=${config_tag}"
         "MAX_WEIGHT_STALENESS=${staleness}"
+        "TRAINING_BUFFER_QUEUE_SIZE=${TRAINING_BUFFER_QUEUE_SIZE_VALUE}"
         "ACTOR_NUM_NODES=${train_nodes}"
         "ROLLOUT_NUM_GPUS=$(( rollout_nodes * GPUS_PER_NODE ))"
         "ASYNC_MAX_CONCURRENT_SAMPLES=${ASYNC_MAX_CONCURRENT_SAMPLES_VALUE}"
@@ -719,6 +731,7 @@ submit_colocated_chain() {
         "SAVE_HF=${SAVE_HF_VALUE}"
         "HF_SAVE_INTERVAL=${HF_SAVE_INTERVAL_VALUE}"
         "MAX_WEIGHT_STALENESS="
+        "TRAINING_BUFFER_QUEUE_SIZE=1000"
         "STALENESS_REFERENCE=completion"
         "PAUSE_GENERATION_MODE="
         "QUEUE_TYPE=none"

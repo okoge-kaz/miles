@@ -745,8 +745,9 @@ reward coverage rather than inventing zero rewards.
 ### Queue policies and the formula boundary
 
 - `queue-recycle` is the default: completion FIFO, immediate
-  next-batch prefetch by the driver, safety backpressure at 1000 completed
-  groups, and over-age groups returned to the prompt buffer. With
+  next-batch prefetch by the driver, safety backpressure at
+  `--training-buffer-queue-size` completed groups (default 1000), and over-age
+  groups returned to the prompt buffer. With
   `--staleness-reference prefill`, this is the former
   FIFO-prefill-age-cutoff configuration.
 - `queue-max` waits until the trainer requests a complete batch, takes the oldest

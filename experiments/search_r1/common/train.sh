@@ -163,6 +163,7 @@ if [[ "${PLACEMENT}" == "async" ]]; then
    ROLLOUT_ARGS+=(
       --fully-async
       --fully-async-queue-type "${QUEUE_TYPE}"
+      --training-buffer-queue-size "${TRAINING_BUFFER_QUEUE_SIZE}"
       --staleness-reference "${STALENESS_REFERENCE}"
       --pause-generation-mode "${PAUSE_GENERATION_MODE}"
    )

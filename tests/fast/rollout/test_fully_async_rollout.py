@@ -83,6 +83,7 @@ def make_args(**overrides) -> Namespace:
         save_debug_rollout_data=None,
         fully_async_queue_type="queue-recycle",
         fully_async_queue_factor=1,
+        training_buffer_queue_size=1000,
     )
     defaults.update(overrides)
     return Namespace(**defaults)
@@ -548,19 +549,27 @@ async def test_async_max_concurrent_samples_caps_in_flight_groups(monkeypatch):
 
 
 async def test_queue_recycle_preserves_completion_fifo_and_backpressure(monkeypatch):
-    fn = make_fn(monkeypatch, make_args(rollout_batch_size=2), FakeDataSource())
+    fn = make_fn(
+        monkeypatch,
+        make_args(rollout_batch_size=2, training_buffer_queue_size=1),
+        FakeDataSource(),
+    )
     fn._output = asyncio.Queue()
-    fn._output_slots = asyncio.Semaphore(fully_async.OUTPUT_QUEUE_MAX_GROUPS)
+    fn._output_slots = asyncio.Semaphore(fn._queue_capacity_groups())
     never = asyncio.Event()
     fn._worker = asyncio.create_task(never.wait())
 
     first, second = make_group(2), make_group(1)
     await fn._enqueue_completed_group((first, first))
-    await fn._enqueue_completed_group((second, second))
+    blocked_enqueue = asyncio.create_task(fn._enqueue_completed_group((second, second)))
+    await asyncio.sleep(0)
+    assert not blocked_enqueue.done()
 
-    selected = [await fn._next_group(), await fn._next_group()]
+    selected = [await fn._next_group()]
+    await blocked_enqueue
+    selected.append(await fn._next_group())
     assert [item[1][0].group_index for item in selected] == [2, 1]
-    assert fn._output_slots._value == fully_async.OUTPUT_QUEUE_MAX_GROUPS
+    assert fn._output_slots._value == 1
 
     fn._worker.cancel()
     with suppress(asyncio.CancelledError):
@@ -610,7 +619,7 @@ async def test_queue_max_waits_for_full_batch_then_takes_oldest(monkeypatch):
     fn = make_fn(monkeypatch, args, FakeDataSource())
     fn._policy_output = deque()
     fn._policy_output_ready = asyncio.Event()
-    fn._output_slots = asyncio.Semaphore(fully_async.OUTPUT_QUEUE_MAX_GROUPS)
+    fn._output_slots = asyncio.Semaphore(fn._queue_capacity_groups())
     never = asyncio.Event()
     fn._worker = asyncio.create_task(never.wait())
 
@@ -623,7 +632,7 @@ async def test_queue_max_waits_for_full_batch_then_takes_oldest(monkeypatch):
     await fn._enqueue_completed_group((second, second))
     selected = await take
     assert [item[0][1][0].group_index for item in selected] == [1, 2]
-    assert fn._output_slots._value == fully_async.OUTPUT_QUEUE_MAX_GROUPS
+    assert fn._output_slots._value == args.training_buffer_queue_size
 
     fn._worker.cancel()
     with suppress(asyncio.CancelledError):
@@ -652,7 +661,8 @@ async def test_policy_queue_worker_failure_beats_queued_groups(monkeypatch):
 
 def test_queue_max_safety_capacity_cannot_deadlock_a_large_batch(monkeypatch):
     args = make_args(
-        rollout_batch_size=fully_async.OUTPUT_QUEUE_MAX_GROUPS + 1,
+        rollout_batch_size=4,
+        training_buffer_queue_size=3,
         fully_async_queue_type="queue-max",
         max_weight_staleness=2,
         staleness_reference="prefill",
@@ -745,7 +755,7 @@ async def test_worker_failure_beats_queued_groups(monkeypatch):
     async def boom():
         raise RuntimeError("generation exploded")
 
-    fn._output = asyncio.Queue(maxsize=fully_async.OUTPUT_QUEUE_MAX_GROUPS)
+    fn._output = asyncio.Queue(maxsize=fn._queue_capacity_groups())
     group = make_group(1)
     await fn._output.put((group, group))
     fn._worker = asyncio.create_task(boom())
