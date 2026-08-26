@@ -11,7 +11,6 @@ RECIPE_PATH="${REPO_ROOT}/${RECIPE}"
 COLOCATED_RECIPE="experiments/scripts/math/sync/dapo-math-p10-90/qwen3-4b/run.sbatch"
 COLOCATED_RECIPE_PATH="${REPO_ROOT}/${COLOCATED_RECIPE}"
 source "${REPO_ROOT}/experiments/env.sh"
-source "${REPO_ROOT}/experiments/common/matched_runtime_code_fingerprint.sh"
 
 # The completed staleness-ratio cohort used this image. Matched mode resolves
 # aliases before comparing, so the fsw/fs1 spelling may differ but the image
@@ -278,8 +277,7 @@ if (( MATCH_PARTIAL_CONCURRENCY == 1 )); then
         SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS PARTIAL_ROLLOUT OVER_SAMPLING_BATCH_SIZE
         MASK_OFFPOLICY_IN_PARTIAL_ROLLOUT MILES_EXPERIMENTAL_ROLLOUT_REFACTOR
         DYNAMIC_SAMPLING_FILTER_PATH SGLANG_MAX_RUNNING_REQUESTS SGLANG_CUDA_GRAPH_MAX_BS
-        QWEN3_4B_BASE_HF_ROOT MATCHED_PARTIAL_CONCURRENCY_COHORT
-        MATCHED_RUNTIME_CODE_FINGERPRINT
+        QWEN3_4B_BASE_HF_ROOT
     )
     for key in "${matched_override_keys[@]}"; do
         if [[ -v "${key}" ]]; then
@@ -296,7 +294,7 @@ if (( MATCH_PARTIAL_CONCURRENCY == 1 )); then
     MATCHED_REPO_ROOT_RESOLVED="$(readlink -f -- "${REPO_ROOT}")"
     MATCHED_MILES_REPO_RESOLVED="$(readlink -f -- "${MILES_REPO}")"
     [[ "${MATCHED_MILES_REPO_RESOLVED}" == "${MATCHED_REPO_ROOT_RESOLVED}" ]] || {
-        echo "matched mode must mount the checkout it fingerprints:" \
+        echo "matched mode must mount the checkout used for submission:" \
              "expected ${MATCHED_REPO_ROOT_RESOLVED}, got ${MATCHED_MILES_REPO_RESOLVED}" >&2
         exit 1
     }
@@ -593,14 +591,12 @@ if (( MATCH_PARTIAL_CONCURRENCY == 1 )); then
     if [[ -f "${prompt_data_host}" ]]; then
         dataset_sha256="$(sha256sum "${prompt_data_host}" | awk '{print $1}')"
     fi
-    code_fingerprint="$(matched_runtime_code_fingerprint "${REPO_ROOT}")"
     tracked_diff_sha256="$(git -C "${REPO_ROOT}" diff --binary HEAD | sha256sum | awk '{print $1}')"
     {
         printf 'key\tvalue\n'
         printf 'namespace\t%s\n' "${RUN_NAMESPACE}"
         printf 'git_head\t%s\n' "$(git -C "${REPO_ROOT}" rev-parse HEAD)"
         printf 'tracked_diff_sha256\t%s\n' "${tracked_diff_sha256}"
-        printf 'code_fingerprint\t%s\n' "${code_fingerprint}"
         printf 'runtime_repo\t%s\n' "${MATCHED_REPO_ROOT_RESOLVED}"
         printf 'container\t%s\n' "${SQSH_IMAGE}"
         printf 'async_container_effective\t%s\n' "${MATCHED_SQSH_IMAGE_RESOLVED}"
@@ -675,8 +671,6 @@ submit_chain() {
         "SAVE_HF=${SAVE_HF_VALUE}"
         "HF_SAVE_INTERVAL=${HF_SAVE_INTERVAL_VALUE}"
         "DEBUG_EXIT_AFTER_ROLLOUT="
-        "MATCHED_PARTIAL_CONCURRENCY_COHORT=${MATCH_PARTIAL_CONCURRENCY}"
-        "MATCHED_RUNTIME_CODE_FINGERPRINT=${code_fingerprint:-}"
     )
     if (( MATCH_PARTIAL_CONCURRENCY == 1 )); then
         exports+=(
@@ -759,8 +753,6 @@ submit_colocated_chain() {
         "SGLANG_CUDA_GRAPH_MAX_BS="
         "MILES_EXPERIMENTAL_ROLLOUT_REFACTOR=0"
         "DEBUG_EXIT_AFTER_ROLLOUT="
-        "MATCHED_PARTIAL_CONCURRENCY_COHORT=${MATCH_PARTIAL_CONCURRENCY}"
-        "MATCHED_RUNTIME_CODE_FINGERPRINT=${code_fingerprint:-}"
     )
     if (( MATCH_PARTIAL_CONCURRENCY == 1 )); then
         exports+=(

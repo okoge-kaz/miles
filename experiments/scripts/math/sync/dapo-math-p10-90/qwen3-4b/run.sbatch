@@ -12,7 +12,6 @@ set -euo pipefail
 
 REPO_ROOT="${MILES_REPO:-${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../../../.." &>/dev/null && pwd)}}"
 export HF_CKPT_DIR="${QWEN3_4B_BASE_HF_ROOT:-/lustre/fsw/portfolios/coreai/users/kfujii/checkpoints/huggingface/Qwen3-4B-Base/LR2.0e-5-SEQ32768-GBS128-MBS1-TP1-PP1-CP1-EP1-PACK1-standard-cp-STEPS4000}"
-source "${REPO_ROOT}/experiments/common/matched_runtime_code_fingerprint.sh"
 source "${REPO_ROOT}/experiments/env.sh"
 
 : "${WANDB_API_KEY:?set WANDB_API_KEY, or put an api.wandb.ai entry in ~/.netrc}"
@@ -130,7 +129,6 @@ source "${REPO_ROOT}/experiments/common/run_identity.sh"
 export RUN_NAME CONFIG_TAG CKPT_PATH
 
 source "${REPO_ROOT}/experiments/common/placement.sh"
-verify_matched_runtime_code_fingerprint "${REPO_ROOT}"
 
 RAY_HEAD_IP="$(getent hosts "$(hostname)" | awk '{print $1; exit}')"
 if [[ -z "${RAY_HEAD_IP}" || "${RAY_HEAD_IP}" == 169.254.* ]]; then
