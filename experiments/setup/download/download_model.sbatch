@@ -1,23 +1,30 @@
 #!/bin/bash
 #SBATCH --job-name=miles-download-model
-#SBATCH --partition=cpu_interactive
+#SBATCH --partition=cpu_datamover
+#SBATCH --qos=cpu-datamover
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
 #SBATCH --time=08:00:00
 #SBATCH --output=experiments/outputs/download/%x-%j.log
+#SBATCH --export=NIL
 
 # Download one HuggingFace model into $HF_CKPT_DIR/$MODEL_NAME.
 #
 #   sbatch -A coreai_horizon_dilations \
-#     --export=ALL,HF_REPO=Qwen/Qwen3-8B,MODEL_NAME=Qwen3-8B \
-#     experiments/setup/download_model.sbatch
+#     --export=USER,HF_REPO=Qwen/Qwen3-8B,MODEL_NAME=Qwen3-8B,HF_TOKEN \
+#     experiments/setup/download/download_model.sbatch
 #
 # Idempotent: hf download verifies existing files instead of refetching them.
 
 set -euo pipefail
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." &>/dev/null && pwd)}"
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+USER="${USER:-$(id -un)}"
+WANDB_MODE=disabled
+export PATH USER WANDB_MODE
+
+REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
 source "${REPO_ROOT}/experiments/env.sh"
 
 : "${HF_REPO:?set HF_REPO, e.g. Qwen/Qwen3-8B}"

@@ -66,7 +66,7 @@ while IFS='|' read -r model_name hf_root hf_model_name model_type; do
         --time=04:00:00 \
         --job-name="cv-${model_name}" \
         "${dependency[@]}" \
-        --export="ALL,HF_CKPT_DIR=${hf_root},MODEL_NAME=${model_name},HF_MODEL_NAME=${hf_model_name},MEGATRON_MODEL_TYPE=${model_type}" \
+        --export="USER,WANDB_MODE=disabled,HF_CKPT_DIR=${hf_root},MODEL_NAME=${model_name},HF_MODEL_NAME=${hf_model_name},MEGATRON_MODEL_TYPE=${model_type}" \
         experiments/setup/models/convert_checkpoint.sbatch)"
     previous_job="${raw_job_id%%;*}"
     printf 'submitted %-41s job=%s dependency=%s\n' \

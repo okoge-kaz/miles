@@ -8,6 +8,7 @@
 #SBATCH --exclusive
 #SBATCH --time=01:00:00
 #SBATCH --output=experiments/outputs/convert/%x-%j.log
+#SBATCH --export=NIL
 
 # Convert the HuggingFace checkpoint into the torch_dist format Megatron loads.
 #
@@ -19,6 +20,11 @@
 # the trainer reads torch_dist (--ref-load / --load).
 
 set -euo pipefail
+
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+USER="${USER:-$(id -un)}"
+WANDB_MODE=disabled
+export PATH USER WANDB_MODE
 
 # sbatch copies this script into Slurm's spool directory, so BASH_SOURCE does
 # not point at the repo. Resolve through the submit directory (submit from the

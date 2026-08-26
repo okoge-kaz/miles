@@ -1,7 +1,7 @@
 #!/bin/bash
 # Stage ONE model: download the HF weights, then convert them to torch_dist.
 #
-#   experiments/setup/stage_model.sh <MODEL_NAME>
+#   experiments/setup/download/stage_model.sh <MODEL_NAME>
 #
 # MODEL_NAME is looked up in models.txt, which supplies the HF repo, the
 # MODEL_ARGS file and any per-model convert overrides. Use this instead of
@@ -18,14 +18,16 @@
 
 set -euo pipefail
 
-MODEL_NAME="${1:?usage: stage_model.sh <MODEL_NAME>   (a name from experiments/setup/models.txt)}"
+MODEL_NAME="${1:?usage: stage_model.sh <MODEL_NAME>   (a name from experiments/setup/manifests/models.txt)}"
 
-REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." &>/dev/null && pwd)"
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)"
 cd "${REPO_ROOT}"
 source experiments/env.sh
 
 ACCOUNT="${SLURM_ACCOUNT_NAME:-coreai_horizon_dilations}"
-MODELS_TXT="experiments/setup/models.txt"
+MODELS_TXT="experiments/setup/manifests/models.txt"
+HF_TOKEN_EXPORT=""
+[[ -z "${HF_TOKEN:-}" ]] || HF_TOKEN_EXPORT=",HF_TOKEN"
 
 # Pull the one row out of models.txt. Comments and blank lines are dropped
 # first so a commented-out (disabled) model cannot be staged by accident.
@@ -63,8 +65,8 @@ if [[ -f "${HF_CKPT_DIR}/${name}/.download_complete" ]]; then
 else
     dl=$(sbatch --parsable -A "${ACCOUNT}" \
          --job-name="dl-${name}" \
-         --export=ALL,HF_REPO="${repo}",MODEL_NAME="${name}" \
-         experiments/setup/download_model.sbatch)
+         --export="USER,WANDB_MODE=disabled,HF_REPO=${repo},MODEL_NAME=${name}${HF_TOKEN_EXPORT}" \
+         experiments/setup/download/download_model.sbatch)
     dl_dep="--dependency=afterok:${dl}"
     echo "download  ${dl}"
 fi
@@ -78,9 +80,10 @@ fi
 cv=$(sbatch --parsable -A "${ACCOUNT}" \
      --job-name="cv-${name}" \
      ${dl_dep} \
-     -p interactive --time=04:00:00 --nodes="${nodes}" \
-     --export=ALL,MODEL_NAME="${name}",MEGATRON_MODEL_TYPE="${type}",CONVERT_EXTRA_ARGS="${extra}" \
-     experiments/setup/convert_checkpoint.sbatch)
+     -p "${GPU_PARTITION}" --qos="${INTERACTIVE_GPU_QOS}" \
+     --time=04:00:00 --nodes="${nodes}" \
+     --export="USER,WANDB_MODE=disabled,MODEL_NAME=${name},MEGATRON_MODEL_TYPE=${type},CONVERT_EXTRA_ARGS=${extra}" \
+     experiments/setup/models/convert_checkpoint.sbatch)
 echo "convert   ${cv}${dl_dep:+  (waits on ${dl})}"
 echo
 echo "  ${HF_CKPT_DIR}/${name}"
