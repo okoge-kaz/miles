@@ -53,6 +53,54 @@ SGLang router and the session server are reachable at the node's address without
 extra port plumbing — the equivalent of docker's `--network=host` in the
 upstream quick start.
 
+## AWS EFA and NCCL
+
+`docker/install_aws_efa.sh` installs the versioned AWS EFA 1.49.0 userspace
+release used by both `docker/Dockerfile` and
+`container/derive_sglang_prefill_version_image.sbatch`. It contains libfabric
+2.4.0amzn5.0, AWS OFI NCCL 1.20.0, and rdma-core 63.0. The download is pinned by
+SHA-256; the kernel module and EFA devices remain host-owned.
+
+The image intentionally contains only the named plugins:
+
+```
+/opt/amazon/ofi-nccl/lib/libnccl-net-ofi.so
+/opt/amazon/ofi-nccl/lib/libnccl-tuner-ofi.so
+```
+
+It must not contain `/opt/amazon/ofi-nccl/lib/libnccl-net.so`. That generic name
+would let NCCL auto-load OFI and could change transport selection on a non-EFA
+host. EFA jobs opt in explicitly with:
+
+```bash
+export NCCL_NET="AWS Libfabric"
+export NCCL_NET_PLUGIN=ofi
+export NCCL_TUNER_PLUGIN=ofi
+export NCCL_IB_DISABLE=0
+export FI_PROVIDER=efa
+export LD_LIBRARY_PATH=/opt/amazon/efa/lib:/opt/amazon/ofi-nccl/lib:$LD_LIBRARY_PATH
+```
+
+`NCCL_NET` forces the network registered by the external plugin; if that network
+cannot initialize, NCCL fails instead of falling back to Socket or its built-in
+IB transport. Pyxis reconstructs `LD_LIBRARY_PATH` while entering the container,
+so exporting the EFA path only on the host is insufficient.
+`common/run_with_efa_env.sh` prepends the path and reasserts all EFA selectors
+inside that boundary before it `exec`s the training command.
+`common/check_efa.sh` does the same and is a fail-closed preflight: it checks the
+named plugin, dynamic dependencies, and `fi_info -p efa -t FI_EP_RDM` on every
+allocated node. EFA-enabled multi-node launchers run it before Ray starts and
+carry the same selectors into the Ray runtime environment.
+To validate a new image independently and compare its bandwidth with the TCP
+fallback, submit:
+
+```bash
+sbatch -A "$ACC" experiments/container/validate_efa_collective.sbatch
+```
+
+`NCCL_IB_DISABLE=1` is retained only as the explicit
+`MILES_NCCL_TRANSPORT=tcp` diagnostic/control mode, not as the training default.
+
 ## Mount layout
 
 Defined once in `experiments/env.sh` as `CONTAINER_MOUNTS`:

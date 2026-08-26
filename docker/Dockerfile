@@ -24,6 +24,12 @@ ARG MEGATRON_BRANCH=miles-main
 
 ARG ENABLE_CUDA_13=1
 
+# EFA installer 1.49.0 carries libfabric 2.4.0amzn5.0 and AWS OFI NCCL 1.20.0.
+# The checksum is for the versioned AWS release tarball, whose signature was
+# verified against the Amazon EC2 EFA release key (4E90...3CCC).
+ARG EFA_INSTALLER_VERSION=1.49.0
+ARG EFA_INSTALLER_SHA256=cf2e9281a2328a243c76f911a490faed43ca0fecfe4733c25e34b2e92a32c309
+
 ARG WHEELS_REPO=yueming-yuan/miles-wheels
 # Two complete wheels release tags (the wheels repo's own names). The build picks
 # one by TARGETARCH and installs it verbatim — no on-the-fly tag assembly here.
@@ -40,6 +46,15 @@ WORKDIR /root/
 RUN apt update
 # ethtool for network diagnostics
 RUN apt install -y nvtop rsync dnsutils ethtool
+
+# Include EFA userspace in every image, but do not auto-enable it. The installer
+# uses the named libnccl-net-ofi.so NGC layout, so non-AWS jobs keep the base
+# image's NCCL transport unless they explicitly select the named plugin and
+# NCCL_NET="AWS Libfabric".
+RUN --mount=type=bind,source=docker/install_aws_efa.sh,target=/tmp/install_aws_efa.sh \
+    EFA_INSTALLER_VERSION="${EFA_INSTALLER_VERSION}" \
+    EFA_INSTALLER_SHA256="${EFA_INSTALLER_SHA256}" \
+    bash /tmp/install_aws_efa.sh
 
 # nccl-tests for diagnostics
 RUN git clone https://github.com/NVIDIA/nccl-tests.git /tmp/nccl-tests && \

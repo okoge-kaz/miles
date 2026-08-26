@@ -1,6 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=miles-dapo-math-p10-90-async-qwen3-4b
+#SBATCH --account=coreai_horizon_dilations
 #SBATCH --partition=batch
+#SBATCH --qos=interactive
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -126,6 +128,40 @@ fi
 : "${SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS:=1}"  # compact exact token/version boundaries
 : "${DEBUG_EXIT_AFTER_ROLLOUT:=}"               # validation only; empty runs the full schedule
 
+: "${MILES_NCCL_TRANSPORT:=efa}"
+: "${ASYNC_SQSH_IMAGE_OVERRIDE:=/lustre/fsw/portfolios/coreai/users/kfujii/containers/miles-staleness-weight-boundaries-f994b9aed-efa-1.49.0.sqsh}"
+case "${MILES_NCCL_TRANSPORT}" in
+   efa)
+      [[ "${NCCL_IB_DISABLE:-0}" != 1 ]] || {
+         echo "EFA mode refuses NCCL_IB_DISABLE=1" >&2
+         exit 1
+      }
+      [[ "${NCCL_NET_PLUGIN:-ofi}" == ofi ]] || {
+         echo "EFA mode requires NCCL_NET_PLUGIN=ofi" >&2
+         exit 1
+      }
+      NCCL_IB_DISABLE=0
+      NCCL_NET_PLUGIN=ofi
+      NCCL_TUNER_PLUGIN=ofi
+      NCCL_NET="AWS Libfabric"
+      FI_PROVIDER=efa
+      LD_LIBRARY_PATH="/opt/amazon/efa/lib:/opt/amazon/ofi-nccl/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+      ;;
+   tcp)
+      NCCL_IB_DISABLE=1
+      NCCL_NET=Socket
+      unset NCCL_NET_PLUGIN NCCL_TUNER_PLUGIN FI_PROVIDER
+      ;;
+   system)
+      NCCL_IB_DISABLE=0
+      unset NCCL_NET NCCL_NET_PLUGIN NCCL_TUNER_PLUGIN FI_PROVIDER
+      ;;
+   *)
+      echo "unknown MILES_NCCL_TRANSPORT=${MILES_NCCL_TRANSPORT}; expected efa, tcp, or system" >&2
+      exit 1
+      ;;
+esac
+
 export MODEL_NAME HF_MODEL_NAME PLACEMENT DATASET_TAG PROMPT_DATA
 export ADVANTAGE_ESTIMATOR ENTROPY_COEF KL_LOSS_COEF EPS_CLIP EPS_CLIP_HIGH EPS_CLIP_C
 export RATIO_DENOMINATOR IS_CORRECTION TIS_CLIP TIS_CLIP_LOW MIS_PROFILE M2PO_BUDGET USE_OPSM OPSM_DELTA
@@ -145,6 +181,8 @@ export DUMP_TRAIN_DATA DUMP_POLICY_LOSS_DEBUG FUSE_ONE_STEP_ACTOR_LOGPROBS VERIF
 export LOG_SAMPLE_STALENESS_METRICS LOG_SAMPLE_STALENESS_RATIO_HISTOGRAM LOG_UPDATE_DIAGNOSTICS
 export SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS
 export DEBUG_EXIT_AFTER_ROLLOUT
+export MILES_NCCL_TRANSPORT ASYNC_SQSH_IMAGE_OVERRIDE NCCL_IB_DISABLE LD_LIBRARY_PATH
+export NCCL_NET NCCL_NET_PLUGIN NCCL_TUNER_PLUGIN FI_PROVIDER
 
 source "${REPO_ROOT}/experiments/common/run_identity.sh"
 export RUN_NAME CONFIG_TAG CKPT_PATH
@@ -177,6 +215,27 @@ STEP_CPUS_PER_NODE="${SLURM_JOB_CPUS_PER_NODE%%\(*}"
     echo "invalid SLURM_JOB_CPUS_PER_NODE=${SLURM_JOB_CPUS_PER_NODE:-unset}" >&2
     exit 1
 }
+
+if [[ "${MILES_NCCL_TRANSPORT}" == efa ]]; then
+   echo "running EFA fail-closed preflight on every node"
+   srun \
+      --nodes="${SLURM_JOB_NUM_NODES}" \
+      --ntasks="${SLURM_JOB_NUM_NODES}" \
+      --ntasks-per-node=1 \
+      --cpus-per-task=8 \
+      --mem=0 \
+      --container-image="${SQSH_IMAGE}" \
+      --container-mounts="${CONTAINER_MOUNTS}" \
+      --no-container-mount-home \
+      --export=ALL \
+      bash /root/miles/experiments/common/check_efa.sh
+fi
+
+container_command=(bash /root/miles/experiments/scripts/math/async/dapo-math-p10-90/qwen3-4b/train.sh)
+if [[ "${MILES_NCCL_TRANSPORT}" == efa ]]; then
+   container_command=(bash /root/miles/experiments/common/run_with_efa_env.sh "${container_command[@]}")
+fi
+
 srun \
     --nodes="${SLURM_JOB_NUM_NODES}" \
     --ntasks-per-node=1 \
@@ -187,4 +246,4 @@ srun \
     --container-writable \
     --no-container-mount-home \
     --export=ALL \
-    bash /root/miles/experiments/scripts/math/async/dapo-math-p10-90/qwen3-4b/train.sh
+    "${container_command[@]}"
