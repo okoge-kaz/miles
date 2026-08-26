@@ -1,21 +1,34 @@
-# Qwen3-4B RL reasoning evaluation
+# Qwen3-4B RL checkpoint evaluation
 
 The shell entry points live in `experiments/scripts/reasoning_eval/`; this
 directory contains only their Python helpers, result aggregation, figures, and
 documentation.
 
-The evaluator follows the pinned NeMo 26.03 reference protocol:
+There are two benchmark-specific entry points in the same hierarchy:
+
+- `run-evaluation.sbatch` is the reportable AIME24/25/26 path and follows the
+  pinned NeMo 26.03 reference protocol described below.
+- `run-suite.sbatch` serves the checkpoint once, then generates and scores
+  MATH-500, GPQA, LiveCodeBench, and IFBench (and can run lightweight AIME
+  diagnostics). Its scorer is `suite.py`; code execution is isolated with an
+  unroutable user namespace and Bubblewrap. `score-suite.sbatch` can rescore
+  existing candidates without starting a GPU server.
+
+They share the reasoning-evaluation location and checkpoint validation helpers,
+but do not pretend that the NeMo AIME metric and the benchmark-specific suite
+scorers are interchangeable.
+
+The reportable AIME evaluator follows the pinned NeMo 26.03 reference protocol:
 
 - vLLM 0.20.2 is imported as SquashFS and serves one Qwen3-4B RL Hugging Face
   checkpoint with tensor parallelism 1 and data parallelism 8.
 - NeMo Evaluator/NeMo Skills 26.03 is imported as a second SquashFS image and
   prepares and grades AIME24, AIME25, and AIME26.
-- Qwen3-4B-Instruct-2507 defaults to `ENABLE_THINKING=false`; this is required
-  because forcing its chat template into thinking mode can leave the final
-  `content` field empty. vLLM still uses `--reasoning-parser qwen3`, and a
-  preflight request requires non-empty final content. Set
-  `ENABLE_THINKING=true` only for a thinking checkpoint; that mode requires both
-  parser-separated reasoning and final content.
+- The checked-in default targets `Qwen3-4B-Base-LR2e-5-Step4000` and uses
+  `ENABLE_THINKING=true`. vLLM uses `--reasoning-parser qwen3`, and the preflight
+  requires parser-separated reasoning plus non-empty final content. Set
+  `ENABLE_THINKING=false` explicitly only when evaluating a non-thinking
+  checkpoint; that mode still requires non-empty final content.
 - Full evaluation uses temperature 0.6, top-p 0.95, top-k 20, 64 repeats, a
   32,768-token context, and at most 28,672 generated tokens.
 

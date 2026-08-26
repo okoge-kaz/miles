@@ -6,7 +6,7 @@
 #SBATCH --qos=interactive
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gpus-per-node=8
+#SBATCH --gres=gpu:8
 #SBATCH --cpus-per-task=128
 #SBATCH --time=04:00:00
 #SBATCH --signal=B:TERM@120
@@ -17,21 +17,20 @@ set -euo pipefail
 REPO_ROOT="$(realpath -- "${SLURM_SUBMIT_DIR:?submit from the Miles repository root}")"
 source "${REPO_ROOT}/experiments/env.sh"
 
-: "${CHECKPOINT_PATH:?set CHECKPOINT_PATH to a Qwen3-4B Hugging Face checkpoint}"
-: "${RESULT_ROOT:?set RESULT_ROOT to the checkpoint evaluation result directory}"
-
 TASKS_TEXT="${TASKS:-aime24 aime25 aime26}"
 EVAL_MODE="${EVAL_MODE:-full}"
+: "${CHECKPOINT_PATH:=${HF_CKPT_DIR}/Qwen3-4B-Base/LR2.0e-5-SEQ32768-GBS128-MBS1-TP1-PP1-CP1-EP1-PACK1-standard-cp-STEPS4000/iter_0004000}"
+: "${RESULT_ROOT:=${OUTPUT_DIR}/reasoning_eval/aime/qwen3-4b-base-lr2e-5-step4000/${EVAL_MODE}}"
 REQUESTED_PROTOCOL_NAME="${PROTOCOL_NAME:-}"
-ARM_NAME="${ARM_NAME:-unknown}"
-TRAINING_STEP="${TRAINING_STEP:-unknown}"
-RUN_NAMESPACE="${RUN_NAMESPACE:-unknown}"
+ARM_NAME="${ARM_NAME:-sft-step4000}"
+TRAINING_STEP="${TRAINING_STEP:-4000}"
+RUN_NAMESPACE="${RUN_NAMESPACE:-qwen3-4b-base-lr2e-5-step4000}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-32768}"
 PROMPT_TOKEN_RESERVE="${PROMPT_TOKEN_RESERVE:-4096}"
 TEMPERATURE="${TEMPERATURE:-0.6}"
 TOP_P="${TOP_P:-0.95}"
 TOP_K="${TOP_K:-20}"
-ENABLE_THINKING="${ENABLE_THINKING:-false}"
+ENABLE_THINKING="${ENABLE_THINKING:-true}"
 AIME_REPEATS="${AIME_REPEATS:-64}"
 AIME_PARALLELISM="${AIME_PARALLELISM:-1024}"
 SMOKE_LIMIT_SAMPLES="${SMOKE_LIMIT_SAMPLES:-2}"
@@ -573,7 +572,7 @@ else
         .choices[0].message.content
         | (type == "string") and (length > 0)
     ' "${PREFLIGHT_RESPONSE}" >/dev/null || {
-        echo "preflight did not return final content in instruct mode" >&2
+        echo "preflight did not return final content in non-thinking mode" >&2
         exit 27
     }
 fi
