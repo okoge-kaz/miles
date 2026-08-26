@@ -1,5 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=miles-convert-ckpt
+#SBATCH --account=coreai_horizon_dilations
 #SBATCH --partition=batch
 #SBATCH --qos=interactive
 #SBATCH --nodes=1

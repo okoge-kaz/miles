@@ -1,5 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=miles-download-dataset
+#SBATCH --account=coreai_horizon_dilations
 #SBATCH --partition=cpu_datamover
 #SBATCH --qos=cpu-datamover
 #SBATCH --nodes=1

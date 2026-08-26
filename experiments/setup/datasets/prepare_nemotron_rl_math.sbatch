@@ -1,6 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=prep-nemotron-rl-math-v2
-#SBATCH --partition=cpu_interactive
+#SBATCH --account=coreai_horizon_dilations
+#SBATCH --partition=cpu_datamover
+#SBATCH --qos=cpu-datamover
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
@@ -11,7 +13,7 @@
 # recipes read.
 #
 #   sbatch -A coreai_horizon_dilations \
-#     experiments/setup/prepare_nemotron_rl_math.sbatch
+#     experiments/setup/datasets/prepare_nemotron_rl_math.sbatch
 #
 # The released file masks every row that came from a public source: 3984 of 7732
 # rows (2586 Skywork, 1398 DAPO-Math-17k) ship with empty `question` and
@@ -20,11 +22,11 @@
 # them back in, so this step is a prerequisite, not an optimisation -- without it
 # half the file is blank prompts.
 #
-# CPU only and network-bound; `cpu_interactive` is the fast lane.
+# CPU only and network-bound; use the dedicated datamover partition and QoS.
 
 set -euo pipefail
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." &>/dev/null && pwd)}"
+REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
 source "${REPO_ROOT}/experiments/env.sh"
 
 LOCAL_NAME="${LOCAL_NAME:-nemotron-rl-math-v2}"
@@ -59,7 +61,7 @@ assert blank == 0, f'{blank} rows still blank after restore'
 PY
 
 echo '--- converting to miles prompt jsonl ---'
-python3 /root/miles/experiments/setup/build_math_jsonl.py \
+python3 /root/miles/experiments/setup/datasets/build_math_jsonl.py \
     --input \${D}/restored/train.jsonl \
     --output \${D}/nemotron-rl-math-v2-miles.jsonl \
     --dataset nemotron-rl-math-v2 \
