@@ -68,6 +68,7 @@ async def _completion(
     temperature: float,
     top_p: float,
     tools: list[dict[str, Any]] | None = None,
+    enable_thinking: bool = True,
 ) -> tuple[dict[str, Any], int]:
     payload: dict[str, Any] = {
         "model": model,
@@ -76,7 +77,7 @@ async def _completion(
         "temperature": temperature,
         "top_p": top_p,
         "seed": seed,
-        "chat_template_kwargs": {"enable_thinking": True},
+        "chat_template_kwargs": {"enable_thinking": enable_thinking},
     }
     if tools:
         payload["tools"] = tools
@@ -134,6 +135,7 @@ async def _user_completion(
             seed=seed,
             temperature=args.user_temperature,
             top_p=args.user_top_p,
+            enable_thinking=False,
         )
         text = str(message.get("content") or "").strip()
         if not text:

@@ -38,6 +38,8 @@ cd /root/miles
 export PYTHONPATH=/root/tau-bench:/root/miles
 export WANDB_MODE=offline
 
+python3 -m pytest -q tests/fast/experiments/test_tau_bench.py
+
 TAU_TRAIN_SCRIPT=/root/miles/experiments/scripts/tau_bench/async/nemotron3-agentic-retail/qwen3-4b-instruct-2507/train.sh
 if grep -q GEMINI_API_KEY "${TAU_TRAIN_SCRIPT}"; then
     echo "Tau train.sh must not serialize the Gemini key in Ray submit arguments or runtime metadata" >&2

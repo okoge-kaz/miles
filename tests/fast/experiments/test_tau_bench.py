@@ -288,6 +288,36 @@ async def test_evaluator_gemini_backend_dispatches_to_external_user(monkeypatch)
     assert calls[0][1]["seed"] == 42
 
 
+async def test_evaluator_local_user_disables_thinking(monkeypatch):
+    calls = []
+
+    async def fake_completion(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {"content": "customer reply"}, 4
+
+    monkeypatch.setattr(tau_evaluator, "_completion", fake_completion)
+    args = SimpleNamespace(
+        user_backend="local-policy",
+        endpoint="http://local-policy/v1/chat/completions",
+        model="local-policy",
+        user_max_tokens=512,
+        user_temperature=0.7,
+        user_top_p=0.95,
+    )
+    messages = [{"role": "system", "content": "private"}, {"role": "user", "content": "hello"}]
+
+    text, tokens = await tau_evaluator._user_completion(
+        args,
+        object(),
+        asyncio.Semaphore(1),
+        messages,
+        seed=42,
+    )
+
+    assert (text, tokens) == ("customer reply", 4)
+    assert calls[0][1]["enable_thinking"] is False
+
+
 def test_reservoir_sample_is_deterministic_and_rejects_eval_rows(tmp_path):
     source = tmp_path / "source.jsonl"
     _write_rows(source, [{"prompt": str(index), "metadata": {"verifier": "expert_action"}} for index in range(20)])
