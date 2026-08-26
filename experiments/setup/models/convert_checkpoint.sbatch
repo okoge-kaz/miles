@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=miles-convert-ckpt
-#SBATCH --partition=interactive
+#SBATCH --partition=batch
+#SBATCH --qos=interactive
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:8
@@ -10,7 +11,7 @@
 
 # Convert the HuggingFace checkpoint into the torch_dist format Megatron loads.
 #
-#   sbatch -A coreai_horizon_dilations experiments/setup/convert_checkpoint.sbatch
+#   sbatch -A coreai_horizon_dilations experiments/setup/models/convert_checkpoint.sbatch
 #
 #   $HF_CKPT_DIR/$HF_MODEL_NAME  ->  $MEGATRON_CKPT_DIR/${MODEL_NAME}_torch_dist
 #
@@ -22,7 +23,7 @@ set -euo pipefail
 # sbatch copies this script into Slurm's spool directory, so BASH_SOURCE does
 # not point at the repo. Resolve through the submit directory (submit from the
 # repo root), falling back to the path for a direct `bash` invocation.
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." &>/dev/null && pwd)}"
+REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
 source "${REPO_ROOT}/experiments/env.sh"
 
 MODEL_NAME="${MODEL_NAME:-Qwen3-4B}"

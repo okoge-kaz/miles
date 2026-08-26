@@ -43,7 +43,8 @@ swe-bench-verified     | princeton-nlp/SWE-bench_Verified          # 2MB   the s
 swe-bench-lite         | princeton-nlp/SWE-bench_Lite              # 1MB
 swe-bench-full         | princeton-nlp/SWE-bench                   # 120MB
 swe-gym                | SWE-Gym/SWE-Gym                           # 44MB  training instances
-swe-rebench            | nebius/SWE-rebench                        # 245MB
+swe-rebench-v2         | nebius/SWE-rebench-V2                     # 429MB, exact V2 schema
+swe-rebench-v2-filtered-verified | PrimeIntellect/SWE-rebench-V2-Filtered-Verified # distinct filtered provenance
 swe-smith              | SWE-bench/SWE-smith                       # 278MB
 r2e-gym-v1             | R2E-Gym/R2E-Gym-V1                        # 1.7GB
 #

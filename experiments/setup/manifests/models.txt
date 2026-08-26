@@ -59,12 +59,12 @@ Qwen3-32B                         | Qwen/Qwen3-32B                              
 # gpt-oss-20b                     | openai/gpt-oss-20b                             | gpt-oss-20b | --no-bias-dropout-fusion
 #
 # --- >= 80B: the scales the SWE-RL / agentic examples actually use ---
-# Conversion is single-node (8xH100 = 640 GB); the 355B entry is the first that
-# may not fit and is expected to need a multi-node path.
+# Conversion defaults to one 8xB300 node. The 355B entry remains two-node
+# because its qualified PP=4, EP=4 topology uses 16 ranks; raw HBM is no longer
+# the limiting reason on aws-pdx.
 Qwen3-Next-80B-A3B-Instruct       | Qwen/Qwen3-Next-80B-A3B-Instruct               | qwen3-next-80B-A3B
 GLM-4.5-Air                       | zai-org/GLM-4.5-Air                            | glm4.5-106B-A12B
 Qwen3-235B-A22B                   | Qwen/Qwen3-235B-A22B                           | qwen3-235B-A22B | --pipeline-model-parallel-size 2 --expert-model-parallel-size 4
-# 355B bf16 is ~710 GB: one node (640 GB) cannot hold it, so convert on two.
 # 92 layers => PP must divide 92; PP=4 gives 23 layers per stage, EP=4 shards
 # the experts across the remaining ranks (4 x 4 = 16 GPUs).
 GLM-4.5                           | zai-org/GLM-4.5                                | glm4.5-355B-A32B | --pipeline-model-parallel-size 4 --expert-model-parallel-size 4 | 2
