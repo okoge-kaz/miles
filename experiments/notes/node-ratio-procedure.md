@@ -278,27 +278,57 @@ run, which split does that bound want?
   prints `gbs/dp` per point, and drops any split megatron would reject, at
   submission. Across the four splits dp is 4/8/12/16 and gbs/dp is
   768/384/256/192 — all four divide.
-- The launcher never deletes or repairs checkpoints. Its timestamped
-  `RUN_NAMESPACE` creates a fresh identity by default; explicitly reusing a
-  namespace is what opts into continuing that identity.
-- The interface is intentionally narrow: dry-run, `--submit`, and repeatable
-  `--point M:T:R`. Grid values and allocation details can be supplied through
-  environment variables. Log analysis and checkpoint administration are
-  separate tools, not branches in the submission script.
-- wandb project `async-rl-dapo-math-node-ratio`, separate from the convergence
-  study's `off-policy-<dataset>`, because these runs are a throughput
-  measurement and do not belong on the same board as the quality curves.
-  `train.sh` honours `WANDB_PROJECT` with the old value as its default, so
-  nothing else moves.
+- The launcher never repairs checkpoints and does not delete them by default.
+  Original-grid mode deletes only when `--clean-checkpoint` is explicitly
+  requested; matched mode rejects that option. Its timestamped `RUN_NAMESPACE`
+  creates a fresh identity by default; explicitly reusing a namespace is what
+  opts into continuing that identity.
+- The original-grid interface remains narrow: dry-run, `--submit`, and
+  repeatable `--point M:T:R`. The same launcher now has one fail-closed
+  `--matched-partial-concurrency` follow-up mode, documented below. Log
+  analysis and checkpoint administration remain separate tools.
+- The launcher uses wandb project `async-rl-dapo-math`. Cohorts are separated
+  by an explicit namespace and descriptive group/config tags rather than by
+  silently changing the project between the quality and throughput views.
 - The wandb group is `s<S>-t<T>r<R>-<namespace>`. The namespace prevents a new
   invocation from silently joining an earlier checkpoint or W&B run.
 
-All learning settings other than `MAX_WEIGHT_STALENESS` come from
+In original-grid mode, all learning settings other than `MAX_WEIGHT_STALENESS`
+come from
 `experiments/scripts/math/async/dapo-math-p10-90/qwen3-4b/run.sbatch`. In
-particular the launcher no longer copies LR, TIS, replay-buffer, checkpoint,
-batch-shape, reward, or telemetry defaults. It reads the few recipe values
-needed to validate the node split, then exports only staleness, placement, and
-run identity.
+particular the launcher no longer owns independent LR, TIS, replay-buffer,
+checkpoint, batch-shape, reward, or telemetry defaults. It reads recipe values
+needed to validate the node split and explicitly re-exports the derived safety
+settings together with staleness, placement, and run identity.
+
+### Matched colocated-partial/concurrency follow-up (2026-08-25)
+
+`--matched-partial-concurrency` owns exactly five arms: one colocated
+partial-rollout arm with `R=192`, `O=256`, and `n=16`, plus the four original
+train:rollout ratios at max weight staleness 4 with
+`ASYNC_MAX_CONCURRENT_SAMPLES=O*n=4096`. It is not an extra point in the old
+16-arm grid. The colocated comparison against the completed O=192 reference is
+an intentional compound treatment (cutoff concurrency and carry-over change
+together); each async comparison against its old same-ratio arm changes the
+global admitted concurrency from 3072 to 4096.
+
+Matched mode fixes the completed cohort's 8 nodes, `batch` partition, 4-hour
+wall limit, ten chained allocations, batch/model shape, save cadence, container,
+and memory/engine settings. It rejects ambient learning overrides, derives the
+five identities into fresh checkpoint namespaces, writes a submission manifest,
+and passes a content fingerprint to every allocation so a later chain fails
+before Ray startup if the mounted runtime checkout changed. Only the 4:4 async
+arm also matches the colocated arm's 32-engine count and nominal 128 trajectories
+per engine; the other ratios match global C but deliberately retain their
+placement-native engine counts.
+
+The content check is not an immutable source snapshot. Submit from a committed,
+clean, dedicated worktree and do not edit its runtime files until all chains
+finish. The completed colocated baseline predates the direction-specific switch
+metrics; compare it on full step time/time-to-quality, not by reconstructing
+switch components it never logged. The metric contract and validation evidence
+are in `experiments/notes/telemetry.md` under "Colocated train/rollout switching
+cost".
 
 For `queue-recycle`, the dequeue-time admission test uses the generation-side
 comparison version and requires `D_g - F_g < M`. Logging intentionally uses the

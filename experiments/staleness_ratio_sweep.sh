@@ -11,6 +11,17 @@ RECIPE_PATH="${REPO_ROOT}/${RECIPE}"
 COLOCATED_RECIPE="experiments/scripts/math/sync/dapo-math-p10-90/qwen3-4b/run.sbatch"
 COLOCATED_RECIPE_PATH="${REPO_ROOT}/${COLOCATED_RECIPE}"
 source "${REPO_ROOT}/experiments/env.sh"
+source "${REPO_ROOT}/experiments/common/matched_runtime_code_fingerprint.sh"
+
+# The completed staleness-ratio cohort used this image. Matched mode resolves
+# aliases before comparing, so the fsw/fs1 spelling may differ but the image
+# itself may not. Keep this independent of SHARED_WS/CONTAINER_DIR overrides.
+MATCHED_BASELINE_SQSH_IMAGE="/lustre/fsw/portfolios/coreai/users/kfujii/container/miles-staleness-weight-boundaries-f994b9aed.sqsh"
+MATCHED_SQSH_IMAGE_RESOLVED=""
+MATCHED_SQSH_IMAGE_STAT=""
+MATCHED_REPO_ROOT_RESOLVED=""
+MATCHED_PARTIAL_OVER_SAMPLING_BATCH_SIZE=256
+MATCHED_SWITCH_METRIC_CONTRACT=colocate_switch_metrics_v1
 
 : "${TOTAL_NODES:=8}"
 : "${STALENESS_LEVELS:=1 2 4 8}"
@@ -19,7 +30,13 @@ source "${REPO_ROOT}/experiments/env.sh"
 : "${WALL:=04:00:00}"
 : "${CHAIN_JOBS:=10}"
 WANDB_PROJECT=async-rl-dapo-math
-: "${RUN_NAMESPACE:=sr-$(date +%Y%m%d-%H%M%S)}"
+if [[ -v RUN_NAMESPACE ]]; then
+    RUN_NAMESPACE_WAS_EXPLICIT=1
+else
+    RUN_NAMESPACE_WAS_EXPLICIT=0
+    RUN_NAMESPACE="sr-$(date +%Y%m%d-%H%M%S)-p$$"
+fi
+: "${PARTIAL_OVER_SAMPLING_BATCH_SIZE:=${MATCHED_PARTIAL_OVER_SAMPLING_BATCH_SIZE}}"
 
 ACCOUNT="${SLURM_ACCOUNT_NAME:-coreai_horizon_dilations}"
 LOG_DIR="${OUTPUT_DIR}/training/math/dapo-math-p10-90/qwen3-4b"
@@ -27,12 +44,14 @@ IDLE_EXEMPTION='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"60","reason"
 
 SUBMIT=0
 INCLUDE_COLOCATED=0
+MATCH_PARTIAL_CONCURRENCY=0
 CLEAN_CHECKPOINT=0
 declare -a REQUESTED_POINTS=()
 
 usage() {
     cat <<'EOF'
 usage: experiments/staleness_ratio_sweep.sh [--submit] [--include-colocated]
+                                            [--matched-partial-concurrency]
                                             [--clean-checkpoint]
                                             [--point M:T:R ...]
 
@@ -47,6 +66,15 @@ grid therefore contains 16 async arms plus one colocated arm. With
 --clean-checkpoint, only the first allocation in each chain removes that arm's
 exact derived checkpoint directory before starting.
 
+--matched-partial-concurrency creates the five-arm follow-up: one colocated
+partial-rollout arm at PARTIAL_OVER_SAMPLING_BATCH_SIZE=256, plus the
+four node ratios at max weight staleness 4. It derives async concurrency as
+over_sampling_batch_size * n_samples_per_prompt, requires fresh checkpoint
+identities, and cannot be combined with --include-colocated or
+--clean-checkpoint. To preserve the completed cohort's allocation and restart
+protocol, this mode fixes TOTAL_NODES=8, PARTITION=batch, WALL=04:00:00, and
+CHAIN_JOBS=10.
+
 Useful environment overrides: TOTAL_NODES, STALENESS_LEVELS, RATIOS,
 CHAIN_JOBS, PARTITION, WALL, and RUN_NAMESPACE.
 EOF
@@ -60,6 +88,10 @@ while (( $# > 0 )); do
             ;;
         --include-colocated)
             INCLUDE_COLOCATED=1
+            shift
+            ;;
+        --matched-partial-concurrency)
+            MATCH_PARTIAL_CONCURRENCY=1
             shift
             ;;
         --clean-checkpoint)
@@ -83,20 +115,38 @@ while (( $# > 0 )); do
     esac
 done
 
+if (( INCLUDE_COLOCATED == 1 && MATCH_PARTIAL_CONCURRENCY == 1 )); then
+    echo "--include-colocated and --matched-partial-concurrency are mutually exclusive" >&2
+    exit 2
+fi
+if (( MATCH_PARTIAL_CONCURRENCY == 1 && CLEAN_CHECKPOINT == 1 )); then
+    echo "--matched-partial-concurrency requires fresh identities; do not use --clean-checkpoint" >&2
+    exit 2
+fi
+if (( MATCH_PARTIAL_CONCURRENCY == 1 && ${#REQUESTED_POINTS[@]} > 0 )); then
+    echo "--matched-partial-concurrency owns its exact five-arm grid; do not use --point" >&2
+    exit 2
+fi
+
 if (( CLEAN_CHECKPOINT == 1 && SUBMIT == 0 )); then
     echo "--clean-checkpoint requires --submit" >&2
     exit 2
 fi
 
-recipe_default() {
-    local key="$1"
+recipe_default_from() {
+    local recipe_path="$1"
+    local key="$2"
     local value
-    value="$(sed -n 's/^: "${'"${key}"':=\([^}]*\)}".*/\1/p' "${RECIPE_PATH}" | head -n 1)"
+    value="$(sed -n 's/^: "${'"${key}"':=\([^}]*\)}".*/\1/p' "${recipe_path}" | head -n 1)"
     [[ -n "${value}" ]] || {
-        echo "could not read ${key} from ${RECIPE}" >&2
+        echo "could not read ${key} from ${recipe_path}" >&2
         return 1
     }
     printf '%s\n' "${value}"
+}
+
+recipe_default() {
+    recipe_default_from "${RECIPE_PATH}" "$1"
 }
 
 recipe_or_environment() {
@@ -134,6 +184,8 @@ require_setting() {
 
 GPUS_PER_NODE="$(recipe_or_environment ACTOR_GPUS_PER_NODE)"
 GLOBAL_BATCH="$(recipe_or_environment GLOBAL_BATCH_SIZE)"
+ROLLOUT_BATCH="$(recipe_or_environment ROLLOUT_BATCH_SIZE)"
+SAMPLES_PER_PROMPT="$(recipe_or_environment N_SAMPLES_PER_PROMPT)"
 TENSOR_PARALLEL="$(recipe_or_environment TENSOR_PARALLEL_SIZE)"
 CONTEXT_PARALLEL="$(recipe_or_environment CONTEXT_PARALLEL_SIZE)"
 QUEUE_POLICY="$(recipe_or_environment QUEUE_TYPE)"
@@ -148,6 +200,137 @@ FUSE_ONE_STEP_ACTOR_LOGPROBS_VALUE="$(recipe_or_environment FUSE_ONE_STEP_ACTOR_
 SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS_VALUE="$(recipe_or_environment SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS)"
 SAVE_HF_VALUE="$(recipe_or_environment SAVE_HF)"
 HF_SAVE_INTERVAL_VALUE="$(recipe_or_environment HF_SAVE_INTERVAL)"
+SAVE_INTERVAL_VALUE="$(recipe_or_environment SAVE_INTERVAL)"
+SAVE_RETAIN_INTERVAL_VALUE="$(recipe_or_environment SAVE_RETAIN_INTERVAL)"
+ASYNC_GPUS_PER_ENGINE="$(recipe_or_environment ROLLOUT_NUM_GPUS_PER_ENGINE)"
+ASYNC_MEM_FRACTION="$(recipe_or_environment SGLANG_MEM_FRACTION)"
+COLOCATED_GPUS_PER_ENGINE="$(recipe_default_from "${COLOCATED_RECIPE_PATH}" ROLLOUT_NUM_GPUS_PER_ENGINE)"
+COLOCATED_MEM_FRACTION="$(recipe_default_from "${COLOCATED_RECIPE_PATH}" SGLANG_MEM_FRACTION)"
+ASYNC_MAX_CONCURRENT_SAMPLES_VALUE="${ASYNC_MAX_CONCURRENT_SAMPLES:-}"
+
+[[ "${ROLLOUT_BATCH}" =~ ^[1-9][0-9]*$ && "${SAMPLES_PER_PROMPT}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "rollout batch and samples per prompt must be positive integers" >&2
+    exit 1
+}
+if [[ -n "${ASYNC_MAX_CONCURRENT_SAMPLES_VALUE}" ]]; then
+    [[ "${ASYNC_MAX_CONCURRENT_SAMPLES_VALUE}" =~ ^[1-9][0-9]*$ ]] || {
+        echo "ASYNC_MAX_CONCURRENT_SAMPLES must be a positive integer" >&2
+        exit 1
+    }
+    (( ASYNC_MAX_CONCURRENT_SAMPLES_VALUE % SAMPLES_PER_PROMPT == 0 )) || {
+        echo "ASYNC_MAX_CONCURRENT_SAMPLES must be divisible by N_SAMPLES_PER_PROMPT=${SAMPLES_PER_PROMPT}" >&2
+        exit 1
+    }
+fi
+if (( MATCH_PARTIAL_CONCURRENCY == 1 )); then
+    [[ "${PARTIAL_OVER_SAMPLING_BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]] || {
+        echo "PARTIAL_OVER_SAMPLING_BATCH_SIZE must be a positive integer" >&2
+        exit 1
+    }
+    [[ "${PARTIAL_OVER_SAMPLING_BATCH_SIZE}" == "${MATCHED_PARTIAL_OVER_SAMPLING_BATCH_SIZE}" ]] || {
+        echo "matched mode requires PARTIAL_OVER_SAMPLING_BATCH_SIZE=${MATCHED_PARTIAL_OVER_SAMPLING_BATCH_SIZE}," \
+             "got ${PARTIAL_OVER_SAMPLING_BATCH_SIZE}" >&2
+        exit 1
+    }
+    (( PARTIAL_OVER_SAMPLING_BATCH_SIZE > ROLLOUT_BATCH )) || {
+        echo "PARTIAL_OVER_SAMPLING_BATCH_SIZE must exceed ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH}" >&2
+        exit 1
+    }
+    MATCHED_ASYNC_CONCURRENCY=$(( PARTIAL_OVER_SAMPLING_BATCH_SIZE * SAMPLES_PER_PROMPT ))
+    if [[ -n "${ASYNC_MAX_CONCURRENT_SAMPLES_VALUE}" \
+          && "${ASYNC_MAX_CONCURRENT_SAMPLES_VALUE}" -ne "${MATCHED_ASYNC_CONCURRENCY}" ]]; then
+        echo "matched mode derives ASYNC_MAX_CONCURRENT_SAMPLES=${MATCHED_ASYNC_CONCURRENCY}," \
+             "got ${ASYNC_MAX_CONCURRENT_SAMPLES_VALUE}" >&2
+        exit 1
+    fi
+    ASYNC_MAX_CONCURRENT_SAMPLES_VALUE="${MATCHED_ASYNC_CONCURRENCY}"
+
+    # This cohort is paired against the completed production sweep. Refuse
+    # ambient training overrides instead of silently letting --export=ALL turn
+    # the follow-up into a multi-variable experiment.
+    matched_override_keys=(
+        ADVANTAGE_ESTIMATOR ENTROPY_COEF KL_LOSS_COEF EPS_CLIP EPS_CLIP_HIGH EPS_CLIP_C
+        RATIO_DENOMINATOR IS_CORRECTION TIS_CLIP TIS_CLIP_LOW MIS_PROFILE M2PO_BUDGET
+        USE_OPSM OPSM_DELTA LR MAX_RESPONSE_LEN NUM_ROLLOUT TRAIN_SEED ROLLOUT_SEED
+        ROLLOUT_BATCH_SIZE N_SAMPLES_PER_PROMPT GLOBAL_BATCH_SIZE NUM_STEPS_PER_ROLLOUT
+        QUEUE_TYPE QUEUE_FACTOR MAX_WEIGHT_STALENESS STALENESS_REFERENCE PAUSE_GENERATION_MODE
+        USE_REPLAY_BUFFER REPLAY_BUFFER_TYPE REPLAY_BUFFER_IDENTITY_TAG
+        ACTOR_NUM_NODES ACTOR_GPUS_PER_NODE ROLLOUT_NUM_GPUS
+        TENSOR_PARALLEL_SIZE CONTEXT_PARALLEL_SIZE EXPERT_PARALLEL_SIZE
+        MAX_TOKENS_PER_GPU LOG_PROBS_CHUNK_SIZE RECOMPUTE_GRANULARITY OVERLAP_COMM
+        ROLLOUT_NUM_GPUS_PER_ENGINE SGLANG_MEM_FRACTION RM_TYPE ZERO_REWARD_ON_TRUNCATED
+        EVAL_INTERVAL N_SAMPLES_PER_EVAL_PROMPT EVAL_MAX_RESPONSE_LEN SKIP_EVAL_BEFORE_TRAIN
+        SAVE_INTERVAL SAVE_RETAIN_INTERVAL SAVE_HF HF_SAVE_INTERVAL DUMP_TRAIN_DATA
+        DUMP_POLICY_LOSS_DEBUG OBSERVE_TRAINING_ENTROPY FUSE_ONE_STEP_ACTOR_LOGPROBS
+        VERIFY_FUSED_ONE_STEP_ACTOR_LOGPROBS LOG_SAMPLE_STALENESS_METRICS
+        LOG_SAMPLE_STALENESS_RATIO_HISTOGRAM LOG_UPDATE_DIAGNOSTICS
+        SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS PARTIAL_ROLLOUT OVER_SAMPLING_BATCH_SIZE
+        MASK_OFFPOLICY_IN_PARTIAL_ROLLOUT MILES_EXPERIMENTAL_ROLLOUT_REFACTOR
+        DYNAMIC_SAMPLING_FILTER_PATH SGLANG_MAX_RUNNING_REQUESTS SGLANG_CUDA_GRAPH_MAX_BS
+        QWEN3_4B_BASE_HF_ROOT MATCHED_PARTIAL_CONCURRENCY_COHORT
+        MATCHED_RUNTIME_CODE_FINGERPRINT
+    )
+    for key in "${matched_override_keys[@]}"; do
+        if [[ -v "${key}" ]]; then
+            echo "matched mode refuses ambient training override ${key}=${!key}" >&2
+            exit 1
+        fi
+    done
+    unset matched_override_keys key
+
+    [[ -d "${MILES_REPO}" ]] || {
+        echo "matched cohort MILES_REPO is not a directory: ${MILES_REPO}" >&2
+        exit 1
+    }
+    MATCHED_REPO_ROOT_RESOLVED="$(readlink -f -- "${REPO_ROOT}")"
+    MATCHED_MILES_REPO_RESOLVED="$(readlink -f -- "${MILES_REPO}")"
+    [[ "${MATCHED_MILES_REPO_RESOLVED}" == "${MATCHED_REPO_ROOT_RESOLVED}" ]] || {
+        echo "matched mode must mount the checkout it fingerprints:" \
+             "expected ${MATCHED_REPO_ROOT_RESOLVED}, got ${MATCHED_MILES_REPO_RESOLVED}" >&2
+        exit 1
+    }
+
+    [[ -z "${ASYNC_SQSH_IMAGE_OVERRIDE:-}" ]] || {
+        echo "matched mode refuses async-only container override" \
+             "ASYNC_SQSH_IMAGE_OVERRIDE=${ASYNC_SQSH_IMAGE_OVERRIDE}" >&2
+        exit 1
+    }
+    [[ -r "${MATCHED_BASELINE_SQSH_IMAGE}" ]] || {
+        echo "matched cohort baseline container is not readable:" \
+             "${MATCHED_BASELINE_SQSH_IMAGE}" >&2
+        exit 1
+    }
+    [[ -r "${SQSH_IMAGE}" ]] || {
+        echo "matched cohort container is not readable: ${SQSH_IMAGE}" >&2
+        exit 1
+    }
+    MATCHED_BASELINE_SQSH_IMAGE_RESOLVED="$(readlink -f -- "${MATCHED_BASELINE_SQSH_IMAGE}")"
+    MATCHED_SQSH_IMAGE_RESOLVED="$(readlink -f -- "${SQSH_IMAGE}")"
+    [[ "${MATCHED_SQSH_IMAGE_RESOLVED}" == "${MATCHED_BASELINE_SQSH_IMAGE_RESOLVED}" ]] || {
+        echo "matched mode requires the completed cohort container:" \
+             "${MATCHED_BASELINE_SQSH_IMAGE_RESOLVED}; got ${MATCHED_SQSH_IMAGE_RESOLVED}" >&2
+        exit 1
+    }
+    # A full sha256 would reread a 34 GB image at every submission. The
+    # resolved immutable path plus device/inode/size/mtime is a cheap,
+    # auditable identity; the image filename pins the SGLang build commit.
+    MATCHED_SQSH_IMAGE_STAT="$(stat -Lc '%d:%i:%s:%Y' -- "${MATCHED_SQSH_IMAGE_RESOLVED}")"
+
+    [[ "${TOTAL_NODES}" == 8 && "${PARTITION}" == batch \
+       && "${WALL}" == 04:00:00 && "${CHAIN_JOBS}" == 10 \
+       && "${GPUS_PER_NODE}" == 8 \
+       && "${ROLLOUT_BATCH}" == 192 && "${SAMPLES_PER_PROMPT}" == 16 \
+       && "${GLOBAL_BATCH}" == 3072 && "${TENSOR_PARALLEL}" == 2 \
+       && "${CONTEXT_PARALLEL}" == 1 \
+       && "${ASYNC_GPUS_PER_ENGINE}" == 1 && "${ASYNC_MEM_FRACTION}" == 0.70 \
+       && "${COLOCATED_GPUS_PER_ENGINE}" == 2 && "${COLOCATED_MEM_FRACTION}" == 0.65 ]] || {
+        echo "matched mode requires the completed cohort protocol:" \
+             "nodes=8, partition=batch, wall=04:00:00, chains=10," \
+             "gpus/node=8, rbs=192, n=16, gbs=3072, tp=2, cp=1," \
+             "async engine/mem=1/0.70, colocated engine/mem=2/0.65" >&2
+        exit 1
+    }
+fi
 
 [[ "${QUEUE_POLICY}" == queue-recycle ]] || {
     echo "this sweep requires the recipe's QUEUE_TYPE=queue-recycle, got ${QUEUE_POLICY}" >&2
@@ -167,6 +350,10 @@ require_setting FUSE_ONE_STEP_ACTOR_LOGPROBS 1
 require_setting SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS 1
 require_setting SAVE_HF 1
 require_setting HF_SAVE_INTERVAL 10
+if (( MATCH_PARTIAL_CONCURRENCY == 1 )); then
+    require_setting SAVE_INTERVAL 10
+    require_setting SAVE_RETAIN_INTERVAL 100
+fi
 [[ -z "${DEBUG_EXIT_AFTER_ROLLOUT:-}" ]] || {
     echo "this sweep requires DEBUG_EXIT_AFTER_ROLLOUT to be empty" >&2
     exit 1
@@ -175,6 +362,10 @@ require_setting HF_SAVE_INTERVAL 10
 declare -a RAW_POINTS=()
 if (( ${#REQUESTED_POINTS[@]} > 0 )); then
     RAW_POINTS=("${REQUESTED_POINTS[@]}")
+elif (( MATCH_PARTIAL_CONCURRENCY == 1 )); then
+    # Literal rather than RATIOS: matched mode must stay a five-arm cohort even
+    # when a caller has a RATIOS override in its shell.
+    RAW_POINTS=("4:1:7" "4:2:6" "4:3:5" "4:4:4")
 else
     for staleness in ${STALENESS_LEVELS}; do
         for ratio in ${RATIOS}; do
@@ -191,6 +382,10 @@ validate_point() {
         return 1
     }
     IFS=: read -r staleness train_nodes rollout_nodes <<<"${point}"
+    if (( MATCH_PARTIAL_CONCURRENCY == 1 && staleness != 4 )); then
+        echo "matched partial/concurrency mode requires max weight staleness 4, got '${point}'" >&2
+        return 1
+    fi
     (( train_nodes + rollout_nodes == TOTAL_NODES )) || {
         echo "invalid point '${point}'; T+R must equal TOTAL_NODES=${TOTAL_NODES}" >&2
         return 1
@@ -218,9 +413,23 @@ for point in "${RAW_POINTS[@]}"; do
     POINTS+=("${validated}")
 done
 (( ${#POINTS[@]} > 0 )) || { echo "no sweep points selected" >&2; exit 1; }
+if (( MATCH_PARTIAL_CONCURRENCY == 1 )); then
+    expected_matched_points=("4 1 7 4" "4 2 6 8" "4 3 5 12" "4 4 4 16")
+    (( ${#POINTS[@]} == ${#expected_matched_points[@]} )) || {
+        echo "matched mode requires exactly the four ratios 1:7, 2:6, 3:5, and 4:4" >&2
+        exit 1
+    }
+    for expected_point in "${expected_matched_points[@]}"; do
+        [[ -n "${SEEN_POINTS[${expected_point}]:-}" ]] || {
+            echo "matched mode is missing point '${expected_point}'" >&2
+            exit 1
+        }
+    done
+    unset expected_matched_points expected_point
+fi
 
 COLOCATED_DATA_PARALLEL=0
-if (( INCLUDE_COLOCATED == 1 )); then
+if (( INCLUDE_COLOCATED == 1 || MATCH_PARTIAL_CONCURRENCY == 1 )); then
     colocated_train_gpus=$(( TOTAL_NODES * GPUS_PER_NODE ))
     colocated_model_parallel=$(( TENSOR_PARALLEL * CONTEXT_PARALLEL ))
     (( colocated_train_gpus % colocated_model_parallel == 0 )) || {
@@ -234,7 +443,42 @@ if (( INCLUDE_COLOCATED == 1 )); then
     }
 fi
 
-SETTING_COUNT=$(( ${#POINTS[@]} + INCLUDE_COLOCATED ))
+SETTING_COUNT=$(( ${#POINTS[@]} + INCLUDE_COLOCATED + MATCH_PARTIAL_CONCURRENCY ))
+DEFAULT_ASYNC_CONCURRENCY=$(( ROLLOUT_BATCH * SAMPLES_PER_PROMPT ))
+
+async_run_name() {
+    local staleness="$1"
+    local train_nodes="$2"
+    local rollout_nodes="$3"
+    local name="s${staleness}-t${train_nodes}r${rollout_nodes}"
+    if [[ -n "${ASYNC_MAX_CONCURRENT_SAMPLES_VALUE}" ]]; then
+        name="${name}-c${ASYNC_MAX_CONCURRENT_SAMPLES_VALUE}"
+    fi
+    printf '%s-%s\n' "${name}" "${RUN_NAMESPACE}"
+}
+
+async_config_tag() {
+    local staleness="$1"
+    local train_nodes="$2"
+    local rollout_nodes="$3"
+    # common/run_identity.sh appends the non-default concurrency axis. Keep the
+    # visible W&B group descriptive without duplicating that checkpoint suffix.
+    printf 's%s-t%sr%s-%s\n' "${staleness}" "${train_nodes}" "${rollout_nodes}" "${RUN_NAMESPACE}"
+}
+
+colocated_run_name() {
+    if (( MATCH_PARTIAL_CONCURRENCY == 1 )); then
+        printf 's0-colocated-partial-o%s-%s\n' "${PARTIAL_OVER_SAMPLING_BATCH_SIZE}" "${RUN_NAMESPACE}"
+    else
+        printf 's0-colocated-%s\n' "${RUN_NAMESPACE}"
+    fi
+}
+
+colocated_config_tag() {
+    # common/run_identity.sh appends partial-oN and places this arm under
+    # partial-rollout/unbounded.
+    printf 's0-colocated-%s\n' "${RUN_NAMESPACE}"
+}
 
 printf 'recipe: %s\n' "${RECIPE}"
 printf 'fixed by recipe: queue=%s, reference=%s, rollouts=%s, steps/rollout=%s, gbs=%s, tp=%s, cp=%s\n' \
@@ -249,20 +493,68 @@ printf 'fixed checkpoints: save-hf=%s, hf interval=%s; settings=%s; clean=%s\n' 
     "${SAVE_HF_VALUE}" "${HF_SAVE_INTERVAL_VALUE}" "${SETTING_COUNT}" "${CLEAN_CHECKPOINT}"
 printf 'submission: %s nodes, %s, %s, %s chained job(s), wandb=%s\n' \
     "${TOTAL_NODES}" "${PARTITION}" "${WALL}" "${CHAIN_JOBS}" "${WANDB_PROJECT}"
-printf 'namespace: %s\n\n' "${RUN_NAMESPACE}"
-printf '  %-4s %-3s %-3s %-4s %-8s %s\n' max T R dp gbs/dp run
+printf 'generation: rbs=%s groups, n=%s, async in-flight=%s trajectories\n' \
+    "${ROLLOUT_BATCH}" "${SAMPLES_PER_PROMPT}" \
+    "${ASYNC_MAX_CONCURRENT_SAMPLES_VALUE:-${DEFAULT_ASYNC_CONCURRENCY}}"
+if (( MATCH_PARTIAL_CONCURRENCY == 1 )); then
+    printf 'matched protocol: colocated partial O=%s groups; async C=%s trajectories; max staleness=4\n' \
+        "${PARTIAL_OVER_SAMPLING_BATCH_SIZE}" "${ASYNC_MAX_CONCURRENT_SAMPLES_VALUE}"
+    printf 'causal warning: versus the old colocated baseline, both partial rollout and O change\n'
+fi
+if (( RUN_NAMESPACE_WAS_EXPLICIT == 1 )); then
+    namespace_source=explicit
+else
+    namespace_source=automatic
+fi
+printf 'namespace: %s (%s)\n\n' "${RUN_NAMESPACE}" "${namespace_source}"
+printf '  %-10s %-4s %-3s %-3s %-4s %-8s %-8s %-8s %-10s %s\n' \
+    mode max T R dp gbs/dp inflight engines C/engine run
 for point in "${POINTS[@]}"; do
     read -r staleness train_nodes rollout_nodes data_parallel <<<"${point}"
-    run_name="s${staleness}-t${train_nodes}r${rollout_nodes}-${RUN_NAMESPACE}"
-    printf '  %-4s %-3s %-3s %-4s %-8s %s\n' \
-        "${staleness}" "${train_nodes}" "${rollout_nodes}" "${data_parallel}" \
-        "$(( GLOBAL_BATCH / data_parallel ))" "${run_name}"
+    run_name="$(async_run_name "${staleness}" "${train_nodes}" "${rollout_nodes}")"
+    async_engines=$(( rollout_nodes * GPUS_PER_NODE / ASYNC_GPUS_PER_ENGINE ))
+    printf '  %-10s %-4s %-3s %-3s %-4s %-8s %-8s %-8s %-10s %s\n' \
+        async "${staleness}" "${train_nodes}" "${rollout_nodes}" "${data_parallel}" \
+        "$(( GLOBAL_BATCH / data_parallel ))" \
+        "${ASYNC_MAX_CONCURRENT_SAMPLES_VALUE:-${DEFAULT_ASYNC_CONCURRENCY}}" \
+        "${async_engines}" \
+        "${ASYNC_MAX_CONCURRENT_SAMPLES_VALUE:-${DEFAULT_ASYNC_CONCURRENCY}}/${async_engines}" \
+        "${run_name}"
 done
-if (( INCLUDE_COLOCATED == 1 )); then
-    colocated_run_name="s0-colocated-${RUN_NAMESPACE}"
-    printf '  %-4s %-3s %-3s %-4s %-8s %s\n' \
-        0 "${TOTAL_NODES}" 0 "${COLOCATED_DATA_PARALLEL}" \
-        "$(( GLOBAL_BATCH / COLOCATED_DATA_PARALLEL ))" "${colocated_run_name}"
+if (( INCLUDE_COLOCATED == 1 || MATCH_PARTIAL_CONCURRENCY == 1 )); then
+    colocated_name="$(colocated_run_name)"
+    if (( MATCH_PARTIAL_CONCURRENCY == 1 )); then
+        colocated_mode=partial
+        colocated_inflight=$(( PARTIAL_OVER_SAMPLING_BATCH_SIZE * SAMPLES_PER_PROMPT ))
+    else
+        colocated_mode=colocated
+        colocated_inflight="${DEFAULT_ASYNC_CONCURRENCY}"
+    fi
+    colocated_engines=$(( TOTAL_NODES * GPUS_PER_NODE / COLOCATED_GPUS_PER_ENGINE ))
+    printf '  %-10s %-4s %-3s %-3s %-4s %-8s %-8s %-8s %-10s %s\n' \
+        "${colocated_mode}" none "${TOTAL_NODES}" 0 "${COLOCATED_DATA_PARALLEL}" \
+        "$(( GLOBAL_BATCH / COLOCATED_DATA_PARALLEL ))" "${colocated_inflight}" \
+        "${colocated_engines}" "${colocated_inflight}/${colocated_engines}" "${colocated_name}"
+    if (( MATCH_PARTIAL_CONCURRENCY == 1 )); then
+        printf 'global C is matched; only t4r4 also matches colocated engine count and nominal C/engine\n'
+    fi
+fi
+
+if (( MATCH_PARTIAL_CONCURRENCY == 1 )); then
+    existing_checkpoint=""
+    existing_log=""
+    if [[ -d "${TRAIN_CKPT_DIR}" ]]; then
+        existing_checkpoint="$(find "${TRAIN_CKPT_DIR}" -type d -name "*${RUN_NAMESPACE}*" -print -quit 2>/dev/null)"
+    fi
+    if [[ -d "${LOG_DIR}" ]]; then
+        existing_log="$(find "${LOG_DIR}" -maxdepth 1 -type f -name "*${RUN_NAMESPACE}*" -print -quit 2>/dev/null)"
+    fi
+    if [[ -n "${existing_checkpoint}" || -n "${existing_log}" ]]; then
+        echo "matched mode refuses an existing namespace: ${RUN_NAMESPACE}" >&2
+        [[ -z "${existing_checkpoint}" ]] || echo "checkpoint: ${existing_checkpoint}" >&2
+        [[ -z "${existing_log}" ]] || echo "log: ${existing_log}" >&2
+        exit 1
+    fi
 fi
 
 if (( SUBMIT == 0 )); then
@@ -271,21 +563,86 @@ if (( SUBMIT == 0 )); then
 fi
 
 mkdir -p "${LOG_DIR}"
+MANIFEST_PATH=""
+if (( MATCH_PARTIAL_CONCURRENCY == 1 )); then
+    MANIFEST_PATH="${LOG_DIR}/${RUN_NAMESPACE}.manifest.tsv"
+    if ! (set -o noclobber; : > "${MANIFEST_PATH}") 2>/dev/null; then
+        echo "matched mode could not reserve its namespace manifest: ${MANIFEST_PATH}" >&2
+        exit 1
+    fi
+    prompt_data_container="$(sed -n 's/^PROMPT_DATA=//p' "${RECIPE_PATH}" | head -n 1)"
+    prompt_data_host="${DATASET_DIR}/${prompt_data_container#/data/}"
+    dataset_sha256=missing
+    if [[ -f "${prompt_data_host}" ]]; then
+        dataset_sha256="$(sha256sum "${prompt_data_host}" | awk '{print $1}')"
+    fi
+    code_fingerprint="$(matched_runtime_code_fingerprint "${REPO_ROOT}")"
+    tracked_diff_sha256="$(git -C "${REPO_ROOT}" diff --binary HEAD | sha256sum | awk '{print $1}')"
+    {
+        printf 'key\tvalue\n'
+        printf 'namespace\t%s\n' "${RUN_NAMESPACE}"
+        printf 'git_head\t%s\n' "$(git -C "${REPO_ROOT}" rev-parse HEAD)"
+        printf 'tracked_diff_sha256\t%s\n' "${tracked_diff_sha256}"
+        printf 'code_fingerprint\t%s\n' "${code_fingerprint}"
+        printf 'runtime_repo\t%s\n' "${MATCHED_REPO_ROOT_RESOLVED}"
+        printf 'container\t%s\n' "${SQSH_IMAGE}"
+        printf 'async_container_effective\t%s\n' "${MATCHED_SQSH_IMAGE_RESOLVED}"
+        printf 'colocated_container_effective\t%s\n' "${MATCHED_SQSH_IMAGE_RESOLVED}"
+        printf 'container_stat_device_inode_size_mtime\t%s\n' "${MATCHED_SQSH_IMAGE_STAT}"
+        printf 'dataset\t%s\n' "${prompt_data_host}"
+        printf 'dataset_sha256\t%s\n' "${dataset_sha256}"
+        printf 'baseline_namespace\t%s\n' "${BASELINE_RUN_NAMESPACE:-sr-20260819-212906}"
+        printf 'baseline_training_root\t%s\n' \
+            "${BASELINE_TRAINING_ROOT:-/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/hiso/async-rl/checkpoints/training}"
+        printf 'account\t%s\n' "${ACCOUNT}"
+        printf 'partition\t%s\n' "${PARTITION}"
+        printf 'wall\t%s\n' "${WALL}"
+        printf 'chain_jobs\t%s\n' "${CHAIN_JOBS}"
+        printf 'total_nodes\t%s\n' "${TOTAL_NODES}"
+        printf 'gpus_per_node\t%s\n' "${GPUS_PER_NODE}"
+        printf 'wandb_project\t%s\n' "${WANDB_PROJECT}"
+        printf 'save_interval\t%s\n' "${SAVE_INTERVAL_VALUE}"
+        printf 'save_retain_interval\t%s\n' "${SAVE_RETAIN_INTERVAL_VALUE}"
+        printf 'hf_save_interval\t%s\n' "${HF_SAVE_INTERVAL_VALUE}"
+        printf 'async_gpus_per_engine\t%s\n' "${ASYNC_GPUS_PER_ENGINE}"
+        printf 'async_mem_fraction\t%s\n' "${ASYNC_MEM_FRACTION}"
+        printf 'colocated_gpus_per_engine\t%s\n' "${COLOCATED_GPUS_PER_ENGINE}"
+        printf 'colocated_mem_fraction\t%s\n' "${COLOCATED_MEM_FRACTION}"
+        printf 'rollout_batch_groups\t%s\n' "${ROLLOUT_BATCH}"
+        printf 'samples_per_prompt\t%s\n' "${SAMPLES_PER_PROMPT}"
+        printf 'partial_over_sampling_groups\t%s\n' "${PARTIAL_OVER_SAMPLING_BATCH_SIZE}"
+        printf 'partial_over_sampling_groups_effective\t%s\n' "${PARTIAL_OVER_SAMPLING_BATCH_SIZE}"
+        printf 'async_max_concurrent_samples\t%s\n' "${ASYNC_MAX_CONCURRENT_SAMPLES_VALUE}"
+        printf 'max_weight_staleness\t4\n'
+        printf 'switch_metric_contract\t%s\n' "${MATCHED_SWITCH_METRIC_CONTRACT}"
+        printf 'job\tarm\tchain_index\tjob_id\tdependency\trecipe\texports_csv\n'
+    } >> "${MANIFEST_PATH}"
+fi
 
 submit_chain() {
     local staleness="$1"
     local train_nodes="$2"
     local rollout_nodes="$3"
-    local run_name="s${staleness}-t${train_nodes}r${rollout_nodes}-${RUN_NAMESPACE}"
+    local run_name
+    run_name="$(async_run_name "${staleness}" "${train_nodes}" "${rollout_nodes}")"
+    local config_tag
+    config_tag="$(async_config_tag "${staleness}" "${train_nodes}" "${rollout_nodes}")"
     local base_exports_csv exports_csv raw_job_id job_id chain_index clean_value
     local -a dependency=()
     local -a exports=(
         "WANDB_PROJECT=${WANDB_PROJECT}"
         "RUN_NAME=${run_name}"
-        "CONFIG_TAG=${run_name}"
+        "CONFIG_TAG=${config_tag}"
         "MAX_WEIGHT_STALENESS=${staleness}"
         "ACTOR_NUM_NODES=${train_nodes}"
         "ROLLOUT_NUM_GPUS=$(( rollout_nodes * GPUS_PER_NODE ))"
+        "ASYNC_MAX_CONCURRENT_SAMPLES=${ASYNC_MAX_CONCURRENT_SAMPLES_VALUE}"
+        "PARTIAL_ROLLOUT=0"
+        "OVER_SAMPLING_BATCH_SIZE=${ROLLOUT_BATCH}"
+        "MASK_OFFPOLICY_IN_PARTIAL_ROLLOUT=0"
+        "DYNAMIC_SAMPLING_FILTER_PATH="
+        "SGLANG_MAX_RUNNING_REQUESTS="
+        "SGLANG_CUDA_GRAPH_MAX_BS="
         "NUM_ROLLOUT=${NUM_ROLLOUT_VALUE}"
         "NUM_STEPS_PER_ROLLOUT=${NUM_STEPS_PER_ROLLOUT_VALUE}"
         "MAX_RESPONSE_LEN=${MAX_RESPONSE_LEN_VALUE}"
@@ -297,7 +654,16 @@ submit_chain() {
         "SAVE_HF=${SAVE_HF_VALUE}"
         "HF_SAVE_INTERVAL=${HF_SAVE_INTERVAL_VALUE}"
         "DEBUG_EXIT_AFTER_ROLLOUT="
+        "MATCHED_PARTIAL_CONCURRENCY_COHORT=${MATCH_PARTIAL_CONCURRENCY}"
+        "MATCHED_RUNTIME_CODE_FINGERPRINT=${code_fingerprint:-}"
     )
+    if (( MATCH_PARTIAL_CONCURRENCY == 1 )); then
+        exports+=(
+            "MILES_REPO=${MATCHED_REPO_ROOT_RESOLVED}"
+            "SQSH_IMAGE=${MATCHED_SQSH_IMAGE_RESOLVED}"
+            "ASYNC_SQSH_IMAGE_OVERRIDE="
+        )
+    fi
     base_exports_csv="$(IFS=,; printf '%s' "${exports[*]}")"
 
     for (( chain_index = 1; chain_index <= CHAIN_JOBS; chain_index++ )); do
@@ -319,20 +685,33 @@ submit_chain() {
         printf 'submitted %-40s chain %d/%d job=%s dependency=%s\n' \
             "${run_name}" "${chain_index}" "${CHAIN_JOBS}" "${job_id}" \
             "${dependency[*]:-none}"
+        if [[ -n "${MANIFEST_PATH}" ]]; then
+            printf 'job\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "${run_name}" "${chain_index}" "${job_id}" "${dependency[*]:-none}" \
+                "${RECIPE}" "${exports_csv}" >> "${MANIFEST_PATH}"
+        fi
         dependency=("--dependency=afterany:${job_id}")
     done
 }
 
 submit_colocated_chain() {
-    local run_name="s0-colocated-${RUN_NAMESPACE}"
+    local run_name
+    run_name="$(colocated_run_name)"
+    local config_tag
+    config_tag="$(colocated_config_tag)"
+    local colocated_over_sampling="${ROLLOUT_BATCH}"
+    if (( MATCH_PARTIAL_CONCURRENCY == 1 )); then
+        colocated_over_sampling="${PARTIAL_OVER_SAMPLING_BATCH_SIZE}"
+    fi
     local base_exports_csv exports_csv raw_job_id job_id chain_index clean_value
     local -a dependency=()
     local -a exports=(
         "WANDB_PROJECT=${WANDB_PROJECT}"
         "RUN_NAME=${run_name}"
-        "CONFIG_TAG=${run_name}"
+        "CONFIG_TAG=${config_tag}"
         "ACTOR_NUM_NODES=${TOTAL_NODES}"
         "ROLLOUT_NUM_GPUS=0"
+        "ASYNC_MAX_CONCURRENT_SAMPLES="
         "NUM_ROLLOUT=${NUM_ROLLOUT_VALUE}"
         "NUM_STEPS_PER_ROLLOUT=${NUM_STEPS_PER_ROLLOUT_VALUE}"
         "MAX_RESPONSE_LEN=${MAX_RESPONSE_LEN_VALUE}"
@@ -349,8 +728,24 @@ submit_colocated_chain() {
         "REPLAY_BUFFER_IDENTITY_TAG=0"
         "FUSE_ONE_STEP_ACTOR_LOGPROBS=0"
         "SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS=0"
+        "OVER_SAMPLING_BATCH_SIZE=${colocated_over_sampling}"
+        "PARTIAL_ROLLOUT=${MATCH_PARTIAL_CONCURRENCY}"
+        "MASK_OFFPOLICY_IN_PARTIAL_ROLLOUT=0"
+        "DYNAMIC_SAMPLING_FILTER_PATH="
+        "SGLANG_MAX_RUNNING_REQUESTS="
+        "SGLANG_CUDA_GRAPH_MAX_BS="
+        "MILES_EXPERIMENTAL_ROLLOUT_REFACTOR=0"
         "DEBUG_EXIT_AFTER_ROLLOUT="
+        "MATCHED_PARTIAL_CONCURRENCY_COHORT=${MATCH_PARTIAL_CONCURRENCY}"
+        "MATCHED_RUNTIME_CODE_FINGERPRINT=${code_fingerprint:-}"
     )
+    if (( MATCH_PARTIAL_CONCURRENCY == 1 )); then
+        exports+=(
+            "MILES_REPO=${MATCHED_REPO_ROOT_RESOLVED}"
+            "SQSH_IMAGE=${MATCHED_SQSH_IMAGE_RESOLVED}"
+            "ASYNC_SQSH_IMAGE_OVERRIDE="
+        )
+    fi
     base_exports_csv="$(IFS=,; printf '%s' "${exports[*]}")"
 
     for (( chain_index = 1; chain_index <= CHAIN_JOBS; chain_index++ )); do
@@ -372,6 +767,11 @@ submit_colocated_chain() {
         printf 'submitted %-40s chain %d/%d job=%s dependency=%s\n' \
             "${run_name}" "${chain_index}" "${CHAIN_JOBS}" "${job_id}" \
             "${dependency[*]:-none}"
+        if [[ -n "${MANIFEST_PATH}" ]]; then
+            printf 'job\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "${run_name}" "${chain_index}" "${job_id}" "${dependency[*]:-none}" \
+                "${COLOCATED_RECIPE}" "${exports_csv}" >> "${MANIFEST_PATH}"
+        fi
         dependency=("--dependency=afterany:${job_id}")
     done
 }
@@ -381,6 +781,6 @@ for point in "${POINTS[@]}"; do
     read -r staleness train_nodes rollout_nodes _ <<<"${point}"
     submit_chain "${staleness}" "${train_nodes}" "${rollout_nodes}"
 done
-if (( INCLUDE_COLOCATED == 1 )); then
+if (( INCLUDE_COLOCATED == 1 || MATCH_PARTIAL_CONCURRENCY == 1 )); then
     submit_colocated_chain
 fi

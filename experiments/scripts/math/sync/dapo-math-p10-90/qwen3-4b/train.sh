@@ -36,6 +36,7 @@ ROLLOUT_ARGS=(
    --rm-type "${RM_TYPE}"
    --num-rollout "${NUM_ROLLOUT}"
    --rollout-batch-size "${ROLLOUT_BATCH_SIZE}"
+   --over-sampling-batch-size "${OVER_SAMPLING_BATCH_SIZE}"
    --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT}"
    --rollout-max-response-len "${MAX_RESPONSE_LEN}"
    --rollout-max-context-len 32768
@@ -48,6 +49,12 @@ ROLLOUT_ARGS=(
 )
 if [[ "${ZERO_REWARD_ON_TRUNCATED}" != "0" ]]; then
    ROLLOUT_ARGS+=(--zero-reward-on-truncated)
+fi
+if [[ "${PARTIAL_ROLLOUT:-0}" != "0" ]]; then
+   ROLLOUT_ARGS+=(--partial-rollout)
+fi
+if [[ "${MASK_OFFPOLICY_IN_PARTIAL_ROLLOUT:-0}" != "0" ]]; then
+   ROLLOUT_ARGS+=(--mask-offpolicy-in-partial-rollout)
 fi
 
 TELEMETRY_ARGS=(
@@ -171,11 +178,12 @@ MISC_ARGS=(
    --attention-backend flash
 )
 
+# WANDB_API_KEY is inherited through --export=ALL. Never put it in this argv:
+# both shell xtrace and Ray's "Running entrypoint" line are persisted in job logs.
 WANDB_ARGS=(
    --use-wandb
    --wandb-project "${WANDB_PROJECT:-off-policy-${DATASET_TAG}}"
    --wandb-group "${RUN_NAME}"
-   --wandb-key "${WANDB_API_KEY}"
 )
 
 RUNTIME_ENV_JSON=$(cat <<JSON

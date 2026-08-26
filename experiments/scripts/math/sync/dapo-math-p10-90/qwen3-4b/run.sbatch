@@ -10,8 +10,9 @@
 
 set -euo pipefail
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../../../.." &>/dev/null && pwd)}"
+REPO_ROOT="${MILES_REPO:-${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../../../.." &>/dev/null && pwd)}}"
 export HF_CKPT_DIR="${QWEN3_4B_BASE_HF_ROOT:-/lustre/fsw/portfolios/coreai/users/kfujii/checkpoints/huggingface/Qwen3-4B-Base/LR2.0e-5-SEQ32768-GBS128-MBS1-TP1-PP1-CP1-EP1-PACK1-standard-cp-STEPS4000}"
+source "${REPO_ROOT}/experiments/common/matched_runtime_code_fingerprint.sh"
 source "${REPO_ROOT}/experiments/env.sh"
 
 : "${WANDB_API_KEY:?set WANDB_API_KEY, or put an api.wandb.ai entry in ~/.netrc}"
@@ -52,6 +53,27 @@ PROMPT_DATA=/data/dapo-math-p10-90-qwen3-4b-base-lr2e-5-step4000/dapo-math-p10-9
 : "${N_SAMPLES_PER_PROMPT:=16}"
 : "${GLOBAL_BATCH_SIZE:=3072}"
 : "${NUM_STEPS_PER_ROLLOUT:=1}"
+: "${OVER_SAMPLING_BATCH_SIZE:=${ROLLOUT_BATCH_SIZE}}"
+: "${PARTIAL_ROLLOUT:=0}"
+: "${MASK_OFFPOLICY_IN_PARTIAL_ROLLOUT:=0}"
+[[ "${PARTIAL_ROLLOUT}" =~ ^[01]$ ]] || { echo "PARTIAL_ROLLOUT must be 0 or 1" >&2; exit 1; }
+[[ "${MASK_OFFPOLICY_IN_PARTIAL_ROLLOUT}" =~ ^[01]$ ]] || {
+   echo "MASK_OFFPOLICY_IN_PARTIAL_ROLLOUT must be 0 or 1" >&2
+   exit 1
+}
+[[ "${OVER_SAMPLING_BATCH_SIZE}" =~ ^[1-9][0-9]*$ \
+   && "${OVER_SAMPLING_BATCH_SIZE}" -ge "${ROLLOUT_BATCH_SIZE}" ]] || {
+   echo "OVER_SAMPLING_BATCH_SIZE must be an integer >= ROLLOUT_BATCH_SIZE" >&2
+   exit 1
+}
+if [[ "${PARTIAL_ROLLOUT}" == 1 && "${OVER_SAMPLING_BATCH_SIZE}" -eq "${ROLLOUT_BATCH_SIZE}" ]]; then
+   echo "PARTIAL_ROLLOUT requires OVER_SAMPLING_BATCH_SIZE > ROLLOUT_BATCH_SIZE in this filter-free recipe" >&2
+   exit 1
+fi
+[[ "${MASK_OFFPOLICY_IN_PARTIAL_ROLLOUT}" == 0 || "${PARTIAL_ROLLOUT}" == 1 ]] || {
+   echo "MASK_OFFPOLICY_IN_PARTIAL_ROLLOUT requires PARTIAL_ROLLOUT=1" >&2
+   exit 1
+}
 
 # distributed setting
 : "${ACTOR_NUM_NODES:=2}"
@@ -94,6 +116,7 @@ export ADVANTAGE_ESTIMATOR ENTROPY_COEF KL_LOSS_COEF EPS_CLIP EPS_CLIP_HIGH EPS_
 export RATIO_DENOMINATOR IS_CORRECTION TIS_CLIP TIS_CLIP_LOW MIS_PROFILE M2PO_BUDGET USE_OPSM OPSM_DELTA
 export LR MAX_RESPONSE_LEN NUM_ROLLOUT TRAIN_SEED ROLLOUT_SEED
 export ROLLOUT_BATCH_SIZE N_SAMPLES_PER_PROMPT GLOBAL_BATCH_SIZE NUM_STEPS_PER_ROLLOUT
+export OVER_SAMPLING_BATCH_SIZE PARTIAL_ROLLOUT MASK_OFFPOLICY_IN_PARTIAL_ROLLOUT
 export ACTOR_NUM_NODES ACTOR_GPUS_PER_NODE ROLLOUT_NUM_GPUS
 export TENSOR_PARALLEL_SIZE CONTEXT_PARALLEL_SIZE EXPERT_PARALLEL_SIZE
 export MAX_TOKENS_PER_GPU LOG_PROBS_CHUNK_SIZE RECOMPUTE_GRANULARITY OVERLAP_COMM
@@ -107,6 +130,7 @@ source "${REPO_ROOT}/experiments/common/run_identity.sh"
 export RUN_NAME CONFIG_TAG CKPT_PATH
 
 source "${REPO_ROOT}/experiments/common/placement.sh"
+verify_matched_runtime_code_fingerprint "${REPO_ROOT}"
 
 RAY_HEAD_IP="$(getent hosts "$(hostname)" | awk '{print $1; exit}')"
 if [[ -z "${RAY_HEAD_IP}" || "${RAY_HEAD_IP}" == 169.254.* ]]; then

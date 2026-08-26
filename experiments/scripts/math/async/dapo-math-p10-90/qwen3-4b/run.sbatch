@@ -12,10 +12,11 @@
 
 set -euo pipefail
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../../../.." &>/dev/null && pwd)}"
+REPO_ROOT="${MILES_REPO:-${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../../../.." &>/dev/null && pwd)}}"
 # This checkpoint lives outside the shared checkpoints/hf directory. Mount its
 # parent directly so both SGLang and the tokenizer read iter_0004000 in place.
 export HF_CKPT_DIR="${QWEN3_4B_BASE_HF_ROOT:-/lustre/fsw/portfolios/coreai/users/kfujii/checkpoints/huggingface/Qwen3-4B-Base/LR2.0e-5-SEQ32768-GBS128-MBS1-TP1-PP1-CP1-EP1-PACK1-standard-cp-STEPS4000}"
+source "${REPO_ROOT}/experiments/common/matched_runtime_code_fingerprint.sh"
 source "${REPO_ROOT}/experiments/env.sh"
 
 : "${WANDB_API_KEY:?set WANDB_API_KEY, or put an api.wandb.ai entry in ~/.netrc}"
@@ -72,6 +73,14 @@ fi
 : "${STALENESS_REFERENCE:=prefill}"   # completion | submission | prefill
 : "${PAUSE_GENERATION_MODE:=in_place}"
 : "${ASYNC_MAX_CONCURRENT_SAMPLES:=}"
+if [[ -n "${ASYNC_MAX_CONCURRENT_SAMPLES}" ]]; then
+   [[ "${ASYNC_MAX_CONCURRENT_SAMPLES}" =~ ^[1-9][0-9]*$ \
+      && "${ASYNC_MAX_CONCURRENT_SAMPLES}" -ge "${N_SAMPLES_PER_PROMPT}" \
+      && $(( ASYNC_MAX_CONCURRENT_SAMPLES % N_SAMPLES_PER_PROMPT )) -eq 0 ]] || {
+      echo "ASYNC_MAX_CONCURRENT_SAMPLES must be a positive multiple of N_SAMPLES_PER_PROMPT" >&2
+      exit 1
+   }
+fi
 : "${USE_REPLAY_BUFFER:=1}"
 : "${REPLAY_BUFFER_TYPE:=inflight}" # rollout | inflight
 : "${REPLAY_BUFFER_IDENTITY_TAG:=1}" # keep buffer types in separate checkpoint namespaces
@@ -150,6 +159,7 @@ source "${REPO_ROOT}/experiments/common/run_identity.sh"
 export RUN_NAME CONFIG_TAG CKPT_PATH
 
 source "${REPO_ROOT}/experiments/common/placement.sh"
+verify_matched_runtime_code_fingerprint "${REPO_ROOT}"
 
 RAY_HEAD_IP="$(getent hosts "$(hostname)" | awk '{print $1; exit}')"
 if [[ -z "${RAY_HEAD_IP}" || "${RAY_HEAD_IP}" == 169.254.* ]]; then
