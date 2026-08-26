@@ -220,10 +220,34 @@ result_is_complete() {
 }
 
 declare -A ACTIVE_SLURM_JOBS=()
+declare -A TRACKED_SLURM_JOBS=()
+for ((step = START_STEP; step <= END_STEP; step += STEP_INTERVAL)); do
+    printf -v step_name 'step_%04d' "${step}"
+    for arm_name in "${ARM_NAMES[@]}"; do
+        if [[ -n "${SNAPSHOT_ARM_MAX_STEPS}" ]] \
+            && (( step > SNAPSHOT_MAX_STEP_BY_ARM[${arm_name}] )); then
+            continue
+        fi
+        result_root="${RESULT_STUDY_ROOT}/${arm_name}/${step_name}/${PROTOCOL_NAME}/${EVAL_MODE}"
+        for marker in "${result_root}/.submitted-job" "${result_root}/.active-job"; do
+            [[ -s "${marker}" ]] || continue
+            read -r tracked_job_id _ < "${marker}"
+            [[ "${tracked_job_id}" =~ ^[1-9][0-9]*$ ]] || continue
+            TRACKED_SLURM_JOBS["${tracked_job_id}"]=1
+        done
+    done
+done
+tracked_job_ids=""
+for tracked_job_id in "${!TRACKED_SLURM_JOBS[@]}"; do
+    [[ -z "${tracked_job_ids}" ]] || tracked_job_ids+=","
+    tracked_job_ids+="${tracked_job_id}"
+done
 active_job_query_ok=1
-if active_job_output="$(
+if [[ -z "${tracked_job_ids}" ]]; then
+    active_job_output=""
+elif active_job_output="$(
     timeout "${SQUEUE_TIMEOUT_SECONDS}" \
-        squeue --noheader --user="${SLURM_JOB_USER:-${USER:?USER is not set}}" --format='%i' 2>/dev/null
+        squeue --noheader --jobs="${tracked_job_ids}" --format='%i' 2>/dev/null
 )"; then
     while IFS= read -r active_job_id; do
         [[ "${active_job_id}" =~ ^[1-9][0-9]*$ ]] || continue
@@ -318,6 +342,16 @@ fi
 printf 'status: available=%d complete=%d active=%d pending=%d missing=%d incomplete=%d unreadable=%d\n' \
     "${available_count}" "${complete_count}" "${active_count}" "${#PENDING_ARMS[@]}" \
     "${missing_count}" "${incomplete_count}" "${unreadable_count}"
+if (( active_job_query_ok == 1 )); then
+    active_job_ids=""
+    for active_job_id in "${!ACTIVE_SLURM_JOBS[@]}"; do
+        [[ -z "${active_job_ids}" ]] || active_job_ids+=","
+        active_job_ids+="${active_job_id}"
+    done
+    printf 'active job ids: %s\n' "${active_job_ids}"
+else
+    echo "active job ids: unavailable"
+fi
 
 for pending_index in "${!PENDING_ARMS[@]}"; do
     (( pending_index < PRINT_LIMIT )) || break

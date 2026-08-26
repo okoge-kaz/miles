@@ -14,16 +14,21 @@ import statistics
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 from typing import Any
 
-ARM_PATTERN = re.compile(r"^(s(?:0-colocated|[1248]-t[1-4]r[4-7]))-")
+ARM_PATTERN = re.compile(r"s(?:0-colocated|[1248]-t[1-4]r[4-7])")
 ROLLOUT_STEP = "rollout/step"
 TRAIN_STEP = "train/step"
 ROLLOUT_METRICS = (
     "perf/step_time",
     "perf/train_time",
     "perf/train_wait_time",
+    "perf/colocate/rollout_offload_block_time",
+    "perf/colocate/rollout_to_train_active_time",
+    "perf/colocate/train_to_rollout_block_time",
+    "perf/colocate/switch_total_active_time",
     "throughput/generated_tokens_per_second",
     "throughput/accepted_tokens_per_second",
     "throughput/useful_tokens_per_second",
@@ -116,16 +121,20 @@ def _finite_number(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
-def _arm_from_run(run: Any) -> str:
+def _arm_from_run(run: Any, *, namespace: str) -> str:
     candidates = (
         run.config.get("wandb_group", ""),
         getattr(run, "group", ""),
         getattr(run, "name", ""),
     )
+    namespace_suffix = f"-{namespace}"
     for candidate in candidates:
-        match = ARM_PATTERN.match(str(candidate))
-        if match is not None:
-            return match.group(1)
+        value = str(candidate)
+        if not value.endswith(namespace_suffix):
+            continue
+        arm = value[: -len(namespace_suffix)]
+        if ARM_PATTERN.fullmatch(arm) is not None:
+            return arm
     raise ValueError(f"cannot identify sweep arm for W&B run {run.id}")
 
 
@@ -135,6 +144,7 @@ def _merge_row_metrics(
     row: dict[str, Any],
     step_key: str,
     metric_keys: Iterable[str],
+    timestamp_anchor_keys: Iterable[str],
 ) -> None:
     raw_step = _finite_number(row.get(step_key))
     if raw_step is None:
@@ -142,7 +152,8 @@ def _merge_row_metrics(
     step = int(raw_step)
     record = target.setdefault(step, {})
     timestamp = _finite_number(row.get("_timestamp"))
-    if timestamp is not None:
+    has_timestamp_anchor = any(_finite_number(row.get(key)) is not None for key in timestamp_anchor_keys)
+    if timestamp is not None and ("_timestamp" not in record or has_timestamp_anchor):
         record["_timestamp"] = timestamp
     for metric in metric_keys:
         value = _finite_number(row.get(metric))
@@ -150,7 +161,7 @@ def _merge_row_metrics(
             record[metric] = value
 
 
-def _fetch_run_history(run: Any) -> RunHistory:
+def _fetch_run_history(run: Any, *, namespace: str) -> RunHistory:
     rollout: dict[int, dict[str, float]] = {}
     train: dict[int, dict[str, float]] = {}
     # W&B treats a long ``keys`` list as a sparse-row intersection. Rollout and
@@ -162,15 +173,17 @@ def _fetch_run_history(run: Any) -> RunHistory:
             row=row,
             step_key=ROLLOUT_STEP,
             metric_keys=ROLLOUT_METRICS,
+            timestamp_anchor_keys=("perf/step_time",),
         )
         _merge_row_metrics(
             train,
             row=row,
             step_key=TRAIN_STEP,
             metric_keys=TRAIN_METRICS,
+            timestamp_anchor_keys=("train/loss",),
         )
     return RunHistory(
-        arm=_arm_from_run(run),
+        arm=_arm_from_run(run, namespace=namespace),
         run_id=run.id,
         created_at=run.created_at or "",
         rollout=rollout,
@@ -367,7 +380,7 @@ def main() -> None:
         raise ValueError("--max-workers must be positive")
     entity, runs = _wandb_runs(entity=args.entity, project=args.project, namespace=args.namespace)
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.max_workers) as executor:
-        histories = list(executor.map(_fetch_run_history, runs))
+        histories = list(executor.map(partial(_fetch_run_history, namespace=args.namespace), runs))
     lineage, replacements = _merge_lineage(histories)
     rows = _history_rows(lineage)
     output_csv = args.output_csv.resolve()
@@ -376,7 +389,7 @@ def main() -> None:
     _atomic_write_json(
         metadata_json.resolve(),
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "generated_at_utc": datetime.now(timezone.utc).isoformat(),
             "entity": entity,
             "project": args.project,

@@ -27,6 +27,10 @@ STALENESS_STATISTICS = ("mean", "variance", "std", "p90", "max")
 STALENESS_FEATURES = tuple(
     f"staleness/{phase}/{statistic}" for phase in STALENESS_PHASES for statistic in STALENESS_STATISTICS
 )
+STALENESS_AUXILIARY_FEATURES = (
+    "staleness/token_lag/exact/mean",
+    "staleness/version_mix/train/forward_version_span/sequence_mean",
+)
 STALENESS_CORRELATION_FEATURES = (
     "staleness/total/mean",
     "staleness/total/variance",
@@ -34,10 +38,10 @@ STALENESS_CORRELATION_FEATURES = (
     "staleness/pre_queue/variance",
     "staleness/in_queue/mean",
     "staleness/in_queue/variance",
-    "staleness/token_lag/exact/mean",
-    "staleness/version_mix/train/forward_version_span/sequence_mean",
+    *STALENESS_AUXILIARY_FEATURES,
 )
-MEDIATOR_METRICS = (
+REALIZED_STALENESS_FEATURES = (*STALENESS_FEATURES, *STALENESS_AUXILIARY_FEATURES)
+STEP_MEDIATOR_METRICS = (
     "train/policy_rollout_kl",
     "train/policy_rollout_abs_diff",
     "train/policy_rollout_token_ess",
@@ -46,9 +50,11 @@ MEDIATOR_METRICS = (
     "train/tis_clipfrac",
     "train/grad_norm_pre_clip",
     "train/grad_clip_coefficient",
-    "train/update_norm",
-    "train/relative_update_norm",
+    "train/final_loss_tokens",
     "train/advantage_std",
+    "train/advantage_rms",
+    "train/advantage_abs_mean",
+    "train/loss",
     "rollout/raw_reward",
     "rollout/truncated_ratio",
     "throughput/useful_tokens_per_second",
@@ -57,6 +63,11 @@ MEDIATOR_METRICS = (
     "rollout/fully_async/wasted_token_frac",
     "perf/step_time",
 )
+CHECKPOINT_DISPLACEMENT_METRICS = (
+    "checkpoint/net_parameter_displacement_per_update",
+    "checkpoint/relative_net_parameter_displacement",
+)
+MEDIATOR_METRICS = (*STEP_MEDIATOR_METRICS, *CHECKPOINT_DISPLACEMENT_METRICS)
 STALENESS_PSEUDOCORRELATION_OUTCOMES = frozenset(
     {
         "throughput/cohort_useful_efficiency",
@@ -65,10 +76,11 @@ STALENESS_PSEUDOCORRELATION_OUTCOMES = frozenset(
         "throughput/useful_tokens_per_second",
     }
 )
-STALENESS_CORRELATION_OUTCOMES = tuple(
-    metric for metric in MEDIATOR_METRICS if metric not in STALENESS_PSEUDOCORRELATION_OUTCOMES
+STALENESS_CORRELATION_STEP_OUTCOMES = tuple(
+    metric for metric in STEP_MEDIATOR_METRICS if metric not in STALENESS_PSEUDOCORRELATION_OUTCOMES
 )
-INTERVAL_METRICS = (*STALENESS_FEATURES, *MEDIATOR_METRICS)
+INTERVAL_METRICS = (*REALIZED_STALENESS_FEATURES, *STEP_MEDIATOR_METRICS)
+DOWNSTREAM_PREDICTORS = (*INTERVAL_METRICS, *CHECKPOINT_DISPLACEMENT_METRICS)
 
 
 @dataclass(frozen=True)
@@ -169,9 +181,7 @@ def _checkpoint_series(
         removed_seconds = _optional_float(history.get("resume_overhead_removed_seconds"))
         calendar_seconds = _optional_float(history.get("calendar_elapsed_seconds"))
         row["active_wallclock_hours"] = active_seconds / 3600.0 if active_seconds is not None else ""
-        row["observed_active_wallclock_hours"] = (
-            observed_seconds / 3600.0 if observed_seconds is not None else ""
-        )
+        row["observed_active_wallclock_hours"] = observed_seconds / 3600.0 if observed_seconds is not None else ""
         row["resume_overhead_removed_hours"] = removed_seconds / 3600.0 if removed_seconds is not None else ""
         row["calendar_elapsed_hours"] = calendar_seconds / 3600.0 if calendar_seconds is not None else ""
         row["active_wallclock_coverage"] = history.get("active_wallclock_coverage", "")
@@ -220,6 +230,8 @@ def _interval_records(
             for label in SCORE_COLUMNS:
                 start_score = _score_value(start, label)
                 end_score = _score_value(end, label)
+                record[f"start_{label}_score"] = start_score if start_score is not None else ""
+                record[f"end_{label}_score"] = end_score if end_score is not None else ""
                 record[f"delta_{label}"] = (
                     end_score - start_score if start_score is not None and end_score is not None else ""
                 )
@@ -253,6 +265,30 @@ def _interval_records(
                 record[metric] = value if value is not None else ""
             intervals.append(record)
     return intervals
+
+
+def _join_checkpoint_displacements(
+    intervals: list[dict[str, Any]],
+    displacements: Iterable[dict[str, str]],
+) -> list[dict[str, Any]]:
+    by_interval = {(row["arm"], int(row["start_step"]), int(row["end_step"])): row for row in displacements}
+    joined: list[dict[str, Any]] = []
+    for interval in intervals:
+        key = (interval["arm"], int(interval["start_step"]), int(interval["end_step"]))
+        displacement = by_interval.get(key, {})
+        row = dict(interval)
+        row.update(
+            {
+                "checkpoint/net_parameter_displacement_per_update": displacement.get(
+                    "net_parameter_displacement_per_update", ""
+                ),
+                "checkpoint/relative_net_parameter_displacement": displacement.get(
+                    "relative_net_parameter_displacement", ""
+                ),
+            }
+        )
+        joined.append(row)
+    return joined
 
 
 def _wallclock_decomposition(intervals: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -291,16 +327,18 @@ def _wallclock_decomposition(intervals: list[dict[str, Any]]) -> list[dict[str, 
             "covered_updates": covered_updates,
             "active_interval_hours": active_hours,
             "updates_per_active_hour": covered_updates / active_hours,
+            "learning_effect_estimator": "ols_score_slope",
         }
-        staleness_values = [
-            _optional_float(interval.get("staleness/total/mean")) for interval in arm_intervals
-        ]
+        staleness_values = [_optional_float(interval.get("staleness/total/mean")) for interval in arm_intervals]
         if all(value is not None for value in staleness_values):
-            row["training_staleness_mean"] = sum(
-                value * (int(interval["end_step"]) - int(interval["start_step"]))
-                for interval, value in zip(arm_intervals, staleness_values, strict=True)
-                if value is not None
-            ) / covered_updates
+            row["training_staleness_mean"] = (
+                sum(
+                    value * (int(interval["end_step"]) - int(interval["start_step"]))
+                    for interval, value in zip(arm_intervals, staleness_values, strict=True)
+                    if value is not None
+                )
+                / covered_updates
+            )
         elif arm == "s0-colocated":
             # Colocated execution completes generation before the only update;
             # no intervening policy version exists, so the unlogged lag is zero.
@@ -308,10 +346,25 @@ def _wallclock_decomposition(intervals: list[dict[str, Any]]) -> list[dict[str, 
         else:
             row["training_staleness_mean"] = ""
         for label in SCORE_COLUMNS:
-            score_change = sum(float(interval[f"delta_{label}"]) for interval in arm_intervals)
+            score_by_step: dict[int, float] = {}
+            for interval in arm_intervals:
+                start_score = _optional_float(interval.get(f"start_{label}_score"))
+                end_score = _optional_float(interval.get(f"end_{label}_score"))
+                if start_score is not None:
+                    score_by_step[int(interval["start_step"])] = start_score
+                if end_score is not None:
+                    score_by_step[int(interval["end_step"])] = end_score
+            if len(score_by_step) < 2:
+                raise ValueError(f"cannot estimate {label} score trend for {arm}")
+            score_steps = sorted(score_by_step)
+            points_per_update = _slope(
+                [float(step) for step in score_steps],
+                [score_by_step[step] for step in score_steps],
+            )
+            score_change = score_by_step[score_steps[-1]] - score_by_step[score_steps[0]]
             row[f"{label}_score_change"] = score_change
-            row[f"{label}_points_per_update"] = score_change / covered_updates
-            row[f"{label}_points_per_active_hour"] = score_change / active_hours
+            row[f"{label}_points_per_update"] = points_per_update
+            row[f"{label}_points_per_active_hour"] = points_per_update * row["updates_per_active_hour"]
         rows.append(row)
     return rows
 
@@ -427,7 +480,7 @@ def _fixed_effect_correlation(
 
 def _downstream_correlations(intervals: list[dict[str, Any]], bootstrap_samples: int) -> list[Correlation]:
     correlations = []
-    for metric_index, predictor in enumerate(INTERVAL_METRICS):
+    for metric_index, predictor in enumerate(DOWNSTREAM_PREDICTORS):
         for outcome_index, label in enumerate(SCORE_COLUMNS):
             correlations.append(
                 _fixed_effect_correlation(
@@ -454,17 +507,29 @@ def _per_step_records(histories: dict[str, dict[int, dict[str, str]]]) -> list[d
 
 def _staleness_correlations(
     histories: dict[str, dict[int, dict[str, str]]],
+    intervals: list[dict[str, Any]],
 ) -> list[Correlation]:
     records = _per_step_records(histories)
     correlations = []
     for predictor in STALENESS_CORRELATION_FEATURES:
-        for outcome in STALENESS_CORRELATION_OUTCOMES:
+        for outcome in STALENESS_CORRELATION_STEP_OUTCOMES:
             correlations.append(
                 _fixed_effect_correlation(
                     records,
                     predictor=predictor,
                     outcome=outcome,
                     group_keys=("training_step", "ratio"),
+                    bootstrap_samples=0,
+                    seed=0,
+                )
+            )
+        for outcome in CHECKPOINT_DISPLACEMENT_METRICS:
+            correlations.append(
+                _fixed_effect_correlation(
+                    intervals,
+                    predictor=predictor,
+                    outcome=outcome,
+                    group_keys=("end_step", "ratio"),
                     bootstrap_samples=0,
                     seed=0,
                 )
@@ -491,7 +556,8 @@ def _selected_metrics(correlations: Iterable[Correlation]) -> list[Correlation]:
     selected = [
         record
         for record in correlations
-        if record.outcome == "delta_macro"
+        if record.predictor in REALIZED_STALENESS_FEATURES
+        and record.outcome == "delta_macro"
         and record.ci_low is not None
         and record.ci_high is not None
         and (record.ci_low > 0.0 or record.ci_high < 0.0)
@@ -565,7 +631,7 @@ def _summary_markdown(
         "then centered within the same ending step and trainer:rollout ratio. Wall-clock uses cumulative",
         "step time after clipping repeated resume-boundary wait to the nearby steady-state median.",
         "",
-        "## Largest absolute AIME mean correlations",
+        "## Largest absolute AIME mean correlations (all predictors)",
         "",
         "| Predictor | n | r | 95% arm-bootstrap interval |",
         "|---|---:|---:|---:|",
@@ -586,7 +652,7 @@ def _summary_markdown(
             )
     else:
         lines.append(
-            "No metric met both |r| >= 0.2 and an arm-cluster bootstrap interval excluding zero. "
+            "No realized-staleness predictor met both |r| >= 0.2 and an arm-cluster bootstrap interval excluding zero. "
             "No selective downstream trajectory should be interpreted as established."
         )
     lines.append("")
@@ -597,6 +663,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--aggregate-csv", type=Path, required=True)
     parser.add_argument("--training-history-csv", type=Path, required=True)
+    parser.add_argument("--checkpoint-displacements-csv", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--bootstrap-samples", type=int, default=500)
     return parser.parse_args()
@@ -610,9 +677,14 @@ def main() -> None:
     histories = _history_index(_read_csv(args.training_history_csv.resolve()))
     series = _checkpoint_series(aggregates, histories)
     intervals = _interval_records(aggregates, histories)
+    if args.checkpoint_displacements_csv is not None:
+        intervals = _join_checkpoint_displacements(
+            intervals,
+            _read_csv(args.checkpoint_displacements_csv.resolve()),
+        )
     decomposition = _wallclock_decomposition(intervals)
     downstream = _downstream_correlations(intervals, args.bootstrap_samples)
-    staleness = _staleness_correlations(histories)
+    staleness = _staleness_correlations(histories, intervals)
     selected_groups = _selected_arm_groups(intervals, _selected_metrics(downstream))
     output_dir = args.output_dir.resolve()
     series_fields = list(series[0]) if series else []

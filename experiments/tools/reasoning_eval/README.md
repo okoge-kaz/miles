@@ -15,6 +15,30 @@ The evaluator follows the pinned NeMo 26.03 reference protocol:
   reasoning and final content before evaluation starts.
 - Full evaluation uses temperature 0.6, top-p 0.95, top-k 20, 64 repeats, a
   32,768-token context, and at most 28,672 generated tokens.
+- vLLM compilation state lives in each job's container rather than a shared
+  writable compilation cache. This avoids concurrent jobs mutating the same
+  TorchInductor artifacts. The evaluation server still uses data parallelism
+  8 and compiled execution. vLLM's internal engine deadline is 40 minutes and
+  the outer health check allows 45 minutes, so a slow compile cannot be killed
+  by the default ten-minute engine timeout. The pinned vLLM release includes
+  this operational deadline in its compile-cache hash even though it cannot
+  affect a compiled graph. A mounted `sitecustomize.py` keeps that one hash
+  factor at the image's 600-second default while preserving the effective
+  2,400-second deadline, allowing the image's validated compile artifacts to be
+  reused.
+- The pinned vLLM `.sqsh` is atomically staged under the job's node-local
+  temporary root before the server starts. All server startup attempts in that
+  allocation reuse the copy; cross-job reuse is not assumed because Slurm may
+  assign a private `SLURM_TMPDIR` to each job. Thus eight vLLM workers do not
+  repeatedly fault Python, CUDA, and JIT artifacts through the shared
+  filesystem. Before the workers spawn, the runner reads the image's Python
+  site-packages once into the node page cache. The overlapping
+  vLLM Slurm step explicitly requests 512 GiB: without that step-level request,
+  the cluster assigns only 2 GiB even though the parent eight-GPU job owns the
+  node's full memory allocation, causing cold nodes to swap and repeatedly read
+  the same container pages. The NeMo dry-run and evaluation steps likewise
+  request 128 GiB and 512 GiB respectively, so their parallel Python workers do
+  not fall back to the same 2 GiB step default.
 
 ## Setup
 
@@ -54,7 +78,10 @@ learning steps `10,20,...,300` resolve to directories `9,19,...,299`.
 One Slurm job loads each checkpoint once and evaluates all three AIME tasks.
 Each task has its own response cache and is finalized atomically with `_SUCCESS`.
 Re-running the launcher skips completed task suites and queued/running jobs; a
-job interrupted between tasks resumes only unfinished task caches. Use
+job interrupted between tasks resumes only unfinished task caches. The
+evaluator also retries a transient task-process failure up to three times
+inside the same allocation, reusing the partial response cache on each attempt.
+Use
 `--max-submissions N` to change the default eight-job submission wave. Re-run
 the same command as jobs finish; use `--max-submissions 0` only when the Slurm
 association is allowed to queue every pending checkpoint at once.
@@ -107,9 +134,53 @@ history inside `SQSH_IMAGE`, then invokes the same analysis with
 installed on the CPU host while still refreshing W&B immediately before the
 final figures are generated.
 
+Exact Adam update norms were not logged during training. To add an offline,
+zero-training-overhead proxy, compute the observed net parameter displacement
+between adjacent evaluated Hugging Face checkpoints. Submit one CPU array task
+per sweep arm, then merge the resumable per-arm files:
+
+```bash
+ANALYSIS_ROOT=/path/to/analysis/protocol/full \
+STUDY_ROOT=/path/to/grpo-clip0.2-0.28-tis2.0 \
+RUN_NAMESPACE=sr-20260819-212906 \
+SEED_PARTS_ROOT=/path/to/earlier/staleness/checkpoint-displacements-parts \
+sbatch --partition=cpu_interactive --array=0-16%4 \
+  --export=ALL,ANALYSIS_ROOT,STUDY_ROOT,RUN_NAMESPACE,SEED_PARTS_ROOT \
+  experiments/scripts/reasoning_eval/compute-checkpoint-displacements.sbatch
+
+ANALYSIS_ROOT=/path/to/analysis/protocol/full \
+STUDY_ROOT=/path/to/grpo-clip0.2-0.28-tis2.0 \
+RUN_NAMESPACE=sr-20260819-212906 \
+MERGE_ONLY=1 \
+sbatch --dependency=afterok:<array-job-id> \
+  --export=ALL,ANALYSIS_ROOT,STUDY_ROOT,RUN_NAMESPACE,MERGE_ONLY \
+  experiments/scripts/reasoning_eval/compute-checkpoint-displacements.sbatch
+```
+
+`net_parameter_displacement_per_update` is
+`||theta_end - theta_start||_2 / 10`. It is a lower-bound net displacement and
+must not be interpreted as the mean Adam update norm or cumulative update path;
+opposing update directions can cancel between checkpoints. The Hugging Face
+weights are BF16, so serialization precision also limits this checkpoint-space
+proxy; it is not an exact reconstruction of FP32 optimizer updates. The current
+4B checkpoint scan takes roughly two minutes per ten-update interval on the CPU
+filesystem, but it does not touch the training process. `SEED_PARTS_ROOT` is
+optional; when supplied, a row is reused only if its study root, namespace,
+checkpoint paths, interval, and required numeric outputs match the current
+request. Older seed files without that provenance are safely recomputed. The
+analysis consumes the merged CSV only after the merge job atomically publishes
+`checkpoint-displacements._SUCCESS`.
+
 The command resolves resumed W&B runs into one latest-write-wins training
 lineage per arm, joins evaluation step `N` to update `N`, and writes the
 following under `analysis/<protocol>/full/staleness/`:
+
+This pipeline is intentionally scoped to the completed legacy 17-arm cohort.
+It rejects matched-cohort group variants such as `partial-o256` and `c4096`
+instead of collapsing them into `s0-colocated` or the legacy async arms. In
+particular, do not use the legacy rule that assigns structural staleness zero to
+`s0-colocated` for a partial-rollout run. The five-arm matched cohort needs a
+separate arm schema, checkpoint resolver, and partial-rollout metric export.
 
 - the selected training history, ten-update score intervals, full correlation
   tables, and an analysis summary;
@@ -117,18 +188,45 @@ following under `analysis/<protocol>/full/staleness/`:
   training step and once by active wall-clock;
 - an AIME mean wall-clock comparison that separates max-weight-staleness panels and
   trainer:rollout ratios;
+- a 4-by-4 W&B heatmap of the realized late-window
+  `staleness/total/mean`, with max weight staleness as rows and
+  train:rollout node ratios as columns. Each cell reports the mean and
+  population standard deviation over the trailing 50 contiguous optimizer
+  updates (normally steps 251--300), and marks a setting as still changing
+  when its fitted drift across that window exceeds the larger of one standard
+  deviation, 10% of the mean, and 0.05. The exact window, slope, tolerance,
+  and status are written to `steady-state-staleness.csv`;
+- per-update W&B `staleness/total/mean` trajectories in four train:rollout
+  panels, showing both the raw value and a trailing 10-update mean for max
+  weight staleness 1, 2, 4, and 8;
+- a W&B time-series matrix for training metrics whose strongest correlation
+  with a realized-staleness predictor has `|r| >= 0.25`. Signed `train/tis` is
+  included as a reference even when its mean stays near one, so cancellation
+  in signed TIS can be compared with `train/tis_abs` and
+  `train/tis_clipfrac`. The exact metric selection and strongest predictor are
+  recorded in `staleness-sensitive-metrics.csv`;
 - a balanced-common-window, per-setting `dQ/dt = (dQ/dU) × (dU/dt)`
-  decomposition separating AIME mean points per update, optimizer-update
-  throughput, AIME mean points per hour, and training-data staleness mean. The
-  colocated on-policy baseline is shown as zero even though it does not log the
-  async staleness namespace;
+  decomposition separating the AIME mean linear trend per update,
+  optimizer-update throughput, AIME mean points per hour, and training-data
+  staleness mean. The learning-effect term is an OLS slope over every evaluated
+  checkpoint in the common window rather than a noise-sensitive endpoint
+  difference. The colocated on-policy baseline is shown as zero even though it
+  does not log the async staleness namespace;
+- a standalone `optimizer-update-throughput-by-setting.svg` comparison of
+  `dU/dt` for all 17 settings. Each row reports both optimizer updates per
+  active hour and the reciprocal active seconds per update, using the same
+  balanced common window and resume-adjusted active clock as the decomposition;
 - a correlation heatmap spanning total, pre-queue, and in-queue mean/variance,
-  exact token lag, and within-sample forward-version span;
+  exact token lag, and within-sample forward-version span. When
+  `checkpoint-displacements.csv` is present, it also includes the observed net
+  parameter displacement between adjacent 10-step Hugging Face checkpoints;
 - the heatmap excludes cohort useful efficiency, wasted-token fraction, step
   time, and useful tokens per second because scheduling and the configured
   staleness bound jointly determine them;
 - downstream-correlation rows for mean, variance, standard deviation, p90, and
-  maximum total/pre-queue/in-queue staleness versus ten-update AIME improvement;
+  maximum total/pre-queue/in-queue staleness, plus exact token lag and
+  within-sample forward-version span, versus ten-update AIME improvement. Every
+  predictor is averaged over the same ten-update interval as its score change;
 - a reduced downstream trajectory figure only when a relationship has
   `|r| >= 0.2` and its arm-cluster bootstrap interval excludes zero.
 
@@ -144,8 +242,11 @@ confounding the nominal training ratio.
 
 `unpad_vocab.py` creates a job-local vLLM view when a Megatron export retains
 padded embedding rows beyond `config.json:vocab_size`. The source checkpoint is
-never modified. `export_adapter_cache.py` joins NeMo Evaluator request and
-response caches into a readable `model-outputs.jsonl` artifact.
+never modified. All shards in that runtime view are materialized on job-local
+storage before the eight data-parallel vLLM workers start, avoiding repeated
+shared-filesystem reads from each worker. `export_adapter_cache.py` joins NeMo
+Evaluator request and response caches into a readable `model-outputs.jsonl`
+artifact.
 `validate_checkpoint.py` checks every indexed tensor mapping and requires each
 safetensors shard's byte length to match the end offset in its header, so a
 launcher running alongside training does not enqueue a partially written HF

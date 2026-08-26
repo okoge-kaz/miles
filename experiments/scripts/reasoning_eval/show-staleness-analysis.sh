@@ -57,11 +57,20 @@ else
         exit 4
     }
 fi
-"${ANALYSIS_PYTHON}" "${REPO_ROOT}/experiments/tools/reasoning_eval/analyze_staleness.py" \
-    --aggregate-csv "${ANALYSIS_ROOT}/aggregate-results.csv" \
-    --training-history-csv "${STALENESS_ROOT}/training-history.csv" \
-    --output-dir "${STALENESS_ROOT}" \
+analysis_args=(
+    --aggregate-csv "${ANALYSIS_ROOT}/aggregate-results.csv"
+    --training-history-csv "${STALENESS_ROOT}/training-history.csv"
+    --output-dir "${STALENESS_ROOT}"
     --bootstrap-samples "${BOOTSTRAP_SAMPLES}"
+)
+if [[ -s "${STALENESS_ROOT}/checkpoint-displacements.csv" \
+    && -s "${STALENESS_ROOT}/checkpoint-displacements._SUCCESS" ]]; then
+    analysis_args+=(
+        --checkpoint-displacements-csv "${STALENESS_ROOT}/checkpoint-displacements.csv"
+    )
+fi
+"${ANALYSIS_PYTHON}" "${REPO_ROOT}/experiments/tools/reasoning_eval/analyze_staleness.py" \
+    "${analysis_args[@]}"
 "${ANALYSIS_PYTHON}" "${REPO_ROOT}/experiments/tools/reasoning_eval/plot_staleness_analysis.py" \
     --checkpoint-series-csv "${STALENESS_ROOT}/checkpoint-series.csv" \
     --downstream-correlations-csv "${STALENESS_ROOT}/downstream-correlations.csv" \
@@ -69,6 +78,10 @@ fi
     --wallclock-decomposition-csv "${STALENESS_ROOT}/wallclock-decomposition.csv" \
     --selected-relationships-json "${STALENESS_ROOT}/selected-relationships.json" \
     --output-dir "${STALENESS_ROOT}/figures"
+"${ANALYSIS_PYTHON}" "${REPO_ROOT}/experiments/tools/reasoning_eval/plot_training_staleness.py" \
+    --training-history-csv "${STALENESS_ROOT}/training-history.csv" \
+    --staleness-correlations-csv "${STALENESS_ROOT}/staleness-metric-correlations.csv" \
+    --output-dir "${STALENESS_ROOT}"
 
 echo
 cat "${STALENESS_ROOT}/staleness-summary.md"

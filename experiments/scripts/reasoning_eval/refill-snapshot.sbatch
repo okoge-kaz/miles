@@ -121,6 +121,25 @@ extract_status_count() {
     ' <<< "${status_output}"
 }
 
+extract_active_job_ids() {
+    awk '
+        /^active job ids:/ {
+            sub(/^active job ids:[[:space:]]*/, "")
+            print
+            found = 1
+            exit
+        }
+        END { if (!found) print "unavailable" }
+    ' <<< "$1"
+}
+
+query_active_queue() {
+    local job_ids="$1"
+    [[ -n "${job_ids}" ]] || return 0
+    timeout "${SQUEUE_TIMEOUT_SECONDS}" \
+        squeue --noheader --jobs="${job_ids}" --format='%i|%P|%T|%j'
+}
+
 cancel_pending_job_for_reassignment() {
     local job_id="$1"
     local destination="$2"
@@ -159,12 +178,18 @@ while true; do
     pending_count="$(extract_status_count "${scan_output}" pending)"
     incomplete_count="$(extract_status_count "${scan_output}" incomplete)"
     unreadable_count="$(extract_status_count "${scan_output}" unreadable)"
+    active_job_ids="$(extract_active_job_ids "${scan_output}")"
     [[ -n "${available_count}" && -n "${complete_count}" \
         && -n "${active_count}" && -n "${pending_count}" \
         && -n "${incomplete_count}" && -n "${unreadable_count}" ]] || {
         echo "could not parse launcher status" >&2
         exit 4
     }
+    if [[ "${active_job_ids}" == unavailable ]]; then
+        echo "could not query tracked evaluation jobs; retrying" >&2
+        sleep "${POLL_SECONDS}"
+        continue
+    fi
     if [[ -n "${SNAPSHOT_ARM_MAX_STEPS}" ]]; then
         if (( available_count != EXPECTED_CHECKPOINTS )); then
             echo "snapshot availability changed: expected=${EXPECTED_CHECKPOINTS} actual=${available_count}" >&2
@@ -207,8 +232,7 @@ while true; do
     fi
 
     if ! queue_snapshot="$(
-        timeout "${SQUEUE_TIMEOUT_SECONDS}" \
-            squeue --noheader --user="${SLURM_JOB_USER}" --format='%i|%P|%T|%j'
+        query_active_queue "${active_job_ids}"
     )"; then
         echo "could not query current partition job counts; retrying" >&2
         sleep "${POLL_SECONDS}"
@@ -247,8 +271,7 @@ while true; do
             pending_count=$((pending_count + reassigned_count))
             echo "released ${reassigned_count} excess ${BATCH_PARTITION} job(s)"
             if ! queue_snapshot="$(
-                timeout "${SQUEUE_TIMEOUT_SECONDS}" \
-                    squeue --noheader --user="${SLURM_JOB_USER}" --format='%i|%P|%T|%j'
+                query_active_queue "${active_job_ids}"
             )"; then
                 echo "could not refresh the queue after reassignment; retrying" >&2
                 sleep "${POLL_SECONDS}"

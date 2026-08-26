@@ -49,6 +49,11 @@ STALENESS_CORRELATION_FEATURES = (
         ("within-sample", "version span"),
     ),
 )
+DOWNSTREAM_STALENESS_FEATURES = (
+    *STALENESS_FEATURES,
+    "staleness/token_lag/exact/mean",
+    "staleness/version_mix/train/forward_version_span/sequence_mean",
+)
 STALENESS_PSEUDOCORRELATION_OUTCOMES = frozenset(
     {
         "throughput/cohort_useful_efficiency",
@@ -101,6 +106,8 @@ class DecompositionRow:
     updates_per_active_hour: float
     macro_points_per_active_hour: float
     training_staleness_mean: float | None
+    common_start_step: int | None = None
+    common_end_step: int | None = None
 
 
 def _optional_float(value: str | None) -> float | None:
@@ -168,6 +175,8 @@ def _read_decomposition(path: Path) -> list[DecompositionRow]:
                     updates_per_active_hour=float(record["updates_per_active_hour"]),
                     macro_points_per_active_hour=float(record["macro_points_per_active_hour"]),
                     training_staleness_mean=_optional_float(record.get("training_staleness_mean")),
+                    common_start_step=(int(record["common_start_step"]) if record.get("common_start_step") else None),
+                    common_end_step=(int(record["common_end_step"]) if record.get("common_end_step") else None),
                 )
             )
     return rows
@@ -451,6 +460,12 @@ def _render_wallclock_aime_mean(rows: list[SeriesRow]) -> str:
 
 
 def _short_metric(metric: str) -> str:
+    exact_labels = {
+        "checkpoint/net_parameter_displacement_per_update": "net parameter displacement / update",
+        "checkpoint/relative_net_parameter_displacement": "relative net parameter displacement",
+    }
+    if metric in exact_labels:
+        return exact_labels[metric]
     replacements = {
         "train/policy_rollout_": "policy–rollout ",
         "train/": "",
@@ -465,6 +480,14 @@ def _short_metric(metric: str) -> str:
     for source, target in replacements.items():
         label = label.replace(source, target)
     return label
+
+
+def _short_staleness_feature(metric: str) -> str:
+    labels = {
+        "staleness/token_lag/exact/mean": "exact-token-lag/mean",
+        "staleness/version_mix/train/forward_version_span/sequence_mean": ("within-sample/span"),
+    }
+    return labels.get(metric, metric.removeprefix("staleness/").replace("_", "-"))
 
 
 def _correlation_x(value: float, *, plot_x: float, plot_width: float, bound: float) -> float:
@@ -529,16 +552,21 @@ def _render_staleness_metric_correlations(rows: list[CorrelationRow]) -> str:
         for predictor, labels in STALENESS_CORRELATION_FEATURES
         if any(lookup.get((predictor, row.outcome)) is not None for row in rows)
     )
+    available_outcomes = {
+        row.outcome
+        for row in rows
+        if row.correlation is not None and row.outcome not in STALENESS_PSEUDOCORRELATION_OUTCOMES
+    }
     outcomes = sorted(
-        {row.outcome for row in rows if row.outcome not in STALENESS_PSEUDOCORRELATION_OUTCOMES},
+        available_outcomes,
         key=lambda outcome: max(
             (abs(lookup.get((predictor, outcome)) or 0.0) for predictor, _ in predictors),
             default=0.0,
         ),
         reverse=True,
-    )[:14]
+    )
     width, row_height = 1570, 44
-    height = 225 + row_height * len(outcomes)
+    height = 250 + row_height * len(outcomes)
     plot_x, plot_y, cell_width = 375.0, 130.0, 140.0
     plot_width = cell_width * len(predictors)
     plot_height = row_height * len(outcomes)
@@ -546,7 +574,7 @@ def _render_staleness_metric_correlations(rows: list[CorrelationRow]) -> str:
         width,
         height,
         "Metrics most associated with realized training-data staleness",
-        "Fixed-effect Pearson r after centering within the same update and trainer:rollout ratio",
+        "Per-update metrics or 10-update checkpoint displacement; centered within the same step and ratio",
     )
     for column, (_, labels) in enumerate(predictors):
         center_x = plot_x + (column + 0.5) * cell_width
@@ -571,7 +599,7 @@ def _render_staleness_metric_correlations(rows: list[CorrelationRow]) -> str:
             elements.append(
                 f'<g><rect x="{cell_x:.2f}" y="{cell_y:.2f}" width="{cell_width:.2f}" '
                 f'height="{row_height:.2f}" fill="{_heatmap_color(value)}" stroke="white"/>'
-                f'<title>{html.escape(predictor)} versus {html.escape(outcome)}: '
+                f"<title>{html.escape(predictor)} versus {html.escape(outcome)}: "
                 f'r={value:+.3f}</title><text class="{text_class}" x="{cell_x + cell_width / 2:.2f}" '
                 f'y="{center_y + 4:.2f}" text-anchor="middle">{value:+.2f}</text></g>'
             )
@@ -590,6 +618,11 @@ def _render_staleness_metric_correlations(rows: list[CorrelationRow]) -> str:
         f'<text class="label" x="{plot_x + plot_width / 2:.2f}" y="{legend_y + 48:.2f}" '
         'text-anchor="middle">Fixed-effect Pearson correlation</text>'
     )
+    elements.append(
+        f'<text class="subtitle" x="{plot_x + plot_width / 2:.2f}" y="{legend_y + 70:.2f}" '
+        'text-anchor="middle">Exact Adam update norms were not logged; checkpoint rows use BF16-export net '
+        "parameter displacement over each 10-update interval.</text>"
+    )
     elements.append("</svg>")
     return "\n".join(elements) + "\n"
 
@@ -604,14 +637,14 @@ def _render_downstream_correlations(rows: list[CorrelationRow]) -> str:
     lookup = {(row.predictor, row.outcome): row.correlation for row in rows}
     bound = _correlation_bound(
         value
-        for predictor in STALENESS_FEATURES
+        for predictor in DOWNSTREAM_STALENESS_FEATURES
         for outcome, _, _ in outcome_colors
         if (value := lookup.get((predictor, outcome))) is not None
     )
     width, group_height = 1500, 82
-    height = 155 + group_height * len(STALENESS_FEATURES)
+    height = 155 + group_height * len(DOWNSTREAM_STALENESS_FEATURES)
     plot_x, plot_y, plot_width = 220.0, 105.0, 1060.0
-    plot_height = group_height * len(STALENESS_FEATURES)
+    plot_height = group_height * len(DOWNSTREAM_STALENESS_FEATURES)
     elements = _svg_header(
         width,
         height,
@@ -635,11 +668,11 @@ def _render_downstream_correlations(rows: list[CorrelationRow]) -> str:
             bound=bound,
         )
     )
-    for group_index, predictor in enumerate(STALENESS_FEATURES):
+    for group_index, predictor in enumerate(DOWNSTREAM_STALENESS_FEATURES):
         center_y = plot_y + (group_index + 0.5) * group_height
         elements.append(
             f'<text class="correlation-label" x="{plot_x - 22}" y="{center_y + 6:.2f}" '
-            f'text-anchor="end">{html.escape(predictor.removeprefix("staleness/").replace("_", "-"))}</text>'
+            f'text-anchor="end">{html.escape(_short_staleness_feature(predictor))}</text>'
         )
         for outcome_index, (outcome, _, color) in enumerate(outcome_colors):
             value = lookup.get((predictor, outcome))
@@ -734,7 +767,7 @@ def _render_wallclock_decomposition(rows: list[DecompositionRow]) -> str:
     panel_width = 480.0
     panel_xs = (190.0, 720.0, 1250.0, 1780.0)
     metrics = (
-        ("macro_points_per_update", "dQ/dU", "AIME mean points per update", True),
+        ("macro_points_per_update", "dQ/dU", "AIME mean OLS trend per update", True),
         ("updates_per_active_hour", "dU/dt", "Updates per active hour", False),
         ("macro_points_per_active_hour", "dQ/dt", "AIME mean points per active hour", True),
         ("training_staleness_mean", "L train", "Training staleness mean", False),
@@ -744,7 +777,7 @@ def _render_wallclock_decomposition(rows: list[DecompositionRow]) -> str:
         height,
         "Learning-effect and throughput decomposition by setting",
         "s=max weight staleness, t=train nodes, r=rollout nodes; s0-colocated is the baseline; "
-        "dQ/dt = (dQ/dU) × (dU/dt)",
+        "dQ/dU fits all common checkpoints; dQ/dt = (dQ/dU) × (dU/dt)",
     )
     elements.extend(
         _legend(
@@ -783,9 +816,7 @@ def _render_wallclock_decomposition(rows: list[DecompositionRow]) -> str:
                 )
             value = getattr(row, attribute)
             if value is None:
-                elements.append(
-                    f'<text class="tick" x="{panel_x + 8:.2f}" y="{center_y + 4:.2f}">not logged</text>'
-                )
+                elements.append(f'<text class="tick" x="{panel_x + 8:.2f}" y="{center_y + 4:.2f}">not logged</text>')
             else:
                 elements.extend(
                     _factor_bar(
@@ -797,6 +828,99 @@ def _render_wallclock_decomposition(rows: list[DecompositionRow]) -> str:
                         bounds=bounds,
                     )
                 )
+    elements.append("</svg>")
+    return "\n".join(elements) + "\n"
+
+
+def _render_training_throughput(rows: list[DecompositionRow]) -> str:
+    """Render dU/dt and its reciprocal for every sweep setting."""
+    ordered = sorted(rows, key=lambda row: ALL_ARMS.index(row.arm))
+    row_height = 42
+    plot_x = 330.0
+    plot_y = 125.0
+    plot_width = 620.0
+    plot_height = row_height * len(ordered)
+    annotation_x = plot_x + plot_width + 22.0
+    width, height = 1450, int(plot_y + plot_height + 70)
+    values = [row.updates_per_active_hour for row in ordered]
+    bounds = _factor_bounds(values, signed=False)
+    common_windows = {
+        (row.common_start_step, row.common_end_step)
+        for row in ordered
+        if row.common_start_step is not None and row.common_end_step is not None
+    }
+    if len(common_windows) == 1:
+        common_start_step, common_end_step = next(iter(common_windows))
+        window_label = f"shared updates {common_start_step}–{common_end_step}"
+    else:
+        window_label = "the same shared update window"
+    elements = _svg_header(
+        width,
+        height,
+        "Optimizer-update throughput by setting (dU/dt)",
+        "s=max weight staleness, t=train nodes, r=rollout nodes; active time removes repeated resume startup; "
+        f"all settings use {window_label}",
+    )
+    elements.extend(
+        _legend(
+            (
+                *((f"T:R={trainer}:{8 - trainer}", RATIO_COLORS[trainer], False) for trainer in (1, 2, 3, 4)),
+                ("colocated", RATIO_COLORS[0], False),
+            ),
+            y=78,
+            center_x=width / 2,
+            spacing=185,
+        )
+    )
+    elements.append(
+        f'<rect class="panel-frame" x="{plot_x - 20:.2f}" y="91" '
+        f'width="{width - plot_x - 20:.2f}" height="{plot_height + 72:.2f}" rx="4"/>'
+    )
+    elements.append(
+        f'<text class="panel-title" x="{plot_x + plot_width / 2:.2f}" y="108" text-anchor="middle">'
+        "dU/dt — Optimizer updates per active hour (higher is faster)</text>"
+    )
+    elements.append(
+        f'<text class="panel-title" x="{annotation_x + 180:.2f}" y="108" text-anchor="middle">'
+        "Equivalent active step time</text>"
+    )
+    elements.extend(
+        _factor_grid(
+            plot_x=plot_x,
+            plot_y=plot_y,
+            plot_width=plot_width,
+            plot_height=plot_height,
+            bounds=bounds,
+        )
+    )
+    zero_x = _factor_x(0.0, plot_x=plot_x, plot_width=plot_width, bounds=bounds)
+    for index, row in enumerate(ordered):
+        center_y = plot_y + (index + 0.5) * row_height
+        endpoint = _factor_x(
+            row.updates_per_active_hour,
+            plot_x=plot_x,
+            plot_width=plot_width,
+            bounds=bounds,
+        )
+        elements.append(
+            f'<text class="setting-label" x="{plot_x - 35:.2f}" y="{center_y + 5:.2f}" '
+            f'text-anchor="end">{html.escape(_display_arm(row.arm))}</text>'
+        )
+        elements.append(
+            f'<rect class="throughput-bar" x="{zero_x:.2f}" y="{center_y - 10:.2f}" '
+            f'width="{max(endpoint - zero_x, 0.8):.2f}" height="20" fill="{RATIO_COLORS[row.trainer_nodes]}"/>'
+        )
+        step_time_seconds = 3600.0 / row.updates_per_active_hour
+        elements.append(
+            f'<text class="correlation-label" x="{annotation_x:.2f}" y="{center_y + 6:.2f}">'
+            f"{row.updates_per_active_hour:.2f} updates/h · {step_time_seconds:.0f} seconds/update</text>"
+        )
+        if index in (3, 7, 11, 15):
+            separator_y = plot_y + (index + 1) * row_height
+            elements.append(
+                f'<line class="axis" x1="{plot_x - 300:.2f}" y1="{separator_y:.2f}" '
+                f'x2="{width - 25:.2f}" y2="{separator_y:.2f}" opacity="0.28"/>'
+            )
     elements.append("</svg>")
     return "\n".join(elements) + "\n"
 
@@ -847,6 +971,7 @@ def main() -> None:
         ),
         "aime-mean-vs-active-wallclock-by-staleness.svg": _render_wallclock_aime_mean(series),
         "learning-throughput-decomposition.svg": _render_wallclock_decomposition(decomposition),
+        "optimizer-update-throughput-by-setting.svg": _render_training_throughput(decomposition),
         "staleness-metric-correlations.svg": _render_staleness_metric_correlations(staleness),
         "staleness-downstream-correlations.svg": _render_downstream_correlations(downstream),
     }
