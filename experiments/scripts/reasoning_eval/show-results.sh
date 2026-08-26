@@ -8,7 +8,28 @@ source "${REPO_ROOT}/experiments/env.sh"
 
 RUN_NAMESPACE="${RUN_NAMESPACE:-sr-20260819-212906}"
 EVAL_MODE="${EVAL_MODE:-full}"
-PROTOCOL_NAME="${PROTOCOL_NAME:-eval-factory-26.03-vllm-0.20.2-cu130-qwen3-rl-thinking-t0.6-p0.95-k20-aime64-v1}"
+REQUESTED_PROTOCOL_NAME="${PROTOCOL_NAME:-}"
+TEMPERATURE="${TEMPERATURE:-0.6}"
+TOP_P="${TOP_P:-0.95}"
+TOP_K="${TOP_K:-20}"
+AIME_REPEATS="${AIME_REPEATS:-64}"
+if [[ "${EVAL_MODE}" == smoke ]]; then
+    EFFECTIVE_REPEATS=1
+else
+    EFFECTIVE_REPEATS="${AIME_REPEATS}"
+fi
+PROTOCOL_ARGS=(
+    --temperature "${TEMPERATURE}"
+    --top-p "${TOP_P}"
+    --top-k "${TOP_K}"
+    --effective-repeats "${EFFECTIVE_REPEATS}"
+)
+if [[ -n "${REQUESTED_PROTOCOL_NAME}" ]]; then
+    PROTOCOL_ARGS+=(--protocol-name "${REQUESTED_PROTOCOL_NAME}")
+fi
+PROTOCOL_NAME="$(
+    python3 "${REPO_ROOT}/experiments/tools/reasoning_eval/protocol.py" "${PROTOCOL_ARGS[@]}"
+)"
 EVALUATION_ROOT="${EVALUATION_ROOT:-${WS}/evaluations/reasoning_eval}"
 RESULT_STUDY_ROOT="${EVALUATION_ROOT}/staleness-ratio-sweep/${RUN_NAMESPACE}"
 ANALYSIS_ROOT="${RESULT_STUDY_ROOT}/analysis/${PROTOCOL_NAME}/${EVAL_MODE}"

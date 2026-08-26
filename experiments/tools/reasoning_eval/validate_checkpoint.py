@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import struct
 import sys
@@ -27,6 +28,14 @@ EXPECTED_ARCHITECTURE = {
     "num_hidden_layers": 36,
     "num_key_value_heads": 8,
 }
+VALIDATION_ERRORS = (
+    FileNotFoundError,
+    KeyError,
+    OSError,
+    TypeError,
+    ValueError,
+    json.JSONDecodeError,
+)
 
 
 @dataclass(frozen=True)
@@ -118,7 +127,12 @@ def validate_checkpoint(path: Path) -> CheckpointInfo:
     if not isinstance(weight_map, dict) or not weight_map:
         raise ValueError(f"weight_map is missing from {path / 'model.safetensors.index.json'}")
     shard_names = set(weight_map.values())
-    if not all(isinstance(name, str) and name.endswith(".safetensors") for name in shard_names):
+    if not all(
+        isinstance(name, str)
+        and name.endswith(".safetensors")
+        and Path(name).name == name
+        for name in shard_names
+    ):
         raise ValueError(f"invalid shard names in {path / 'model.safetensors.index.json'}")
 
     shard_tensors: dict[str, dict[str, Any]] = {}
@@ -129,6 +143,14 @@ def validate_checkpoint(path: Path) -> CheckpointInfo:
     for tensor_name, shard_name in weight_map.items():
         if tensor_name not in shard_tensors[shard_name]:
             raise ValueError(f"{tensor_name} is absent from indexed shard {shard_name}")
+    actual_weight_map = {
+        tensor_name: shard_name
+        for shard_name, tensors in shard_tensors.items()
+        for tensor_name in tensors
+    }
+    if actual_weight_map != weight_map:
+        extra_tensors = sorted(set(actual_weight_map).difference(weight_map))
+        raise ValueError(f"unindexed tensors are present in checkpoint shards: {extra_tensors[:5]}")
 
     embedding_name = "model.embed_tokens.weight"
     embedding_shard = weight_map.get(embedding_name)
@@ -150,18 +172,71 @@ def validate_checkpoint(path: Path) -> CheckpointInfo:
     )
 
 
+def checkpoint_manifest_sha256(path: Path) -> str:
+    """Hash every runtime file after validating the checkpoint structure."""
+    validate_checkpoint(path)
+    index = _read_json(path / "model.safetensors.index.json")
+    shard_names = set(index["weight_map"].values())
+    file_names = sorted(set(REQUIRED_FILES).union(shard_names))
+    manifest_digest = hashlib.sha256()
+    for file_name in file_names:
+        file_digest = hashlib.sha256()
+        with (path / file_name).open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1 << 20), b""):
+                file_digest.update(chunk)
+        manifest_digest.update(file_name.encode("utf-8"))
+        manifest_digest.update(b"\0")
+        manifest_digest.update(file_digest.digest())
+    return manifest_digest.hexdigest()
+
+
+def select_latest_checkpoint(root: Path) -> Path:
+    """Return the newest structurally valid checkpoint in a numeric directory."""
+    if not root.is_dir():
+        raise FileNotFoundError(root)
+    candidates = sorted(
+        (child for child in root.iterdir() if child.is_dir() and child.name.isdigit()),
+        key=lambda child: int(child.name),
+        reverse=True,
+    )
+    if not candidates:
+        raise ValueError(f"no numeric Hugging Face exports under {root}")
+    for candidate in candidates:
+        try:
+            validate_checkpoint(candidate)
+        except VALIDATION_ERRORS:
+            continue
+        return candidate.resolve()
+    raise ValueError(f"no complete Hugging Face export under {root}")
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("checkpoint", type=Path)
+    parser.add_argument("checkpoint", type=Path, nargs="?")
+    parser.add_argument("--latest-under", type=Path)
     parser.add_argument("--quiet", action="store_true")
-    return parser.parse_args()
+    parser.add_argument("--print-manifest", action="store_true")
+    args = parser.parse_args()
+    if (args.checkpoint is None) == (args.latest_under is None):
+        parser.error("provide exactly one checkpoint or --latest-under ROOT")
+    if args.latest_under is not None and args.print_manifest:
+        parser.error("--print-manifest requires a checkpoint path")
+    return args
 
 
 def main() -> None:
     args = _parse_args()
+    if args.latest_under is not None:
+        try:
+            print(select_latest_checkpoint(args.latest_under.resolve()))
+        except VALIDATION_ERRORS as error:
+            print(f"could not select checkpoint: {error}", file=sys.stderr)
+            raise SystemExit(1) from error
+        return
+    assert args.checkpoint is not None
     try:
         info = validate_checkpoint(args.checkpoint.resolve())
-    except (FileNotFoundError, KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+    except VALIDATION_ERRORS as error:
         print(f"invalid checkpoint {args.checkpoint}: {error}", file=sys.stderr)
         raise SystemExit(1) from error
     if not args.quiet:
@@ -171,6 +246,8 @@ def main() -> None:
             f"context={info.context_length} shards={info.shard_count} "
             f"tensors={info.tensor_count} bytes={info.tensor_bytes}"
         )
+    if args.print_manifest:
+        print(checkpoint_manifest_sha256(args.checkpoint.resolve()))
 
 
 if __name__ == "__main__":

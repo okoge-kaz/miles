@@ -10,9 +10,12 @@ The evaluator follows the pinned NeMo 26.03 reference protocol:
   checkpoint with tensor parallelism 1 and data parallelism 8.
 - NeMo Evaluator/NeMo Skills 26.03 is imported as a second SquashFS image and
   prepares and grades AIME24, AIME25, and AIME26.
-- Qwen3 thinking is enabled in the chat template and vLLM uses
-  `--reasoning-parser qwen3`. A preflight request requires both parser-separated
-  reasoning and final content before evaluation starts.
+- Qwen3-4B-Instruct-2507 defaults to `ENABLE_THINKING=false`; this is required
+  because forcing its chat template into thinking mode can leave the final
+  `content` field empty. vLLM still uses `--reasoning-parser qwen3`, and a
+  preflight request requires non-empty final content. Set
+  `ENABLE_THINKING=true` only for a thinking checkpoint; that mode requires both
+  parser-separated reasoning and final content.
 - Full evaluation uses temperature 0.6, top-p 0.95, top-k 20, 64 repeats, a
   32,768-token context, and at most 28,672 generated tokens.
 
@@ -25,8 +28,11 @@ experiments/scripts/reasoning_eval/import-evaluator-images.sbatch
 experiments/scripts/reasoning_eval/prepare-aime-data.sbatch
 ```
 
-Both setup jobs use `cpu_interactive`; no GPU allocation is held while images
-or benchmark data are downloaded and prepared.
+Both setup jobs use partition `cpu` with QoS `cpu-interactive`; no GPU
+allocation is held while images or benchmark data are downloaded and prepared.
+An existing preparation marker may contain additional benchmarks, but all three
+AIME datasets, their 30 unique records, evaluator image, and any recorded
+checksums must validate before it is reused.
 
 The default shared locations can be changed with
 `REASONING_EVAL_CONTAINER_ROOT`, `REASONING_EVAL_DATA_ROOT`, and
@@ -59,6 +65,23 @@ job interrupted between tasks resumes only unfinished task caches. Use
 the same command as jobs finish; use `--max-submissions 0` only when the Slurm
 association is allowed to queue every pending checkpoint at once.
 
+The protocol name is derived from the effective repeat count. For example,
+`AIME_REPEATS=8` produces an `aime8` protocol rather than reusing the default
+`aime64` identity; smoke evaluation uses `aime1`. An explicit `PROTOCOL_NAME`
+must contain the same repeat tag. `evaluation-contract.env` prevents a result
+root from being reused with a different checkpoint, dataset, image, or sampling
+configuration, and each completed task has a checked `artifact-manifest.sha256`.
+
+For a post-training evaluation, submit `run-after-training.sbatch` with
+`TRAINING_HF_ROOT` and a new `RESULT_ROOT`. It selects the newest structurally
+complete numeric Hugging Face export and records that choice atomically before
+running the ordinary evaluator.
+
+`refill-snapshot.sbatch` uses the aws-pdx `batch` partition for all lanes and
+distinguishes them by QoS: `short`, `normal`, and `interactive`. Set
+`REFILL_ONCE=1` to execute one controller iteration, which is useful for a
+controlled validation of lane routing.
+
 ## Results and figures
 
 ```bash
@@ -78,4 +101,5 @@ response caches into a readable `model-outputs.jsonl` artifact.
 `validate_checkpoint.py` checks every indexed tensor mapping and requires each
 safetensors shard's byte length to match the end offset in its header, so a
 launcher running alongside training does not enqueue a partially written HF
-export.
+export. The evaluator also records a SHA-256 manifest over every indexed shard
+and required tokenizer/configuration file.

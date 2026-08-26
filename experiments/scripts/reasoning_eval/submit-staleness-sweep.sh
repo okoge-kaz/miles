@@ -6,6 +6,8 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../../.." && pwd)"
 RUN_SCRIPT="${SCRIPT_DIR}/run-evaluation.sbatch"
 VALIDATE_TOOL="${REPO_ROOT}/experiments/tools/reasoning_eval/validate_checkpoint.py"
+PREPARED_DATA_TOOL="${REPO_ROOT}/experiments/tools/reasoning_eval/prepared_data.py"
+PROTOCOL_TOOL="${REPO_ROOT}/experiments/tools/reasoning_eval/protocol.py"
 source "${REPO_ROOT}/experiments/env.sh"
 
 SUBMIT=0
@@ -16,7 +18,11 @@ END_STEP="${END_STEP:-300}"
 STEP_INTERVAL="${STEP_INTERVAL:-10}"
 EVAL_MODE="${EVAL_MODE:-full}"
 TASKS="${TASKS:-aime24 aime25 aime26}"
-PROTOCOL_NAME="${PROTOCOL_NAME:-eval-factory-26.03-vllm-0.20.2-cu130-qwen3-rl-thinking-t0.6-p0.95-k20-aime64-v1}"
+REQUESTED_PROTOCOL_NAME="${PROTOCOL_NAME:-}"
+TEMPERATURE="${TEMPERATURE:-0.6}"
+TOP_P="${TOP_P:-0.95}"
+TOP_K="${TOP_K:-20}"
+AIME_REPEATS="${AIME_REPEATS:-64}"
 TRAINING_ROOT="${TRAINING_ROOT:-${TRAIN_CKPT_DIR}}"
 STUDY_RELATIVE_ROOT="math/dapo-math-p10-90-qwen3-4b-base-lr2e-5-step4000/Qwen3-4B-Base-LR2e-5-Step4000/grpo-clip0.2-0.28-tis2.0"
 STUDY_ROOT="${STUDY_ROOT:-${TRAINING_ROOT}/${STUDY_RELATIVE_ROOT}}"
@@ -37,6 +43,22 @@ SQUEUE_TIMEOUT_SECONDS="${SQUEUE_TIMEOUT_SECONDS:-10}"
 SNAPSHOT_ARM_MAX_STEPS="${SNAPSHOT_ARM_MAX_STEPS:-}"
 TRUST_PINNED_SNAPSHOT="${TRUST_PINNED_SNAPSHOT:-0}"
 LOG_DIR="${OUTPUT_DIR}/reasoning_eval/staleness-ratio-sweep/${RUN_NAMESPACE}"
+
+if [[ "${EVAL_MODE}" == smoke ]]; then
+    EFFECTIVE_REPEATS=1
+else
+    EFFECTIVE_REPEATS="${AIME_REPEATS}"
+fi
+PROTOCOL_ARGS=(
+    --temperature "${TEMPERATURE}"
+    --top-p "${TOP_P}"
+    --top-k "${TOP_K}"
+    --effective-repeats "${EFFECTIVE_REPEATS}"
+)
+if [[ -n "${REQUESTED_PROTOCOL_NAME}" ]]; then
+    PROTOCOL_ARGS+=(--protocol-name "${REQUESTED_PROTOCOL_NAME}")
+fi
+PROTOCOL_NAME="$(python3 "${PROTOCOL_TOOL}" "${PROTOCOL_ARGS[@]}")"
 
 usage() {
     cat <<'EOF'
@@ -140,10 +162,11 @@ if (( SUBMIT == 1 )); then
         echo "NeMo Skills image OCI provenance is missing or mismatched" >&2
         exit 8
     }
-    grep -Fx "nemo_skills_image=${NEMO_SKILLS_IMAGE}" "${NEMO_SKILLS_DATA_ROOT}/_PREPARED" >/dev/null || {
-        echo "AIME data was prepared with a different NeMo Skills image" >&2
-        exit 8
-    }
+    python3 "${PREPARED_DATA_TOOL}" \
+        --data-root "${NEMO_SKILLS_DATA_ROOT}" \
+        --image "${NEMO_SKILLS_IMAGE}" \
+        --marker "${NEMO_SKILLS_DATA_ROOT}/_PREPARED" \
+        --benchmark aime24 --benchmark aime25 --benchmark aime26
     mkdir -p "${RESULT_STUDY_ROOT}"
     exec 8> "${RESULT_STUDY_ROOT}/.submission.lock"
     flock --nonblock 8 || { echo "another sweep submission process is active" >&2; exit 9; }
@@ -347,7 +370,7 @@ sbatch \
     --partition="${PARTITION}" \
     --qos="${QOS}" \
     --time="${WALL}" \
-    --export="ALL,CHECKPOINT_PATH=${first_checkpoint},RESULT_ROOT=${first_result},ARM_NAME=${first_arm},TRAINING_STEP=${first_step},RUN_NAMESPACE=${RUN_NAMESPACE},TASKS=${TASKS},EVAL_MODE=${EVAL_MODE},PROTOCOL_NAME=${PROTOCOL_NAME}" \
+    --export="ALL,CHECKPOINT_PATH=${first_checkpoint},RESULT_ROOT=${first_result},ARM_NAME=${first_arm},TRAINING_STEP=${first_step},RUN_NAMESPACE=${RUN_NAMESPACE},TASKS=${TASKS},EVAL_MODE=${EVAL_MODE},PROTOCOL_NAME=${PROTOCOL_NAME},AIME_REPEATS=${AIME_REPEATS},TEMPERATURE=${TEMPERATURE},TOP_P=${TOP_P},TOP_K=${TOP_K}" \
     "${RUN_SCRIPT}"
 
 for ((pending_index = 0; pending_index < submission_limit; pending_index++)); do
@@ -365,7 +388,7 @@ for ((pending_index = 0; pending_index < submission_limit; pending_index++)); do
         --time="${WALL}" \
         --job-name="q3e-${arm_name}-${step_label}" \
         --output="${LOG_DIR}/q3e-${arm_name}-${step_label}-%j.log" \
-        --export="ALL,CHECKPOINT_PATH=${checkpoint_path},RESULT_ROOT=${result_root},ARM_NAME=${arm_name},TRAINING_STEP=${step},RUN_NAMESPACE=${RUN_NAMESPACE},TASKS=${TASKS},EVAL_MODE=${EVAL_MODE},PROTOCOL_NAME=${PROTOCOL_NAME}" \
+        --export="ALL,CHECKPOINT_PATH=${checkpoint_path},RESULT_ROOT=${result_root},ARM_NAME=${arm_name},TRAINING_STEP=${step},RUN_NAMESPACE=${RUN_NAMESPACE},TASKS=${TASKS},EVAL_MODE=${EVAL_MODE},PROTOCOL_NAME=${PROTOCOL_NAME},AIME_REPEATS=${AIME_REPEATS},TEMPERATURE=${TEMPERATURE},TOP_P=${TOP_P},TOP_K=${TOP_K}" \
         "${RUN_SCRIPT}")"
     job_id="${raw_job_id%%;*}"
     printf '%s %s\n' "${job_id}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "${result_root}/.submitted-job"

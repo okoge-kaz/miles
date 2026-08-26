@@ -3,7 +3,7 @@
 #SBATCH --job-name=q3-4b-rl-eval
 #SBATCH --account=coreai_horizon_dilations
 #SBATCH --partition=batch
-#SBATCH --qos=normal
+#SBATCH --qos=interactive
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gpus-per-node=8
@@ -22,7 +22,7 @@ source "${REPO_ROOT}/experiments/env.sh"
 
 TASKS_TEXT="${TASKS:-aime24 aime25 aime26}"
 EVAL_MODE="${EVAL_MODE:-full}"
-PROTOCOL_NAME="${PROTOCOL_NAME:-eval-factory-26.03-vllm-0.20.2-cu130-qwen3-rl-thinking-t0.6-p0.95-k20-aime64-v1}"
+REQUESTED_PROTOCOL_NAME="${PROTOCOL_NAME:-}"
 ARM_NAME="${ARM_NAME:-unknown}"
 TRAINING_STEP="${TRAINING_STEP:-unknown}"
 RUN_NAMESPACE="${RUN_NAMESPACE:-unknown}"
@@ -31,6 +31,7 @@ PROMPT_TOKEN_RESERVE="${PROMPT_TOKEN_RESERVE:-4096}"
 TEMPERATURE="${TEMPERATURE:-0.6}"
 TOP_P="${TOP_P:-0.95}"
 TOP_K="${TOP_K:-20}"
+ENABLE_THINKING="${ENABLE_THINKING:-false}"
 AIME_REPEATS="${AIME_REPEATS:-64}"
 AIME_PARALLELISM="${AIME_PARALLELISM:-1024}"
 SMOKE_LIMIT_SAMPLES="${SMOKE_LIMIT_SAMPLES:-2}"
@@ -54,6 +55,8 @@ NEMO_SKILLS_DATA_ROOT="${REASONING_EVAL_DATA_ROOT:-${DATASET_DIR}/evaluation}/ne
 EVALUATION_CACHE_ROOT="${REASONING_EVAL_CACHE_ROOT:-${CACHE_DIR}/reasoning_eval}"
 UNPAD_TOOL="${REPO_ROOT}/experiments/tools/reasoning_eval/unpad_vocab.py"
 VALIDATE_TOOL="${REPO_ROOT}/experiments/tools/reasoning_eval/validate_checkpoint.py"
+PREPARED_DATA_TOOL="${REPO_ROOT}/experiments/tools/reasoning_eval/prepared_data.py"
+PROTOCOL_TOOL="${REPO_ROOT}/experiments/tools/reasoning_eval/protocol.py"
 EXPORT_TOOL_DIR="${REPO_ROOT}/experiments/tools/reasoning_eval"
 API_BASE_URL="http://127.0.0.1:${VLLM_PORT}"
 API_ENDPOINT="${API_BASE_URL}/v1/chat/completions"
@@ -63,8 +66,8 @@ API_ENDPOINT="${API_BASE_URL}/v1/chat/completions"
     echo "EVAL_MODE must be smoke or full" >&2
     exit 3
 }
-[[ "${PROTOCOL_NAME}" =~ ^[A-Za-z0-9._-]+$ ]] || {
-    echo "PROTOCOL_NAME contains unsupported characters" >&2
+[[ "${ENABLE_THINKING}" == true || "${ENABLE_THINKING}" == false ]] || {
+    echo "ENABLE_THINKING must be true or false" >&2
     exit 4
 }
 [[ "${ARM_NAME}" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "ARM_NAME contains unsupported characters" >&2; exit 5; }
@@ -107,6 +110,30 @@ awk -v value="${VLLM_GPU_MEMORY_UTILIZATION}" 'BEGIN { exit !(value > 0 && value
 }
 (( VLLM_PORT <= 65535 )) || { echo "VLLM_PORT must be at most 65535" >&2; exit 8; }
 MAX_NEW_TOKENS=$((CONTEXT_LENGTH - PROMPT_TOKEN_RESERVE))
+if [[ "${EVAL_MODE}" == smoke ]]; then
+    NUM_REPEATS=1
+    LIMIT_SAMPLES_YAML="${SMOKE_LIMIT_SAMPLES}"
+    EXPECTED_OUTPUT_RECORDS="${SMOKE_LIMIT_SAMPLES}"
+else
+    NUM_REPEATS="${AIME_REPEATS}"
+    LIMIT_SAMPLES_YAML=null
+    EXPECTED_OUTPUT_RECORDS=$((30 * AIME_REPEATS))
+fi
+PROTOCOL_ARGS=(
+    --temperature "${TEMPERATURE}"
+    --top-p "${TOP_P}"
+    --top-k "${TOP_K}"
+    --effective-repeats "${NUM_REPEATS}"
+)
+if [[ "${ENABLE_THINKING}" == true ]]; then
+    PROTOCOL_ARGS+=(--enable-thinking)
+else
+    PROTOCOL_ARGS+=(--disable-thinking)
+fi
+if [[ -n "${REQUESTED_PROTOCOL_NAME}" ]]; then
+    PROTOCOL_ARGS+=(--protocol-name "${REQUESTED_PROTOCOL_NAME}")
+fi
+PROTOCOL_NAME="$(python3 "${PROTOCOL_TOOL}" "${PROTOCOL_ARGS[@]}")"
 
 CHECKPOINT_SOURCE="$(realpath -- "${CHECKPOINT_PATH}")"
 RESULT_ROOT="$(realpath -m -- "${RESULT_ROOT}")"
@@ -135,10 +162,14 @@ done
     echo "prepared AIME data not found: ${NEMO_SKILLS_DATA_ROOT}/_PREPARED" >&2
     exit 12
 }
-grep -Fx "nemo_skills_image=${NEMO_SKILLS_IMAGE}" "${NEMO_SKILLS_DATA_ROOT}/_PREPARED" >/dev/null || {
-    echo "AIME data was prepared with a different NeMo Skills image" >&2
-    exit 13
-}
+DATASET_PROVENANCE="$(
+    python3 "${PREPARED_DATA_TOOL}" \
+        --data-root "${NEMO_SKILLS_DATA_ROOT}" \
+        --image "${NEMO_SKILLS_IMAGE}" \
+        --marker "${NEMO_SKILLS_DATA_ROOT}/_PREPARED" \
+        --benchmark aime24 --benchmark aime25 --benchmark aime26 \
+        --print-env
+)"
 for checkpoint_file in \
     config.json tokenizer.json tokenizer_config.json generation_config.json \
     chat_template.jinja model.safetensors.index.json; do
@@ -170,6 +201,14 @@ for checkpoint_shard in "${CHECKPOINT_SHARDS[@]}"; do
     }
 done
 python3 "${VALIDATE_TOOL}" --quiet "${CHECKPOINT_SOURCE}"
+CHECKPOINT_MANIFEST_SHA256="$(
+    python3 "${VALIDATE_TOOL}" --quiet --print-manifest "${CHECKPOINT_SOURCE}"
+)"
+checkpoint_config_sha256="$(sha256sum "${CHECKPOINT_SOURCE}/config.json")"
+checkpoint_config_sha256="${checkpoint_config_sha256%% *}"
+tokenizer_config_sha256="$(sha256sum "${CHECKPOINT_SOURCE}/tokenizer_config.json")"
+tokenizer_config_sha256="${tokenizer_config_sha256%% *}"
+JOB_TMP_ROOT="${SLURM_TMPDIR:-/tmp}"
 
 read -r -a REQUESTED_TASKS <<< "${TASKS_TEXT}"
 (( ${#REQUESTED_TASKS[@]} > 0 )) || { echo "TASKS is empty" >&2; exit 19; }
@@ -187,13 +226,75 @@ if ! flock --nonblock 9; then
     exit 0
 fi
 printf '%s\n' "${SLURM_JOB_ID}" > "${RESULT_ROOT}/.active-job"
-trap 'rm -f -- "${RESULT_ROOT}/.active-job"' EXIT
+contract_partial="${RESULT_ROOT}/.evaluation-contract.partial-${SLURM_JOB_ID}"
+trap 'rm -f -- "${RESULT_ROOT}/.active-job" "${contract_partial}"' EXIT
+
+desired_result_contract="${JOB_TMP_ROOT}/reasoning-eval-contract-${SLURM_JOB_ID}.env"
+cat > "${desired_result_contract}" <<EOF
+checkpoint=${CHECKPOINT_SOURCE}
+checkpoint_manifest_sha256=${CHECKPOINT_MANIFEST_SHA256}
+checkpoint_config_sha256=${checkpoint_config_sha256}
+tokenizer_config_sha256=${tokenizer_config_sha256}
+arm_name=${ARM_NAME}
+training_step=${TRAINING_STEP}
+run_namespace=${RUN_NAMESPACE}
+eval_mode=${EVAL_MODE}
+protocol_name=${PROTOCOL_NAME}
+temperature=${TEMPERATURE}
+top_p=${TOP_P}
+top_k=${TOP_K}
+effective_repeats=${NUM_REPEATS}
+aime_repeats=${AIME_REPEATS}
+smoke_limit_samples=${SMOKE_LIMIT_SAMPLES}
+context_length=${CONTEXT_LENGTH}
+prompt_token_reserve=${PROMPT_TOKEN_RESERVE}
+max_new_tokens=${MAX_NEW_TOKENS}
+aime_parallelism=${AIME_PARALLELISM}
+max_retries=${MAX_RETRIES}
+request_timeout_seconds=${REQUEST_TIMEOUT_SECONDS}
+vllm_seed=${VLLM_SEED}
+vllm_gpu_memory_utilization=${VLLM_GPU_MEMORY_UTILIZATION}
+vllm_max_num_seqs=${VLLM_MAX_NUM_SEQS}
+vllm_triton_ptxas_path=${VLLM_TRITON_PTXAS_PATH}
+vllm_reasoning_parser=qwen3
+enable_thinking=${ENABLE_THINKING}
+vllm_tensor_parallel_size=1
+vllm_data_parallel_size=8
+vllm_image=${VLLM_IMAGE}
+vllm_oci_digest=${VLLM_OCI_DIGEST}
+nemo_skills_image=${NEMO_SKILLS_IMAGE}
+nemo_skills_oci_digest=${NEMO_SKILLS_OCI_DIGEST}
+${DATASET_PROVENANCE}
+evaluator_catalog_commit=eb3ddf2acc7f2e1fa03aeba168afea636562779c
+EOF
+if [[ -f "${RESULT_ROOT}/evaluation-contract.env" ]]; then
+    cmp --silent "${desired_result_contract}" "${RESULT_ROOT}/evaluation-contract.env" || {
+        diff --unified "${RESULT_ROOT}/evaluation-contract.env" "${desired_result_contract}" || true
+        echo "refusing to reuse RESULT_ROOT with a changed evaluation contract" >&2
+        exit 32
+    }
+else
+    for existing_task in aime24 aime25 aime26; do
+        [[ ! -e "${RESULT_ROOT}/${existing_task}" \
+            && ! -e "${RESULT_ROOT}/${existing_task}.partial" ]] || {
+            echo "legacy RESULT_ROOT has task data but no evaluation contract; use a new root" >&2
+            exit 32
+        }
+    done
+    cp -- "${desired_result_contract}" "${contract_partial}"
+    mv -- "${contract_partial}" "${RESULT_ROOT}/evaluation-contract.env"
+fi
 
 declare -a PENDING_TASKS=()
 for task in "${REQUESTED_TASKS[@]}"; do
     final_result="${RESULT_ROOT}/${task}"
     partial_result="${final_result}.partial"
     if [[ -f "${final_result}/_SUCCESS" ]]; then
+        [[ -s "${final_result}/artifact-manifest.sha256" ]] \
+            && (cd "${final_result}" && sha256sum --check artifact-manifest.sha256 >/dev/null) || {
+            echo "completed result failed artifact verification: ${final_result}" >&2
+            exit 33
+        }
         echo "Already complete: ${final_result}"
         continue
     fi
@@ -203,7 +304,9 @@ for task in "${REQUESTED_TASKS[@]}"; do
     }
     if [[ -f "${partial_result}/_SUCCESS" \
         && -s "${partial_result}/model-outputs.jsonl" \
-        && -s "${partial_result}/evaluator/eval-results/${task}/metrics.json" ]]; then
+        && -s "${partial_result}/evaluator/eval-results/${task}/metrics.json" \
+        && -s "${partial_result}/artifact-manifest.sha256" ]] \
+        && (cd "${partial_result}" && sha256sum --check artifact-manifest.sha256 >/dev/null); then
         mv -- "${partial_result}" "${final_result}"
         echo "Finalized completed partial result: ${final_result}"
         continue
@@ -216,16 +319,12 @@ if (( ${#PENDING_TASKS[@]} == 0 )); then
     exit 0
 fi
 
-JOB_TMP_ROOT="${SLURM_TMPDIR:-/tmp}"
 MODEL_RUNTIME_DIR="${JOB_TMP_ROOT}/reasoning-eval-model-${SLURM_JOB_ID}"
 TOKENIZER_RUNTIME_DIR="${JOB_TMP_ROOT}/reasoning-eval-tokenizer-${SLURM_JOB_ID}"
-checkpoint_config_sha256="$(sha256sum "${CHECKPOINT_SOURCE}/config.json")"
-checkpoint_config_sha256="${checkpoint_config_sha256%% *}"
-tokenizer_config_sha256="$(sha256sum "${CHECKPOINT_SOURCE}/tokenizer_config.json")"
-tokenizer_config_sha256="${tokenizer_config_sha256%% *}"
 desired_server_config="${JOB_TMP_ROOT}/reasoning-eval-server-${SLURM_JOB_ID}.env"
 cat > "${desired_server_config}" <<EOF
 checkpoint=${CHECKPOINT_SOURCE}
+checkpoint_manifest_sha256=${CHECKPOINT_MANIFEST_SHA256}
 checkpoint_config_sha256=${checkpoint_config_sha256}
 tokenizer_config_sha256=${tokenizer_config_sha256}
 context_length=${CONTEXT_LENGTH}
@@ -285,16 +384,6 @@ case "${TOKENIZER_EXTRA_TYPE}" in
         ;;
 esac
 
-if [[ "${EVAL_MODE}" == smoke ]]; then
-    NUM_REPEATS=1
-    LIMIT_SAMPLES_YAML="${SMOKE_LIMIT_SAMPLES}"
-    EXPECTED_OUTPUT_RECORDS="${SMOKE_LIMIT_SAMPLES}"
-else
-    NUM_REPEATS="${AIME_REPEATS}"
-    LIMIT_SAMPLES_YAML=null
-    EXPECTED_OUTPUT_RECORDS=$((30 * AIME_REPEATS))
-fi
-
 for task in "${PENDING_TASKS[@]}"; do
     partial_result="${RESULT_ROOT}/${task}.partial"
     desired_config="${JOB_TMP_ROOT}/reasoning-eval-${SLURM_JOB_ID}-${task}.yaml"
@@ -329,7 +418,7 @@ target:
     adapter_config:
       params_to_add:
         chat_template_kwargs:
-          enable_thinking: true
+          enable_thinking: ${ENABLE_THINKING}
         skip_special_tokens: false
         top_k: ${TOP_K}
       use_caching: true
@@ -466,18 +555,28 @@ curl \
     --show-error \
     --max-time 600 \
     --header 'Content-Type: application/json' \
-    --data "{\"model\":\"${SERVED_MODEL_NAME}\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with OK.\"}],\"max_tokens\":${VLLM_PREFLIGHT_MAX_TOKENS},\"temperature\":0,\"chat_template_kwargs\":{\"enable_thinking\":true}}" \
+    --data "{\"model\":\"${SERVED_MODEL_NAME}\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with OK.\"}],\"max_tokens\":${VLLM_PREFLIGHT_MAX_TOKENS},\"temperature\":0,\"chat_template_kwargs\":{\"enable_thinking\":${ENABLE_THINKING}}}" \
     "${API_ENDPOINT}" > "${PREFLIGHT_RESPONSE}"
-jq --exit-status '
-    .choices[0].message
-    | ((.reasoning | type) == "string")
-      and ((.reasoning | length) > 0)
-      and ((.content | type) == "string")
-      and ((.content | length) > 0)
-' "${PREFLIGHT_RESPONSE}" >/dev/null || {
-    echo "preflight did not separate Qwen3 reasoning and final content" >&2
-    exit 27
-}
+if [[ "${ENABLE_THINKING}" == true ]]; then
+    jq --exit-status '
+        .choices[0].message
+        | ((.reasoning | type) == "string")
+          and ((.reasoning | length) > 0)
+          and ((.content | type) == "string")
+          and ((.content | length) > 0)
+    ' "${PREFLIGHT_RESPONSE}" >/dev/null || {
+        echo "preflight did not separate Qwen3 reasoning and final content" >&2
+        exit 27
+    }
+else
+    jq --exit-status '
+        .choices[0].message.content
+        | (type == "string") and (length > 0)
+    ' "${PREFLIGHT_RESPONSE}" >/dev/null || {
+        echo "preflight did not return final content in instruct mode" >&2
+        exit 27
+    }
+fi
 
 for task in "${PENDING_TASKS[@]}"; do
     partial_result="${RESULT_ROOT}/${task}.partial"
@@ -491,6 +590,7 @@ for task in "${PENDING_TASKS[@]}"; do
     cat > "${provenance_file}" <<EOF
 checkpoint=${CHECKPOINT_SOURCE}
 checkpoint_config_sha256=${checkpoint_config_sha256}
+checkpoint_manifest_sha256=${CHECKPOINT_MANIFEST_SHA256}
 arm_name=${ARM_NAME}
 training_step=${TRAINING_STEP}
 run_namespace=${RUN_NAMESPACE}
@@ -507,11 +607,12 @@ max_new_tokens=${MAX_NEW_TOKENS}
 vocab_compat_action=${VOCAB_COMPAT_ACTION}
 tokenizer_compat_action=${TOKENIZER_COMPAT_ACTION}
 vllm_reasoning_parser=qwen3
-enable_thinking=true
+enable_thinking=${ENABLE_THINKING}
 vllm_image=${VLLM_IMAGE}
 vllm_oci_digest=${VLLM_OCI_DIGEST}
 nemo_skills_image=${NEMO_SKILLS_IMAGE}
 nemo_skills_oci_digest=${NEMO_SKILLS_OCI_DIGEST}
+${DATASET_PROVENANCE}
 evaluator_catalog_commit=eb3ddf2acc7f2e1fa03aeba168afea636562779c
 slurm_job_id=${SLURM_JOB_ID}
 started_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -556,6 +657,16 @@ EOF
         echo "${task} symbolic_correct metric is missing or outside [0, 100]" >&2
         exit 31
     }
+    (
+        cd "${partial_result}"
+        sha256sum \
+            model-outputs.jsonl \
+            "evaluator/eval-results/${task}/metrics.json" \
+            "$(basename -- "${provenance_file}")" \
+            run-config.yaml \
+            > artifact-manifest.sha256
+        sha256sum --check artifact-manifest.sha256 >/dev/null
+    )
     touch "${partial_result}/_SUCCESS"
     mv -- "${partial_result}" "${final_result}"
     echo "Completed ${final_result}"
