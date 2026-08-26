@@ -42,8 +42,10 @@ rather than entirely new top-level subsystems.
 The following already exist in the `5efc1971` snapshot and should not be counted as
 v0.1 gaps:
 
-- Fully-async RL itself and `--max-weight-staleness`. This branch has both, and
-  the 8B and 30B-A3B validation runs used staleness 4 successfully.
+- Fully-async RL itself and `--max-weight-staleness`. This branch has both. The
+  completed 8B and 30B-A3B difficulty filters are not RL evidence, and no
+  current-code forward/backward+resume result for those two sizes is recorded in
+  this audit.
 - `--use-dynamic-global-batch-size`. v0.1 adds partial-step scheduling and
   FLOPs balancing around it, not the basic flag.
 - Base TITO/session support. The missing part is the v2 branching tree and its

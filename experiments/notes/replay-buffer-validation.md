@@ -4,8 +4,10 @@ This note records the correctness, resume-latency, batching-efficiency, and
 short-horizon convergence checks for the opt-in replay buffer. The earlier runs
 cover what is now `--replay-buffer-type rollout`. The 2026-08-19 production-shape
 validation below directly compares `rollout` with the newer `inflight`
-token-prefix mode. The record is retained so the results remain reproducible
-after the Slurm logs have aged out.
+token-prefix mode. Several old images, logs, and result files have since aged
+out, so the numerical sections are an audit record rather than a fully
+reproducible current-tree package. Current admission status is stated
+separately below.
 
 ## Scope and revisions
 
@@ -15,8 +17,10 @@ after the Slurm logs have aged out.
 - Packed replay serialization: `5134ce9e`
 - Streaming tensor parts and incremental checksums: `d0adc6c6`
 - Trainer batching metrics: `5a0d2775`
-- Container:
-  `/lustre/fsw/portfolios/coreai/users/kfujii/container/miles-prefill-weight-version-23aaf6597.sqsh`
+- Historical container: `miles-prefill-weight-version-23aaf6597.sqsh`. The
+  recorded absolute path no longer exists, so these old jobs are not directly
+  reproducible from that image. The maintained 4B recipes currently pin
+  `/lustre/fsw/portfolios/coreai/users/kfujii/containers/miles-staleness-weight-boundaries-f994b9aed-efa-1.49.0.sqsh`.
 - Dataset: real `dapo-math-p10-90` prompts
 - Model: `Qwen3-4B-Instruct-2507`
 
@@ -66,6 +70,78 @@ The new per-optimizer-step metrics are:
 
 Only a small fixed-size statistic is gathered across data-parallel ranks; no
 per-token payload is introduced by this telemetry.
+
+## Custom rewards and stateful generators: current admission audit (2026-08-26)
+
+The 2026-08-24 IFEvalG jobs 299318/299319 and Tau jobs 299793--299795 are
+historical replay-mechanism evidence only. IFEvalG imported the now-removed broad
+`experiments.src.nemo_blends.rewards.blend_reward`; Tau imported the removed
+`experiments.src.nemo_blends` and `experiments.src.tau_bench` layouts. Their
+checkpoint/replay restoration metrics remain useful for the revisions named at
+the top of this note, but they do not admit the current restricted reward modules
+or current generators.
+
+The current-code evidence is narrower:
+
+| Domain | Current entry point | Fresh GPU evidence | Current-code resume/replay admission |
+|---|---|---|---|
+| IFEvalG | `experiments.src.reward_sets.instruction_following.reward` | job 306686 trained/saved iteration 0 with `replay_buffer_0`; job 306687 restored iteration 0, trained step 1, and saved iteration 1 with `replay_buffer_1` | current 4-node, 16K, n=16 inflight replay fresh+resume gate passed |
+| Code | `experiments.src.reward_sets.code.reward` | job 306787 completed optimizer step 0 and published iteration 0 plus `replay_buffer_0` | job 306788 restored model iteration 0 and replay state, completed optimizer step 1, and published iteration 1 plus `replay_buffer_1`; current fresh/resume gate passed |
+| STEM | `experiments.src.reward_sets.stem.reward` | job 306790 completed optimizer step 0 and published iteration 0 plus `replay_buffer_0` | job 306792 restored model iteration 0 and replay state, completed optimizer step 1, and published iteration 1 plus `replay_buffer_1`; current fresh/resume gate passed |
+| Math+Code+STEM | `experiments.src.reward_sets.math_code_stem.reward` | job 306793 completed optimizer step 0 and published iteration 0 plus `replay_buffer_0` | job 306796 restored model iteration 0 and replay state, completed optimizer step 1, and published iteration 1 plus `replay_buffer_1`; current fresh/resume gate passed |
+| Exact tool action | `experiments.src.reward_sets.tool_call.reward` | job 306920 completed optimizer step 0 and published iteration 0 plus `replay_buffer_0` | job 306921 restored replay and advanced to iteration 1, but both jobs used the retired Qwen3-4B-Instruct-2507 recipe; current-SFT admission is still missing |
+| Tau | `experiments.src.reward_sets.tau.reward` plus `experiments.src.environments.tau_bench.generator.generate` | current-SFT local-policy job 307433 trained through iteration 1 with rollout replay | job 307434 restored iteration 1 plus replay state and advanced to iteration 2; the replacement SFT recipe is not yet committed, so this is runtime evidence rather than a complete checked-in recipe admission |
+
+Tau is stateful and its current recipe accepts only completed `rollout` replay
+when replay is explicitly enabled; `inflight` is rejected because a partial
+environment cannot yet be restored. Jobs 307433/307434 now provide fresh/resume
+runtime evidence for completed-rollout replay, but the replacement current-SFT
+recipe still has to be committed with its tests before the path is a maintained
+submission entry point. The old 299801 statistics must not be reported as
+results of the current Tau implementation.
+
+CPU audit jobs 306786 and 306797 both completed with exit code 0. Each logged
+seven Tau resume-contract tests, twelve selected replay-buffer tests, and one
+`train_async` replay integration test as passing; 306797 repeated the audit after
+the reward allowlist correction. These establish CPU serialization and guard
+behavior only. The earlier n=2 GPU submission 306809 was canceled because it did
+not use the required n=16 training shape. Jobs 306813/306814 later completed a
+fresh/resume pair, but used the now-prohibited Qwen3-4B-Instruct-2507
+checkpoint. They remain historical mechanism evidence and cannot substitute for
+the current-SFT 307433/307434 result.
+
+Both IFEvalG jobs ran with EFA and exited successfully. `BrokenPipeError` lines
+appear during final Ray teardown only after the optimizer update and durable
+replay/model publication; they are shutdown noise, not evidence that the
+fresh/resume validation failed. Code jobs 306787/306788 likewise completed with
+exit code 0 before the same teardown noise. The second job loaded model
+iteration 0, restored `replay_buffer_0` in 0.459 seconds (six pending groups,
+four inflight groups / 397,991 inflight tokens, and one prepared batch), applied
+optimizer step 1, and published iteration 1 plus `replay_buffer_1`. This admits
+the current Code replay/resume path at revision `a6dcaaf1`.
+
+STEM jobs 306790/306792 also completed with exit code 0. The resume loaded model
+iteration 0 and restored `replay_buffer_0` in 1.173 seconds (46 pending groups,
+40 ready groups, four inflight groups / 169,572 inflight tokens, and one prepared
+batch). It then applied optimizer step 1 and published iteration 1 plus
+`replay_buffer_1`. This admits the current STEM replay/resume path at revision
+`82bfd482`; the separate
+CPU verifier job 306819 passed 121 tests and the official Reasoning Gym
+correct/wrong probes.
+
+Math+Code+STEM jobs 306793/306796 completed with exit code 0. The second job
+loaded model iteration 0 and restored `replay_buffer_0` in 0.868 seconds (15
+pending, 3 ready, 6 inflight groups / 467,826 inflight tokens, and one prepared
+batch). It applied optimizer step 1 and published iteration 1 plus
+`replay_buffer_1`.
+
+Tau current-SFT local-policy jobs 307433/307434 completed with exit code 0. The
+fresh job trained steps 0 and 1 and saved `replay_buffer_1`; the second loaded
+model iteration 1, restored the buffer in 0.349 seconds (6 pending, 2 ready, 2
+active groups for regeneration, and one prepared batch), applied optimizer step
+2, and published iteration 2 plus `replay_buffer_2`. This admits the local-policy
+runtime's completed-rollout replay mechanism; it does not establish a successful
+downstream Tau episode or a committed replacement recipe.
 
 ## Replay buffer serialization benchmark
 
@@ -287,7 +363,7 @@ eight samples per prompt, a 4096-token response cap, and no generation
 failures. The first submissions (15712674 and 15712682) exposed a common HF
 export issue: the config declared vocabulary size 151,936 while the padded
 embedding tensor had 152,064 rows. This was independent of the replay buffer. The
-official `experiments/src/offline_eval/unpad_vocab.py` utility removed only the
+current `experiments/tools/reasoning_eval/unpad_vocab.py` utility removed only the
 128 padded rows in eval-only checkpoint copies. CPU jobs 15718013 and 15718020
 verified every retained tensor value against the original before jobs 15718112
 and 15718134 performed the successful evaluations. The original training
@@ -308,34 +384,37 @@ Pairing the 30 prompt pass rates gives an enabled-minus-disabled difference of
 from checkpointing. It is not evidence that the two asynchronous runs are
 trajectory-identical or a substitute for a full-scale convergence study.
 
-The retained evaluation results are:
+The two absolute evaluation paths previously listed here are no longer present
+in the shared dataset tree. Treat the table as a historical record tied to the
+job ids above, not as a currently inspectable result artifact or a current
+reasoning-evaluation contract.
 
-```text
-/lustre/fsw/portfolios/coreai/users/kfujii/datasets/offline_eval/sidecar-on-100-v2-20260813/aime24.jsonl
-/lustre/fsw/portfolios/coreai/users/kfujii/datasets/offline_eval/sidecar-off-100-v2-20260813/aime24.jsonl
-```
+## Reproducing on the current tree
 
-## Reproduction command template
+The current math recipe is
+`experiments/scripts/math/async/dapo-math-p10-90/qwen3-4b/run.sbatch` and the
+comparison launcher is
+`experiments/tools/replay_buffer_validation/dapo-math/submit_replay_buffer_validation.sh`.
+The old `qwen3-4b-instruct-2507` recipe in the former command template no longer
+exists.
 
-Run from the repository root. Use a real W&B credential or `offline`; never put
-the credential in this note or a committed script.
+Do not copy the historical `WANDB_API_KEY=offline` or `--export=ALL` command.
+Offline mode is selected with `WANDB_MODE=offline` and needs no fake credential.
+Python training/evaluation code must not discover or parse repository dotenv
+files; credentials, when needed, belong at an allowlisted Slurm job boundary.
+The current comparison launcher still unconditionally
+requires `WANDB_API_KEY` at submission and exports the caller environment, so it
+must be hardened before it is the canonical offline reproduction path. Until
+then, run the maintained recipe from a credential-clean shell with an explicit
+fixed-name export list.
 
-```bash
-export SLURM_ACCOUNT_NAME=coreai_horizon_dilations
-export WS=/lustre/fsw/portfolios/coreai/users/kfujii
-export SQSH_IMAGE=/lustre/fsw/portfolios/coreai/users/kfujii/container/miles-prefill-weight-version-23aaf6597.sqsh
-export WANDB_MODE=offline
-export WANDB_API_KEY=offline
-
-sbatch -A "${SLURM_ACCOUNT_NAME}" -p interactive -N 2 -t 02:00:00 \
-  --export=ALL,CONFIG_TAG=<unique-tag>,NUM_ROLLOUT=100,DEBUG_EXIT_AFTER_ROLLOUT=50,SAVE_INTERVAL=50,SAVE_RETAIN_INTERVAL=100,SAVE_HF=1,HF_SAVE_INTERVAL=100,USE_REPLAY_BUFFER=1,REPLAY_BUFFER_TYPE=rollout,MAX_RESPONSE_LEN=2048,ROLLOUT_BATCH_SIZE=8,N_SAMPLES_PER_PROMPT=4,GLOBAL_BATCH_SIZE=32,MAX_TOKENS_PER_GPU=8192,ASYNC_MAX_CONCURRENT_SAMPLES=64,SGLANG_MAX_RUNNING_REQUESTS=64,EVAL_INTERVAL=0,DUMP_TRAIN_DATA=0,FUSE_ONE_STEP_ACTOR_LOGPROBS=1 \
-  experiments/scripts/math/async/dapo-math-p10-90/qwen3-4b-instruct-2507/run.sbatch
-```
-
-Submit the second invocation with the same `CONFIG_TAG` and
-`--dependency=afterok:<first-job-id>` so it resumes from the step-49
-checkpoint. For the control, change only
-`USE_REPLAY_BUFFER=0` and use a distinct `CONFIG_TAG`.
+A fresh/resume proof uses the same deterministic `CONFIG_TAG`, buffer type,
+sampling shape, and checkpoint path twice. The fresh job exits after a few real
+optimizer updates and saves; the dependent job uses `CLEAN_CHECKPOINT=0`, restores
+that saved iteration plus its matching replay artifact, and advances. An
+iteration-0 restore is valid after optimizer step 0. The control
+changes only `USE_REPLAY_BUFFER=0` and uses a distinct identity. Changing
+`REPLAY_BUFFER_TYPE` also requires a distinct identity.
 
 ## Interpretation constraints
 
@@ -349,9 +428,9 @@ checkpoint. For the control, change only
 - Slurm queue delay is excluded from trainer wallclock comparisons; job
   `Elapsed`, per-step timing, and resume-side `perf/rollout_time` are reported
   separately.
-- The 2048-token validation cap is intentionally cheaper than the production
-  32K recipe. Serialization benchmarks separately cover large compact tensor
-  payloads; full 32K training remains the production-scale confirmation.
+- The 2048-token historical validation cap was intentionally cheaper than the
+  maintained 16,384-token response cap (with a 32,768-token context). The later
+  Qwen3-4B Base comparison below exercised the maintained 16K response shape.
 
 ## Qwen3-4B Base step-4000 `rollout` versus `inflight` validation (2026-08-19)
 
@@ -390,10 +469,10 @@ all due.
 | `inflight` fresh | 16080548 | 0--3 | passed |
 | `inflight` resume | 16080549 | 4--5 | passed |
 
-The generated report is retained at
-`experiments/outputs/replay_buffer_validation/rbtype-step4000-16080496.md`, and
-the four training logs are under
-`experiments/outputs/training/math/dapo-math-p10-90/qwen3-4b/`.
+The generated report and the four job logs are no longer retained in this
+checkout. The numeric record below is historical evidence associated with jobs
+16080545, 16080547, 16080548, and 16080549; it cannot replace a current-tree
+fresh/resume rerun.
 
 ### Correct restart-boundary comparison
 
@@ -474,10 +553,11 @@ The ten-step interval therefore gives `inflight` meaningful operational value
 for restart-heavy training, even before assigning value to preserving the
 experimental staleness distribution itself.
 
-The math-async recipe currently defaults to `REPLAY_BUFFER_TYPE=rollout`.
-Production uses `inflight` only when it is selected explicitly (or if the recipe
-default is changed); the validation jobs set the type explicitly and keep the
-two checkpoint namespaces separate.
+The maintained math-async recipe now defaults to `REPLAY_BUFFER_TYPE=inflight`.
+The 2026-08-19 validation jobs set each type explicitly and kept the two
+checkpoint namespaces separate; their comparison remains valid for that
+revision. A default is not a current resume proof, so changing the recipe default
+does not by itself admit every custom reward to inflight replay.
 
 ### Why `inflight` saving pauses training
 

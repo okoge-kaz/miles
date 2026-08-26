@@ -9,7 +9,7 @@ the analysis scripts are a separate exercise.
 > completion-FIFO implementation, now named `queue-recycle`. The current code also
 > supports scheduler-authoritative `--staleness-reference prefill`, `queue-max`,
 > and bounded `queue-drop`. See the current "Staleness reference and queue policy"
-> section in `notes/telemetry.md`; do not apply the historical completion-only or
+> section in [telemetry.md](telemetry.md); do not apply the historical completion-only or
 > blocking-queue conclusions below to those two new policies.
 
 Historical primary axis: **`MAX_WEIGHT_STALENESS`** — how many weight versions a
@@ -159,7 +159,7 @@ The names are Applied Compute's PQS/IQS
 ([staleness in fully-async RL](https://www.appliedcompute.com/research/staleness-in-fully-async-rl)).
 Q is stamped only after the complete group has finished generation, reward, and
 finalization. It can exceed the group's last-forward version if a weight update
-lands during post-forward work. See `notes/telemetry.md` for the exact boundaries.
+lands during post-forward work. See [telemetry.md](telemetry.md) for the exact boundaries.
 The accepted-group decomposition is emitted whether or not a
 bound is configured, but a group rejected by the bound or dynamic filter does
 not enter it. The metrics are absent when their provenance is unavailable; a
@@ -170,10 +170,10 @@ scheduled update before training this is equivalent to `T-S <= max`.
 The bound must be at least 1 because the nonnegative dequeue gap cannot satisfy
 the strict rule at 0, not because of startup. Startup has `T=D`; normal
 prefetched batches have `T=D+1`.
-`--staleness-reference` selects `S`. The flag is in the checkpoint path
-(`max-weight-staleness-<s>-from-submission`) because it changes which groups are
-recycled. A tight bound under `submission` collapses throughput to the
-synchronous condition rather than hanging -- see `notes/telemetry.md`.
+`--staleness-reference` selects `S`. A non-default reference is in the checkpoint
+path (`max-weight-staleness-<s>-from-<reference>`) because it changes which
+groups are recycled. A tight bound under `submission` collapses throughput to the
+synchronous condition rather than hanging -- see [telemetry.md](telemetry.md).
 
 **`total` is the train-time number a staleness claim is about, and `pre_queue` is the one to
 read first.** If `pre_queue` is materially non-zero the arms are separated by less
@@ -342,7 +342,7 @@ off-policy looks better than it is. Compare at equal length, and record
 | variable | value | why |
 |---|---|---|
 | `GLOBAL_BATCH_SIZE`, `N_SAMPLES_PER_PROMPT`, `ROLLOUT_BATCH_SIZE` | prior-work values | see the dataset README; not a research question here |
-| dynamic sampling | **off**, and no over-sampling | `--dynamic-sampling-filter-path` is not passed, and `--over-sampling-batch-size` is left to default to `rollout_batch_size`. The prompt set is already filtered offline to a 10–80% pass-rate window (`dapo-math-p10-90`, see `tools/difficulty_filter/`), which is where the online filter's value went. Keeping it off also removes the only source of discarded generation from the colocated reference arm: the rollout loop tops up by a whole `over_sampling_batch_size` whenever the filter rejects a group (`inference_rollout_train.py:101-104`), and the surplus is what `abort()` throws away at the batch boundary. With the filter off, `pendings` drains to zero, `abort()` has nothing to discard, and the reference arm's wall-clock contains no wasted generation for the off-policy arms to be compared against |
+| dynamic sampling | **off**, and no over-sampling | `--dynamic-sampling-filter-path` is not passed, and `--over-sampling-batch-size` is left to default to `rollout_batch_size`. The prompt set is already filtered offline to a 10–90% pass-rate window (`dapo-math-p10-90`, see `experiments/tools/difficulty_filter/`), which is where the online filter's value went. Keeping it off also removes the only source of discarded generation from the colocated reference arm: the rollout loop tops up by a whole `over_sampling_batch_size` whenever the filter rejects a group (`inference_rollout_train.py:101-104`), and the surplus is what `abort()` throws away at the batch boundary. With the filter off, `pendings` drains to zero, `abort()` has nothing to discard, and the reference arm's wall-clock contains no wasted generation for the off-policy arms to be compared against |
 | R3 (MoE) | always on | removes routing mismatch; MoE RL is known to collapse without it |
 | verifier (`RM_TYPE`) | per checkpoint | correctness, not a knob |
 | temperature, KL coefficient | 1.0, 0 | matches DAPO |
@@ -404,13 +404,13 @@ first.** Any swept knob missing from the path is a silent data corruption.
 
 ```
 /ckpt/training/math/<DATASET_TAG>/<MODEL_NAME>/<RL_ALGORITHM>/<PLACEMENT>/
-    <POLICY_REGIME>/max-weight-staleness-<S>[-from-submission]/<CONFIG_TAG>
+    <POLICY_REGIME>/max-weight-staleness-<S>[-from-<REFERENCE>]/<CONFIG_TAG>
 
 CONFIG_TAG = rollout-length-<N>k-lr<LR>-rbs<RBS>-gbs<GBS>
              -tseed<TRAIN_SEED>-rseed<ROLLOUT_SEED>
 ```
 
-The `-from-submission` suffix appears only when `STALENESS_REFERENCE` is not
+The `-from-<REFERENCE>` suffix appears only when `STALENESS_REFERENCE` is not
 `completion`, so paths written before the option existed keep their spelling.
 It has to be in the path: the reference decides which groups are recycled, so two
 runs differing only there train on different data.

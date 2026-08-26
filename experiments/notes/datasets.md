@@ -11,22 +11,42 @@ inside the container.
 
 | Dataset | Path | Used by |
 |---|---|---|
-| DAPO-Math-17K | `/data/dapo-math-17k/dapo-math-17k.jsonl` | source for the difficulty-filtered set below |
-| DAPO-Math p10-80 | `/data/dapo-math-p10-80/dapo-math-p10-80.jsonl` | training prompts (both recipes). 3962 of 17398, pass rate 0.1–0.8 measured with Qwen3-4B-Instruct-2507 |
-| AIME-2025 | `/data/aime-2025/aime-2025.jsonl` | in-training eval, the only one |
-| AIME-2023 / 24 / 25 / 26 | `/data/aime-20{23,24,25,26}/…` | offline eval on saved checkpoints (`src/offline_eval`) |
+| DAPO-Math-17K | `/data/dapo-math-17k/dapo-math-17k.jsonl` | 17,398-row source for the policy-specific difficulty filters |
+| DAPO-Math SFT p10-90 | `/data/dapo-math-p10-90-<model>/…jsonl` | policy-specific outputs for Qwen3 4B (10,891), 8B (9,816), and 30B-A3B (7,425) |
+| AIME-2024 / 25 / 26 | prepared by `experiments/scripts/reasoning_eval/prepare-aime-data.sbatch` | reportable offline checkpoint evaluation; maintained training recipes set `EVAL_INTERVAL=0` |
+| MATH-500 | `/data/math-500/math-500.jsonl` | training-aligned offline diagnostic only; 500 canonical eval-only rows |
 
-DAPO-Math-17K is pulled by `experiments/setup/download_assets.sbatch` from
-`zhuzilin/dapo-math-17k` — the same repo the upstream miles scripts use, so the
-field names match what `run-qwen3-4B.sh` expects. The p10-80 file is produced from
-it by `experiments/tools/difficulty_filter`.
+DAPO-Math-17K is listed in `experiments/setup/manifests/datasets.txt` and staged
+through `experiments/setup/download/stage_all.sh` from
+`zhuzilin/dapo-math-17k` — the same repo the upstream Miles scripts use. The
+policy-specific p10-90 files are produced from it by
+`experiments/tools/difficulty_filter`. The former
+`/data/dapo-math-p10-80/dapo-math-p10-80.jsonl` path is not staged on the current
+cluster and is not a maintained-recipe input.
 
-The AIME years are staged by `experiments/src/offline_eval/prepare_aime.py`, which
-cross-checks every answer against a second AoPS-derived source and asserts that the
-instruction wrapper is byte-identical across years. That assert exists because
-AIME-2024 was staged without the wrapper until 2026-08-05: the verifier grades a
-boxed answer, and that year alone was never asking for one. Each year's directory
-carries a `README.md` with its provenance.
+The reportable AIME path is `experiments/scripts/reasoning_eval/`: its setup job
+prepares pinned NeMo Skills AIME24/25/26 data and its evaluator records dataset,
+image, checkpoint and sampling-protocol provenance. Current-refactor job 306691
+completed the full 30-prompt AIME24 set with one repeat and wrote checksummed
+artifacts. The YAML `experiments/configs/eval_aime.yaml` is a separate,
+training-aligned diagnostic contract. Job 306776 generated and scored two AIME24
+rows through that YAML-entry path, but AIME25/26 and the full YAML-config suite
+remain unverified. Unified-runner job 307365 separately completed two-prompt,
+16-repeat current-SFT smokes for all three AIME years and published checksummed
+artifacts; those small samples validate execution, not full-set accuracy.
+
+CPU data-contract job 306823 separately completed ten tests and audited the
+actual AIME24/25/26 artifacts: 30 canonical eval-only rows per year with matching
+source and output SHA-256 provenance. Job 306822 completed four tests and audited
+the actual 500-row MATH-500 artifact plus its source provenance. These jobs
+validate prepared data and config contracts, not model generation or benchmark
+scores; the generation evidence remains 306691/306776/307365 as scoped above.
+
+Difficulty filtering for all three SFT policies is complete. The 8B first pass
+had one failed prompt group and was resumed to the full 17,398 measurements before
+the 9,816-row output was finalized. Conversion/filter completion does not by
+itself prove that a corresponding 8B or 30B-A3B RL recipe can forward, backward,
+checkpoint and resume.
 
 ## Inspecting the files
 
@@ -59,13 +79,13 @@ For a real token count (this is what `--rollout-max-prompt-len` is compared
 against), use the tokenizer from the HF checkpoint inside the container:
 
 ```bash
-srun -A coreai_horizon_dilations -p cpu -n1 --time=20 \
-  --container-image=/lustre/fsw/portfolios/coreai/users/kfujii/container/miles-latest.sqsh \
-  --container-mounts=/lustre/fsw/portfolios/coreai/users/kfujii/datasets:/data,/lustre/fsw/portfolios/coreai/users/kfujii/checkpoints/hf:/ckpt/hf \
+srun -A coreai_horizon_dilations -p cpu --qos=cpu-interactive -n1 --time=20 \
+  --container-image=/lustre/fsw/portfolios/coreai/users/kfujii/containers/miles-search-r1-b300-20260815.sqsh \
+  --container-mounts=/lustre/fsw/portfolios/coreai/users/kfujii/datasets:/data,/lustre/fsw/portfolios/coreai/users/kfujii/checkpoints/huggingface/Qwen3-4B-Base/LR2.0e-5-SEQ32768-GBS128-MBS1-TP1-PP1-CP1-EP1-PACK1-standard-cp-STEPS4000:/ckpt/hf \
   python3 - <<'PY'
 import json
 from transformers import AutoTokenizer
-tok = AutoTokenizer.from_pretrained("/ckpt/hf/Qwen3-4B")
+tok = AutoTokenizer.from_pretrained("/ckpt/hf/iter_0004000")
 lens = []
 with open("/data/dapo-math-17k/dapo-math-17k.jsonl") as f:
     for i, line in enumerate(f):

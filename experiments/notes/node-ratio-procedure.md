@@ -1,11 +1,12 @@
 # Choosing the train:rollout node split
 
-The procedure for fixing one train:rollout split for the whole study, and the
-reason each step is in the order it is. Nothing here has been run yet — every
-measurement taken before 2026-08-06 is discarded, because the staleness cap was
-never enforced (`notes/off-policy-variables.md`) and the throughput analysis
-silently dropped well-provisioned configurations (`analyze_throughput.py` drain
-rule).
+The procedure for fixing one train:rollout split for the historical study, and
+the reason each step is in the order it is. Later sections record old job
+measurements, but the original launcher is no longer in the tree and the
+retired Qwen3-4B-Instruct-2507 model must not be submitted. Measurements taken
+before 2026-08-06 were discarded because the staleness cap was never enforced
+([off-policy-variables.md](off-policy-variables.md)) and the historical
+throughput analysis silently dropped well-provisioned configurations.
 
 ## What makes this circular
 
@@ -38,9 +39,10 @@ binds, so `staleness/rollout/*` measures the offered train-time distribution
 without recycling groups. The accepted `staleness/{total,pre_queue,in_queue}/*`
 decomposition is emitted whether or not a bound is configured.
 
-`experiments/realized_staleness_sweep.sh` runs this pass (renamed from
-`node_ratio_sweep.sh`, whose name described the axis rather than the readout). It
-has two modes:
+The historical `experiments/realized_staleness_sweep.sh` launcher ran this pass,
+but neither it nor the earlier `node_ratio_sweep.sh` exists in the current tree.
+The two historical modes below remain the study design; a maintained launcher
+and a fresh dry-run/Slurm smoke are required before using these as commands:
 
 | mode | shape | answers |
 |---|---|---|
@@ -159,7 +161,7 @@ run.
 The output is a frozen training environment: node split, `SGLANG_MEM_FRACTION`,
 batch shape, and the staleness levels that are worth running. Every algorithm
 arm is then run inside it, unchanged, so that a difference between arms is a
-difference between algorithms. See `notes/algorithm-ablation.md`.
+difference between algorithms. See [algorithm-ablation.md](algorithm-ablation.md).
 
 ## The bound feeds back on the thing it is supposed to measure (2026-08-08)
 
@@ -327,7 +329,7 @@ sweep recorded at fixed settings. The maximum allocation is
 `arms × CHAIN_JOBS × 8 nodes × 4 hours`; reduce `CHAIN_JOBS` for a probe.
 
 The checkpoint cost is small and its bias runs the other way from what
-`notes/checkpoints.md` estimates. Measured from the `save_model` timer on jobs
+[checkpoints.md](checkpoints.md) estimates. Measured from the `save_model` timer on jobs
 15319376 and 15319392, at the recipe's cadence:
 
 | artifact | every | elapsed |

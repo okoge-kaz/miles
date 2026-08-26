@@ -354,16 +354,20 @@ Two rules that go with it:
   wall-clock; giving one arm fewer evals changes the measured quantity, even
   though it changes nothing about the learning.
 - Report the discarded fraction alongside the result, the same way
-  `active_elapsed_hours` reports `excluded_h` for inter-allocation gaps
-  (`experiments/src/offpolicy_acceleration/log_source.py:133`). The two
-  exclusions compose: queue gaps between jobs, and eval windows within a job.
+  the historical `active_elapsed_hours` analysis reported `excluded_h` for
+  inter-allocation gaps. Its former
+  `experiments/src/offpolicy_acceleration/log_source.py` implementation is not
+  present in the current tree, so restore or replace that analysis before
+  reproducing the old report. The two exclusions compose: queue gaps between
+  jobs, and eval windows within a job.
 
 ### The alternative worth taking for later tiers
 
 The runs analyzed in this section used `HF_SAVE_INTERVAL=5`; the current math
 recipes use `HF_SAVE_INTERVAL=10`. In either case,
-`experiments/src/offline_eval/run_eval.sbatch` can score the exports off the
-training critical path. That removes the exclusion entirely and buys a better eval
+`experiments/scripts/reasoning_eval/run-after-training.sbatch` is the current
+AIME entry point for scoring an exported checkpoint off the training critical
+path. That removes the exclusion entirely and buys a better eval
 (more samples, more benchmarks) than 30 prompts x 8 affords -- `eval/aime25` at
 n=8 on 30 prompts has se ~0.032, which is wider than the effects being chased.
 Do not switch tier 1 mid-run; switch a whole tier at once or not at all.
@@ -406,8 +410,9 @@ Consequences:
 - The exclusion window applies to `staleness_count_*`, `avg_staleness` and
   `wasted_token_frac` as well as to wall-clock. Drop rollouts from the eval until
   `queue_size` returns to its steady value -- 5 rollouts in the case above.
-- Moving evaluation offline (`experiments/src/offline_eval/run_eval.sbatch`, over
-  the then-current `HF_SAVE_INTERVAL=5` exports) removes the perturbation rather than
+- Moving evaluation offline (now
+  `experiments/scripts/reasoning_eval/run-after-training.sbatch`; the historical
+  runs exported at `HF_SAVE_INTERVAL=5`) removes the perturbation rather than
   correcting for it, and is the right configuration for tier 2 onward. It is
   still not something to change inside a running tier.
 
@@ -1295,11 +1300,13 @@ case, since versions change only on weight updates.  The recipe therefore keeps
 `SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS=1` so exact response- and loss-token lag
 remain observable.
 
-The result bundle is under
-`experiments/outputs/staleness-telemetry-gpu-16109706/`.  Its analyzer also has
-a nominal `clean_head` arm, but this invocation pointed that arm at the same
-working tree; only the telemetry-off versus enabled deltas above are used as a
-code-path comparison.
+The former result bundle path,
+`experiments/outputs/staleness-telemetry-gpu-16109706/`, is no longer retained in
+this checkout. The recorded invocation's analyzer also had a nominal
+`clean_head` arm, but it pointed that arm at the same working tree; only the
+telemetry-off versus enabled deltas above are a code-path comparison. Treat
+these figures as historical job evidence, not a current-tree reproduction
+package.
 
 ### What can be causal
 

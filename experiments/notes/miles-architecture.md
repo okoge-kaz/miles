@@ -82,16 +82,22 @@ Our two recipes sit at different depths:
 ## Launch path
 
 ```
-run.sbatch  → srun (pyxis)  → train.sh
-                                 ├─ source scripts/models/<type>.sh   (MODEL_ARGS)
-                                 ├─ ray start --head
-                                 └─ ray job submit -- python3 train.py <arg groups>
-                                        ├─ create_placement_groups()
-                                        ├─ create_rollout_manager()  → router + SGLang engines
-                                        ├─ create_training_models()  → actor + reference
-                                        └─ rollout → reward → train → weight sync
+run.sbatch  → one srun task per Slurm node (pyxis) → train.sh
+                                                      ├─ source scripts/models/<type>.sh
+                                                      ├─ source experiments/common/ray_cluster.sh
+                                                      │    ├─ node 0: start Ray head
+                                                      │    └─ other nodes: join and wait
+                                                      └─ node 0: ray job submit -- python3 train[_async].py
+                                                               ├─ create_placement_groups()
+                                                               ├─ create_rollout_manager() → router + SGLang engines
+                                                               ├─ create_training_models() → actor + reference
+                                                               └─ rollout → reward → train → weight sync
 ```
 
-`miles/utils/external_utils/command_utils.py` holds the same logic for the `.py`
-launchers under `scripts/` (`execute_train`), including multi-node ray via
-`MILES_SCRIPT_EXTERNAL_RAY`.
+This is the maintained `experiments/scripts/**/run.sbatch` path. It starts and
+joins the multi-node Ray cluster explicitly through
+`experiments/common/ray_cluster.sh`; these recipes do not use
+`MILES_SCRIPT_EXTERNAL_RAY`. The separate `.py` launchers under top-level
+`scripts/` use `miles/utils/external_utils/command_utils.py` (`execute_train`)
+and retain their own optional external-Ray mode. Evidence from one launcher
+family must not be used to describe the other.

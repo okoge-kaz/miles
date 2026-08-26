@@ -6,13 +6,17 @@ Host root: `/lustre/fsw/portfolios/coreai/users/kfujii/checkpoints`
 
 | Directory | In container | Format | Who reads it |
 |---|---|---|---|
-| `hf/` | `/ckpt/hf` | HuggingFace (safetensors + config + tokenizer) | SGLang engines (`--hf-checkpoint`), tokenizer loading, the converter |
+| `huggingface/` | `/ckpt/hf` | HuggingFace (safetensors + config + tokenizer) | SGLang engines (`--hf-checkpoint`), tokenizer loading, the converter |
 | `megatron/` | `/ckpt/megatron` | Megatron `torch_dist` | trainer (`--ref-load`, and `--load` on a cold start) |
 | `training/` | `/ckpt/training` | Megatron `torch_dist` + optimizer state | written by `--save`, read back by `--load` |
 
 Runs land under `training/<task>/<dataset>/<model>/<rl-algorithm>/<placement>/
-<policy-regime>/max-weight-staleness-<s>/<config>/` — see
-`notes/off-policy-variables.md` for what each level encodes and why.
+<policy-regime>/<staleness-tag>/<config>/`. For `queue-recycle`, the tag is
+`max-weight-staleness-<s>` with `-from-<reference>` appended when the reference
+is not `completion`; `queue-max` uses
+`queue-max/max-weight-staleness-<s>-from-prefill`. See
+[off-policy-variables.md](off-policy-variables.md) for what each level encodes
+and why.
 
 ## Why two formats
 
@@ -20,7 +24,7 @@ Megatron cannot consume a raw HuggingFace directory, and SGLang cannot consume a
 `torch_dist` one, so both exist at once:
 
 ```
-hf/Qwen3-4B  ──convert_hf_to_torch_dist.py──►  megatron/Qwen3-4B_torch_dist
+huggingface/Qwen3-4B  ──convert_hf_to_torch_dist.py──►  megatron/Qwen3-4B_torch_dist
      │                                                  │
      └──► SGLang engines (rollout)                       └──► Megatron actor + reference
 ```
@@ -28,9 +32,25 @@ hf/Qwen3-4B  ──convert_hf_to_torch_dist.py──►  megatron/Qwen3-4B_torch
 Keep the HF directory after conversion — the launch scripts still point the
 engines at it.
 
+## SFT baselines staged on aws-pdx
+
+The three SFT baselines used for DAPO-Math difficulty measurement were converted
+successfully on 2026-08-21. Each directory has a
+`latest_checkpointed_iteration.txt` containing `release`.
+
+| Model | Megatron directory | Size |
+|---|---|---:|
+| Qwen3 4B | `megatron/Qwen3-4B-Base-LR2e-5-Step4000_torch_dist` | 7.5 GiB |
+| Qwen3 8B | `megatron/Qwen3-8B-Base-LR1.5e-5-Step4000_torch_dist` | 16 GiB |
+| Qwen3 30B-A3B | `megatron/Qwen3-30B-A3B-Base-LR2e-5-Step4000_torch_dist` | 57 GiB |
+
+The exact HF source roots and model-argument scripts are recorded in
+`experiments/setup/manifests/sft_checkpoints.txt`; use
+`experiments/setup/models/stage_sft_checkpoints.sh` to validate or restage them.
+
 ## Conversion
 
-`experiments/setup/convert_checkpoint.sbatch` wraps:
+`experiments/setup/models/convert_checkpoint.sbatch` wraps:
 
 ```bash
 source scripts/models/qwen3-4B.sh          # MODEL_ARGS: layers, hidden size, rotary base, …
@@ -57,9 +77,12 @@ same job resumes from the last saved iteration; there is no separate resume flag
 Consequences worth remembering:
 
 - Changing hyperparameters and relaunching with the same `RUN_NAME` **continues**
-  the old run rather than starting a new one. `run.sbatch` defaults `RUN_NAME` to
-  include `$SLURM_JOB_ID` so each submission is fresh; set `RUN_NAME` explicitly
-  when you *want* to resume.
+  the old run only when they still derive the same `CKPT_PATH`. The maintained
+  recipes derive a deterministic `RUN_NAME` and checkpoint path from the
+  training identity; the Slurm job id is deliberately not part of either one.
+  Re-submit the same recipe with the same overrides and leave
+  `CLEAN_CHECKPOINT=0` to resume. Changing an identity-bearing setting, including
+  the maintained recipes' `NUM_ROLLOUT`, selects a new checkpoint directory.
 - `--save-interval` is in rollouts, not optimizer steps.
 - Optimizer state is saved alongside the weights, so these directories are
   several times the size of the model. Watch quota when sweeping.
@@ -116,12 +139,11 @@ h=10. Before this
 flag, getting HF every 10 would have meant `--save-interval 10` and 40 torch_dist
 writes -- 2,160 GB/run against 1,080 GB now, or ~311 TB across the 288-run grid.
 
-Disk is not the binding constraint (`/lustre/fsw` has 7.6 PB free). **Offline eval
-GPU time is**: ~0.35 node-hours per checkpoint (90 AIME prompts x n=16 at a 32768
-budget on one 8-GPU node), so evaluating all 40 exports costs ~14 node-hours
-against ~33 node-hours of training. Export at 10 and evaluate coarsely by default,
-then refine around the crossing point -- the exports exist so that refinement
-never requires retraining.
+Do not use a free-space number copied into this note for capacity planning; it
+becomes stale immediately. Check the filesystem quota and free space at
+submission time. Offline-evaluation GPU time and synchronous export time also
+remain part of the experiment cost, so export coarsely by default and refine
+around the crossing point from already exported checkpoints.
 
 ## Exporting a trained policy
 
@@ -134,42 +156,70 @@ PYTHONPATH=/root/Megatron-LM python3 tools/convert_torch_dist_to_hf.py \
 Check the exact flags with `--help`; `convert_torch_dist_to_hf_ray.py` is the
 multi-node variant for large models.
 
-## Resume verified end to end (2026-08-06)
+## What counts as resume validation
 
-`experiments/verify_resume.sh` — two chained jobs, phase A cut by the wall clock
-at 25 min, phase B resuming into the same `CKPT_PATH`. Jobs 15194552 / 15194553.
-This path had never executed before: the throughput probes are all too short to
-reach a save, and the 400-rollout reference run is 3-8 chained jobs where every
-one of them resumes.
+There is no maintained `experiments/verify_resume.sh`; older notes that named it
+described a deleted one-off launcher. A current recipe is considered validated
+for chained four-hour jobs only after this two-job check succeeds:
 
-| | phase A (fresh) | phase B (resume) |
-|---|---|---|
-| `load` | `/ckpt/megatron/Qwen3-4B-Instruct-2507_torch_dist` | the run's own `CKPT_PATH` |
-| `finetune` | True | **False** |
-| `no_load_optim` / `no_load_rng` | True / True | **None / None** |
-| resumed from | — | **iteration 1** (A's only save) |
-| iterations saved | 1 | **3, 5, 7, 9** |
+1. A fresh `batch`/`interactive`-QoS job runs at least one real
+   forward/backward optimizer update and writes a distributed checkpoint. It
+   need not consume the production
+   `NUM_ROLLOUT` schedule or run for four hours.
+2. A second job uses the same identity and `CLEAN_CHECKPOINT=0`, loads the saved
+   training checkpoint, restores optimizer and RNG state, and advances the
+   iteration again. Loading iteration 0 is valid when the first job performed
+   optimizer step 0 and then saved it.
+3. When replay is enabled, the second job must also restore a matching replay
+   artifact and report its restore telemetry. A model checkpoint alone does not
+   validate replay resume.
 
-The optimizer and RNG line is the one that mattered. On the fallback path
-(`arguments.py:2758`) miles sets `finetune` / `no_load_optim` / `no_load_rng`,
-which is right for a fresh start and would be silently wrong on a resume — Adam
-momentum would reset at every 4-hour boundary and nothing would report it. Phase
-B shows all three off, so the optimizer state is genuinely restored.
+The checked-in recipe contract is covered by
+`tests/fast/experiments/test_domain_training_recipes.py`: load and save share one
+path, the identity is stable across Slurm job ids, and a changed rollout schedule
+gets a different identity. That static test prevents path regressions but does
+not replace the two GPU jobs above. Historical fresh/resume jobs may still be
+useful evidence for Miles' checkpoint machinery; if their custom reward or
+generator import path has since been removed, they are not evidence that the
+current environment recipe resumes.
 
-Phase B saving 3,5,7,9 rather than 1,3,5,7 is what proves it continued rather
-than restarting; `start_rollout_id` in the argument dump is still `None` at parse
-time because miles resolves it from the checkpoint afterwards, so the dump is not
-the thing to read.
+The current IFEvalG recipe has passed this gate. Job 306686 performed optimizer
+step 0 and published the iteration-0 checkpoint plus `replay_buffer_0`; job
+306687 reused the same identity, restored iteration 0, performed optimizer step
+1, and published iteration 1 plus `replay_buffer_1`. Both four-node jobs used
+16K responses, 16 samples per prompt, EFA, and exited successfully.
+`BrokenPipeError` messages printed during final process teardown only after each
+job's checkpoint had been published; they are shutdown noise, not a failed
+resume.
 
-`--save-retain-interval 4` left only `iter_0000009`, i.e. it pruned every
-non-retained iteration as the next one landed and never removed the one the
-tracker points at.
+The current Code recipe has also passed the same gate at revision `a6dcaaf1`.
+Job 306787 performed optimizer step 0 and published iteration 0 plus
+`replay_buffer_0`. Job 306788 reused the identity, loaded model iteration 0, and
+restored that replay artifact in 0.459 seconds (six pending groups, four
+inflight groups / 397,991 inflight tokens, and one prepared batch). It then
+performed optimizer step 1 and published iteration 1 plus `replay_buffer_1`.
+Both jobs completed with exit code 0. Teardown `BrokenPipeError` messages came
+after durable publication and do not invalidate the resume result.
 
-**`--hf-save-interval` was exercised here for the first time**: with
-`--save-interval 2` and the recipe's `--hf-save-interval 10`, the distributed
-checkpoints landed at 3,5,7,9 while `hf/` got a single export. Two cadences from
-one run, which is what the flag was added for.
+The current STEM recipe at revision `82bfd482` has passed the gate as well. Job
+306790 exited 0 after optimizer step 0 and publication of iteration 0 plus
+`replay_buffer_0`. Same-identity job 306792 loaded model iteration 0, restored
+that replay state, performed optimizer step 1, and published iteration 1 plus
+`replay_buffer_1` before exiting 0.
 
-The verbose `CKPT_PATH` also survives resume — phase B loaded
-`.../grpo-clip0.2-0.28-tis2.0/async/off-policy/max-weight-staleness-2/resume-test`
-without help, so the added directory levels cost nothing at resume time.
+The current Math recipe passed a reduced-batch resume smoke in jobs
+307062/307063. The first trained steps 0 and 1; the second loaded iteration 1,
+restored 8 pending and 4 inflight groups plus one prepared batch in 0.098
+seconds, and advanced through iteration 3. It exercised the 16K response cap and
+current checkpoint identity but reduced `n` and the rollout/global batch sizes;
+the checked-in production defaults remain n=16.
+
+The current Math+Code+STEM recipe passed the production-shaped n=16 replay gate
+in jobs 306793/306796. The second loaded iteration 0, restored 15 pending, 3
+ready, and 6 inflight groups plus one prepared batch in 0.868 seconds, performed
+optimizer step 1, and published iteration 1 plus `replay_buffer_1`.
+
+Tau local-policy runtime jobs 307433/307434 also restored completed-rollout
+replay and advanced from iteration 1 to 2. This is not yet a complete maintained
+recipe result: the current-SFT replacement recipe and its tests still have to be
+committed, and the held-out evaluator has no successful terminal episode.

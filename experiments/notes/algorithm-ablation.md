@@ -1,6 +1,6 @@
 # RL algorithm ablation
 
-Runs inside the environment frozen by `notes/node-ratio-procedure.md`. The
+Runs inside the environment frozen by [node-ratio-procedure.md](node-ratio-procedure.md). The
 algorithm set is not settled yet; this records the frame it will be run in, what
 miles can express today, and what each arm costs, so that deciding the set is a
 choice about science rather than about plumbing.
@@ -10,7 +10,7 @@ choice about science rather than about plumbing.
 | fixed by | quantity |
 |---|---|
 | `node-ratio-procedure.md` | train:rollout split, staleness levels worth running |
-| `notes/rollout-scaling.md` | `SGLANG_MEM_FRACTION` — async 0.70, colocated 0.80 |
+| [rollout-scaling.md](rollout-scaling.md) | `SGLANG_MEM_FRACTION` — async 0.70, colocated 0.80 |
 | the study design | rbs 256, n 8, gbs 2048, `MAX_RESPONSE_LEN` 32768, LR 1e-6, 400 rollouts |
 
 Every arm runs at the same total GPU count, because the headline metric is
@@ -33,7 +33,7 @@ another algorithm's ceiling.
 ## What miles can express today
 
 `RL_ALGORITHM` is derived from these, so each combination is already a distinct
-checkpoint path and wandb group (`notes/off-policy-variables.md`):
+checkpoint path and wandb group ([off-policy-variables.md](off-policy-variables.md)):
 
 | knob | values | status |
 |---|---|---|
@@ -176,7 +176,7 @@ everything.
 Two independent confirmations:
 
 - **Measured here.** The sequence-level ratio on the running arms is 0.03-0.08
-  (`notes/telemetry.md`), two orders below 0.5, and it deepens with length --
+  ([telemetry.md](telemetry.md)), two orders below 0.5, and it deepens with length --
   -2.48 at 4737 tokens, -3.57 at 7114.
 - **Observed in VCPO** (arXiv:2602.17616, Figure 4): "Most baselines lead to
   training collapse (or crash, e.g. **Geometric MIS masks all sequences and has

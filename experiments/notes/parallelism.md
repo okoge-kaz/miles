@@ -1,5 +1,9 @@
 # Parallelism: why every recipe is CP=1 with the whole context in one budget
 
+The measurements in this note are historical and use the retired
+Qwen3-4B-Instruct-2507 checkpoint. They explain the CP=1 choice but are not
+permission to submit that model or evidence for current 8B/30B-A3B recipes.
+
 Context parallelism was never chosen for its own sake. The only constraint is
 
     max_tokens_per_gpu * context_parallel_size >= rollout_max_context_len (32768)
@@ -28,9 +32,11 @@ already been spent on the larger budget, which bought more than selective would.
 
 ## What is and is not measured
 
-Only **Qwen3-4B-Instruct-2507 under async** is measured. Every recipe has been
-set to CP=1 / mtpg 32768 for consistency, and `validate.py` still enforces the
-`mtpg * cp >= 32768` invariant, but the memory headroom is a per-model question:
+Only **Qwen3-4B-Instruct-2507 under async** is measured. Maintained 4B recipes
+currently use CP=1 / mtpg 32768 for consistency, but there is no shared
+`validate.py` in the current tree that enforces `mtpg * cp >= 32768`. Recipe
+tests cover their checked-in defaults; memory headroom remains a per-model
+question:
 
 | model | TP | measured? | note |
 |---|---|---|---|
@@ -53,8 +59,9 @@ transfer.
 It is still not the same: colocated cycles offload/onload every step, and
 fragmentation across that cycle is exactly what the old sync settings (cp4,
 mtpg 9216 -- far more conservative than async's cp2/16384) look like an
-accommodation for. **In flight: job 15168705**, colocated 2 nodes at cp1 /
-mtpg 32768, which either OOMs in the first step or does not.
+accommodation for. Historical job 15168705 was submitted for colocated two-node
+CP1 / mtpg 32768, but its result artifact is not retained in this checkout. It
+must not be described as running or as a completed validation.
 
 ## Node balance is an async-only question
 
@@ -77,8 +84,8 @@ RuntimeError: TorchMemorySaver is disabled for the current process because
 expandable_segments is not supported yet.
 ```
 
-`--colocate` sets `offload_train=True` (`arguments.py:2985`), and
-`ray/train/actor_factory.py:44-49` then LD_PRELOADs
+`--colocate` currently defaults `offload_train=True` in
+`miles/utils/arguments.py`, and `miles/ray/train/actor_factory.py` then LD_PRELOADs
 `torch_memory_saver_hook_mode_preload` into the trainer actor with
 `TMS_INIT_ENABLE=1`. torch_memory_saver replaces the allocator's segment
 handling to pause/resume HBM around the rollout phase, which is the same
@@ -86,8 +93,10 @@ mechanism `expandable_segments` claims, so the two are mutually exclusive. The
 async trainer never sets `offload_train`, gets no LD_PRELOAD, and is unaffected.
 
 Cost: job 15288321 (`conv-s0-tis-lr1e-6-32768-p1`) FAILED at 4:36, and
-`afterany` released p2 into the same failure before it could be cancelled.
-`validate.py` now rejects `expandable_segments` in any non-async recipe.
+`afterany` released p2 into the same failure before it could be cancelled. The
+historical recipe validator rejected `expandable_segments` in non-async
+recipes; no equivalent shared `validate.py` exists in the current tree, so each
+maintained colocated launcher needs its own guard or test before reuse.
 
 Resolved (job 15290984, colocated 4 nodes, n=16, gbs 3072, 32k): it does not
 OOM, but the margin is thin and does not improve with scale.
@@ -183,6 +192,6 @@ message itself recommends -- is unavailable here: `--colocate` sets
 `offload_train=True`, which LD_PRELOADs torch_memory_saver, which refuses it.
 
 **This is a robustness fix, not a cure.** The OOM was downstream of a training
-collapse at lr 5e-6 (see notes/algorithm-ablation.md): response length tripled,
+collapse at lr 5e-6 (see [algorithm-ablation.md](algorithm-ablation.md)): response length tripled,
 so the activations grew until they did not fit. At a learning rate where the run
 does not diverge, 0.65 should hold; at one where it does, no fraction will.

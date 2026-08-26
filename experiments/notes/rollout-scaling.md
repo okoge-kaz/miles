@@ -1,5 +1,9 @@
 # Why rollout time stops falling when you add rollout GPUs
 
+This note records a historical Qwen3-4B-Instruct scaling study. Its mechanism
+measurements remain useful, but old job state and old colocated defaults are not
+current recipe guidance; the retired checkpoint must not be submitted.
+
 Two separate floors hold rollout time up, and they need separate experiments
 because they have different fixes and only one of them is a property of the
 method rather than of the configuration.
@@ -93,10 +97,11 @@ not a property of async.
 KV cache is not the constraint: `token usage` sits at 0.09-0.14, so there is
 7-10x headroom before memory binds.
 
-**In flight** (jobs 15161704-6): `--async-max-concurrent-samples` at default,
-512, and 1024, at a fixed 3 nodes (1 train node + 2 rollout), 90 minutes each.
-90 rather than 40 because the first 1-4 steps are buffer drain, not steady state
--- see the drain handling in `analyze_throughput.py`.
+Historical jobs 15161704--15161706 were submitted to compare
+`--async-max-concurrent-samples` at default, 512, and 1024 on a fixed three-node
+allocation. Their result artifacts are not retained here, so the sweep is not a
+completed current-tree result. The intended 90-minute duration allowed the first
+1--4 buffer-drain steps to be excluded before measuring steady state.
 
 ## What the answer changes
 
@@ -107,9 +112,10 @@ buying nodes; adding nodes at fixed concurrency should not.
 
 ## SGLang static memory, measured (2026-08-06)
 
-**Adopted: async 0.70, colocated 0.80.** Each recipe carries the value that was
-measured on that recipe, at `MAX_RESPONSE_LEN=32768` and the production batch
-shape (rbs 256, n 8, gbs 2048).
+**Historical study choice: async 0.70, colocated 0.80.** Those values were
+measured at `MAX_RESPONSE_LEN=32768` and the old production batch shape (rbs
+256, n 8, gbs 2048). The maintained Qwen3-4B Math recipes now default to async
+0.70 and colocated 0.65; do not copy the 0.80 colocated value from this table.
 
 | config | KV tokens | free after graph | `token usage` p50 | retractions | `train_wait` |
 |---|---|---|---|---|---|

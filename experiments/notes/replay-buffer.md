@@ -137,6 +137,8 @@ CONFIG_TAG=my-run-replay USE_REPLAY_BUFFER=1 REPLAY_BUFFER_TYPE=rollout sbatch \
 ```
 
 Use `REPLAY_BUFFER_TYPE=inflight` for token-prefix continuation with the
-built-in single-turn generator. `experiments/verify_resume.sh` exercises the
-two-job save/resume transaction and reports retained replay buffers and warm
-resume log records.
+built-in single-turn generator. There is no maintained
+`experiments/verify_resume.sh`; validate a recipe with two real GPU jobs using
+the same deterministic identity. The first must update and save, and the second
+must restore the model, optimizer/RNG state, and matching replay artifact before
+advancing. See [checkpoints.md](checkpoints.md) for the current evidence rule.

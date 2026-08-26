@@ -1,139 +1,161 @@
-# Domain characteristics, for the off-policy staleness sweep
+# Domain contracts and current validation state
 
-Reference table for choosing which domains to sweep and for reading the results.
-Everything here is **measured on Qwen3-4B-Instruct-2507** (n=8, temperature 1.0,
-max_new_tokens 24576) unless a cell says otherwise — a pass rate is a property of
-the (prompt, policy, sampling-params) triple, not of the dataset.
+This note describes how the maintained experiments differ operationally. It is
+not a leaderboard table. Reward rates and sequence lengths depend on the exact
+policy, prompt file, sampling parameters, and verifier revision; old
+Qwen3-4B-Instruct measurements must not be presented as properties of a dataset
+or as evidence for the current Qwen3-4B Base recipes.
 
-Input lengths are token counts after `apply_chat_template` (tools included where
-the dataset ships them), over the first 1500 rows.
+## Three execution shapes
 
-## The table
-
-| domain | training set | eval set | multi-turn | reward density | input p50 / p90 / max | output p50 / p90 / mean | pass rate | zero-std |
-|---|---|---|---|---|---|---|---|---|
-| math | dapo-math-17k (17,398) | AIME24, AIME25 | no (1 turn) | sparse: 0/1 after long CoT | 131 / 198 / 517 | 3,493 / 8,782 / 4,347 | 0.770 | 66.3% |
-| math | skywork-or1-math (105,045) | AIME24, AIME25 | no | sparse | 135 / 204 / 977 | — | — | — |
-| math | nemotron-rl-math-v2 (7,732) | AIME24, AIME25 | no | sparse (judge-intended) | 110 / 197 / 1,230 | — | — | — |
-| math + tool | dapo-math-17k (ReTool) | AIME24, AIME25 | **yes,真** | sparse + tool-use bonus | 131 / 198 / 517 | (longer: interleaved tool output) | — | — |
-| knowledge | knowledge-mcqa (685,573) | MMLU-Pro | no | **dense**: 4-way, chance 0.25 | 269 / 394 / 1,314 | 406 / 1,548 / 805 | 0.462 | **34.0%** |
-| reasoning | reasoning-gym (14,259) | ARC-AGI validation | no | sparse, bimodal per env | 117 / 405 / 9,338 | 2,059 / 12,865 / 4,419 | 0.528 | 63.5% |
-| instruction following | instruction-following (46,391) | IFBench | no | medium: AND over constraints | 92 / 343 / 1,410 | — | — | — |
-| structured output | structured-outputs (9,437) | (train split) | no | medium: schema validates or not | 1,307 / 2,245 / 3,601 | 417 / 1,019 / 535 | 0.663 | 86.5% |
-| tool (single) | fncall-pivot (9,620) | BFCL | context only | dense: name+args match | **3,802 / 12,127 / 27,303** | 158 / 1,052 / 407 | 0.564 | **96.0%** |
-| tool (conversational) | conv-tooluse (96,968) | BFCL, τ-bench | context only | dense | 3,365 / 4,368 / 7,005 | 96 / 260 / 121 | 0.314 | 88.0% |
-| SWE | SWE-Pivot-v1 | — | context only | dense | — | — | — | — |
-| code | competitive_coding (~41k) | LiveCodeBench-v6 | no | sparse: all tests pass | — | — | — | — |
-| **search QA** | searchr1-nq-hotpotqa | NQ, HotpotQA, TriviaQA, PopQA, 2Wiki, Musique, Bamboogle | **yes, true** | sparse: EM on the final answer | short question | ~512/turn | — | — |
-| **tau-bench** | tau1 retail + airline | tau1 retail/airline test | **yes, true** | sparse: end-of-episode task success | long policy doc | ~2k/turn | — | — |
-
-## What "multi-turn" means here, and why it matters
-
-Only **ReTool** is multi-turn in the sense the staleness question cares about:
-the policy acts, a Python interpreter runs, and the *next* observation depends on
-what the policy did. Turn count is a property of the trajectory.
-
-`fncall-pivot` and `conv-tooluse` look multi-turn — their prompts average 17.4
-and 6.9 messages — but each row is a **single-step decision**: reproduce the
-expert's next action given a fixed conversation prefix. Nothing the policy emits
-changes the observation. NVIDIA built them that way on purpose (the Gym
-environment is literally named
-`single_step_tool_use_with_argument_comparison`), and it is why they need no
-sandbox. For measuring how off-policy staleness interacts with *trajectory
-length*, they are long-context single-step tasks, not multi-turn ones.
-
-So the controlled comparison for the multi-turn axis is:
-
-```
-dapo-math-17k, single turn          →  math/sync recipe
-dapo-math-17k, ReTool multi-turn    →  tool_multiturn recipe, --generate-max-turns N
-```
-
-Same prompts, same answer, same verifier family — only the turn structure
-differs. Sweeping `--generate-max-turns` gives turn count as a clean independent
-variable.
-
-### Three shapes of "the environment answers"
-
-All three go through the same mechanism — `tool_call_utils.py:58-64` appends the
-observation's tokens with `loss_mask 0` and decoding resumes — but what comes
-back differs enough to change the rollout's cost profile entirely:
-
-| recipe | observation | length | rollout is bound by |
+| Shape | Current tasks | What runs after generation | Replay implication |
 |---|---|---|---|
-| ReTool | Python stdout | short (a number, a traceback) | decode |
-| Search-R1 | 3 wiki passages | **long** | **prefill** |
-| tau-bench | a user-simulator turn + mock tool rows | medium | **an external API round-trip** |
+| Static local verifier | Math, MCQA/GPQA, Reasoning Gym, IFEvalG, JSON Schema, exact next tool action, Calendar | deterministic parser/scorer; code additionally launches a local sandbox | inflight replay can be considered after a real fresh/resume proof |
+| Stateful local environment | Tau | a policy action changes episode state and produces a loss-masked observation before generation resumes | begin with completed-rollout replay; inflight state requires explicit environment snapshot semantics |
+| External execution sandbox/service | full SWE; future Lean/browser/desktop work | repository/compiler/VM state plus a clean terminal grader | replay must pin the image, task, grader, and any restorable environment artifact |
 
-The consequence for staleness: observations are not trained on, so the fraction
-of a trajectory that carries gradient falls as observations grow. Search-R1 is
-the extreme — most of the trajectory is retrieved text the policy never
-produced — and it is the only way to vary that ratio without also varying the
-task.
+Search-R1 is multi-turn but read-only: an action issues a retrieval query and the
+retrieved passages are appended as loss-masked observations. Its infrastructure
+and failure modes are still closer to a service-backed environment than to a
+static reward.
 
-## Reward density, ordered
+Conversation history alone does not make a task interactive. Nemotron
+conversational tool-use, function-calling pivot, and SWE pivot ask for one expert
+next action from a fixed prefix. They do not execute that action and therefore
+remain static single-step RLVR.
 
-Density is what determines how much signal survives a stale gradient, so it is
-the second axis worth sweeping:
+## Maintained domain implementations
 
-```
-dense   knowledge-mcqa   34.0% zero-std   short outputs, chance floor 0.25
-        instruction-following            AND over several checkable constraints
-        reasoning-gym    63.5%           per-environment, strongly bimodal
-        math (DAPO)      66.3%           0/1 after a long chain
-        structured-out.  86.5%
-        conv-tooluse     88.0%
-sparse  fncall-pivot     96.0% zero-std   exact name+arguments match
-```
+| Domain | Training input and routing | Verification semantics | Current evidence |
+|---|---|---|---|
+| Math | 4B policy-filtered DAPO; built-in `deepscaler` reward | normalize and compare the final/boxed answer; truncation is forced to reward zero by the recipe | jobs 307062/307063 completed a current 16K-response fresh/resume smoke, restoring iteration 1 plus inflight replay and advancing through iteration 3; the smoke reduced `n` and batch size, while the checked-in production defaults remain n=16. 8B/30B filters are complete, but current RL/resume for those sizes is unverified |
+| Code | competitive-code blend; `experiments.src.reward_sets.code.reward` permits only `python_code` | extract Python and require every published stdin/function/harness test to pass in a Bubblewrap filesystem/process sandbox inside an unroutable network namespace | jobs 306787/306788 completed the current same-identity fresh+resume gate: iteration 0 plus `replay_buffer_0` was restored, optimizer step 1 ran, and iteration 1 plus `replay_buffer_1` was published |
+| STEM | Knowledge-MCQA + Reasoning Gym; `experiments.src.reward_sets.stem.reward` permits `gpqa`, `mcqa_regex`, and `reasoning_gym` | per-row MCQA regex/letter scoring or the pinned Reasoning Gym task scorer | jobs 306790/306792 completed the current same-identity fresh+resume gate: iteration 0 plus `replay_buffer_0` was restored, optimizer step 1 ran, and iteration 1 plus `replay_buffer_1` was published |
+| Math+Code+STEM | balanced JSONL; `experiments.src.reward_sets.math_code_stem.reward` permits only `math`, `python_code`, `mcqa_regex`, and `reasoning_gym` | route each row by `metadata.verifier`, group a reward batch by verifier, score groups concurrently, and restore original order | jobs 306793/306796 completed the current 4-node, 16K, n=16 fresh/resume gate. The resume restored iteration 0 and replay state (15 pending, 3 ready, 6 inflight groups, and one prepared batch), trained step 1, and published iteration 1 plus `replay_buffer_1` |
+| IFEvalG | Nemotron instruction following; `experiments.src.reward_sets.instruction_following.reward` | pinned Open-Instruct IFEvalG registry, hidden-thinking removal, mean constraint satisfaction | current jobs 306686/306687 completed a 4-node, 16K, n=16 fresh+resume pair with inflight replay; iteration 0 restored and iteration 1 advanced |
+| Exact tool action | balanced function-call-only split; `experiments.src.reward_sets.tool_call.reward` | exactly one expected tool call, exact tool and argument keys, normalized scalar values | jobs 306920/306921 proved 16K, n=16 inflight replay/resume for the verifier, but used the retired Qwen3-4B-Instruct-2507 checkpoint. That recipe is now fail-closed, so the current SFT model still needs a replacement recipe, fresh/resume validation, and held-out evaluation |
+| Tau Bench | pinned Tau v1 task identities; `experiments.src.environments.tau_bench.generator.generate` plus `experiments.src.reward_sets.tau.reward` | execute official state transitions, append user/tool observations with loss mask zero, use the terminal environment reward | current-SFT local-policy jobs 307433/307434 completed 16K, n=16 rollout replay/resume: the second restored iteration 1 plus 6 pending, 2 ready, 2 regenerated active groups, and one prepared batch, then saved iteration 2. The replacement SFT recipe is not yet committed, and downstream evaluation still fails, so Tau is not an effectiveness result |
+| Calendar | converted expected calendar state; `experiments.src.environments.calendar.verifier.score_calendar_response` | require the complete event set, exact durations, allowed windows/constraints, and global non-overlap | job 305108 solved and locally verified all 9,915 converted rows; official-grader parity and GPU RL are not proved |
+| Workplace | `experiments.src.environments.workplace.runtime` and `.verifier` | isolated fixture state, multiple tool calls, terminal state comparison | runtime/verifier correctness tests exist, but no Workplace custom-generate entry point is checked in; GPU training, resume, and production lifecycle are therefore unverified |
+| Full SWE | Harbor/E2B candidates and source-specific graders | agent edits in one sandbox; apply the captured patch and run task tests in a separate clean grader sandbox | implementation/contracts exist, but zero rows have passed live E2B admission and no 4-node RL/downstream result exists |
 
-`zero-std` is the fraction of 8-sample groups that are unanimous and therefore
-contribute no GRPO gradient at all. **knowledge-mcqa is the only set that gives a
-usable gradient out of the box**; everything else needs the pass-rate filter, and
-`fncall-pivot` at 96% needs it badly.
+Recipe-specific reward modules reject unexpected verifier ids. The broad
+`experiments.src.reward_sets.all_domains` module is for conversion diagnostics,
+not a maintained training entry point.
 
-Note the two are not the same thing: `conv-tooluse` has a *dense* reward (a short
-exact match, no long chain to get through) but a *degenerate* distribution (0.314
-mean with 88% unanimous). Density describes the reward function, zero-std
-describes this policy's competence on it.
+STEM CPU job 306819 completed with exit code 0 after 121 passing tests plus an
+official Reasoning Gym correct/wrong probe (`correct=1`, `wrong=0`). It is
+supporting verifier evidence; the separate 306790/306792 GPU pair supplies the
+current forward/backward and replay-resume evidence.
 
-## Sequence-length regimes
+GPQA CPU job 306854 completed five actual-artifact tests, audited all three
+198/448/546-row splits, and ran a scorer correct/wrong probe. This validates the
+prepared held-out data/scorer contract, not downstream model effectiveness.
 
-Three distinct regimes, which matter because KV pressure and rollout latency
-drive how much staleness a fully-async setup actually produces:
+## How the static multi-environment recipe dispatches
 
-- **short in, long out** — math, reasoning-gym. ~130 in, 3.5k–13k out. Rollout
-  time dominated by decode; this is where the 24,576 budget is needed.
-- **short in, short out** — knowledge-mcqa, instruction-following. Cheapest to
-  sweep, most steps per GPU-hour.
-- **long in, short out** — tool-use, structured-outputs. `fncall-pivot` reaches
-  **27,303 input tokens** (p90 12,127) because the whole conversation plus every
-  tool signature is in the prompt, while the answer is one call. Prefill-bound,
-  and the only sets that risk the 32,768 context limit in
-  `--rollout-max-context-len`.
+`/data/nemotron-performance-transfer/math-code-stem-balanced-train.jsonl`
+contains 32,673 rows: 10,891 math, 10,891 code, and 10,891 STEM. The STEM slice
+contains 10,578 MCQA and 313 Reasoning Gym rows. Every row carries a
+`metadata.verifier` value.
 
-`fncall-pivot`'s p99 of 22.5k against a 32,768 context leaves ~10k for
-generation. Raise `--rollout-max-context-len` before training on it.
+`experiments.src.reward_sets.math_code_stem.reward` calls
+`dispatch_restricted_reward`. The dispatcher:
 
-## Verifier per dataset
+1. reads the verifier id from every generated sample;
+2. fails the whole call if any id is missing or outside the four-value allowlist;
+3. groups the batch by verifier;
+4. evaluates the independent groups concurrently; and
+5. returns rewards in the original sample order.
 
-| dataset | verifier | notes |
-|---|---|---|
-| dapo-math-17k, skywork-or1-math | `--rm-type math` | `deepscaler` returns 0 for a non-thinking policy |
-| nemotron-rl-math-v2 | `--rm-type math` | NeMo-RL uses `math_with_judge`; ~10% of labels are prose a rule cannot grade |
-| knowledge-mcqa | `--rm-type gpqa` | grades `Answer: C`; `plain_boxed` scores 0 |
-| instruction-following | `--rm-type ifbench` | clones allenai/IFBench at runtime; needs nltk, langdetect, immutabledict, absl-py, emoji |
-| reasoning-gym | `rewards.reasoning_gym_reward` | literal answer, normalised |
-| structured-outputs | `rewards.structured_output_reward` | JSON Schema; some rows `$ref` into Draft-7 `definitions` |
-| fncall-pivot, conv-tooluse, SWE-Pivot | `rewards.tool_call_match_reward` | same verifier NeMo-RL uses for all three |
-| ReTool | `examples.retool_v2.tool_sandbox.reward_func` | returns a dict — needs `--reward-key score` |
+This is a static heterogeneous reward mixture, not a scheduler that launches
+three remote environments. Only `python_code` starts subprocesses. Its verifier
+owns one semaphore per asyncio event loop (`CODE_EXEC_CONCURRENCY`, default 4),
+so scalar reward calls cannot bypass the process cap.
 
-## External difficulty labels, for validating our own measurement
+Miles also places an `asyncio.Semaphore` at
+`GenerateState.generate_fn_semaphore` in
+`miles/rollout/inference_rollout/inference_rollout_common.py`. That semaphore
+bounds concurrent custom-generate calls according to SGLang request concurrency;
+it is not an independent CPU environment worker pool.
 
-Three sets ship a pass rate measured by someone else, which is the only
-independent check we have on the measurement pipeline:
+## Tau and the user simulator
 
-| dataset | reference | detail |
-|---|---|---|
-| skywork-or1-math | DeepSeek-R1-Distill 1.5B / 7B / 32B | `metadata.model_difficulty` |
-| knowledge-mcqa | Qwen3-30B-A3B | `metadata.reward_profiles`, 5 generations |
-| conv-tooluse | Qwen3-235B | `metadata.pass_rate`, **32 samples** — finer than our 8 |
+The checked-in Tau generator supports two user-simulator backends:
+
+- `TAU_USER_BACKEND=local-policy` uses the same local SGLang checkpoint and
+  needs no external API key;
+- `TAU_USER_BACKEND=gemini` defaults to `gemini-2.5-flash-lite` and requires
+  `GEMINI_API_KEY` to be exported into the submitted job environment.
+
+Secrets must be present at the Slurm job boundary; the Python environment code
+does not discover or parse dotenv files. The local-policy backend is sufficient
+for cluster bring-up and controlled pre/post comparisons, but it is not directly
+comparable with a Tau leaderboard run that uses a different user simulator. The
+Gemini path exists in the checked-in generator and evaluator; it must not be
+called validated until both an evaluation and an RL optimizer update actually
+complete with that backend.
+
+Jobs 307433/307434 used the local-policy backend. Downstream job 307463 attempted
+eight episodes and rejected the result because all eight failed before reaching
+a terminal state (`mean_reward=0`). This is a fail-closed evaluator result, not a
+zero-quality benchmark score. It proves neither Tau effectiveness nor that a
+specialized SFT is unnecessary.
+
+IFBench does not require Gemini. Its released 300-prompt test set is generated
+with the policy checkpoint and scored offline by the pinned IFBench constraints.
+Current full offline evidence is job 305176: 2,400 samples and sample accuracy
+0.20375. Current-SFT smoke job 307365 also completed two prompts x eight samples,
+with accuracy 0 and four length-finished empty responses. These validate the
+held-out evaluator contracts at their respective scopes, not reward improvement
+during a training run.
+
+## Offline evaluation versus analysis tools
+
+`experiments/scripts/reasoning_eval/run-suite.sbatch` and
+`experiments/tools/reasoning_eval/suite.py` form the generate-then-score runner
+for the AIME/MATH diagnostics, LiveCodeBench, GPQA, and IFBench. Job 307365
+completed all nine requested current-SFT smoke tasks and published checksummed
+artifacts. Generation
+completes before code scoring starts; the scoring step uses an unroutable
+network namespace and Bubblewrap. It lives beside the stricter NeMo-backed AIME
+runner rather than in a second `domain_eval` hierarchy.
+
+`experiments/tools/training_analysis/` summarizes already-written training logs
+and rollout dump files. It does not train a model or implement a benchmark; its
+output is diagnostic evidence about a run, not an independent effectiveness
+measurement. The directory name deliberately describes that responsibility and
+replaces the ambiguous former `domain_rl` name.
+
+Search-R1 has its own interactive held-out runner under
+`experiments/search_r1/evaluation/`. Job 307366 generated the two-prompt NQ and
+HotpotQA smoke; job 307427 audited all seven staged eval sets, revalidated the
+retriever/SGLang services, and accepted the protocol-matched completed artifacts.
+Both tasks scored exact match 0 and the policy made zero search calls, so this is
+environment/evaluator plumbing evidence rather than retrieval effectiveness.
+
+Miles-native files under `experiments/configs/eval_*.yaml` are a separate path.
+Job 306776 completed a two-prompt generate-and-score YAML-entry smoke for
+AIME24, MATH500, and GPQA Diamond, including `_SUCCESS` markers. This validates
+only those selected dataset/reward contracts: the other AIME and GPQA splits and
+the unrelated configs remain unverified. Legacy aggregate configs in the tree
+must not be treated as validated merely because their YAML parses. See
+[offline-eval.md](offline-eval.md) before using one in a report.
+
+## Admission rule
+
+For a domain to be called end-to-end validated on the current revision, require:
+
+1. audited input and current reward/generator correct-vs-wrong probes;
+2. a real GPU job with generation, forward, backward, and at least one applied
+   optimizer update;
+3. a second same-identity job that restores the checkpoint actually saved by
+   the first job and advances it (iteration 0 is valid after optimizer step 0);
+4. if replay is enabled, explicit replay-artifact restoration and reuse evidence;
+5. a held-out offline-evaluation smoke, followed by the intended full benchmark
+   for any effectiveness claim.
+
+The four-hour `batch`/`interactive` allocation is a maximum and can be chained.
+Validation does not require consuming all four hours; a few real optimizer steps
+plus a real resume are sufficient. Do not promote a pending, failed, or old-path
+job to “verified.”

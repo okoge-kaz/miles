@@ -1,206 +1,205 @@
 # Offline evaluation
 
-Scoring exported HF checkpoints after the fact, rather than inside the training
-loop. In-run eval is off (`EVAL_INTERVAL=0`) because it perturbs the independent
-variable — see `notes/telemetry.md`.
+Maintained RL recipes set `EVAL_INTERVAL=0`; held-out evaluation runs after a
+Hugging Face checkpoint has been exported. The runners are consolidated under
+`reasoning_eval`, but their benchmark-specific scoring contracts remain
+distinct. Evidence for one contract must not be used to mark another as
+validated.
 
-## The procedure
+## 1. General reasoning suite: MATH, LiveCodeBench, GPQA, and IFBench
 
-Three steps, in order. Skipping step 1 fails at model load; skipping the mount in
-step 2 fails at weight load, several minutes in.
+The current validated entry point is
+`experiments/scripts/reasoning_eval/run-suite.sbatch`. Its implementation is
+`experiments/tools/reasoning_eval/suite.py`.
 
-### 1. Unpad the vocabulary
+The job performs two phases:
 
-```
-uv run --no-project python experiments/src/offline_eval/unpad_vocab.py \
-    <src-hf-dir> $CKPT_ROOT/training/offline_eval_unpadded/<tag>
-```
+1. validate the source Hugging Face checkpoint, create a job-local unpadded
+   vocabulary view if needed, and generate candidates through an eight-GPU vLLM
+   server;
+2. stop the server, then score candidates offline. AIME/MATH use the local math
+   answer verifier, LiveCodeBench scoring runs in an unroutable network namespace
+   with Bubblewrap and the pinned evaluator, GPQA uses the converted row label,
+   and IFBench uses the pinned constraint scorer.
 
-`--vocab-size 151936` is padded to `padded_vocab_size` 152064 by
-`_vocab_size_with_padding` (`megatron_utils/arguments.py:35`), and
-`megatron.bridge`'s `save_hf_pretrained` writes the padded tensor while leaving
-`config.json` at the true 151936. sglang refuses it:
+Candidate writes are resumable through `.partial` files, final outputs are
+atomically renamed, and each completed task receives `_SUCCESS`. `EVAL_MODE=smoke`
+uses two prompts per task; `EVAL_MODE=full` uses the complete requested split.
 
-```
-AssertionError: self.org_vocab_size=151936 ... loaded_weight.shape[0]=152064
-```
+Jobs 305175 and 305176 completed the current generate-and-score path:
 
-Setting `vocab_size` to 152064 instead would load, and would be wrong. The model
-ties its output projection to the embedding (`tie_word_embeddings: true`), so the
-padding rows become 128 extra logits. They are not zero — measured at 1.65e-09
-against 8e-2 for real rows — which puts them at a logit of about 0. Against a
-peaked distribution that is ~4e-5 of the mass per token, and over a 6k-token
-response it is a coin-flip whether at least one sampled id is outside the
-tokenizer's range.
+| Task | Smoke shape | Full shape | Full sample accuracy |
+|---|---:|---:|---:|
+| LiveCodeBench release v6 | 2 x 1 | 1,055 x 1 | 0.409478672985782 |
+| GPQA Diamond | 2 x 8 | 198 x 8 | 0.4185606060606061 |
+| IFBench | 2 x 8 | 300 x 8 | 0.20375 |
 
-~16 s per checkpoint. Only the shard holding the embedding is rewritten; the
-others are hard-linked where the filesystem allows and **symlinked otherwise**,
-which is what makes step 2 mandatory.
+The retained pre-consolidation summaries are under
+`experiments/outputs/domain_eval/env-{smoke,full}-20260825/<task>/summary.json`.
+These are checkpoint baselines, not proof that a particular RL run improved the
+benchmark. An effectiveness claim requires a pinned pre/post checkpoint pair
+evaluated with the same contract.
 
-### 2. Submit, with the source tree mounted
+Job 307365 completed the current unified runner against the user's Qwen3-4B Base
+step-4000 SFT checkpoint. It ran all nine smoke tasks, published `_SUCCESS` and
+artifact manifests, and produced:
 
-```
-HISO=/lustre/fs1/portfolios/coreai/projects/coreai_horizon_dilations/users/hiso
-sbatch -A coreai_horizon_dilations \
-  --partition=batch,batch_short \
-  --job-name="oeval-${TAG}" \
-  --export=ALL,CKPT=/ckpt/training/offline_eval_unpadded/${TAG},TAG=${TAG},EXTRA_MOUNTS=${HISO}:${HISO} \
-  experiments/src/offline_eval/run_eval.sbatch
-```
+| Task | Smoke shape | Sample accuracy |
+|---|---:|---:|
+| AIME24 / AIME25 / AIME26 | 2 prompts x 16 | 0.40625 / 0.84375 / 0.84375 |
+| MATH500 | 2 x 4 | 1.0 |
+| LiveCodeBench v6 | 2 x 1 | 0.0 |
+| GPQA Diamond / Main / Extended | 2 x 8 | 0.4375 / 0.5 / 0.375 |
+| IFBench | 2 x 8 | 0.0 |
 
-`EXTRA_MOUNTS` must expose the **symlink target's** path, at the same path inside
-the container. The targets resolve to `/lustre/fs1/...`, not the `/lustre/fsw/...`
-spelling the checkpoints are usually referred to by; `Path.resolve()` picks the
-former and the symlink is written with it.
+The IFBench smoke had four length-finished empty responses. All values above are
+two-prompt plumbing checks, not benchmark estimates.
 
-`--partition=batch,batch_short` because `batch_short`'s QOS carries a
-cluster-wide `GrpTRES=node=20` that other users fill (`notes/cluster.md`).
-Already-pending jobs can be moved with `scontrol update jobid=<id>
-partition=batch,batch_short` without a kill.
+`experiments/scripts/reasoning_eval/run-suite-after-training.sbatch` selects a complete
+post-training export before invoking the same evaluator.
+`experiments/scripts/reasoning_eval/score-suite.sbatch` scores already
+generated candidates. Neither script runs inside the optimizer loop.
 
-### 3. Read the result
+## 2. Reasoning evaluation: AIME24, AIME25, and AIME26
 
-`report.py <out-dir>` pools the years. Resumable: `measure_pass_rate.py` appends
-per prompt and skips indices already present, so re-submitting after a
-wall-clock kill continues rather than restarting.
+The reportable reasoning path is under
+`experiments/scripts/reasoning_eval/`, with helpers in
+`experiments/tools/reasoning_eval/`. It is separate from
+`experiments/configs/eval_aime.yaml`.
 
-## Search-R1
+The intended pinned protocol uses:
 
-Search-R1 has a separate runner because the AIME client performs one generation
-request per answer.  A search trajectory must instead alternate LLM generation
-and retrieval, append each `<information>...</information>` observation, and
-resume generation.  The offline driver imports the same
-`generate_with_search.generate` and `reward_func` functions as training; it does
-not maintain a second inference implementation.
+- a vLLM 0.20.2 SquashFS image to serve a Qwen3-4B Hugging Face checkpoint;
+- the NeMo Evaluator/NeMo Skills 26.03 image to prepare and grade AIME24/25/26;
+- Qwen3 thinking plus `--reasoning-parser qwen3`;
+- a 32,768-token context and at most 28,672 generated tokens;
+- temperature 0.6, top-p 0.95, top-k 20;
+- one repeat and two prompts in smoke mode, or 64 repeats over all 30 prompts
+  per year in the current full default.
 
-Evaluate one checkpoint:
+The setup entry points are:
 
-```
-sbatch -A coreai_horizon_dilations \
-  --export=ALL,CKPT=/ckpt/training/search_r1/.../hf/19,UNPAD_VOCAB=1 \
-  experiments/src/offline_eval/run_search_r1_eval.sbatch
-```
-
-The job starts an 8-way data-parallel SGLang server and the CPU e5/wiki-18
-retriever, then evaluates NQ, HotpotQA, TriviaQA, PopQA, 2WikiMultiHopQA,
-MuSiQue, and Bamboogle.  Defaults match training: temperature/top-p 1.0,
-512 generated tokens per LLM turn, at most three LLM turns, top-3 passages, and
-outcome exact match with no format shaping.  Six sets are capped at 500 prompts;
-Bamboogle contains 125, for 3,125 trajectories per checkpoint at avg@1.
-
-```
-python3 experiments/src/offline_eval/report_search_r1.py \
-  $DATASET_DIR/offline_eval/search_r1/<tag>
+```bash
+sbatch experiments/scripts/reasoning_eval/import-evaluator-images.sbatch
+sbatch experiments/scripts/reasoning_eval/prepare-aime-data.sbatch
 ```
 
-In addition to EM, the report gives retriever calls per trajectory (`search`),
-LLM generation calls per trajectory (`turns`), search-use and final-answer
-rates, truncation, generated tokens, and injected observation tokens.  The
-observation count is derived from `loss_mask == 0` and includes both retrieval
-blocks and invalid-action feedback; it is therefore also a check that
-environment text did not become policy loss.  Aborted trajectories are treated
-as infrastructure failures, leave their prompt incomplete, and make the job
-fail rather than lowering model accuracy silently.  Re-submission resumes from
-the completed prompt records.
+Image validation job 306707 confirmed the two pinned SquashFS artifacts. The
+evaluator validates every indexed checkpoint shard, records a checkpoint
+manifest, refuses to reuse a result directory with a changed protocol, and
+finalizes each task atomically with an artifact checksum. The unpadding helper
+is `experiments/tools/reasoning_eval/unpad_vocab.py`; it builds a job-local view
+and never modifies the training checkpoint.
 
-For a checkpoint series, first inspect, then probe one checkpoint end-to-end,
-then fan out:
+Prepared-data job 306823 completed ten contract tests and then opened the actual
+AIME24/25/26 artifacts, confirming 30 canonical eval-only math rows per year and
+matching source/output SHA-256 provenance. This admits the data/config revision
+`5135c7aa`; it is setup evidence, not a generation or scoring run.
 
-```
-SOURCE_ROOT=<host Search-R1 run root> SWEEP_NAME=<name> \
-  experiments/src/offline_eval/submit_search_r1_sweep.sh check
-SOURCE_ROOT=<host Search-R1 run root> SWEEP_NAME=<name> \
-  experiments/src/offline_eval/submit_search_r1_sweep.sh probe
-SOURCE_ROOT=<host Search-R1 run root> SWEEP_NAME=<name> \
-  experiments/src/offline_eval/submit_search_r1_sweep.sh all
-```
+Earlier pre/post jobs 301121 and 301122 completed AIME24/25/26 with eight repeats
+per prompt. They are useful historical end-to-end evidence and their logs are
+under `experiments/outputs/reasoning_eval/`.
 
-`<search>` and `<information>` are deliberately ordinary text, not tokenizer
-special tokens.  SGLang matches `</search>`/`</answer>` as stop strings, while
-the host inserts and normally tokenizes the information block before the next
-turn.  The offline driver records the tag token IDs and fails if any tag does
-not encode/decode exactly; adding special tokens would change the vocabulary and
-would require training new embedding rows.
+Current-refactor job 306691 subsequently completed AIME24 over all 30 prompts
+with one repeat and exited successfully. It exported 30 request/response records,
+wrote `_SUCCESS`, and published a checksummed artifact manifest under
+`experiments/outputs/reasoning_eval/revalidate-aime1-20260826/aime24/`. This
+validates the current runner for that AIME24 single-repeat contract. Job 307365
+then exercised AIME24/25/26 at two prompts x 16 repeats. Neither run validates
+the 30-prompt x 64-repeat full default. Do not infer that a setup-image job is an
+evaluation job.
 
-## What is measured, and why it differs from in-run eval
+For a post-training run, use
+`experiments/scripts/reasoning_eval/run-after-training.sbatch`. It selects the
+newest structurally complete numeric HF export and records the selected path.
+For a sweep, use
+`experiments/scripts/reasoning_eval/submit-staleness-sweep.sh`; rerunning the
+launcher skips completed task suites and resumes unfinished ones.
 
-In-run eval was AIME-2025 only at n=8 and existed to show that a run is learning.
+## 3. Miles-native `eval_*.yaml` configs
 
-- Generation budget 32768, not the 24576 the training recipe uses. 13.75% of
-  AIME-2024 truncates at 24576 and a truncated sample scores 0 under every
-  rule-based verifier, so the in-training number is depressed by the budget
-  rather than by the model.
-- n=16 over three years rather than n=8 over one. 30 problems put the standard
-  error at ~9 points; 90 put it at ~4.5. Paired against a common baseline the
-  between-problem variance cancels and the standard error falls to ~1.3.
-- Sampling is whatever the comparison needs. Qwen's card reports AIME25 = 47.4
-  at temperature 0.7 / top_p 0.8; the training recipe generates at 1.0 / 1.0,
-  which is the default here.
+Files under `experiments/configs/` describe datasets for Miles' native eval
+arguments. They are not the same reportable protocol as the pinned reasoning
+runner. `tests/fast/experiments/test_eval_configs.py` proves that
+`eval_aime.yaml` and `eval_gpqa.yaml` parse and expose the expected sampling
+fields; job 304741 ran those two static tests.
 
-All years carry the same instruction wrapper, asserted at staging time by
-`prepare_aime.py --template-reference`. AIME-2024 was the exception until
-2026-08-05 (bare problem text, so the boxed answer the verifier grades was never
-asked for); `aime-2024.nowrapper.jsonl` is that older file, and scores measured
-against it do not compare to scores measured now.
+Three later container jobs exercised the prepared data rather than just parsing
+YAML. Job 306822 passed four MATH-500 contract tests and audited all 500 actual
+eval-only rows plus source provenance (revision `2c800d2e`). Job 306823 passed
+ten AIME data/marker tests and audited all three 30-row files with source/output
+SHA-256 provenance (revision `5135c7aa`). Job 306854 passed five GPQA tests,
+opened the 198/448/546-row actual splits, audited balance/source preservation,
+and ran a scorer correct/wrong probe (revision `565d50c1`). None generated model
+responses.
 
-**AIME 2023 is deliberately excluded: it is in the training data.** Normalized
-verbatim matching against the prompt files gives
+Job 306776 added a real YAML-entry smoke for the selected AIME24, MATH500, and
+GPQA Diamond contracts. For each task it opened the configured staged data,
+generated two responses, invoked the corresponding math or GPQA scorer, wrote
+two score records and a summary, and published `_SUCCESS`. The retained results
+are under `experiments/outputs/domain_eval/yaml-entry-e2e-20260826/`. This is
+end-to-end evidence for those three selected dataset/reward contracts, not for
+every dataset listed in their YAML files and not for the unrelated configs.
 
-| set | AIME-2023 overlap |
-|---|---|
-| dapo-math-17k | 23/30 |
-| dapo-math-p10-90 (the set trained on) | 11/30 |
-| deepscaler | 26/30 |
+Current audit status:
 
-so an AIME-2023 score is a memorisation score. 2024/2025 are clean against all
-three. 2026 is clean against the filtered p10-80 set but not against unfiltered
-dapo-math-17k, so re-check the overlap whenever the difficulty window widens.
-Matching is exact-after-normalisation and therefore a **lower** bound:
-paraphrases and number-swapped variants are missed.
+| Config family | Static state | End-to-end state |
+|---|---|---|
+| `eval_gpqa.yaml` | job 306854 passed five tests, audited all 198/448/546-row actual splits, and ran a scorer correct/wrong probe | job 306776 generated and scored two GPQA Diamond prompts; main and extended have not completed this current YAML-entry smoke |
+| `eval_aime.yaml` | job 306823 passed ten tests and audited all three canonical 30-row, SHA-256-provenanced eval-only files | job 306776 generated and scored two AIME24 prompts; AIME25/26 have not completed this YAML-entry smoke, and this path is not the pinned NeMo Skills protocol |
+| `eval_math500.yaml` | job 306822 passed four tests and audited all 500 canonical eval-only rows plus source provenance | job 306776 generated and scored two prompts successfully; the complete 500-prompt config evaluation has not run |
+| `eval_ifbench.yaml`, `eval_livecodebench.yaml` | YAML present; their datasets and dedicated scorers are validated separately | the YAML-native entry itself has not completed a current smoke; use the unified reasoning runner for the recorded evidence |
+| Legacy aggregate `eval_math.yaml`, `eval_knowledge.yaml`, `eval_search_r1.yaml`, and `eval_tool.yaml` | files remain in the committed tree | stale paths/settings and removed integrations make them unvalidated; do not advertise or submit them |
+| `eval_arc_agi.yaml` | YAML present | its old converter/verifier path was removed; unvalidated and not safe to advertise |
 
-## Failure taxonomy (measured 2026-08-06/07, 35 jobs)
+Before committing a config as validated, require a job that opens every
+configured path, generates at least one real response, invokes the intended
+verifier/generator, and writes a complete result. A YAML parse test alone is
+insufficient.
 
-15 of 35 jobs failed. Three distinct causes, and only one of them is random.
+## Search-R1 evaluation
 
-| Cause | Count | Symptom | Fix |
-|---|---|---|---|
-| Vocab padding | 1 | `org_vocab_size=151936 ... loaded_weight.shape[0]=152064` at load | step 1 |
-| Dangling symlink | 13 | `Rank 0 scheduler died during initialization (exit code: -3)`, `FileNotFoundError: .../model-00002-of-00003.safetensors` | step 2's `EXTRA_MOUNTS` |
-| NaN at sampling | 1 | `probability tensor contains inf, nan or element < 0`; job exits **COMPLETED** with 30 generation failures | resubmit elsewhere |
+Search-R1 uses `experiments/search_r1/evaluation/run.sbatch`, because each
+trajectory may call the pinned retrieval service between policy turns.
+Job 307366 generated and scored the two-prompt NQ and HotpotQA smoke against the
+user's step-4000 SFT checkpoint. Job 307427 completed a current-code revalidation:
+it audited all seven staged eval files, passed retriever and SGLang health/content
+probes, recognized both protocol-matched task artifacts as complete, and
+republished the aggregate result. Both tasks scored exact match 0;
+`search_calls_mean=0` and `searched_frac=0`, so this validates the pipeline but
+not effective retrieval use. Full seven-benchmark evaluation and current GPU
+RL/resume remain separate gates.
 
-The 13 were a single wave (15301356–15301426), one cause, submitted together
-before any one of them had been verified. Every one of them retried clean.
-**Probe one checkpoint end-to-end before fanning out** — a whole submission
-sharing one config also shares one config bug.
+## Tau and tool-call evaluators
 
-The NaN case (job 15305744, `s4-r24`, `pool0-00707`) is worth reading carefully
-because it *lies*: the sampler dies on the first batch, every request returns
-`ServerDisconnectedError`, `report.py` prints an empty table, and the Slurm state
-is `COMPLETED` with exit code 0:0. Nothing in `sacct` distinguishes it from a
-real run. The weights were checked and are clean — every bf16 tensor in the
-checkpoint has a finite exponent — and no other job on any other node reproduced
-it, so it is node-local. Resubmit with `--exclude=<node>`.
+Tau and exact tool action have dedicated entry points:
 
-The consequence for monitoring: **`sacct` state is not a completion signal
-here.** Check line counts.
+- `experiments/scripts/tau_bench/evaluate.sbatch`
+- `experiments/scripts/tool_call/evaluate.sbatch`
 
-```
-for d in $DATASET_DIR/offline_eval/*/; do
-    printf '%-10s %s\n' "$(basename $d)" "$(wc -l < $d/aime26.jsonl)"
-done
-```
+Tau can use either the local policy or the Gemini user simulator, whose checked-
+in default is `gemini-2.5-flash-lite`. Credentials must be present at the Slurm
+job boundary; the Python evaluator/environment does not parse dotenv files.
+Current-SFT local-policy job 307463 attempted eight episodes, then correctly
+failed the evaluation because all eight ended in errors before reaching a
+terminal state. Its `mean_reward=0` is therefore not an accuracy measurement.
+The Gemini downstream path and current-SFT exact tool-call held-out evaluator
+still require successful execution evidence.
 
-30 per benchmark is complete. A count between 1 and 29 is a job still running or
-one that hit the wall clock — resubmit, it resumes. A count of 0 with a
-`COMPLETED` state is the NaN case.
+## Validation checklist
 
-## Two shape choices in the sbatch
+For a quick evaluation validation, a small smoke is sufficient; it need not
+consume the four-hour allocation. Check all of the following:
 
-**`--dp-size 8 --tp-size 1`.** A 4B model fits on one H100, so eight independent
-replicas beat one tensor-parallel engine for a pure-inference sweep — no
-cross-GPU collectives on the critical path.
+1. the exact checkpoint and tokenizer pass structural validation;
+2. the job opens the real held-out data path;
+3. generation returns the expected number of unique `(prompt, repeat)` records;
+4. the intended scorer runs, including the sandbox for generated code;
+5. summaries and success markers are present and nonempty;
+6. W&B is offline or disabled;
+7. the full evaluation uses a new, protocol-locked result root rather than
+   silently mixing sampling settings.
 
-**Benchmarks run backgrounded, not sequentially.** A benchmark is 30 prompts, so
-its last few long generations leave the eight replicas nearly idle; run
-sequentially that tail is paid once per year. Overlapping them keeps the engines
-fed and costs nothing, since 90 prompts still fits under `--concurrency`.
+Slurm `COMPLETED` by itself is not sufficient: inspect result counts and success
+markers. Conversely, a smoke score of exactly zero on two prompts can still
+validate plumbing; it is not enough to judge model quality.

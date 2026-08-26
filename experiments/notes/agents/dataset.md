@@ -4,7 +4,8 @@
 
 ### Chosen sources
 
-`experiments/setup/download_assets.sbatch` pulls:
+The original `experiments/setup/download_assets.sbatch` all-in-one asset job
+pulled:
 
 - `zhuzilin/dapo-math-17k` → `$DATASET_DIR/dapo-math-17k/dapo-math-17k.jsonl`
 - `zhuzilin/aime-2024` → `$DATASET_DIR/aime-2024/aime-2024.jsonl`
@@ -17,6 +18,10 @@ mirrors were chosen because the example scripts reference them directly.
 
 Destination is `/lustre/fsw/portfolios/coreai/users/kfujii/datasets`, mounted at
 `/data` in the container.
+
+That path is historical; the transient launcher was later replaced by
+`experiments/setup/download/stage_all.sh` and the declarative manifests under
+`experiments/setup/manifests`.
 
 ### Ingestion path in miles
 
