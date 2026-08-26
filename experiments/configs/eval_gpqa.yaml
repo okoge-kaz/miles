@@ -1,0 +1,19 @@
+# GPQA evaluation. Diamond is repeated more often because it has only 198 rows.
+
+eval:
+  defaults:
+    n_samples_per_eval_prompt: 4
+    max_response_len: 16384
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+    rm_type: gpqa
+
+  datasets:
+    - name: gpqa_diamond
+      path: /data/gpqa/gpqa-diamond-miles.jsonl
+      n_samples_per_eval_prompt: 8
+    - name: gpqa_main
+      path: /data/gpqa/gpqa-main-miles.jsonl
+    - name: gpqa_extended
+      path: /data/gpqa/gpqa-extended-miles.jsonl
