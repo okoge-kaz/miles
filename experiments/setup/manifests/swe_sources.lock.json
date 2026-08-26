@@ -1,0 +1,125 @@
+{
+  "schema_version": "miles-swe-source-lock-v1",
+  "downstream_holdout": {
+    "dataset_id": "princeton-nlp/SWE-bench_Verified",
+    "revision": "c104f840cc67f8b6eec6f759ebc8b2693d585d4a",
+    "rows": 500,
+    "file": {
+      "name": "test-00000-of-00001.parquet",
+      "sha256": "a45b1fe4e2f0c8390b2b2938ac83e92ed5979000856808f3679c07812e9e6dcd",
+      "size": 2096679
+    }
+  },
+  "sources": {
+    "nemotron3-super-swe2": {
+      "dataset_id": "nvidia/Nemotron-RL-Super-Training-Blends",
+      "revision": "b90f74f1d0bafeec6d1f1321173f6775ba5bda2e",
+      "usage": "train",
+      "schemas": ["r2e-gym-v1", "swe-gym"],
+      "row_source_datasets": ["R2E-Gym/R2E-Gym-Subset", "SWE-Gym/SWE-Gym"],
+      "splits": ["train"],
+      "artifacts": [
+        {
+          "files": [
+            {
+              "name": "swe2.jsonl",
+              "sha256": "4d2d52ea5baf8bd1034c85cfdfb5ff28a78db9a70364e9a9eca27313a13d5129",
+              "size": 1056114965
+            }
+          ]
+        }
+      ]
+    },
+    "nemotron3-ultra-swe": {
+      "dataset_id": "nvidia/Nemotron-RL-Ultra-Training-Blends",
+      "revision": "79f8eda15ea12e1adf7bb14dcb338a29d391b80e",
+      "usage": "train",
+      "schemas": ["swe-rebench-v2", "swe-gym"],
+      "row_source_datasets": ["nebius/SWE-rebench-V2", "SWE-Gym/SWE-Gym"],
+      "splits": ["train"],
+      "artifacts": [
+        {
+          "files": [
+            {
+              "name": "swe.jsonl",
+              "sha256": "24a0f1c2fe96c699ffadcc86ba6ea646388a1f3c7efe9679d7d0b31e06f127dd",
+              "size": 563165856
+            }
+          ]
+        }
+      ]
+    },
+    "r2e-gym-v1": {
+      "dataset_id": "R2E-Gym/R2E-Gym-V1",
+      "revision": "903d405799ac435061c41e72260c81ca5100f964",
+      "usage": "train",
+      "schemas": ["r2e-gym-v1"],
+      "row_source_datasets": ["R2E-Gym/R2E-Gym-V1"],
+      "splits": ["train"],
+      "artifacts": [
+        {
+          "files": [
+            {"name": "train-00000-of-00013.parquet", "sha256": "97771e19db968982e755279963a313eac86faf804a99c6d6abc61a9fa5d88a3b", "size": 60142549},
+            {"name": "train-00001-of-00013.parquet", "sha256": "829d73a4218eded277b6cd04569a282aea7b7de221ceb359b4f8d8dfc3200746", "size": 80007503},
+            {"name": "train-00002-of-00013.parquet", "sha256": "a38a7b35203ede449a34c210b8497fbb85e78112d82eb782c7f682113e4e8ac0", "size": 79283495},
+            {"name": "train-00003-of-00013.parquet", "sha256": "7d8c326b05ac426558d468b10f8ead82f7a3b5926d8e8dc03c89b7cb839a0c7d", "size": 85119470},
+            {"name": "train-00004-of-00013.parquet", "sha256": "07e1c164cc823b23f949d5b90dfe8d10dcef377ba30e5bf51b570ec0a4e63968", "size": 177550470},
+            {"name": "train-00005-of-00013.parquet", "sha256": "92f1e6c7def8b89a27b719b1f67e5cb406dec4ce15679819d0f800cc487537f6", "size": 249835155},
+            {"name": "train-00006-of-00013.parquet", "sha256": "960116eaf1bc9983dd32429fde4ee77dcd18874a092daac2e6859c547c502069", "size": 94021421},
+            {"name": "train-00007-of-00013.parquet", "sha256": "ee7b44399658a83e9204b702930e69d3244bced79b1f3203653857d4b758bac6", "size": 130637993},
+            {"name": "train-00008-of-00013.parquet", "sha256": "6ab0109e1283da68f6d54495fac1a08aaaadf47315d84bcc6f83d400ac669e5e", "size": 65826121},
+            {"name": "train-00009-of-00013.parquet", "sha256": "62020fdcdf4d924a356bf134ee84eb2d0876fe969cda1269123408b5284bec45", "size": 54977459},
+            {"name": "train-00010-of-00013.parquet", "sha256": "32f523c3b0553ec77db34ac640bb2048061a4ad10a6a091c16ac939b8a0884bd", "size": 114699356},
+            {"name": "train-00011-of-00013.parquet", "sha256": "f58aa1b34c8c6e6dc9bfc523bd95b94d76086b3f2db3162a1f068e1a0fae32c3", "size": 236614981},
+            {"name": "train-00012-of-00013.parquet", "sha256": "e0a04372a9c1ee940bcaba5aea8d875fbc0d4b1f10b60fff9243cd45d5d4316b", "size": 233891995}
+          ]
+        }
+      ]
+    },
+    "swe-rebench-v2": {
+      "dataset_id": "nebius/SWE-rebench-V2",
+      "revision": "475dd5e8703bb5fb22dd3c60b5d038b019eba1e0",
+      "usage": "train",
+      "schemas": ["swe-rebench-v2"],
+      "row_source_datasets": ["nebius/SWE-rebench-V2"],
+      "splits": ["train"],
+      "artifacts": [
+        {"files": [{"name": "train-00000-of-00001.parquet", "sha256": "0e0bf9355f892ad74ae98d4e1c404f39fd6654a8e351ee3e6ab162e4a64cd3ad", "size": 428839266}]}
+      ]
+    },
+    "swe-rebench-v2-filtered-verified": {
+      "dataset_id": "PrimeIntellect/SWE-rebench-V2-Filtered-Verified",
+      "revision": "03cc767ee33126b7fc7890ad57047e9dd6914cca",
+      "usage": "train",
+      "schemas": ["swe-rebench-v2"],
+      "row_source_datasets": ["PrimeIntellect/SWE-rebench-V2-Filtered-Verified"],
+      "splits": ["train"],
+      "artifacts": [
+        {"files": [{"name": "train-00000-of-00001.parquet", "sha256": "7416e352008b35480c82610cf4f5edf160dd269ed6bf382a22bd4c17daed24b9", "size": 226272977}]},
+        {"files": [{"name": "swe-rebench-v2-filtered-verified-train.arrow", "sha256": "b3b1ee9337ef0735b2a11bab003ccba30a7e1b5096eb2c4fc69d089a3ba48c54", "size": 276193088}]}
+      ]
+    },
+    "swe-gym": {
+      "dataset_id": "SWE-Gym/SWE-Gym",
+      "revision": "bb94ed9e39bbeb96a7fcbfb533b80f25a7fd59cb",
+      "usage": "train",
+      "schemas": ["swe-gym"],
+      "row_source_datasets": ["SWE-Gym/SWE-Gym"],
+      "splits": ["train"],
+      "artifacts": [
+        {"files": [{"name": "train-00000-of-00001.parquet", "sha256": "60569cea74bb281f7a5579467436a2bc1932c6e0c5f2f7fa0d084392abd9ad97", "size": 43644473}]}
+      ]
+    },
+    "swe-bench-verified": {
+      "dataset_id": "princeton-nlp/SWE-bench_Verified",
+      "revision": "c104f840cc67f8b6eec6f759ebc8b2693d585d4a",
+      "usage": "eval",
+      "schemas": ["swebench"],
+      "row_source_datasets": ["princeton-nlp/SWE-bench_Verified"],
+      "splits": ["test"],
+      "artifacts": [
+        {"files": [{"name": "test-00000-of-00001.parquet", "sha256": "a45b1fe4e2f0c8390b2b2938ac83e92ed5979000856808f3679c07812e9e6dcd", "size": 2096679}]}
+      ]
+    }
+  }
+}
