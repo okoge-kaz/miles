@@ -30,6 +30,17 @@ if [[ ! -f "experiments/scripts/${RECIPE}/run.sbatch" ]]; then
     exit 1
 fi
 
+# This checkpoint is retained only in historical records and compatibility
+# tests. Refuse before calling sbatch so stale recipes cannot consume an
+# allocation while their SFT migration is still pending.
+FORBIDDEN_MODEL=Qwen3-4B-Instruct-2507
+if [[ "${RECIPE}" == *qwen3-4b-instruct-2507* ]] \
+    || grep -Fq -- "${FORBIDDEN_MODEL}" "experiments/scripts/${RECIPE}/run.sbatch"; then
+    echo "refusing to submit ${RECIPE}: ${FORBIDDEN_MODEL} is prohibited; migrate the recipe to Qwen3-4B-Base-LR2e-5-Step4000" >&2
+    exit 2
+fi
+unset FORBIDDEN_MODEL
+
 # Mirror the recipe path, like the checkpoints do: <task>/<dataset>/<model>/.
 # Sync/async are placement axes, not separate task families.
 TASK_FAMILY="${RECIPE%%/*}"

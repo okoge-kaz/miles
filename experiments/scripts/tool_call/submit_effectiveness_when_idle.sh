@@ -5,6 +5,9 @@
 
 set -euo pipefail
 
+echo "tool-call automatic submission is disabled until its recipe is migrated to Qwen3-4B-Base-LR2e-5-Step4000" >&2
+exit 2
+
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)"
 cd "${REPO_ROOT}"
 source experiments/env.sh

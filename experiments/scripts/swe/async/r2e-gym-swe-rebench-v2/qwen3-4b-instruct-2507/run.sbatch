@@ -20,6 +20,9 @@
 
 set -euo pipefail
 
+echo "this retired recipe is disabled: Qwen3-4B-Instruct-2507 must not be submitted" >&2
+exit 2
+
 REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../../../.." &>/dev/null && pwd)}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH

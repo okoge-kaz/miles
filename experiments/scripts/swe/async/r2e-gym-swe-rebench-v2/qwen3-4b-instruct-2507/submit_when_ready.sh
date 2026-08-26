@@ -2,6 +2,10 @@
 # Submit a CPU readiness gate and make the four-node SWE job depend on it.
 
 set -euo pipefail
+
+echo "SWE automatic submission is disabled until its recipe is migrated to Qwen3-4B-Base-LR2e-5-Step4000" >&2
+exit 2
+
 umask 077
 
 REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../../../.." && pwd -P)}"
