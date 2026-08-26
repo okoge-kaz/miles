@@ -139,6 +139,13 @@ def test_use_replay_buffer_accepts_replay_validated_code_reward(monkeypatch):
     assert args.rollout_function_path == "miles.rollout.fully_async_rollout.FullyAsyncRolloutFn"
 
 
+def test_use_replay_buffer_accepts_replay_validated_stem_reward(monkeypatch):
+    monkeypatch.setattr("miles.utils.arguments.enable_experimental_rollout_refactor", lambda: True)
+    args = _replay_buffer_args(custom_rm_path="experiments.src.reward_sets.stem.reward")
+    _resolve_rollout_functions(args)
+    assert args.rollout_function_path == "miles.rollout.fully_async_rollout.FullyAsyncRolloutFn"
+
+
 def test_use_replay_buffer_rejects_broad_all_domain_reward(monkeypatch):
     monkeypatch.setattr("miles.utils.arguments.enable_experimental_rollout_refactor", lambda: True)
     args = _replay_buffer_args(custom_rm_path="experiments.src.reward_sets.all_domains.blend_reward")
