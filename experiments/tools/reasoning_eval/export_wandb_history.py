@@ -18,7 +18,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
-ARM_PATTERN = re.compile(r"s(?:0-colocated|[1248]-t[1-4]r[4-7])")
+ARM_PATTERN = re.compile(r"(?P<arm>s(?:0-colocated|\d+-t\d+r\d+))(?:-c\d+)?")
 ROLLOUT_STEP = "rollout/step"
 TRAIN_STEP = "train/step"
 ROLLOUT_METRICS = (
@@ -132,9 +132,10 @@ def _arm_from_run(run: Any, *, namespace: str) -> str:
         value = str(candidate)
         if not value.endswith(namespace_suffix):
             continue
-        arm = value[: -len(namespace_suffix)]
-        if ARM_PATTERN.fullmatch(arm) is not None:
-            return arm
+        tagged_arm = value[: -len(namespace_suffix)]
+        match = ARM_PATTERN.fullmatch(tagged_arm)
+        if match is not None:
+            return match.group("arm")
     raise ValueError(f"cannot identify sweep arm for W&B run {run.id}")
 
 

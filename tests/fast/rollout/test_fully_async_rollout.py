@@ -383,6 +383,7 @@ def test_staleness_histogram_reports_the_shape_not_just_moments():
     hundred times.
     """
     cap = fully_async.STALENESS_HISTOGRAM_MAX
+    assert cap == 32
     overflow = f"count_ge_{cap + 1}"
     values = [0] * 90 + [1] * 8 + [4, 12, cap + 3]
     m = fully_async._staleness_metrics(values)

@@ -15,10 +15,17 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-ARM_PATTERN = re.compile(r"^s(?P<staleness>[1248])-t(?P<train>[1-4])r(?P<rollout>[4-7])$")
-STALENESS_LEVELS = (1, 2, 4, 8)
-NODE_RATIOS = ((1, 7), (2, 6), (3, 5), (4, 4))
-STALENESS_COLORS = {1: "#0072B2", 2: "#E69F00", 4: "#009E73", 8: "#CC79A7"}
+from experiments.tools.reasoning_eval.grid import reasoning_eval_grid_from_environment
+
+ARM_PATTERN = re.compile(r"^s(?P<staleness>\d+)-t(?P<train>\d+)r(?P<rollout>\d+)$")
+EVALUATION_GRID = reasoning_eval_grid_from_environment()
+STALENESS_LEVELS = EVALUATION_GRID.staleness_levels
+NODE_RATIOS = EVALUATION_GRID.node_ratios
+STALENESS_PALETTE = ("#0072B2", "#E69F00", "#009E73", "#CC79A7")
+STALENESS_COLORS = {
+    staleness: STALENESS_PALETTE[index % len(STALENESS_PALETTE)]
+    for index, staleness in enumerate(STALENESS_LEVELS)
+}
 METRIC = "staleness/total/mean"
 SENSITIVE_METRIC_THRESHOLD = 0.25
 SENSITIVE_METRIC_CANDIDATES = (
@@ -340,7 +347,10 @@ def _render_steady_grid(rows: list[SteadyState]) -> str:
     plot_x, plot_y = 285.0, 155.0
     cell_width, cell_height = 190.0, 128.0
     maximum = max(row.staleness_total_mean for row in rows)
-    by_setting = {(row.max_weight_staleness, row.trainer_nodes): row for row in rows}
+    by_setting = {
+        (row.max_weight_staleness, row.trainer_nodes, row.rollout_nodes): row
+        for row in rows
+    }
     elements = _svg_header(
         width,
         height,
@@ -360,8 +370,8 @@ def _render_steady_grid(rows: list[SteadyState]) -> str:
             f'<text class="axis-label" x="{plot_x - 22:.2f}" y="{center_y + 5:.2f}" text-anchor="end">'
             f"max weight staleness {staleness}</text>"
         )
-        for column, (trainer_nodes, _) in enumerate(NODE_RATIOS):
-            summary = by_setting.get((staleness, trainer_nodes))
+        for column, (trainer_nodes, rollout_nodes) in enumerate(NODE_RATIOS):
+            summary = by_setting.get((staleness, trainer_nodes, rollout_nodes))
             cell_x = plot_x + column * cell_width
             cell_y = plot_y + row_index * cell_height
             if summary is None:
@@ -605,7 +615,7 @@ def _render_sensitive_metrics(
                 f'text-anchor="end">{correlation_text}</text>',
             ]
         )
-        for column, (trainer_nodes, _) in enumerate(NODE_RATIOS):
+        for column, (trainer_nodes, rollout_nodes) in enumerate(NODE_RATIOS):
             panel_x = plot_left + column * (panel_width + panel_gap)
             plot_x, plot_y = panel_x + 68.0, row_y + 18.0
             plot_width, plot_height = panel_width - 86.0, panel_height - 60.0
@@ -647,7 +657,7 @@ def _render_sensitive_metrics(
                 ]
             )
             for staleness in STALENESS_LEVELS:
-                arm = f"s{staleness}-t{trainer_nodes}r{8 - trainer_nodes}"
+                arm = f"s{staleness}-t{trainer_nodes}r{rollout_nodes}"
                 values_by_step = metric_histories.get(arm, {})
                 if not values_by_step:
                     continue

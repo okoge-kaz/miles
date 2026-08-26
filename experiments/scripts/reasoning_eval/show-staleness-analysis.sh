@@ -30,6 +30,9 @@ if (( $# == 1 )); then
     ANALYSIS_ROOT="${RESULT_STUDY_ROOT}/analysis/${PROTOCOL_NAME}/${EVAL_MODE}"
     STALENESS_ROOT="${ANALYSIS_ROOT}/staleness"
 fi
+if [[ -f "${RESULT_STUDY_ROOT}/grid.env" ]]; then
+    source "${RESULT_STUDY_ROOT}/grid.env"
+fi
 [[ "${BOOTSTRAP_SAMPLES}" =~ ^[0-9]+$ ]] || {
     echo "BOOTSTRAP_SAMPLES must be nonnegative" >&2
     exit 3

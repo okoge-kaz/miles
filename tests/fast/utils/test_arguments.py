@@ -175,10 +175,21 @@ def test_training_buffer_queue_size_cli_defaults_to_legacy_capacity_and_accepts_
     get_miles_extra_args_provider()(parser)
 
     defaults = parser.parse_args(REQUIRED_ARGS)
-    configured = parser.parse_args(["--training-buffer-queue-size", "5760"] + REQUIRED_ARGS)
+    configured = parser.parse_args(["--training-buffer-queue-size", "6000"] + REQUIRED_ARGS)
 
     assert defaults.training_buffer_queue_size == 1000
-    assert configured.training_buffer_queue_size == 5760
+    assert configured.training_buffer_queue_size == 6000
+
+
+def test_sample_staleness_histogram_defaults_to_32_and_accepts_override():
+    parser = argparse.ArgumentParser()
+    get_miles_extra_args_provider()(parser)
+
+    defaults = parser.parse_args(REQUIRED_ARGS)
+    configured = parser.parse_args(["--sample-staleness-max-bin", "48"] + REQUIRED_ARGS)
+
+    assert defaults.sample_staleness_max_bin == 32
+    assert configured.sample_staleness_max_bin == 48
 
 
 def test_zero_reward_on_truncated_cli_is_opt_in():

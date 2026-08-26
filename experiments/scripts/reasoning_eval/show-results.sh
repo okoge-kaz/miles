@@ -22,6 +22,9 @@ if (( $# == 1 )); then
     RESULT_STUDY_ROOT="${EVALUATION_ROOT}/staleness-ratio-sweep/${RUN_NAMESPACE}"
     ANALYSIS_ROOT="${RESULT_STUDY_ROOT}/analysis/${PROTOCOL_NAME}/${EVAL_MODE}"
 fi
+if [[ -f "${RESULT_STUDY_ROOT}/grid.env" ]]; then
+    source "${RESULT_STUDY_ROOT}/grid.env"
+fi
 
 python3 "${REPO_ROOT}/experiments/tools/reasoning_eval/summarize_results.py" \
     --result-study-root "${RESULT_STUDY_ROOT}" \

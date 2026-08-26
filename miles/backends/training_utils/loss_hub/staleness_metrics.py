@@ -265,7 +265,7 @@ def compute_sample_staleness_parts(
     if len(sample_staleness) != len(original_local_masks):
         raise ValueError(f"sample_staleness has {len(sample_staleness)} rows for {len(original_local_masks)} samples")
 
-    max_staleness = int(getattr(args, "sample_staleness_max_bin", 16))
+    max_staleness = int(getattr(args, "sample_staleness_max_bin", 32))
     num_bins = max_staleness + 2
     device = pg_loss_tokens.device
     final_local_mask_list = get_local_response_loss_masks(

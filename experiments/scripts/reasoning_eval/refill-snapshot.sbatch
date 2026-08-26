@@ -16,12 +16,38 @@ set -euo pipefail
 
 REPO_ROOT="$(realpath -- "${SLURM_SUBMIT_DIR:?submit from the Miles repository root}")"
 LAUNCHER="${REPO_ROOT}/experiments/scripts/reasoning_eval/submit-staleness-sweep.sh"
+source "${REPO_ROOT}/experiments/env.sh"
 
 : "${TRAINING_ROOT:?set TRAINING_ROOT to the checkpoint root}"
 : "${RUN_NAMESPACE:?set RUN_NAMESPACE to the training namespace}"
 
 SNAPSHOT_ARM_MAX_STEPS="${SNAPSHOT_ARM_MAX_STEPS:-}"
-EXPECTED_CHECKPOINTS="${EXPECTED_CHECKPOINTS:-510}"
+EVALUATION_ROOT="${EVALUATION_ROOT:-${WS}/evaluations/reasoning_eval}"
+RESULT_STUDY_ROOT="${EVALUATION_ROOT}/staleness-ratio-sweep/${RUN_NAMESPACE}"
+if [[ -f "${RESULT_STUDY_ROOT}/grid.env" ]]; then
+    source "${RESULT_STUDY_ROOT}/grid.env"
+fi
+STALENESS_LEVELS="${STALENESS_LEVELS:-1 2 4 8}"
+RATIOS="${RATIOS:-1:7 2:6 3:5 4:4}"
+INCLUDE_COLOCATED="${INCLUDE_COLOCATED:-1}"
+START_STEP="${START_STEP:-10}"
+END_STEP="${END_STEP:-300}"
+STEP_INTERVAL="${STEP_INTERVAL:-10}"
+staleness_count=$(wc -w <<< "${STALENESS_LEVELS}")
+ratio_count=$(wc -w <<< "${RATIOS}")
+arm_count=$(( staleness_count * ratio_count + INCLUDE_COLOCATED ))
+default_expected_checkpoints=$(( arm_count * ((END_STEP - START_STEP) / STEP_INTERVAL + 1) ))
+if [[ -n "${SNAPSHOT_ARM_MAX_STEPS}" ]]; then
+    default_expected_checkpoints=0
+    IFS=',' read -r -a snapshot_entries <<< "${SNAPSHOT_ARM_MAX_STEPS}"
+    for snapshot_entry in "${snapshot_entries[@]}"; do
+        max_step="${snapshot_entry#*=}"
+        default_expected_checkpoints=$((
+            default_expected_checkpoints + (max_step - START_STEP) / STEP_INTERVAL + 1
+        ))
+    done
+fi
+EXPECTED_CHECKPOINTS="${EXPECTED_CHECKPOINTS:-${default_expected_checkpoints}}"
 POLL_SECONDS="${POLL_SECONDS:-30}"
 DYNAMIC_QUIESCENT_SCANS="${DYNAMIC_QUIESCENT_SCANS:-12}"
 CONTROLLER_DRY_RUN="${CONTROLLER_DRY_RUN:-0}"

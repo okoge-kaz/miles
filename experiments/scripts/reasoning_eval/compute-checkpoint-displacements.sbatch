@@ -18,6 +18,15 @@ source "${REPO_ROOT}/experiments/env.sh"
 : "${ANALYSIS_ROOT:?set ANALYSIS_ROOT to the analysis snapshot directory}"
 : "${STUDY_ROOT:?set STUDY_ROOT to the checkpoint study root}"
 : "${RUN_NAMESPACE:?set RUN_NAMESPACE to the training namespace}"
+RESULT_STUDY_ROOT="${RESULT_STUDY_ROOT:-${ANALYSIS_ROOT%/analysis/*}}"
+if [[ -f "${RESULT_STUDY_ROOT}/grid.env" ]]; then
+    source "${RESULT_STUDY_ROOT}/grid.env"
+fi
+STALENESS_LEVELS="${STALENESS_LEVELS:-1 2 4 8}"
+RATIOS="${RATIOS:-1:7 2:6 3:5 4:4}"
+INCLUDE_COLOCATED="${INCLUDE_COLOCATED:-1}"
+TRAINING_BUFFER_QUEUE_SIZE="${TRAINING_BUFFER_QUEUE_SIZE:-1000}"
+ASYNC_MAX_CONCURRENT_SAMPLES="${ASYNC_MAX_CONCURRENT_SAMPLES:-}"
 STUDY_IDENTITY="$(realpath -- "${STUDY_ROOT}")"
 
 MERGE_ONLY="${MERGE_ONLY:-0}"
@@ -25,13 +34,23 @@ SEED_PARTS_ROOT="${SEED_PARTS_ROOT:-}"
 PARTS_ROOT="${ANALYSIS_ROOT}/staleness/checkpoint-displacements-parts"
 OUTPUT_CSV="${ANALYSIS_ROOT}/staleness/checkpoint-displacements.csv"
 SUCCESS_MARKER="${ANALYSIS_ROOT}/staleness/checkpoint-displacements._SUCCESS"
-arms=(
-    s1-t1r7 s1-t2r6 s1-t3r5 s1-t4r4
-    s2-t1r7 s2-t2r6 s2-t3r5 s2-t4r4
-    s4-t1r7 s4-t2r6 s4-t3r5 s4-t4r4
-    s8-t1r7 s8-t2r6 s8-t3r5 s8-t4r4
-    s0-colocated
+arms=()
+for staleness in ${STALENESS_LEVELS}; do
+    for ratio in ${RATIOS}; do
+        arms+=("s${staleness}-t${ratio%%:*}r${ratio#*:}")
+    done
+done
+if (( INCLUDE_COLOCATED == 1 )); then
+    arms+=(s0-colocated)
+fi
+checkpoint_identity_args=(
+    --training-buffer-queue-size "${TRAINING_BUFFER_QUEUE_SIZE}"
 )
+if [[ -n "${ASYNC_MAX_CONCURRENT_SAMPLES}" ]]; then
+    checkpoint_identity_args+=(
+        --async-max-concurrent-samples "${ASYNC_MAX_CONCURRENT_SAMPLES}"
+    )
+fi
 
 [[ "${MERGE_ONLY}" =~ ^[01]$ ]] || {
     echo "MERGE_ONLY must be 0 or 1" >&2
@@ -63,6 +82,7 @@ if (( MERGE_ONLY == 1 )); then
             --study-root /study \
             --study-identity "${STUDY_IDENTITY}" \
             --namespace "${RUN_NAMESPACE}" \
+            "${checkpoint_identity_args[@]}" \
             --output-csv /analysis/staleness/checkpoint-displacements.csv \
             --merge-parts-root /analysis/staleness/checkpoint-displacements-parts \
             --torch-threads "${SLURM_CPUS_PER_TASK}"
@@ -73,9 +93,9 @@ if (( MERGE_ONLY == 1 )); then
     exit 0
 fi
 
-array_index="${SLURM_ARRAY_TASK_ID:?run compute mode as a 0-16 job array}"
+array_index="${SLURM_ARRAY_TASK_ID:?run compute mode as a zero-based per-arm job array}"
 (( array_index >= 0 && array_index < ${#arms[@]} )) || {
-    echo "SLURM_ARRAY_TASK_ID must be between 0 and 16" >&2
+    echo "SLURM_ARRAY_TASK_ID must be between 0 and $((${#arms[@]} - 1))" >&2
     exit 2
 }
 arm="${arms[${array_index}]}"
@@ -101,6 +121,7 @@ srun \
         --study-root /study \
         --study-identity "${STUDY_IDENTITY}" \
         --namespace "${RUN_NAMESPACE}" \
+        "${checkpoint_identity_args[@]}" \
         --output-csv "/analysis/staleness/checkpoint-displacements-parts/${arm}.csv" \
         --arm "${arm}" \
         --torch-threads "${SLURM_CPUS_PER_TASK}"

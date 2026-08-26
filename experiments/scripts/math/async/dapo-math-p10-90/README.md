@@ -368,11 +368,14 @@ training batch 分しかなく、上限 16 以上を観測する前に producer 
 | 28 | 5376 | 5760 |
 
 比較時に queue size 自体を別の実験軸にしないため、16/20/24/28 の全 arm で共通に
-`TRAINING_BUFFER_QUEUE_SIZE=5760` を使う。これは大きい lag を**許容する**だけで発生を
+2-batch margin を切り上げた `TRAINING_BUFFER_QUEUE_SIZE=6000` を使う。これは大きい lag を**許容する**だけで発生を
 保証しない。producer surplus が持続する `t1r7` で queue が伸びるかを判定し、queue
 が浅い `t2r6` では上限だけを広げても大きい lag は期待しない。平均 response 6.4k
-token、約 8 MB/group という過去の概算では 5760 group は約 46 GB の CPU memory
+token、約 8 MB/group という過去の概算では 6000 group は約 48 GB の CPU memory
 なので、実投入前に rollout manager node の余裕も確認する。
+既存の `c4096` cohort と producer pressure を揃えるため、この high-staleness cohort
+では `ASYNC_MAX_CONCURRENT_SAMPLES=4096` も明示して固定する。未指定時は
+`192 groups × 16 samples = 3072 trajectories` となり、別の concurrency 条件になる。
 
 2026-08-26 時点の dashboard dump の再集計もこの選択を支持する。M=4/c4096 の
 途中経過では、`t1r7` は queue start 最大 525、stale recycle 517 group、offered

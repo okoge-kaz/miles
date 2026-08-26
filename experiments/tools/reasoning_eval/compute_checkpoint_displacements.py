@@ -18,7 +18,7 @@ from typing import Any
 import torch
 from safetensors import safe_open
 
-ASYNC_ARM_PATTERN = re.compile(r"^s(?P<staleness>[1248])-t[1-4]r[4-7]$")
+ASYNC_ARM_PATTERN = re.compile(r"^s(?P<staleness>\d+)-t\d+r\d+$")
 OUTPUT_FIELDS = (
     "arm",
     "study_identity",
@@ -70,18 +70,30 @@ class Displacement:
     end_checkpoint: str
 
 
-def _checkpoint_root(study_root: Path, *, arm: str, namespace: str) -> Path:
+def _checkpoint_root(
+    study_root: Path,
+    *,
+    arm: str,
+    namespace: str,
+    async_max_concurrent_samples: int | None = None,
+    training_buffer_queue_size: int = 1000,
+) -> Path:
     if arm == "s0-colocated":
         return study_root / "colocated/on-policy/max-weight-staleness-0" / f"{arm}-{namespace}-zero-trunc/hf"
     match = ASYNC_ARM_PATTERN.fullmatch(arm)
     if match is None:
         raise ValueError(f"unsupported sweep arm: {arm}")
     staleness = match.group("staleness")
+    identity_suffix = ""
+    if async_max_concurrent_samples is not None:
+        identity_suffix += f"-concurrency-{async_max_concurrent_samples}"
+    if training_buffer_queue_size != 1000:
+        identity_suffix += f"-tbq{training_buffer_queue_size}"
     return (
         study_root
         / "async/off-policy"
         / f"max-weight-staleness-{staleness}-from-prefill"
-        / f"{arm}-{namespace}-zero-trunc-rb-inflight/hf"
+        / f"{arm}-{namespace}-zero-trunc-rb-inflight{identity_suffix}/hf"
     )
 
 
@@ -93,6 +105,8 @@ def _read_intervals(
     namespace: str,
     step_interval: int,
     selected_arm: str | None,
+    async_max_concurrent_samples: int | None = None,
+    training_buffer_queue_size: int = 1000,
 ) -> list[CheckpointInterval]:
     rows_by_arm: dict[str, list[dict[str, str]]] = defaultdict(list)
     with aggregates.open(encoding="utf-8", newline="") as stream:
@@ -105,7 +119,13 @@ def _read_intervals(
 
     intervals: list[CheckpointInterval] = []
     for arm, rows in sorted(rows_by_arm.items()):
-        checkpoint_root = _checkpoint_root(study_root, arm=arm, namespace=namespace)
+        checkpoint_root = _checkpoint_root(
+            study_root,
+            arm=arm,
+            namespace=namespace,
+            async_max_concurrent_samples=async_max_concurrent_samples,
+            training_buffer_queue_size=training_buffer_queue_size,
+        )
         ordered = sorted(rows, key=lambda row: int(row["training_step"]))
         for start, end in zip(ordered, ordered[1:], strict=False):
             start_step = int(start["training_step"])
@@ -338,6 +358,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--step-interval", type=int, default=10)
     parser.add_argument("--chunk-elements", type=int, default=4 * 1024 * 1024)
     parser.add_argument("--torch-threads", type=int, default=4)
+    parser.add_argument("--async-max-concurrent-samples", type=int)
+    parser.add_argument("--training-buffer-queue-size", type=int, default=1000)
     parser.add_argument("--arm")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--merge-parts-root", type=Path)
@@ -348,6 +370,10 @@ def main() -> None:
     args = _parse_args()
     if args.step_interval <= 0 or args.chunk_elements <= 0 or args.torch_threads <= 0:
         raise ValueError("step interval, chunk size, and torch threads must be positive")
+    if args.async_max_concurrent_samples is not None and args.async_max_concurrent_samples <= 0:
+        raise ValueError("async max concurrent samples must be positive")
+    if args.training_buffer_queue_size <= 0:
+        raise ValueError("training buffer queue size must be positive")
     if args.limit is not None and args.limit <= 0:
         raise ValueError("limit must be positive")
     torch.set_num_threads(args.torch_threads)
@@ -359,6 +385,8 @@ def main() -> None:
         namespace=args.namespace,
         step_interval=args.step_interval,
         selected_arm=args.arm,
+        async_max_concurrent_samples=args.async_max_concurrent_samples,
+        training_buffer_queue_size=args.training_buffer_queue_size,
     )
     if args.merge_parts_root is not None:
         if args.arm is not None or args.limit is not None:

@@ -87,7 +87,10 @@ else
    TELEMETRY_ARGS+=(--use-rollout-entropy)
 fi
 if [[ "${LOG_SAMPLE_STALENESS_METRICS:-0}" != "0" ]]; then
-   TELEMETRY_ARGS+=(--log-sample-staleness-metrics)
+   TELEMETRY_ARGS+=(
+      --log-sample-staleness-metrics
+      --sample-staleness-max-bin "${SAMPLE_STALENESS_MAX_BIN}"
+   )
 fi
 if [[ "${LOG_SAMPLE_STALENESS_RATIO_HISTOGRAM:-0}" != "0" ]]; then
    if [[ "${LOG_SAMPLE_STALENESS_METRICS:-0}" == "0" ]]; then

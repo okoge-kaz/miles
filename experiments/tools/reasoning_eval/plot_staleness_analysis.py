@@ -13,11 +13,12 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
-STALENESS_LEVELS = (1, 2, 4, 8)
-ASYNC_ARMS = tuple(
-    f"s{staleness}-t{train_nodes}r{8 - train_nodes}" for staleness in STALENESS_LEVELS for train_nodes in (1, 2, 3, 4)
-)
-ALL_ARMS = (*ASYNC_ARMS, "s0-colocated")
+from experiments.tools.reasoning_eval.grid import reasoning_eval_grid_from_environment
+
+EVALUATION_GRID = reasoning_eval_grid_from_environment()
+STALENESS_LEVELS = EVALUATION_GRID.staleness_levels
+NODE_RATIOS = EVALUATION_GRID.node_ratios
+ALL_ARMS = EVALUATION_GRID.all_arms
 TASK_FIELDS = {
     "AIME24": "aime24_percent",
     "AIME25": "aime25_percent",
@@ -30,7 +31,11 @@ TASK_COLORS = {
     "AIME26": "#54A24B",
     "AIME mean": "#222222",
 }
-RATIO_COLORS = {1: "#0072B2", 2: "#D55E00", 3: "#009E73", 4: "#CC79A7", 0: "#222222"}
+RATIO_PALETTE = ("#0072B2", "#D55E00", "#009E73", "#CC79A7")
+RATIO_COLORS = {
+    trainer_nodes: RATIO_PALETTE[index % len(RATIO_PALETTE)]
+    for index, (trainer_nodes, _) in enumerate(NODE_RATIOS)
+} | {0: "#222222"}
 STALENESS_PHASES = ("total", "pre_queue", "in_queue")
 STALENESS_STATISTICS = ("mean", "variance", "std", "p90", "max")
 STALENESS_FEATURES = tuple(
@@ -404,8 +409,12 @@ def _render_wallclock_aime_mean(rows: list[SeriesRow]) -> str:
         "AIME mean versus estimated uninterrupted training wall-clock",
         "Resume-boundary wait is capped at its nearby steady-state median; scheduler gaps are excluded",
     )
-    entries = [(f"T:R={train}:{8 - train}", RATIO_COLORS[train], False) for train in (1, 2, 3, 4)]
-    entries.append(("colocated", RATIO_COLORS[0], True))
+    entries = [
+        (f"T:R={trainer}:{rollout}", RATIO_COLORS[trainer], False)
+        for trainer, rollout in NODE_RATIOS
+    ]
+    if EVALUATION_GRID.include_colocated:
+        entries.append(("colocated", RATIO_COLORS[0], True))
     elements.extend(_legend(entries, y=72, center_x=width / 2, spacing=190))
     for index, staleness in enumerate(STALENESS_LEVELS):
         panel_x = 25 + index % 2 * 645
@@ -424,8 +433,8 @@ def _render_wallclock_aime_mean(rows: list[SeriesRow]) -> str:
             x_label="Estimated uninterrupted wall-clock (hours)",
         )
         elements.extend(axes)
-        for train_nodes in (1, 2, 3, 4):
-            arm = f"s{staleness}-t{train_nodes}r{8 - train_nodes}"
+        for train_nodes, rollout_nodes in NODE_RATIOS:
+            arm = f"s{staleness}-t{train_nodes}r{rollout_nodes}"
             points = [
                 (row.active_wallclock_hours, row.scores["AIME mean"])
                 for row in valid
@@ -772,16 +781,22 @@ def _render_wallclock_decomposition(rows: list[DecompositionRow]) -> str:
         ("macro_points_per_active_hour", "dQ/dt", "AIME mean points per active hour", True),
         ("training_staleness_mean", "L train", "Training staleness mean", False),
     )
+    colocated_description = (
+        "; s0-colocated is the baseline" if EVALUATION_GRID.include_colocated else ""
+    )
     elements = _svg_header(
         width,
         height,
         "Learning-effect and throughput decomposition by setting",
-        "s=max weight staleness, t=train nodes, r=rollout nodes; s0-colocated is the baseline; "
+        f"s=max weight staleness, t=train nodes, r=rollout nodes{colocated_description}; "
         "dQ/dU fits all common checkpoints; dQ/dt = (dQ/dU) × (dU/dt)",
     )
     elements.extend(
         _legend(
-            ((f"T:R={trainer}:{8 - trainer}", RATIO_COLORS[trainer], False) for trainer in (1, 2, 3, 4)),
+            (
+                (f"T:R={trainer}:{rollout}", RATIO_COLORS[trainer], False)
+                for trainer, rollout in NODE_RATIOS
+            ),
             y=78,
             center_x=width / 2,
             spacing=190,
@@ -861,12 +876,15 @@ def _render_training_throughput(rows: list[DecompositionRow]) -> str:
         "s=max weight staleness, t=train nodes, r=rollout nodes; active time removes repeated resume startup; "
         f"all settings use {window_label}",
     )
+    legend_entries = [
+        (f"T:R={trainer}:{rollout}", RATIO_COLORS[trainer], False)
+        for trainer, rollout in NODE_RATIOS
+    ]
+    if EVALUATION_GRID.include_colocated:
+        legend_entries.append(("colocated", RATIO_COLORS[0], False))
     elements.extend(
         _legend(
-            (
-                *((f"T:R={trainer}:{8 - trainer}", RATIO_COLORS[trainer], False) for trainer in (1, 2, 3, 4)),
-                ("colocated", RATIO_COLORS[0], False),
-            ),
+            legend_entries,
             y=78,
             center_x=width / 2,
             spacing=185,

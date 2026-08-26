@@ -53,6 +53,49 @@ VALIDATE = _load_module(
     "reasoning_eval_validate_checkpoint_test_module",
     "experiments/tools/reasoning_eval/validate_checkpoint.py",
 )
+GRID = _load_module(
+    "reasoning_eval_grid_test_module",
+    "experiments/tools/reasoning_eval/grid.py",
+)
+
+
+def test_reasoning_eval_grid_accepts_high_staleness_single_ratio_without_colocated():
+    grid = GRID.reasoning_eval_grid_from_environment(
+        {
+            "STALENESS_LEVELS": "16 20 24 28",
+            "RATIOS": "1:7",
+            "INCLUDE_COLOCATED": "0",
+        }
+    )
+
+    assert grid.staleness_levels == (16, 20, 24, 28)
+    assert grid.node_ratios == ((1, 7),)
+    assert grid.all_arms == (
+        "s16-t1r7",
+        "s20-t1r7",
+        "s24-t1r7",
+        "s28-t1r7",
+    )
+
+
+def test_reasoning_eval_plotter_loads_the_high_staleness_grid(monkeypatch):
+    monkeypatch.setenv("STALENESS_LEVELS", "16 20 24 28")
+    monkeypatch.setenv("RATIOS", "1:7")
+    monkeypatch.setenv("INCLUDE_COLOCATED", "0")
+
+    high_staleness_plot = _load_module(
+        "reasoning_eval_high_staleness_plot_test_module",
+        "experiments/tools/reasoning_eval/plot_results.py",
+    )
+
+    assert high_staleness_plot.STALENESS_LEVELS == (16, 20, 24, 28)
+    assert high_staleness_plot.NODE_RATIOS == ((1, 7),)
+    assert high_staleness_plot.ALL_ARMS == (
+        "s16-t1r7",
+        "s20-t1r7",
+        "s24-t1r7",
+        "s28-t1r7",
+    )
 
 
 def test_latest_wandb_segment_replaces_replayed_metrics_and_rebuilds_clock():
@@ -142,7 +185,7 @@ def test_switch_only_wandb_row_does_not_replace_step_timestamp_anchor():
     assert target[3]["perf/colocate/train_to_rollout_block_time"] == 4.0
 
 
-def test_legacy_exporter_rejects_matched_cohort_arm_variants():
+def test_exporter_normalizes_async_concurrency_tag_but_rejects_partial_colocated():
     namespace = "partial-c4096-s4-test"
     legacy = SimpleNamespace(
         config={"wandb_group": f"s4-t1r7-{namespace}"},
@@ -150,16 +193,30 @@ def test_legacy_exporter_rejects_matched_cohort_arm_variants():
         name="",
         id="legacy",
     )
-    matched = SimpleNamespace(
+    concurrency_tagged = SimpleNamespace(
         config={"wandb_group": f"s4-t1r7-c4096-{namespace}"},
         group="",
         name="",
-        id="matched",
+        id="concurrency-tagged",
+    )
+    partial_colocated = SimpleNamespace(
+        config={"wandb_group": f"s0-colocated-partial-o256-{namespace}"},
+        group="",
+        name="",
+        id="partial-colocated",
+    )
+    high_staleness = SimpleNamespace(
+        config={"wandb_group": f"s28-t1r7-{namespace}"},
+        group="",
+        name="",
+        id="high-staleness",
     )
 
     assert EXPORT._arm_from_run(legacy, namespace=namespace) == "s4-t1r7"
+    assert EXPORT._arm_from_run(concurrency_tagged, namespace=namespace) == "s4-t1r7"
+    assert EXPORT._arm_from_run(high_staleness, namespace=namespace) == "s28-t1r7"
     with pytest.raises(ValueError, match="cannot identify sweep arm"):
-        EXPORT._arm_from_run(matched, namespace=namespace)
+        EXPORT._arm_from_run(partial_colocated, namespace=namespace)
 
 
 def test_evaluation_allows_slow_vllm_startup_without_a_shared_runtime_cache():
@@ -278,6 +335,22 @@ def test_checkpoint_displacement_skips_unevaluated_placeholders(tmp_path):
     )
 
     assert [(interval.start_step, interval.end_step) for interval in intervals] == [(10, 20)]
+
+
+def test_checkpoint_displacement_resolves_high_staleness_training_identity(tmp_path):
+    checkpoint_root = DISPLACEMENT._checkpoint_root(
+        tmp_path,
+        arm="s28-t1r7",
+        namespace="high-staleness",
+        async_max_concurrent_samples=4096,
+        training_buffer_queue_size=6000,
+    )
+
+    assert checkpoint_root == (
+        tmp_path
+        / "async/off-policy/max-weight-staleness-28-from-prefill"
+        / "s28-t1r7-high-staleness-zero-trunc-rb-inflight-concurrency-4096-tbq6000/hf"
+    )
 
 
 def test_checkpoint_displacement_reuses_only_matching_snapshot_rows(tmp_path):

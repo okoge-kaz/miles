@@ -56,7 +56,7 @@ The default shared locations can be changed with
 `REASONING_EVAL_CONTAINER_ROOT`, `REASONING_EVAL_DATA_ROOT`, and
 `REASONING_EVAL_CACHE_ROOT`.
 
-## Evaluate the 17-arm staleness sweep
+## Evaluate a staleness sweep
 
 The current sweep namespace defaults to `sr-20260819-212906`. Point
 `TRAINING_ROOT` at the owner of the training checkpoints when evaluating another
@@ -74,6 +74,25 @@ The scan covers 16 async arms (`max weight staleness = 1,2,4,8` crossed with
 trainer:rollout nodes `1:7,2:6,3:5,4:4`) plus the colocated arm, at learning
 steps 10 through 300. Miles' HF directory number is zero-based at save time, so
 learning steps `10,20,...,300` resolve to directories `9,19,...,299`.
+
+The high-staleness t1r7 cohort uses the same training namespace printed by the
+launcher and includes the non-default queue size in checkpoint identity:
+
+```bash
+TRAINING_ROOT=/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/hiso/async-rl/checkpoints/training \
+STALENESS_LEVELS="16 20 24 28" \
+RATIOS="1:7" \
+INCLUDE_COLOCATED=0 \
+TRAINING_BUFFER_QUEUE_SIZE=6000 \
+ASYNC_MAX_CONCURRENT_SAMPLES=4096 \
+experiments/scripts/reasoning_eval/submit-staleness-sweep.sh \
+  --namespace <training-namespace>
+```
+
+Add `--submit` only after inspecting the dry-run. The first submitted evaluation
+writes `grid.env` under the result study; refill, summarization, and plotting
+load it automatically, so later commands only need the namespace. The legacy
+17-arm grid above remains the default when no cohort configuration is supplied.
 
 One Slurm job loads each checkpoint once and evaluates all three AIME tasks.
 Each task has its own response cache and is finalized atomically with `_SUCCESS`.
@@ -175,20 +194,19 @@ The command resolves resumed W&B runs into one latest-write-wins training
 lineage per arm, joins evaluation step `N` to update `N`, and writes the
 following under `analysis/<protocol>/full/staleness/`:
 
-This pipeline is intentionally scoped to the completed legacy 17-arm cohort.
-It rejects matched-cohort group variants such as `partial-o256` and `c4096`
-instead of collapsing them into `s0-colocated` or the legacy async arms. In
-particular, do not use the legacy rule that assigns structural staleness zero to
-`s0-colocated` for a partial-rollout run. The five-arm matched cohort needs a
-separate arm schema, checkpoint resolver, and partial-rollout metric export.
+The result study's `grid.env` controls the arm set used by summarization and
+plotting. Async W&B groups with a `cN` concurrency identity are normalized to
+their corresponding `sN-tNrN` arm. Partial colocated variants such as
+`s0-colocated-partial-o256` remain intentionally rejected: they must not be
+collapsed into the fully colocated baseline with structural staleness zero.
 
 - the selected training history, ten-update score intervals, full correlation
   tables, and an analysis summary;
-- AIME24, AIME25, AIME26, and AIME mean trajectories for all 17 settings, once by
+- AIME24, AIME25, AIME26, and AIME mean trajectories for every configured setting, once by
   training step and once by active wall-clock;
 - an AIME mean wall-clock comparison that separates max-weight-staleness panels and
   trainer:rollout ratios;
-- a 4-by-4 W&B heatmap of the realized late-window
+- a configured-grid W&B heatmap of the realized late-window
   `staleness/total/mean`, with max weight staleness as rows and
   train:rollout node ratios as columns. Each cell reports the mean and
   population standard deviation over the trailing 50 contiguous optimizer
@@ -196,9 +214,9 @@ separate arm schema, checkpoint resolver, and partial-rollout metric export.
   when its fitted drift across that window exceeds the larger of one standard
   deviation, 10% of the mean, and 0.05. The exact window, slope, tolerance,
   and status are written to `steady-state-staleness.csv`;
-- per-update W&B `staleness/total/mean` trajectories in four train:rollout
-  panels, showing both the raw value and a trailing 10-update mean for max
-  weight staleness 1, 2, 4, and 8;
+- per-update W&B `staleness/total/mean` trajectories in one panel per configured
+  train:rollout ratio, showing both the raw value and a trailing 10-update mean
+  for every configured max weight staleness;
 - a W&B time-series matrix for training metrics whose strongest correlation
   with a realized-staleness predictor has `|r| >= 0.25`. Signed `train/tis` is
   included as a reference even when its mean stays near one, so cancellation
@@ -213,7 +231,7 @@ separate arm schema, checkpoint resolver, and partial-rollout metric export.
   difference. The colocated on-policy baseline is shown as zero even though it
   does not log the async staleness namespace;
 - a standalone `optimizer-update-throughput-by-setting.svg` comparison of
-  `dU/dt` for all 17 settings. Each row reports both optimizer updates per
+  `dU/dt` for all configured settings. Each row reports both optimizer updates per
   active hour and the reciprocal active seconds per update, using the same
   balanced common window and resume-adjusted active clock as the decomposition;
 - a correlation heatmap spanning total, pre-queue, and in-queue mean/variance,

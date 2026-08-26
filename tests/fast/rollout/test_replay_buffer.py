@@ -234,7 +234,7 @@ async def test_replay_buffer_rejects_cross_policy_and_capacity_restore(monkeypat
 
     different_recycle_capacity = _make_fn(
         monkeypatch,
-        _queue_args("queue-recycle", training_buffer_queue_size=5760),
+        _queue_args("queue-recycle", training_buffer_queue_size=6000),
         _DataSource(),
         lambda *args, **kwargs: None,
     )

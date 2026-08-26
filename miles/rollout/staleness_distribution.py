@@ -6,7 +6,7 @@ import numpy as np
 
 # Values past this fixed-resolution tail use one overflow bucket so metric
 # cardinality remains bounded.
-STALENESS_HISTOGRAM_MAX = 16
+STALENESS_HISTOGRAM_MAX = 32
 
 
 def staleness_distribution_metrics(values: Sequence[int]) -> dict[str, float]:

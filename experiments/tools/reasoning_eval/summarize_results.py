@@ -13,6 +13,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterable
 
+from experiments.tools.reasoning_eval.grid import reasoning_eval_grid_from_environment
+
 
 TASKS = ("aime24", "aime25", "aime26")
 DEFAULT_PROTOCOL = (
@@ -20,6 +22,7 @@ DEFAULT_PROTOCOL = (
     "thinking-t0.6-p0.95-k20-aime64-v1"
 )
 ASYNC_ARM_PATTERN = re.compile(r"^s(?P<staleness>\d+)-t(?P<train>\d+)r(?P<rollout>\d+)$")
+EVALUATION_GRID = reasoning_eval_grid_from_environment()
 
 
 @dataclass(frozen=True)
@@ -61,12 +64,7 @@ class AggregateRecord:
 
 
 def _expected_arms() -> tuple[str, ...]:
-    async_arms = tuple(
-        f"s{staleness}-t{train_nodes}r{8 - train_nodes}"
-        for staleness in (1, 2, 4, 8)
-        for train_nodes in (1, 2, 3, 4)
-    )
-    return (*async_arms, "s0-colocated")
+    return EVALUATION_GRID.all_arms
 
 
 def _arm_metadata(arm: str) -> tuple[str, int, int, int]:

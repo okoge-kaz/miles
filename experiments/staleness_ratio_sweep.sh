@@ -199,6 +199,7 @@ USE_REPLAY_BUFFER_VALUE="$(recipe_or_environment USE_REPLAY_BUFFER)"
 REPLAY_BUFFER_TYPE_VALUE="$(recipe_or_environment REPLAY_BUFFER_TYPE)"
 FUSE_ONE_STEP_ACTOR_LOGPROBS_VALUE="$(recipe_or_environment FUSE_ONE_STEP_ACTOR_LOGPROBS)"
 SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS_VALUE="$(recipe_or_environment SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS)"
+SAMPLE_STALENESS_MAX_BIN_VALUE="$(recipe_or_environment SAMPLE_STALENESS_MAX_BIN)"
 SAVE_HF_VALUE="$(recipe_or_environment SAVE_HF)"
 HF_SAVE_INTERVAL_VALUE="$(recipe_or_environment HF_SAVE_INTERVAL)"
 SAVE_INTERVAL_VALUE="$(recipe_or_environment SAVE_INTERVAL)"
@@ -215,6 +216,10 @@ ASYNC_MAX_CONCURRENT_SAMPLES_VALUE="${ASYNC_MAX_CONCURRENT_SAMPLES:-}"
 }
 [[ "${TRAINING_BUFFER_QUEUE_SIZE_VALUE}" =~ ^[1-9][0-9]*$ ]] || {
     echo "TRAINING_BUFFER_QUEUE_SIZE must be a positive integer" >&2
+    exit 1
+}
+[[ "${SAMPLE_STALENESS_MAX_BIN_VALUE}" =~ ^[0-9]+$ ]] || {
+    echo "SAMPLE_STALENESS_MAX_BIN must be a nonnegative integer" >&2
     exit 1
 }
 if [[ -n "${ASYNC_MAX_CONCURRENT_SAMPLES_VALUE}" ]]; then
@@ -268,7 +273,7 @@ if (( MATCH_PARTIAL_CONCURRENCY == 1 )); then
         EVAL_INTERVAL N_SAMPLES_PER_EVAL_PROMPT EVAL_MAX_RESPONSE_LEN SKIP_EVAL_BEFORE_TRAIN
         SAVE_INTERVAL SAVE_RETAIN_INTERVAL SAVE_HF HF_SAVE_INTERVAL DUMP_TRAIN_DATA
         DUMP_POLICY_LOSS_DEBUG OBSERVE_TRAINING_ENTROPY FUSE_ONE_STEP_ACTOR_LOGPROBS
-        VERIFY_FUSED_ONE_STEP_ACTOR_LOGPROBS LOG_SAMPLE_STALENESS_METRICS
+        VERIFY_FUSED_ONE_STEP_ACTOR_LOGPROBS LOG_SAMPLE_STALENESS_METRICS SAMPLE_STALENESS_MAX_BIN
         LOG_SAMPLE_STALENESS_RATIO_HISTOGRAM LOG_UPDATE_DIAGNOSTICS
         SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS PARTIAL_ROLLOUT OVER_SAMPLING_BATCH_SIZE
         MASK_OFFPOLICY_IN_PARTIAL_ROLLOUT MILES_EXPERIMENTAL_ROLLOUT_REFACTOR
@@ -355,6 +360,7 @@ require_setting USE_REPLAY_BUFFER 1
 require_setting REPLAY_BUFFER_TYPE inflight
 require_setting FUSE_ONE_STEP_ACTOR_LOGPROBS 1
 require_setting SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS 1
+require_setting SAMPLE_STALENESS_MAX_BIN 32
 require_setting SAVE_HF 1
 require_setting HF_SAVE_INTERVAL 10
 if (( MATCH_PARTIAL_CONCURRENCY == 1 )); then
@@ -495,10 +501,11 @@ printf 'fixed by recipe: queue=%s, reference=%s, rollouts=%s, steps/rollout=%s, 
 printf 'completed-group buffer: %s groups (%s training batches)\n' \
     "${TRAINING_BUFFER_QUEUE_SIZE_VALUE}" \
     "$(( TRAINING_BUFFER_QUEUE_SIZE_VALUE / ROLLOUT_BATCH ))"
-printf 'fixed safety: response=%s, zero-trunc=%s, replay=%s/%s, fused-logprobs=%s, exact-segments=%s\n' \
+printf 'fixed safety: response=%s, zero-trunc=%s, replay=%s/%s, fused-logprobs=%s, exact-segments=%s, staleness-bin=%s\n' \
     "${MAX_RESPONSE_LEN_VALUE}" "${ZERO_REWARD_ON_TRUNCATED_VALUE}" \
     "${USE_REPLAY_BUFFER_VALUE}" "${REPLAY_BUFFER_TYPE_VALUE}" \
-    "${FUSE_ONE_STEP_ACTOR_LOGPROBS_VALUE}" "${SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS_VALUE}"
+    "${FUSE_ONE_STEP_ACTOR_LOGPROBS_VALUE}" "${SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS_VALUE}" \
+    "${SAMPLE_STALENESS_MAX_BIN_VALUE}"
 printf 'fixed checkpoints: save-hf=%s, hf interval=%s; settings=%s; clean=%s\n' \
     "${SAVE_HF_VALUE}" "${HF_SAVE_INTERVAL_VALUE}" "${SETTING_COUNT}" "${CLEAN_CHECKPOINT}"
 printf 'submission: %s nodes, %s, %s, %s chained job(s), wandb=%s\n' \
@@ -624,6 +631,7 @@ if (( MATCH_PARTIAL_CONCURRENCY == 1 )); then
         printf 'partial_over_sampling_groups_effective\t%s\n' "${PARTIAL_OVER_SAMPLING_BATCH_SIZE}"
         printf 'async_max_concurrent_samples\t%s\n' "${ASYNC_MAX_CONCURRENT_SAMPLES_VALUE}"
         printf 'training_buffer_queue_size\t%s\n' "${TRAINING_BUFFER_QUEUE_SIZE_VALUE}"
+        printf 'sample_staleness_max_bin\t%s\n' "${SAMPLE_STALENESS_MAX_BIN_VALUE}"
         printf 'max_weight_staleness\t4\n'
         printf 'switch_metric_contract\t%s\n' "${MATCHED_SWITCH_METRIC_CONTRACT}"
         printf 'job\tarm\tchain_index\tjob_id\tdependency\trecipe\texports_csv\n'
@@ -663,6 +671,7 @@ submit_chain() {
         "REPLAY_BUFFER_TYPE=${REPLAY_BUFFER_TYPE_VALUE}"
         "FUSE_ONE_STEP_ACTOR_LOGPROBS=${FUSE_ONE_STEP_ACTOR_LOGPROBS_VALUE}"
         "SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS=${SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS_VALUE}"
+        "SAMPLE_STALENESS_MAX_BIN=${SAMPLE_STALENESS_MAX_BIN_VALUE}"
         "SAVE_HF=${SAVE_HF_VALUE}"
         "HF_SAVE_INTERVAL=${HF_SAVE_INTERVAL_VALUE}"
         "DEBUG_EXIT_AFTER_ROLLOUT="
@@ -741,6 +750,7 @@ submit_colocated_chain() {
         "REPLAY_BUFFER_IDENTITY_TAG=0"
         "FUSE_ONE_STEP_ACTOR_LOGPROBS=0"
         "SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS=0"
+        "SAMPLE_STALENESS_MAX_BIN=${SAMPLE_STALENESS_MAX_BIN_VALUE}"
         "OVER_SAMPLING_BATCH_SIZE=${colocated_over_sampling}"
         "PARTIAL_ROLLOUT=${MATCH_PARTIAL_CONCURRENCY}"
         "MASK_OFFPOLICY_IN_PARTIAL_ROLLOUT=0"

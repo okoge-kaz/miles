@@ -82,13 +82,13 @@ def test_queue_factor_is_rejected_when_it_cannot_affect_selection(policy):
 
 
 def test_training_buffer_queue_size_controls_recycle_and_queue_max_capacity():
-    recycle = make_args(training_buffer_queue_size=5760)
+    recycle = make_args(training_buffer_queue_size=6000)
     queue_max = make_args(
         fully_async_queue_type="queue-max",
         training_buffer_queue_size=100,
     )
 
-    assert fully_async_queue_capacity_groups(recycle) == 5760
+    assert fully_async_queue_capacity_groups(recycle) == 6000
     assert fully_async_queue_capacity_groups(queue_max) == queue_max.rollout_batch_size
 
 
@@ -96,12 +96,12 @@ def test_training_buffer_queue_size_validation():
     with pytest.raises(ValueError, match="must be at least 1"):
         validate_fully_async_queue_args(make_args(training_buffer_queue_size=0))
     with pytest.raises(ValueError, match="requires --fully-async"):
-        validate_fully_async_queue_args(make_args(fully_async=False, training_buffer_queue_size=5760))
+        validate_fully_async_queue_args(make_args(fully_async=False, training_buffer_queue_size=6000))
     with pytest.raises(ValueError, match="only used by queue-recycle and queue-max"):
         validate_fully_async_queue_args(
             make_args(
                 fully_async_queue_type="queue-drop",
-                training_buffer_queue_size=5760,
+                training_buffer_queue_size=6000,
                 max_weight_staleness=None,
             )
         )

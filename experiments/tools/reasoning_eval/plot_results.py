@@ -12,21 +12,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
+from experiments.tools.reasoning_eval.grid import reasoning_eval_grid_from_environment
 
-STALENESS_LEVELS = (1, 2, 4, 8)
-ASYNC_ARMS = tuple(
-    f"s{staleness}-t{train_nodes}r{8 - train_nodes}"
-    for staleness in STALENESS_LEVELS
-    for train_nodes in (1, 2, 3, 4)
-)
-ALL_ARMS = (*ASYNC_ARMS, "s0-colocated")
+
+EVALUATION_GRID = reasoning_eval_grid_from_environment()
+STALENESS_LEVELS = EVALUATION_GRID.staleness_levels
+NODE_RATIOS = EVALUATION_GRID.node_ratios
+ALL_ARMS = EVALUATION_GRID.all_arms
+SERIES_PALETTE = ("#0072B2", "#D55E00", "#009E73", "#CC79A7")
 COLORS = {
-    1: "#0072B2",
-    2: "#D55E00",
-    3: "#009E73",
-    4: "#CC79A7",
-    0: "#222222",
-}
+    trainer_nodes: SERIES_PALETTE[index % len(SERIES_PALETTE)]
+    for index, (trainer_nodes, _) in enumerate(NODE_RATIOS)
+} | {0: "#222222"}
 TASK_COLORS = {"aime24": "#4C78A8", "aime25": "#F58518", "aime26": "#54A24B"}
 
 
@@ -170,12 +167,13 @@ def _render_learning_curves(rows: list[ResultRow]) -> str:
     y_bounds = _score_bounds(row.macro_mean for row in rows if row.macro_mean is not None)
     elements = _svg_header(width, height, "AIME mean by staleness and node ratio")
     legend_y = 60
-    for index, train_nodes in enumerate((1, 2, 3, 4)):
+    for index, (train_nodes, rollout_nodes) in enumerate(NODE_RATIOS):
         legend_x = 210 + index * 180
         elements.append(f'<line x1="{legend_x}" y1="{legend_y}" x2="{legend_x + 28}" y2="{legend_y}" stroke="{COLORS[train_nodes]}" stroke-width="3"/>')
-        elements.append(f'<text class="label" x="{legend_x + 36}" y="{legend_y + 5}">T:R={train_nodes}:{8 - train_nodes}</text>')
-    elements.append('<line x1="930" y1="60" x2="958" y2="60" stroke="#222" stroke-width="3" stroke-dasharray="7 5"/>')
-    elements.append('<text class="label" x="966" y="65">colocated</text>')
+        elements.append(f'<text class="label" x="{legend_x + 36}" y="{legend_y + 5}">T:R={train_nodes}:{rollout_nodes}</text>')
+    if EVALUATION_GRID.include_colocated:
+        elements.append('<line x1="930" y1="60" x2="958" y2="60" stroke="#222" stroke-width="3" stroke-dasharray="7 5"/>')
+        elements.append('<text class="label" x="966" y="65">colocated</text>')
     colocated = [row for row in rows if row.arm == "s0-colocated"]
     for panel_index, staleness in enumerate(STALENESS_LEVELS):
         panel_x = 35 + (panel_index % 2) * 600
@@ -191,8 +189,8 @@ def _render_learning_curves(rows: list[ResultRow]) -> str:
             y_bounds=y_bounds,
         )
         elements.extend(axes)
-        for train_nodes in (1, 2, 3, 4):
-            arm = f"s{staleness}-t{train_nodes}r{8 - train_nodes}"
+        for train_nodes, rollout_nodes in NODE_RATIOS:
+            arm = f"s{staleness}-t{train_nodes}r{rollout_nodes}"
             arm_rows = [row for row in rows if row.arm == arm]
             elements.extend(
                 _line_elements(
