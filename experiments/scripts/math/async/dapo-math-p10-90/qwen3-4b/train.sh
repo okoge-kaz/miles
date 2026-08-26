@@ -10,7 +10,16 @@ NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
 HAS_NVLINK=$([ "$NVLINK_COUNT" -gt 0 ] && echo 1 || echo 0)
 
 cd /root/miles
-source /root/miles/scripts/models/qwen3-4B.sh
+[[ "${MODEL_PROFILE}" =~ ^[A-Za-z0-9._-]+$ ]] || {
+   echo "invalid MODEL_PROFILE=${MODEL_PROFILE}" >&2
+   exit 1
+}
+MODEL_PROFILE_PATH="/root/miles/scripts/models/${MODEL_PROFILE}.sh"
+[[ -r "${MODEL_PROFILE_PATH}" ]] || {
+   echo "model profile is not readable: ${MODEL_PROFILE_PATH}" >&2
+   exit 1
+}
+source "${MODEL_PROFILE_PATH}"
 source /root/miles/experiments/common/ray_cluster.sh
 
 CKPT_ARGS=(
@@ -36,7 +45,6 @@ ROLLOUT_ARGS=(
    --label-key label
    --apply-chat-template
    --rollout-shuffle
-   --rm-type "${RM_TYPE}"
    --num-rollout "${NUM_ROLLOUT}"
    --rollout-batch-size "${ROLLOUT_BATCH_SIZE}"
    --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT}"
@@ -51,6 +59,14 @@ ROLLOUT_ARGS=(
    --staleness-reference "${STALENESS_REFERENCE}"
    --pause-generation-mode "${PAUSE_GENERATION_MODE}"
 )
+if [[ -n "${CUSTOM_RM_PATH:-}" ]]; then
+   ROLLOUT_ARGS+=(--custom-rm-path "${CUSTOM_RM_PATH}")
+else
+   ROLLOUT_ARGS+=(--rm-type "${RM_TYPE}")
+fi
+if [[ -n "${TOOL_KEY:-}" ]]; then
+   ROLLOUT_ARGS+=(--tool-key "${TOOL_KEY}")
+fi
 if [[ "${ZERO_REWARD_ON_TRUNCATED}" != "0" ]]; then
    ROLLOUT_ARGS+=(--zero-reward-on-truncated)
 fi
@@ -106,12 +122,18 @@ EVAL_ARGS=()
 if [[ "${EVAL_INTERVAL}" != "0" ]]; then
    EVAL_ARGS=(
       --eval-interval "${EVAL_INTERVAL}"
-      --n-samples-per-eval-prompt "${N_SAMPLES_PER_EVAL_PROMPT}"
-      --eval-max-response-len "${EVAL_MAX_RESPONSE_LEN}"
-      --eval-top-p 1
-      --eval-prompt-data
-      aime25 /data/aime-2025/aime-2025.jsonl
    )
+   if [[ -n "${EVAL_CONFIG:-}" ]]; then
+      EVAL_ARGS+=(--eval-config "${EVAL_CONFIG}")
+   else
+      EVAL_ARGS+=(
+         --n-samples-per-eval-prompt "${N_SAMPLES_PER_EVAL_PROMPT}"
+         --eval-max-response-len "${EVAL_MAX_RESPONSE_LEN}"
+         --eval-top-p 1
+         --eval-prompt-data
+         aime25 /data/aime-2025/aime-2025.jsonl
+      )
+   fi
    if [[ "${SKIP_EVAL_BEFORE_TRAIN}" != "0" ]]; then
       EVAL_ARGS+=(--skip-eval-before-train)
    fi
@@ -209,6 +231,9 @@ fi
 if [[ -n "${SGLANG_CUDA_GRAPH_MAX_BS:-}" ]]; then
    SGLANG_ARGS+=(--sglang-cuda-graph-max-bs "${SGLANG_CUDA_GRAPH_MAX_BS}")
 fi
+if [[ -n "${SGLANG_MOE_RUNNER_BACKEND:-}" ]]; then
+   SGLANG_ARGS+=(--sglang-moe-runner-backend "${SGLANG_MOE_RUNNER_BACKEND}")
+fi
 if [[ "${SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS:-0}" != "0" ]]; then
    SGLANG_ARGS+=(--sglang-enable-response-weight-version-segments)
 fi
@@ -218,7 +243,7 @@ MISC_ARGS=(
    --hidden-dropout 0.0
    --accumulate-allreduce-grads-in-fp32
    --attention-softmax-in-fp32
-   --attention-backend flash
+   --attention-backend "${TRAINING_ATTENTION_BACKEND}"
 )
 
 # WANDB_API_KEY is inherited through --export=ALL. Never put it in this argv:
@@ -242,6 +267,11 @@ RUNTIME_ENV_JSON=$(cat <<JSON
     "NCCL_TUNER_PLUGIN": "${NCCL_TUNER_PLUGIN:-}",
     "FI_PROVIDER": "${FI_PROVIDER:-}",
     "MILES_NCCL_TRANSPORT": "${MILES_NCCL_TRANSPORT:-system}",
+    "WANDB_MODE": "${WANDB_MODE:-online}",
+    "CODE_EXEC_SANDBOX": "${CODE_EXEC_SANDBOX:-bubblewrap}",
+    "CODE_EXEC_CONCURRENCY": "${CODE_EXEC_CONCURRENCY:-16}",
+    "CODE_EXEC_MAX_TESTS": "${CODE_EXEC_MAX_TESTS:-50}",
+    "REASONING_GYM_DEPS_PATH": "${REASONING_GYM_DEPS_PATH:-/data/reasoning-gym-deps}",
     "no_proxy": "127.0.0.1"
   }
 }

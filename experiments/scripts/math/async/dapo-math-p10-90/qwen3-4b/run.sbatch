@@ -15,19 +15,24 @@
 set -euo pipefail
 
 REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../../../.." &>/dev/null && pwd)}"
-# This checkpoint lives outside the shared checkpoints/hf directory. Mount its
-# parent directly so both SGLang and the tokenizer read iter_0004000 in place.
-export HF_CKPT_DIR="${QWEN3_4B_BASE_HF_ROOT:-/lustre/fsw/portfolios/coreai/users/kfujii/checkpoints/huggingface/Qwen3-4B-Base/LR2.0e-5-SEQ32768-GBS128-MBS1-TP1-PP1-CP1-EP1-PACK1-standard-cp-STEPS4000}"
+# Mount the selected checkpoint root directly so both SGLang and the tokenizer
+# read iter_0004000 in place. HF_CKPT_DIR lets validation jobs select another
+# converted model while the checked-in recipe remains the 4B default.
+: "${HF_CKPT_DIR:=${QWEN3_4B_BASE_HF_ROOT:-/lustre/fsw/portfolios/coreai/users/kfujii/checkpoints/huggingface/Qwen3-4B-Base/LR2.0e-5-SEQ32768-GBS128-MBS1-TP1-PP1-CP1-EP1-PACK1-standard-cp-STEPS4000}}"
+export HF_CKPT_DIR
 source "${REPO_ROOT}/experiments/env.sh"
 
-: "${WANDB_API_KEY:?set WANDB_API_KEY, or put an api.wandb.ai entry in ~/.netrc}"
+if [[ "${WANDB_MODE:-online}" != offline && "${WANDB_MODE:-online}" != disabled ]]; then
+    : "${WANDB_API_KEY:?set WANDB_API_KEY, use WANDB_MODE=offline, or disable wandb}"
+fi
 
 # run identity
-MODEL_NAME=Qwen3-4B-Base-LR2e-5-Step4000
-HF_MODEL_NAME=iter_0004000
+: "${MODEL_NAME:=Qwen3-4B-Base-LR2e-5-Step4000}"
+: "${HF_MODEL_NAME:=iter_0004000}"
+: "${MODEL_PROFILE:=qwen3-4B}"
 PLACEMENT=async
-DATASET_TAG=dapo-math-p10-90-qwen3-4b-base-lr2e-5-step4000
-PROMPT_DATA=/data/dapo-math-p10-90-qwen3-4b-base-lr2e-5-step4000/dapo-math-p10-90-qwen3-4b-base-lr2e-5-step4000.jsonl
+: "${DATASET_TAG:=dapo-math-p10-90-qwen3-4b-base-lr2e-5-step4000}"
+: "${PROMPT_DATA:=/data/dapo-math-p10-90-qwen3-4b-base-lr2e-5-step4000/dapo-math-p10-90-qwen3-4b-base-lr2e-5-step4000.jsonl}"
 
 # rl algorithm: these derive RL_ALGORITHM in common/run_identity.sh, and every
 # one of them is turned into a flag by train.sh
@@ -162,7 +167,7 @@ case "${MILES_NCCL_TRANSPORT}" in
       ;;
 esac
 
-export MODEL_NAME HF_MODEL_NAME PLACEMENT DATASET_TAG PROMPT_DATA
+export MODEL_NAME HF_MODEL_NAME MODEL_PROFILE PLACEMENT DATASET_TAG PROMPT_DATA
 export ADVANTAGE_ESTIMATOR ENTROPY_COEF KL_LOSS_COEF EPS_CLIP EPS_CLIP_HIGH EPS_CLIP_C
 export RATIO_DENOMINATOR IS_CORRECTION TIS_CLIP TIS_CLIP_LOW MIS_PROFILE M2PO_BUDGET USE_OPSM OPSM_DELTA
 export LR MAX_RESPONSE_LEN NUM_ROLLOUT TRAIN_SEED ROLLOUT_SEED
@@ -199,8 +204,11 @@ if [[ -z "${RAY_HEAD_IP}" || "${RAY_HEAD_IP}" == 169.254.* ]]; then
 fi
 export RAY_HEAD_IP
 export RAY_DONE_FLAG="/root/miles/experiments/outputs/.ray/${RUN_NAME}-${SLURM_JOB_ID}.done"
+export RAY_HEAD_IP_FILE="${RAY_DONE_FLAG}.head-ip"
 mkdir -p "${OUTPUT_DIR}/.ray"
-rm -f "${OUTPUT_DIR}/.ray/${RUN_NAME}-${SLURM_JOB_ID}.done"
+rm -f \
+   "${OUTPUT_DIR}/.ray/${RUN_NAME}-${SLURM_JOB_ID}.done" \
+   "${OUTPUT_DIR}/.ray/${RUN_NAME}-${SLURM_JOB_ID}.done.head-ip"
 
 source "${REPO_ROOT}/experiments/common/clean_checkpoint.sh"
 
@@ -210,11 +218,12 @@ echo "checkpoints ${CKPT_PATH}"
 # The validation jobs are submitted by a small CPU finalizer.  Explicit step
 # resources prevent its exported SLURM_MEM_PER_NODE / SLURM_CPUS_PER_TASK from
 # constraining the two-node Ray step instead of the GPU allocation.
-STEP_CPUS_PER_NODE="${SLURM_JOB_CPUS_PER_NODE%%\(*}"
+STEP_CPUS_PER_NODE="${SLURM_CPUS_PER_TASK:-${SLURM_JOB_CPUS_PER_NODE%%\(*}}"
 [[ "${STEP_CPUS_PER_NODE}" =~ ^[1-9][0-9]*$ ]] || {
     echo "invalid SLURM_JOB_CPUS_PER_NODE=${SLURM_JOB_CPUS_PER_NODE:-unset}" >&2
     exit 1
 }
+MOUNTS="${CONTAINER_MOUNTS},/usr/bin/bwrap:/usr/local/bin/bwrap"
 
 if [[ "${MILES_NCCL_TRANSPORT}" == efa ]]; then
    echo "running EFA fail-closed preflight on every node"
@@ -225,7 +234,7 @@ if [[ "${MILES_NCCL_TRANSPORT}" == efa ]]; then
       --cpus-per-task=8 \
       --mem=0 \
       --container-image="${SQSH_IMAGE}" \
-      --container-mounts="${CONTAINER_MOUNTS}" \
+      --container-mounts="${MOUNTS}" \
       --no-container-mount-home \
       --export=ALL \
       bash /root/miles/experiments/common/check_efa.sh
@@ -242,7 +251,7 @@ srun \
     --cpus-per-task="${STEP_CPUS_PER_NODE}" \
     --mem=0 \
     --container-image="${SQSH_IMAGE}" \
-    --container-mounts="${CONTAINER_MOUNTS}" \
+    --container-mounts="${MOUNTS}" \
     --container-writable \
     --no-container-mount-home \
     --export=ALL \
