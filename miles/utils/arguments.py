@@ -37,6 +37,7 @@ _REPLAY_BUFFER_VALIDATED_CUSTOM_RM_PATHS = frozenset(
         "experiments.src.reward_sets.math_code_stem.reward",
         "experiments.src.reward_sets.stem.reward",
         "experiments.src.reward_sets.tau.reward",
+        "experiments.src.reward_sets.tool_call.reward",
     }
 )
 
