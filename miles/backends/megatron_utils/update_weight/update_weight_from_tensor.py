@@ -83,6 +83,7 @@ class UpdateWeightFromTensor:
         self._model_update_groups = None
         self.rollout_engines: Sequence[ActorHandle] | None = None
         self._connection_stale: bool = False
+        self._colocate_transfer_metrics: dict[str, int] = {}
 
     # TODO: avoid dup code during yueming's refactor (temp write this to avoid introducing potentially conflicting base class)
     def is_rollout_engines_fresh(self) -> bool:
@@ -189,6 +190,11 @@ class UpdateWeightFromTensor:
         out = self.__dict__.pop("update_weight_metrics", {})
         return out
 
+    def pop_colocate_transfer_metrics(self) -> dict[str, int]:
+        """Return the most recent opt-in logical payload byte count."""
+        metrics, self._colocate_transfer_metrics = self._colocate_transfer_metrics, {}
+        return metrics
+
     def _all_rollout_engines(self) -> list[ActorHandle]:
         engines = list(self.rollout_engines)
         if self.use_distribute:
@@ -203,6 +209,8 @@ class UpdateWeightFromTensor:
         self.weight_version += 1
 
         rank = dist.get_rank()
+        track_transfer_bytes = getattr(self.args, "log_colocate_transfer_bytes", False)
+        local_payload_bytes = 0
 
         # LoRA never mutates the base. With either path that retains it on the
         # rollout side (distributed keeps it on GPU; colocate + cpu_backup keeps
@@ -235,6 +243,8 @@ class UpdateWeightFromTensor:
             for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(
                 megatron_local_weights, weight_type="base"
             ):
+                if track_transfer_bytes:
+                    local_payload_bytes += sum(tensor.numel() * tensor.element_size() for _, tensor in hf_named_tensors)
                 refs, long_lived_tensors = self._send_base_params(hf_named_tensors)
                 results = ray.get(refs)
                 _check_weight_sync_results(results, is_lora=False)
@@ -248,6 +258,8 @@ class UpdateWeightFromTensor:
             for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(
                 megatron_local_weights, weight_type="lora"
             ):
+                if track_transfer_bytes:
+                    local_payload_bytes += sum(tensor.numel() * tensor.element_size() for _, tensor in hf_named_tensors)
                 accumulated_named_tensors.extend(hf_named_tensors)
 
             if not accumulated_named_tensors:
@@ -275,6 +287,8 @@ class UpdateWeightFromTensor:
                 ray.get(self.rollout_manager.set_applied_weight_version.remote(self.weight_version))
             ray.get([engine.continue_generation.remote() for engine in all_rollout_engines])
         dist.barrier(group=get_gloo_group())
+        if track_transfer_bytes:
+            self._colocate_transfer_metrics = {"weight_update_payload_bytes": local_payload_bytes}
 
     def _send_base_params(self, hf_named_tensors) -> tuple[list[ObjectRef], Any]:
         refs, long_lived_tensors = _send_to_colocated_engine(

@@ -105,3 +105,29 @@ async def test_v1_timing_uses_worker_max_and_default_dispatch_is_unchanged():
         witness_info=None,
         attempt=0,
     )
+
+
+@pytest.mark.asyncio
+async def test_v1_switch_worker_results_are_only_forwarded_when_collection_is_enabled():
+    group = V1RayTrainGroup.__new__(V1RayTrainGroup)
+    group.args = SimpleNamespace(log_colocate_switch_metrics=False)
+    group._broadcast = AsyncMock(return_value=[{"bytes": 10}])
+
+    assert await group.offload() is None
+
+    group.args.log_colocate_switch_metrics = True
+    assert await group.offload() == [{"bytes": 10}]
+
+
+@pytest.mark.asyncio
+async def test_v2_switch_worker_results_are_only_forwarded_when_collection_is_enabled():
+    group = RayTrainGroup.__new__(RayTrainGroup)
+    group.args = SimpleNamespace(log_colocate_switch_metrics=False)
+    cell = SimpleNamespace(health_checker=MagicMock())
+    group._cells = [cell]
+    group._execute_all_alive_and_catch = AsyncMock(return_value=([cell], [{"bytes": 10}]))
+
+    assert await group.offload() is None
+
+    group.args.log_colocate_switch_metrics = True
+    assert await group.offload() == [{"bytes": 10}]

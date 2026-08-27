@@ -3,6 +3,7 @@ import logging
 import os
 import random
 import shutil
+import time
 from argparse import Namespace
 from contextlib import ExitStack, nullcontext
 from typing import TYPE_CHECKING
@@ -214,7 +215,9 @@ class MegatronTrainRayActor(TrainRayActor):
                 translate_gpu_to_cpu=not self.args.enable_weights_backuper,
             ),
             single_tag=None if args.enable_weights_backuper else "actor",
+            track_transfer_nbytes=getattr(args, "log_colocate_transfer_bytes", False),
         )
+        self._last_colocate_weight_snapshot_time = 0.0
         self._active_model_tag: str | None = "actor"
         if self._enable_weight_backup:
             self.weights_backuper.backup("actor")
@@ -282,15 +285,23 @@ class MegatronTrainRayActor(TrainRayActor):
 
     @with_logs
     @timer
-    def sleep(self) -> None:
+    def sleep(self) -> dict[str, int] | None:
         assert self.args.offload_train
         if self._asleep:
             logger.info("sleep() called while already offloaded; skipping")
-            return
+            return {} if getattr(self.args, "log_colocate_transfer_bytes", False) else None
 
         clear_memory(clear_host_memory=True)
-        print_memory("before offload model")
-        should_log_cpu_memory = is_first_replica_megatron_main_rank() and hasattr(self, "_last_rollout_id")
+        if getattr(self.args, "log_memory_usage", False):
+            print_memory("before offload model")
+        should_log_cpu_memory = (
+            getattr(self.args, "log_memory_usage", False)
+            and is_first_replica_megatron_main_rank()
+            and hasattr(self, "_last_rollout_id")
+        )
+        free_hbm_before = (
+            torch.cuda.mem_get_info()[0] if getattr(self.args, "log_colocate_transfer_bytes", False) else None
+        )
 
         destroy_process_groups()
 
@@ -298,10 +309,16 @@ class MegatronTrainRayActor(TrainRayActor):
         torch_memory_saver.pause(tag=tag)
 
         self._asleep = True
-        print_memory("after offload model")
+        if getattr(self.args, "log_memory_usage", False):
+            print_memory("after offload model")
 
         if should_log_cpu_memory:
             log_cpu_memory(self._last_rollout_id, self.args, "after_offload_train")
+
+        if free_hbm_before is None:
+            return {}
+        free_hbm_after = torch.cuda.mem_get_info()[0]
+        return {"trainer_offload_hbm_released_bytes": max(free_hbm_after - free_hbm_before, 0)}
 
     @with_logs
     @timer
@@ -311,7 +328,8 @@ class MegatronTrainRayActor(TrainRayActor):
             logger.info("wake_up() called while already resident; ensuring process groups only")
             reload_process_groups()
             return
-        print_memory("before wake_up model")
+        if getattr(self.args, "log_memory_usage", False):
+            print_memory("before wake_up model")
 
         tag = "default" if is_lora_enabled(self.args) else None
         torch_memory_saver.resume(tag=tag)
@@ -319,7 +337,8 @@ class MegatronTrainRayActor(TrainRayActor):
         clear_memory()
         reload_process_groups()
         self._asleep = False
-        print_memory("after wake_up model")
+        if getattr(self.args, "log_memory_usage", False):
+            print_memory("after wake_up model")
 
     @property
     def _enable_weight_backup(self) -> bool:
@@ -587,7 +606,13 @@ class MegatronTrainRayActor(TrainRayActor):
         if train_step_outcome == TrainStepOutcome.NORMAL:
             # update the cpu actor weight to the latest model
             if self._enable_weight_backup:
+                snapshot_start = (
+                    time.monotonic() if getattr(self.args, "log_colocate_switch_metrics", False) else None
+                )
                 self.weights_backuper.backup("actor")
+                self._last_colocate_weight_snapshot_time = (
+                    time.monotonic() - snapshot_start if snapshot_start is not None else 0.0
+                )
             else:
                 torch.cuda.synchronize()
 
@@ -721,10 +746,10 @@ class MegatronTrainRayActor(TrainRayActor):
 
     @with_logs
     @timer
-    def update_weights(self, info: "EnginesAndLock") -> None:
+    def update_weights(self, info: "EnginesAndLock") -> dict[str, int | float] | None:
         self._heartbeat.bump()
         if self.args.debug_train_only or self.args.debug_rollout_only:
-            return
+            return {} if getattr(self.args, "log_colocate_switch_metrics", False) else None
 
         rollout_engines = info.rollout_engines
         rollout_engine_lock = info.rollout_engine_lock
@@ -753,7 +778,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 logger.warning("Skipping actor-to-rollout weight update because " "--debug-skip-weight-update is set.")
             if process_groups_are_temporary:
                 destroy_process_groups()
-            return
+            return {} if getattr(self.args, "log_colocate_switch_metrics", False) else None
 
         version_update_names: list[str] = []
         if is_multi_lora_enabled(self.args):
@@ -764,9 +789,11 @@ class MegatronTrainRayActor(TrainRayActor):
             )
 
         with torch_memory_saver.disable() if self.args.offload_train else nullcontext():
-            print_memory("before update_weights")
+            if getattr(self.args, "log_memory_usage", False):
+                print_memory("before update_weights")
             self.weight_updater.update_weights()
-            print_memory("after update_weights")
+            if getattr(self.args, "log_memory_usage", False):
+                print_memory("after update_weights")
 
             if is_multi_lora_enabled(self.args):
                 from miles.backends.megatron_utils.multi_lora_utils import commit_weight_push
@@ -795,6 +822,14 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if process_groups_are_temporary:
             destroy_process_groups()
+
+        if not getattr(self.args, "log_colocate_switch_metrics", False):
+            return None
+        metrics = {"actor_weight_snapshot_time": self._last_colocate_weight_snapshot_time}
+        if getattr(self.args, "log_colocate_transfer_bytes", False):
+            metrics["actor_weight_snapshot_bytes"] = self.weights_backuper.backup_transfer_nbytes("actor")
+            metrics.update(self.weight_updater.pop_colocate_transfer_metrics())
+        return metrics
 
     def restore_weight_version(self, version: int) -> int:
         """Set the next weight transfer's durable version base on every trainer rank."""

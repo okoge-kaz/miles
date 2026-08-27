@@ -146,9 +146,11 @@ class TrainRayActor(RayActor):
         _inject_fault(mode=mode)
 
     def clear_memory(self):
-        print_memory("before TrainRayActor.clear_memory")
+        if getattr(self.args, "log_memory_usage", False):
+            print_memory("before TrainRayActor.clear_memory")
         clear_memory()
-        print_memory("after TrainRayActor.clear_memory")
+        if getattr(self.args, "log_memory_usage", False):
+            print_memory("after TrainRayActor.clear_memory")
 
     @abc.abstractmethod
     def sleep(self, tags):

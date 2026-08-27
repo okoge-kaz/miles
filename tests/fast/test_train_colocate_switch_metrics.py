@@ -97,6 +97,10 @@ class _ActorModel:
     async def offload(self):
         self._events.append("train_offload")
         self._clock.advance(4.0)
+        return [
+            {"trainer_offload_hbm_released_bytes": 100},
+            {"trainer_offload_hbm_released_bytes": 120},
+        ]
 
     async def clear_memory(self):
         raise AssertionError("offload_train=True must use offload()")
@@ -104,14 +108,26 @@ class _ActorModel:
     async def update_weights(self, rollout_id=None):
         self._events.append(("update_weights", rollout_id))
         self._clock.advance(6.0)
+        return [
+            {
+                "actor_weight_snapshot_time": 1.0,
+                "actor_weight_snapshot_bytes": 200,
+                "weight_update_payload_bytes": 300,
+            },
+            {
+                "actor_weight_snapshot_time": 1.5,
+                "actor_weight_snapshot_bytes": 220,
+                "weight_update_payload_bytes": 330,
+            },
+        ]
 
     async def save_model(self, rollout_id, force_sync=False, *, write_dist=True, write_hf=True):
         self._events.append(("model_save", rollout_id, force_sync, write_dist, write_hf))
         self._clock.advance(100.0)
 
 
-def _args() -> Namespace:
-    return Namespace(
+def _args(**overrides) -> Namespace:
+    values = dict(
         fully_async=False,
         control_server_port=None,
         ft_components=[],
@@ -129,8 +145,12 @@ def _args() -> Namespace:
         hf_save_interval=None,
         debug_exit_after_rollout=None,
         colocate=True,
+        log_colocate_switch_metrics=True,
+        log_colocate_transfer_bytes=True,
         wandb_always_use_train_step=False,
     )
+    values.update(overrides)
+    return Namespace(**values)
 
 
 @pytest.mark.asyncio
@@ -170,8 +190,19 @@ async def test_colocate_switch_metrics_are_current_step_and_exclude_bootstrap_tr
     for metrics, _step_key in logged:
         assert metrics["perf/colocate/rollout_offload_block_time"] == pytest.approx(2.0)
         assert metrics["perf/colocate/rollout_to_train_active_time"] == pytest.approx(5.0)
+        assert metrics["perf/colocate/trainer_offload_block_time"] == pytest.approx(4.0)
+        assert metrics["perf/colocate/rollout_weight_onload_block_time"] == pytest.approx(5.0)
+        assert metrics["perf/colocate/weight_update_block_time"] == pytest.approx(6.0)
+        assert metrics["perf/colocate/rollout_kv_onload_block_time"] == pytest.approx(7.0)
         assert metrics["perf/colocate/train_to_rollout_block_time"] == pytest.approx(22.0)
         assert metrics["perf/colocate/switch_total_active_time"] == pytest.approx(27.0)
+        assert metrics["perf/colocate/trainer_offload_hbm_released_bytes_max"] == 120
+        assert metrics["perf/colocate/trainer_offload_hbm_released_bytes_sum"] == 220
+        assert metrics["perf/colocate/actor_weight_snapshot_time_max"] == pytest.approx(1.5)
+        assert metrics["perf/colocate/actor_weight_snapshot_bytes_max"] == 220
+        assert metrics["perf/colocate/actor_weight_snapshot_bytes_sum"] == 420
+        assert metrics["perf/colocate/weight_update_payload_bytes_max"] == 330
+        assert metrics["perf/colocate/weight_update_payload_bytes_sum"] == 630
 
     # Bootstrap onload/update costs and the 125 seconds of model/rollout save work
     # are deliberately outside the per-step switch measurements.
@@ -179,6 +210,45 @@ async def test_colocate_switch_metrics_are_current_step_and_exclude_bootstrap_tr
     assert events.count(("update_weights", 0)) == 1
     assert events.count(("update_weights", 1)) == 1
     assert events[-1] == "dispose"
+
+
+@pytest.mark.asyncio
+async def test_colocate_switch_logging_is_opt_in(monkeypatch):
+    clock = _Clock()
+    events = []
+    logged = []
+    manager = _RolloutManager(clock, events)
+    actor = _ActorModel(clock, events)
+
+    monkeypatch.setattr(train.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(train, "create_placement_groups", lambda _args: {"rollout": object()})
+    monkeypatch.setattr(train, "create_rollout_manager", lambda _args, _pg: (manager, 1))
+
+    async def create_models(_args, _pgs, _manager):
+        return actor, None
+
+    monkeypatch.setattr(train, "create_training_models", create_models)
+    monkeypatch.setattr(train.object_store, "init_instance", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(train, "configure_logger", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(train, "maybe_start_periodic_pyspy_dump", lambda: None)
+    monkeypatch.setattr(train, "maybe_start_mini_ft_controller", lambda _args: None)
+    monkeypatch.setattr(train, "init_tracking", lambda _args: None)
+    monkeypatch.setattr(train, "remove_rollout_data_refs", lambda *_args: None)
+    monkeypatch.setattr(train, "checkpoint_artifacts_due", lambda *_args, **_kwargs: (False, False))
+    monkeypatch.setattr(train, "should_run_periodic_action", lambda *_args: False)
+    monkeypatch.setattr(train, "log_tracking", lambda *_args, **_kwargs: logged.append(True))
+
+    await train.train(
+        _args(
+            num_rollout=1,
+            log_colocate_switch_metrics=False,
+            log_colocate_transfer_bytes=False,
+        )
+    )
+
+    assert logged == []
+    train_event = next(event for event in events if isinstance(event, tuple) and event[0] == "train")
+    assert train_event[2] == {}
 
 
 @pytest.mark.asyncio

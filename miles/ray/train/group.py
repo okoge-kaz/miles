@@ -294,12 +294,14 @@ class RayTrainGroup:
         info = await self._rollout_manager.get_updatable_engines_and_lock.remote()
         await self._rollout_manager.health_monitoring_pause.remote()
         # Catch with vanilla retry: cells w/ exceptions are auto marked errored, thus retry will find the next one
-        await retry(
+        results = await retry(
             lambda _: self._execute_first_alive("update_weights", info=info),
             max_attempts=_RETRY_MAX_ATTEMPTS,
         )
 
         await self._maybe_log_inference_engine_weight_checksums(rollout_id=rollout_id)
+        if getattr(self.args, "log_colocate_switch_metrics", False):
+            return results
 
     async def restore_weight_version(self, version: int) -> None:
         """Align every failover cell before the next versioned weight push."""
@@ -331,7 +333,9 @@ class RayTrainGroup:
         for cell in self._cells:
             cell.health_checker.pause()
         # Catch *without* retry: cells w/ exceptions are auto marked errored, and will not be used
-        await self._execute_all_alive_and_catch("sleep")
+        _cells, results = await self._execute_all_alive_and_catch("sleep")
+        if getattr(self.args, "log_colocate_switch_metrics", False):
+            return results
 
     async def clear_memory(self):
         # Catch *without* retry: cells w/ exceptions are auto marked errored, and will not be used

@@ -293,13 +293,15 @@ class FSDPTrainRayActor(TrainRayActor):
         if not self.args.offload_train:
             return
 
-        print_memory("before offload model")
+        if getattr(self.args, "log_memory_usage", False):
+            print_memory("before offload model")
 
         self.model.cpu()
         move_torch_optimizer(self.optimizer, "cpu")
         clear_memory()
         dist.barrier(group=get_gloo_group())
-        print_memory("after offload model")
+        if getattr(self.args, "log_memory_usage", False):
+            print_memory("after offload model")
 
     @timer
     def wake_up(self) -> None:
@@ -310,7 +312,8 @@ class FSDPTrainRayActor(TrainRayActor):
         self.model.cuda()
         move_torch_optimizer(self.optimizer, "cuda")
         dist.barrier(group=get_gloo_group())
-        print_memory("after wake_up model")
+        if getattr(self.args, "log_memory_usage", False):
+            print_memory("after wake_up model")
 
     def save_model(
         self, rollout_id: int, force_sync: bool = False, *, write_dist: bool = True, write_hf: bool = True

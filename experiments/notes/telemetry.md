@@ -197,6 +197,14 @@ switch, with the same `rollout/step` that incurred it:
 |---|---|
 | `perf/colocate/rollout_offload_block_time` | Driver wall time waiting for the existing rollout `offload(tags=...)` RPC. Under the study recipe the tags release weights, KV cache, and CUDA graphs. |
 | `perf/colocate/rollout_to_train_active_time` | Rollout-offload block above plus the maximum worker-local trainer wake-up duration across the successful ranks/cells. Trainer wake restores the tracked model, optimizer state, buffers, and process groups. |
+| `perf/colocate/actor_weight_snapshot_time_max` | Maximum trainer-worker time copying the updated actor shard to its pinned host backup. It occurs after `actor_train` and before the training RPC returns, so it is adjacent to but intentionally outside the directional headline metrics. |
+| `perf/colocate/actor_weight_snapshot_bytes_{max,sum}` | Exact tensor bytes copied GPU-to-pinned-CPU by that snapshot, reported per-rank maximum and sum. |
+| `perf/colocate/weight_update_payload_bytes_{max,sum}` | Exact logical tensor payload produced by trainer ranks for the colocated SGLang weight update, reported per-rank maximum and sum. This is payload handled, not a link-level PCIe/NVLink byte counter. |
+| `perf/colocate/trainer_offload_hbm_released_bytes_{max,sum}` | CUDA driver free-HBM increase around `torch_memory_saver.pause`. This measures physical HBM released, not exact host/device bytes transferred. |
+| `perf/colocate/trainer_offload_block_time` | Driver wall time waiting for trainer offload/clear immediately after checkpoint work. |
+| `perf/colocate/rollout_weight_onload_block_time` | Driver wall time waiting for rollout weights to be restored before fresh weights are published. Zero when rollout weight offload is disabled. |
+| `perf/colocate/weight_update_block_time` | Driver wall time publishing the freshly trained actor weights to the rollout engines. |
+| `perf/colocate/rollout_kv_onload_block_time` | Driver wall time restoring rollout KV-cache/CUDA-graph memory after weight publication. Zero when rollout offload is disabled. |
 | `perf/colocate/train_to_rollout_block_time` | One driver-clock critical path beginning after checkpoint work: trainer offload, rollout-weight onload, fresh-weight publication, and rollout KV/CUDA-graph onload. It ends only when generation can be accepted again. |
 | `perf/colocate/switch_total_active_time` | Sum of the two directional headline values. |
 
@@ -214,7 +222,10 @@ GRPO without a critic, so that qualification does not affect its arm.
 `train_to_rollout_block_time` is an exact driver wall measurement for the
 requested memory switch and weight publication. Weight publication is included
 because the rollout cannot proceed without it, even though it is not a memory
-offload. Checkpoint work is stopped out of this timer. The following costs are
+offload. The four phase metrics added on 2026-08-27 time its existing awaits
+individually with the same driver clock; their sum can differ from the outer
+timer by small Python scheduling gaps. Checkpoint work is stopped out of this
+timer. The following costs are
 also intentionally outside the directional metrics and must not be added to
 them a second time:
 
@@ -225,18 +236,21 @@ them a second time:
 - evaluation, process initialization, recovery, and chain requeue gaps;
 - the W&B call that emits the completed switch row.
 
-One transition-adjacent cost is not yet separately observable:
+One transition-adjacent cost is deliberately separate:
 `weights_backuper.backup("actor")` snapshots the updated actor after
 `actor_train` but before the training RPC returns. It is outside the existing
 `perf/train_time` and before the driver starts `train_to_rollout_block_time`.
-The present metrics answer the requested trainer/rollout memory-switch cost. A
-future claim about the complete optimizer-step-to-rollout-ready interval must
-add a worker-side `perf/colocate/weight_snapshot_time` and combine it explicitly
-rather than silently changing the current metric contract.
+Runs after 2026-08-27 log the maximum worker duration as
+`perf/colocate/actor_weight_snapshot_time_max`. It is not added to
+`switch_total_active_time`, preserving that metric's contract. A claim about
+the complete optimizer-step-to-rollout-ready interval must combine it
+explicitly.
 
-The metrics are emitted only when `args.colocate` is true. Fully-async runs must
-leave them absent, not report zero. Collection is opt-in all the way through the
-train group; the default worker arguments and return values are unchanged. The
+The metrics are emitted only with `--log-colocate-switch-metrics`, which itself
+requires `--colocate`. Fully-async runs must leave them absent, not report zero.
+Byte summaries additionally require `--log-colocate-transfer-bytes`. Collection
+is opt-in all the way through the train group; the default worker arguments and
+return values are unchanged. The
 maximum successful-worker timer is used, and a failed/retried attempt is not
 accumulated into the successful switch. Logging on step N immediately after the
 train-to-rollout switch removes the old N+1 attribution and retains the final
@@ -281,6 +295,17 @@ sample-staleness rows covered all three steps but the rollout-side fragment
 covered only steps 0 and 1. This is a W&B multi-writer teardown/coverage issue,
 not a successful-training signal; every production export must therefore check
 expected step coverage instead of trusting process exit alone.
+
+Two-node 4B validation job 16751089 exercised the opt-in byte telemetry on 16
+H100s with W&B offline. Slurm and Ray completed successfully. The driver W&B
+protobuf contains the complete step-0 row: rollout-to-train 1.152 s,
+train-to-rollout 6.315 s, and total active switch 7.468 s. Exact per-rank
+snapshot bytes were 4,022,991,872 (0.0985 s), exact logical weight-update
+payload was 8,044,936,192 bytes, and the maximum CUDA-driver HBM release across
+trainer ranks was 20,336,082,944 bytes. With `LOG_MEMORY_USAGE=0`, the combined
+job log contained no `Memory-Usage` lines. The secondary W&B writers retained
+the same non-fatal `atexit` broken-pipe warning described above; the requested
+driver row was present in the offline file before teardown.
 
 ## Not yet observed
 

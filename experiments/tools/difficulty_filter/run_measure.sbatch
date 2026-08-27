@@ -42,6 +42,9 @@
 #   CONCURRENCY      prompts in flight                     (96)
 #   TOP_P / TOP_K    sampling cutoffs                      (1.0 / -1)
 #   MAX_RUNNING_REQUESTS  sequences admitted per replica    (96)
+#   SGLANG_TP_SIZE  tensor-parallel ranks per replica        (1)
+#   SGLANG_DP_SIZE  data-parallel replicas                    (8 / TP)
+#   MEM_FRACTION_STATIC  SGLang static-memory fraction        (0.85)
 #   SGLANG_LOG_LEVEL sglang verbosity                      (info)
 #                    Keep at info: the Decode-batch lines carry token usage,
 #                    running-req and gen throughput, which are the only way to
@@ -86,6 +89,21 @@ CONCURRENCY="${CONCURRENCY:-96}"
 # CONCURRENCY * N_SAMPLES spread over GPUS_PER_NODE replicas, i.e.
 # CONCURRENCY sequences each. Sized against the KV budget below.
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-96}"
+SGLANG_TP_SIZE="${SGLANG_TP_SIZE:-1}"
+[[ "${SGLANG_TP_SIZE}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "SGLANG_TP_SIZE must be a positive integer" >&2
+    exit 1
+}
+SGLANG_DP_SIZE="${SGLANG_DP_SIZE:-$(( GPUS_PER_NODE / SGLANG_TP_SIZE ))}"
+MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.85}"
+[[ "${SGLANG_DP_SIZE}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "SGLANG_DP_SIZE must be a positive integer" >&2
+    exit 1
+}
+[[ $(( SGLANG_TP_SIZE * SGLANG_DP_SIZE )) -eq "${GPUS_PER_NODE}" ]] || {
+    echo "SGLANG_TP_SIZE * SGLANG_DP_SIZE must equal GPUS_PER_NODE=${GPUS_PER_NODE}" >&2
+    exit 1
+}
 RM_TYPE="${RM_TYPE:-math}"
 ZERO_TRUNCATED_ARG=""
 [[ "${ZERO_REWARD_ON_TRUNCATED:-0}" != 0 ]] && ZERO_TRUNCATED_ARG="--zero-reward-on-truncated"
@@ -156,9 +174,10 @@ if [[ -n "\${EXTRA_PIP:-}" ]]; then
 fi
 
 if [[ ${SKIP_MEASUREMENT} == 0 ]]; then
-    # dp-size 8: eight independent replicas behind one endpoint. Qwen3-4B fits on a
-    # single H100, so data parallelism beats tensor parallelism here -- no
-    # cross-GPU collectives on the critical path of a pure-inference sweep.
+    # Use TP only when the policy's weight/KV footprint needs it. Qwen3-4B and
+    # Qwen3-8B use TP1/DP8; Qwen3-30B-A3B uses TP2/DP4 so its roughly 57-GiB
+    # checkpoint does not consume almost the entire static allocation on every
+    # rank. Pure-inference filtering otherwise favors data parallelism.
     #
     # KV budget per replica: mem-fraction-static 0.85 * 80 GB = 68 GB, minus ~8 GB
     # of bf16 weights, leaves ~60 GB. Qwen3-4B keeps 36 layers * 8 KV heads * 128
@@ -169,8 +188,8 @@ if [[ ${SKIP_MEASUREMENT} == 0 ]]; then
     python3 -m sglang.launch_server \
         --model-path /ckpt/hf/${HF_MODEL_NAME} \
         --host 127.0.0.1 --port ${SERVER_PORT} \
-        --dp-size ${GPUS_PER_NODE} --tp-size 1 \
-        --mem-fraction-static 0.85 \
+        --dp-size ${SGLANG_DP_SIZE} --tp-size ${SGLANG_TP_SIZE} \
+        --mem-fraction-static ${MEM_FRACTION_STATIC} \
         --max-running-requests ${MAX_RUNNING_REQUESTS} \
         --log-level ${SGLANG_LOG_LEVEL:-info} &
     SERVER_PID=\$!
@@ -191,7 +210,7 @@ if [[ ${SKIP_MEASUREMENT} == 0 ]]; then
         gpu_processes=\$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | sed '/^[[:space:]]*\$/d' | wc -l)
         (( gpu_processes > max_gpu_processes )) && max_gpu_processes=\${gpu_processes}
         if (( max_gpu_processes >= ${GPUS_PER_NODE} && gpu_processes < ${GPUS_PER_NODE} )); then
-            echo \"sglang lost a DP worker during startup: expected=${GPUS_PER_NODE} current=\${gpu_processes}\" >&2
+            echo \"sglang lost a worker during startup: expected=${GPUS_PER_NODE} current=\${gpu_processes}\" >&2
             exit 1
         fi
         sleep 10

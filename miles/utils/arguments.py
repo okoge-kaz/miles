@@ -205,6 +205,33 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--log-colocate-switch-metrics",
+                action="store_true",
+                default=False,
+                help=(
+                    "Log opt-in colocated switch phase timings. The timers only wrap existing blocking operations; "
+                    "metrics are emitted after the measured switch completes."
+                ),
+            )
+            parser.add_argument(
+                "--log-colocate-transfer-bytes",
+                action="store_true",
+                default=False,
+                help=(
+                    "Log opt-in per-rank byte summaries for colocated trainer offload, actor snapshots, and "
+                    "actor-to-rollout weight payloads. Requires --log-colocate-switch-metrics."
+                ),
+            )
+            parser.add_argument(
+                "--log-memory-usage",
+                action="store_true",
+                default=False,
+                help=(
+                    "Log hot-path GPU and CPU memory snapshots around offload, wake-up, and weight updates. "
+                    "This diagnostic can perturb timing and is disabled by default."
+                ),
+            )
+            parser.add_argument(
                 "--offload",
                 action="store_true",
                 default=False,
@@ -3359,6 +3386,11 @@ def miles_validate_args(args):
                 f"* actor_num_nodes {args.actor_num_nodes}, overriding rollout_num_gpus to match actor_num_gpus_per_node * actor_num_nodes."
             )
             args.rollout_num_gpus = args.actor_num_gpus_per_node * args.actor_num_nodes
+
+    if args.log_colocate_switch_metrics and not args.colocate:
+        raise ValueError("--log-colocate-switch-metrics requires --colocate")
+    if args.log_colocate_transfer_bytes and not args.log_colocate_switch_metrics:
+        raise ValueError("--log-colocate-transfer-bytes requires --log-colocate-switch-metrics")
 
     if args.use_critic and not args.debug_rollout_only:
         if args.offload_train is None:

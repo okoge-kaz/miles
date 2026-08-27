@@ -143,7 +143,9 @@ class RayTrainGroup:
         info = await self.rollout_manager.get_updatable_engines_and_lock.remote()
         await self.rollout_manager.health_monitoring_pause.remote()
 
-        await self._broadcast("update_weights", info=info)
+        results = await self._broadcast("update_weights", info=info)
+        if getattr(self.args, "log_colocate_switch_metrics", False):
+            return results
 
     async def restore_weight_version(self, version: int) -> None:
         """Align every trainer rank before the next versioned weight push."""
@@ -158,7 +160,9 @@ class RayTrainGroup:
         await self._broadcast("wake_up")
 
     async def offload(self):
-        await self._broadcast("sleep")
+        results = await self._broadcast("sleep")
+        if getattr(self.args, "log_colocate_switch_metrics", False):
+            return results
 
     async def clear_memory(self):
         await self._broadcast("clear_memory")

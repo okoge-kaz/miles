@@ -203,6 +203,28 @@ def test_zero_reward_on_truncated_cli_is_opt_in():
     assert enabled.zero_reward_on_truncated
 
 
+def test_colocate_switch_telemetry_cli_is_opt_in():
+    parser = argparse.ArgumentParser()
+    get_miles_extra_args_provider()(parser)
+
+    defaults = parser.parse_args(REQUIRED_ARGS)
+    enabled = parser.parse_args(
+        [
+            "--log-colocate-switch-metrics",
+            "--log-colocate-transfer-bytes",
+            "--log-memory-usage",
+        ]
+        + REQUIRED_ARGS
+    )
+
+    assert not defaults.log_colocate_switch_metrics
+    assert not defaults.log_colocate_transfer_bytes
+    assert not defaults.log_memory_usage
+    assert enabled.log_colocate_switch_metrics
+    assert enabled.log_colocate_transfer_bytes
+    assert enabled.log_memory_usage
+
+
 def make_class_with_add_arguments():
     class MyFn:
         @classmethod

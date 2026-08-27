@@ -9,14 +9,22 @@ _SourceGetter = Callable[[], Iterable[tuple[str, torch.Tensor]]]
 
 class TensorBackuper(ABC):
     @staticmethod
-    def create(source_getter, single_tag):
+    def create(source_getter, single_tag, *, track_transfer_nbytes: bool = False):
         if single_tag is None:
-            return _TensorBackuperNormal(source_getter=source_getter)
+            return _TensorBackuperNormal(
+                source_getter=source_getter,
+                track_transfer_nbytes=track_transfer_nbytes,
+            )
         else:
-            return _TensorBackuperNoop(source_getter=source_getter, single_tag=single_tag)
+            return _TensorBackuperNoop(
+                source_getter=source_getter,
+                single_tag=single_tag,
+                track_transfer_nbytes=track_transfer_nbytes,
+            )
 
-    def __init__(self, source_getter: _SourceGetter):
+    def __init__(self, source_getter: _SourceGetter, *, track_transfer_nbytes: bool):
         self._source_getter = source_getter
+        self._track_transfer_nbytes = track_transfer_nbytes
 
     @property
     @abstractmethod
@@ -31,6 +39,11 @@ class TensorBackuper(ABC):
     def backup(self, tag: str):
         raise NotImplementedError
 
+    @abstractmethod
+    def backup_transfer_nbytes(self, tag: str) -> int:
+        """Return bytes copied from the source tensors by one ``backup`` call."""
+        raise NotImplementedError
+
     def copy(self, *, src_tag: str, dst_tag: str):
         raise NotImplementedError
 
@@ -40,9 +53,10 @@ class TensorBackuper(ABC):
 
 
 class _TensorBackuperNormal(TensorBackuper):
-    def __init__(self, source_getter):
-        super().__init__(source_getter=source_getter)
+    def __init__(self, source_getter, *, track_transfer_nbytes: bool):
+        super().__init__(source_getter=source_getter, track_transfer_nbytes=track_transfer_nbytes)
         self._backups: dict[str, dict[str, torch.Tensor]] = defaultdict(dict)
+        self._backup_transfer_nbytes: dict[str, int] = {}
 
     @property
     def backup_tags(self):
@@ -54,11 +68,20 @@ class _TensorBackuperNormal(TensorBackuper):
     @torch.no_grad()
     def backup(self, tag: str) -> None:
         backup_dict = self._backups[tag]
+        should_measure = self._track_transfer_nbytes and tag not in self._backup_transfer_nbytes
+        transfer_nbytes = 0
         for name, param in self._source_getter():
             if name not in backup_dict:
                 backup_dict[name] = torch.empty_like(param, device=torch.device("cpu"), pin_memory=True)
             backup_dict[name].copy_(param.detach(), non_blocking=True)
+            if should_measure:
+                transfer_nbytes += param.numel() * param.element_size()
         torch.cuda.synchronize()
+        if should_measure:
+            self._backup_transfer_nbytes[tag] = transfer_nbytes
+
+    def backup_transfer_nbytes(self, tag: str) -> int:
+        return self._backup_transfer_nbytes.get(tag, 0)
 
     @torch.no_grad()
     def copy(self, *, src_tag: str, dst_tag: str):
@@ -75,8 +98,8 @@ class _TensorBackuperNormal(TensorBackuper):
 
 
 class _TensorBackuperNoop(TensorBackuper):
-    def __init__(self, source_getter, single_tag):
-        super().__init__(source_getter=source_getter)
+    def __init__(self, source_getter, single_tag, *, track_transfer_nbytes: bool):
+        super().__init__(source_getter=source_getter, track_transfer_nbytes=track_transfer_nbytes)
         self._single_tag = single_tag
         # Sanity check for safety
         self._backup_hash_dict = None
@@ -95,6 +118,10 @@ class _TensorBackuperNoop(TensorBackuper):
         assert tag == self._single_tag
         self._backup_hash_dict = _compute_hash_dict(dict(self._source_getter()))
         torch.cuda.synchronize()
+
+    def backup_transfer_nbytes(self, tag: str) -> int:
+        assert tag == self._single_tag
+        return 0
 
     def restore(self, tag: str) -> None:
         assert tag == self._single_tag
