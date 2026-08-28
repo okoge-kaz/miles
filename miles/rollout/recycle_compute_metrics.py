@@ -564,6 +564,7 @@ def finalize_useful_rollout_metrics(
     metrics: dict[str, Any] | None,
     *,
     has_custom_converter: bool,
+    zero_loss_on_truncated: bool = False,
 ) -> None:
     """Finalize efficiency after flattening/trimming, immediately before logging."""
     if metrics is None or GENERATED_TOKENS_KEY not in metrics:
@@ -576,7 +577,12 @@ def finalize_useful_rollout_metrics(
     generated_tokens = int(metrics[GENERATED_TOKENS_KEY])
     admitted_tokens = int(metrics[ADMITTED_TOKENS_KEY])
     selected_tokens = sum(sample.response_length for sample in samples)
-    loss_token_counts = [_loss_input_tokens(sample) for sample in samples]
+    loss_token_counts = [
+        0
+        if zero_loss_on_truncated and sample.status == Sample.Status.TRUNCATED
+        else _loss_input_tokens(sample)
+        for sample in samples
+    ]
     loss_input_tokens = sum(loss_token_counts)
     postprocess_trimmed_tokens = admitted_tokens - selected_tokens
     loss_masked_tokens = selected_tokens - loss_input_tokens

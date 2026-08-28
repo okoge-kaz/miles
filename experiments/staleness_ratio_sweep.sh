@@ -43,6 +43,8 @@ IDLE_EXEMPTION='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"60","reason"
 
 SUBMIT=0
 INCLUDE_COLOCATED=0
+DISABLE_ZERO_REWARD_ON_TRUNCATED=0
+ENABLE_ZERO_LOSS_ON_TRUNCATED=0
 MATCH_PARTIAL_CONCURRENCY=0
 CLEAN_CHECKPOINT=0
 RESUME_MATCHED_CHAIN=0
@@ -51,6 +53,8 @@ declare -a REQUESTED_POINTS=()
 usage() {
     cat <<'EOF'
 usage: experiments/staleness_ratio_sweep.sh [--submit] [--include-colocated]
+                                            [--disable-zero-reward-on-truncated]
+                                            [--zero-loss-on-truncated]
                                             [--matched-partial-concurrency]
                                             [--resume-matched-chain]
                                             [--clean-checkpoint]
@@ -66,6 +70,15 @@ STALENESS_LEVELS and RATIOS. Learning settings come directly from:
 grid therefore contains 16 async arms plus one colocated arm. With
 --clean-checkpoint, only the first allocation in each chain removes that arm's
 exact derived checkpoint directory before starting.
+
+--disable-zero-reward-on-truncated changes only the recipe default
+ZERO_REWARD_ON_TRUNCATED from 1 to 0. It cannot be combined with matched
+partial-concurrency modes.
+
+--zero-loss-on-truncated sets ZERO_REWARD_ON_TRUNCATED=0 and
+ZERO_LOSS_ON_TRUNCATED=1. Truncated samples retain their reward for group
+baseline computation but contribute no training loss. It cannot be combined
+with matched partial-concurrency modes.
 
 --matched-partial-concurrency creates the five-arm follow-up: one colocated
 partial-rollout arm at PARTIAL_OVER_SAMPLING_BATCH_SIZE=256, plus the
@@ -95,6 +108,14 @@ while (( $# > 0 )); do
             ;;
         --include-colocated)
             INCLUDE_COLOCATED=1
+            shift
+            ;;
+        --disable-zero-reward-on-truncated)
+            DISABLE_ZERO_REWARD_ON_TRUNCATED=1
+            shift
+            ;;
+        --zero-loss-on-truncated)
+            ENABLE_ZERO_LOSS_ON_TRUNCATED=1
             shift
             ;;
         --matched-partial-concurrency)
@@ -130,6 +151,24 @@ done
 if (( INCLUDE_COLOCATED == 1 && MATCH_PARTIAL_CONCURRENCY == 1 )); then
     echo "--include-colocated and --matched-partial-concurrency are mutually exclusive" >&2
     exit 2
+fi
+if (( DISABLE_ZERO_REWARD_ON_TRUNCATED == 1 && MATCH_PARTIAL_CONCURRENCY == 1 )); then
+    echo "--disable-zero-reward-on-truncated cannot be combined with matched partial-concurrency modes" >&2
+    exit 2
+fi
+if (( ENABLE_ZERO_LOSS_ON_TRUNCATED == 1 && MATCH_PARTIAL_CONCURRENCY == 1 )); then
+    echo "--zero-loss-on-truncated cannot be combined with matched partial-concurrency modes" >&2
+    exit 2
+fi
+if (( DISABLE_ZERO_REWARD_ON_TRUNCATED == 1 && ENABLE_ZERO_LOSS_ON_TRUNCATED == 1 )); then
+    echo "--disable-zero-reward-on-truncated and --zero-loss-on-truncated are mutually exclusive" >&2
+    exit 2
+fi
+if (( DISABLE_ZERO_REWARD_ON_TRUNCATED == 1 || ENABLE_ZERO_LOSS_ON_TRUNCATED == 1 )); then
+    ZERO_REWARD_ON_TRUNCATED=0
+fi
+if (( ENABLE_ZERO_LOSS_ON_TRUNCATED == 1 )); then
+    ZERO_LOSS_ON_TRUNCATED=1
 fi
 if (( MATCH_PARTIAL_CONCURRENCY == 1 && CLEAN_CHECKPOINT == 1 )); then
     echo "--matched-partial-concurrency requires fresh identities; do not use --clean-checkpoint" >&2
@@ -214,6 +253,7 @@ NUM_ROLLOUT_VALUE="$(recipe_or_environment NUM_ROLLOUT)"
 NUM_STEPS_PER_ROLLOUT_VALUE="$(recipe_or_environment NUM_STEPS_PER_ROLLOUT)"
 MAX_RESPONSE_LEN_VALUE="$(recipe_or_environment MAX_RESPONSE_LEN)"
 ZERO_REWARD_ON_TRUNCATED_VALUE="$(recipe_or_environment ZERO_REWARD_ON_TRUNCATED)"
+ZERO_LOSS_ON_TRUNCATED_VALUE="$(recipe_or_environment ZERO_LOSS_ON_TRUNCATED)"
 USE_REPLAY_BUFFER_VALUE="$(recipe_or_environment USE_REPLAY_BUFFER)"
 REPLAY_BUFFER_TYPE_VALUE="$(recipe_or_environment REPLAY_BUFFER_TYPE)"
 FUSE_ONE_STEP_ACTOR_LOGPROBS_VALUE="$(recipe_or_environment FUSE_ONE_STEP_ACTOR_LOGPROBS)"
@@ -288,7 +328,8 @@ if (( MATCH_PARTIAL_CONCURRENCY == 1 )); then
         ACTOR_NUM_NODES ACTOR_GPUS_PER_NODE ROLLOUT_NUM_GPUS
         TENSOR_PARALLEL_SIZE CONTEXT_PARALLEL_SIZE EXPERT_PARALLEL_SIZE
         MAX_TOKENS_PER_GPU LOG_PROBS_CHUNK_SIZE RECOMPUTE_GRANULARITY OVERLAP_COMM
-        ROLLOUT_NUM_GPUS_PER_ENGINE SGLANG_MEM_FRACTION RM_TYPE ZERO_REWARD_ON_TRUNCATED
+        ROLLOUT_NUM_GPUS_PER_ENGINE SGLANG_MEM_FRACTION RM_TYPE
+        ZERO_REWARD_ON_TRUNCATED ZERO_LOSS_ON_TRUNCATED
         EVAL_INTERVAL N_SAMPLES_PER_EVAL_PROMPT EVAL_MAX_RESPONSE_LEN SKIP_EVAL_BEFORE_TRAIN
         SAVE_INTERVAL SAVE_RETAIN_INTERVAL SAVE_HF HF_SAVE_INTERVAL DUMP_TRAIN_DATA
         DUMP_POLICY_LOSS_DEBUG OBSERVE_TRAINING_ENTROPY FUSE_ONE_STEP_ACTOR_LOGPROBS
@@ -376,7 +417,9 @@ fi
 require_setting NUM_ROLLOUT 300
 require_setting NUM_STEPS_PER_ROLLOUT 1
 require_setting MAX_RESPONSE_LEN 16384
-require_setting ZERO_REWARD_ON_TRUNCATED 1
+require_setting ZERO_REWARD_ON_TRUNCATED \
+    "$(( 1 - DISABLE_ZERO_REWARD_ON_TRUNCATED - ENABLE_ZERO_LOSS_ON_TRUNCATED ))"
+require_setting ZERO_LOSS_ON_TRUNCATED "${ENABLE_ZERO_LOSS_ON_TRUNCATED}"
 require_setting USE_REPLAY_BUFFER 1
 require_setting REPLAY_BUFFER_TYPE inflight
 require_setting FUSE_ONE_STEP_ACTOR_LOGPROBS 1
@@ -495,9 +538,13 @@ async_config_tag() {
     local staleness="$1"
     local train_nodes="$2"
     local rollout_nodes="$3"
+    local config_tag="s${staleness}-t${train_nodes}r${rollout_nodes}-${RUN_NAMESPACE}"
     # common/run_identity.sh appends the non-default concurrency axis. Keep the
     # visible W&B group descriptive without duplicating that checkpoint suffix.
-    printf 's%s-t%sr%s-%s\n' "${staleness}" "${train_nodes}" "${rollout_nodes}" "${RUN_NAMESPACE}"
+    if (( DISABLE_ZERO_REWARD_ON_TRUNCATED == 1 )); then
+        config_tag="${config_tag}-zero-reward-trunc-off"
+    fi
+    printf '%s\n' "${config_tag}"
 }
 
 colocated_run_name() {
@@ -509,9 +556,13 @@ colocated_run_name() {
 }
 
 colocated_config_tag() {
+    local config_tag="s0-colocated-${RUN_NAMESPACE}"
     # common/run_identity.sh appends partial-oN and places this arm under
     # partial-rollout/unbounded.
-    printf 's0-colocated-%s\n' "${RUN_NAMESPACE}"
+    if (( DISABLE_ZERO_REWARD_ON_TRUNCATED == 1 )); then
+        config_tag="${config_tag}-zero-reward-trunc-off"
+    fi
+    printf '%s\n' "${config_tag}"
 }
 
 printf 'recipe: %s\n' "${RECIPE}"
@@ -522,8 +573,8 @@ printf 'fixed by recipe: queue=%s, reference=%s, rollouts=%s, steps/rollout=%s, 
 printf 'completed-group buffer: %s groups (%s training batches)\n' \
     "${TRAINING_BUFFER_QUEUE_SIZE_VALUE}" \
     "$(( TRAINING_BUFFER_QUEUE_SIZE_VALUE / ROLLOUT_BATCH ))"
-printf 'fixed safety: response=%s, zero-trunc=%s, replay=%s/%s, fused-logprobs=%s, exact-segments=%s, staleness-bin=%s\n' \
-    "${MAX_RESPONSE_LEN_VALUE}" "${ZERO_REWARD_ON_TRUNCATED_VALUE}" \
+printf 'fixed safety: response=%s, zero-reward-trunc=%s, zero-loss-trunc=%s, replay=%s/%s, fused-logprobs=%s, exact-segments=%s, staleness-bin=%s\n' \
+    "${MAX_RESPONSE_LEN_VALUE}" "${ZERO_REWARD_ON_TRUNCATED_VALUE}" "${ZERO_LOSS_ON_TRUNCATED_VALUE}" \
     "${USE_REPLAY_BUFFER_VALUE}" "${REPLAY_BUFFER_TYPE_VALUE}" \
     "${FUSE_ONE_STEP_ACTOR_LOGPROBS_VALUE}" "${SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS_VALUE}" \
     "${SAMPLE_STALENESS_MAX_BIN_VALUE}"
@@ -636,7 +687,6 @@ if (( MATCH_PARTIAL_CONCURRENCY == 1 )); then
         if (( RESUME_MATCHED_CHAIN == 1 )); then
             printf 'resume_of_manifest\t%s\n' "${LOG_DIR}/${RUN_NAMESPACE}.manifest.tsv"
         fi
-        printf 'git_head\t%s\n' "$(git -C "${REPO_ROOT}" rev-parse HEAD)"
         printf 'tracked_diff_sha256\t%s\n' "${tracked_diff_sha256}"
         printf 'runtime_repo\t%s\n' "${MATCHED_REPO_ROOT_RESOLVED}"
         printf 'container\t%s\n' "${SQSH_IMAGE}"
@@ -704,6 +754,7 @@ submit_chain() {
         "NUM_STEPS_PER_ROLLOUT=${NUM_STEPS_PER_ROLLOUT_VALUE}"
         "MAX_RESPONSE_LEN=${MAX_RESPONSE_LEN_VALUE}"
         "ZERO_REWARD_ON_TRUNCATED=${ZERO_REWARD_ON_TRUNCATED_VALUE}"
+        "ZERO_LOSS_ON_TRUNCATED=${ZERO_LOSS_ON_TRUNCATED_VALUE}"
         "USE_REPLAY_BUFFER=${USE_REPLAY_BUFFER_VALUE}"
         "REPLAY_BUFFER_TYPE=${REPLAY_BUFFER_TYPE_VALUE}"
         "FUSE_ONE_STEP_ACTOR_LOGPROBS=${FUSE_ONE_STEP_ACTOR_LOGPROBS_VALUE}"
@@ -772,6 +823,7 @@ submit_colocated_chain() {
         "NUM_STEPS_PER_ROLLOUT=${NUM_STEPS_PER_ROLLOUT_VALUE}"
         "MAX_RESPONSE_LEN=${MAX_RESPONSE_LEN_VALUE}"
         "ZERO_REWARD_ON_TRUNCATED=${ZERO_REWARD_ON_TRUNCATED_VALUE}"
+        "ZERO_LOSS_ON_TRUNCATED=${ZERO_LOSS_ON_TRUNCATED_VALUE}"
         "SAVE_HF=${SAVE_HF_VALUE}"
         "HF_SAVE_INTERVAL=${HF_SAVE_INTERVAL_VALUE}"
         "MAX_WEIGHT_STALENESS="

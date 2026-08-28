@@ -90,6 +90,27 @@ def test_useful_rollout_accounting_is_an_exact_partition() -> None:
     assert metrics["rollout/fully_async/useful_rollout/accounting_error_tokens"] == 0
 
 
+def test_useful_rollout_accounting_includes_zero_loss_truncated_samples() -> None:
+    completed = _sample(1, 4, [1, 1, 1, 1])
+    truncated = _sample(2, 6, [1, 1, 1, 1, 1, 1])
+    truncated.status = Sample.Status.TRUNCATED
+    metrics = {
+        GENERATED_TOKENS_KEY: 10,
+        ADMITTED_TOKENS_KEY: 10,
+    }
+
+    finalize_useful_rollout_metrics(
+        [completed, truncated],
+        metrics,
+        has_custom_converter=False,
+        zero_loss_on_truncated=True,
+    )
+
+    assert metrics["rollout/fully_async/useful_rollout/loss_input_tokens"] == 4
+    assert metrics["rollout/fully_async/useful_rollout/loss_masked_tokens"] == 6
+    assert metrics["rollout/fully_async/useful_rollout/accounting_error_tokens"] == 0
+
+
 def test_waste_reason_metrics_have_fixed_cardinality() -> None:
     metrics = discard_waste_metrics({})
 

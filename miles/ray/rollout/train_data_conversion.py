@@ -115,7 +115,10 @@ def convert_samples_to_train_data(
         assert (
             len(sample.loss_mask) == sample.response_length
         ), f"loss mask length {len(sample.loss_mask)} != response length {sample.response_length}"
-        if sample.remove_sample:
+        zero_truncated_loss = (
+            getattr(args, "zero_loss_on_truncated", False) and sample.status == Sample.Status.TRUNCATED
+        )
+        if sample.remove_sample or zero_truncated_loss:
             sample.loss_mask = [0] * sample.response_length
         loss_masks.append(sample.loss_mask)
     train_data["loss_masks"] = loss_masks

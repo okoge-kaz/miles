@@ -50,6 +50,9 @@ ROLLOUT_ARGS=(
 if [[ "${ZERO_REWARD_ON_TRUNCATED}" != "0" ]]; then
    ROLLOUT_ARGS+=(--zero-reward-on-truncated)
 fi
+if [[ "${ZERO_LOSS_ON_TRUNCATED}" != "0" ]]; then
+   ROLLOUT_ARGS+=(--zero-loss-on-truncated)
+fi
 if [[ "${PARTIAL_ROLLOUT:-0}" != "0" ]]; then
    ROLLOUT_ARGS+=(--partial-rollout)
 fi

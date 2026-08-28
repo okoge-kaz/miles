@@ -55,6 +55,9 @@ ROLLOUT_ARGS=(
 if [[ "${ZERO_REWARD_ON_TRUNCATED}" != "0" ]]; then
    ROLLOUT_ARGS+=(--zero-reward-on-truncated)
 fi
+if [[ "${ZERO_LOSS_ON_TRUNCATED}" != "0" ]]; then
+   ROLLOUT_ARGS+=(--zero-loss-on-truncated)
+fi
 if [[ "${QUEUE_TYPE}" == queue-drop ]]; then
    ROLLOUT_ARGS+=(--fully-async-queue-factor "${QUEUE_FACTOR}")
 else

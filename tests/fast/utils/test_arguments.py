@@ -203,6 +203,17 @@ def test_zero_reward_on_truncated_cli_is_opt_in():
     assert enabled.zero_reward_on_truncated
 
 
+def test_zero_loss_on_truncated_cli_is_opt_in():
+    parser = argparse.ArgumentParser()
+    get_miles_extra_args_provider()(parser)
+
+    defaults = parser.parse_args(REQUIRED_ARGS)
+    assert not defaults.zero_loss_on_truncated
+
+    enabled = parser.parse_args(["--zero-loss-on-truncated"] + REQUIRED_ARGS)
+    assert enabled.zero_loss_on_truncated
+
+
 def test_colocate_switch_telemetry_cli_is_opt_in():
     parser = argparse.ArgumentParser()
     get_miles_extra_args_provider()(parser)

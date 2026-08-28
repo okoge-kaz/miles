@@ -106,6 +106,29 @@ class TestConvertSamplesToTrainData:
             custom_reward_post_process_func=None,
         )
         assert out["truncated"][0] == 1
+        assert out["loss_masks"][0] == [1, 1, 1, 1]
+
+    def test_zero_loss_on_truncated_keeps_reward_in_group_baseline(self):
+        args = make_args(
+            n_samples_per_prompt=2,
+            rollout_batch_size=1,
+            rewards_normalization=True,
+            zero_loss_on_truncated=True,
+        )
+        samples = make_samples_grouped(n_groups=1, group_size=2, rewards=[0.0, 1.0])
+        samples[1].status = Sample.Status.TRUNCATED
+
+        out = convert_samples_to_train_data(
+            args,
+            samples,
+            metadata={},
+            custom_convert_samples_to_train_data_func=None,
+            custom_reward_post_process_func=None,
+        )
+
+        assert out["raw_reward"] == [0.0, 1.0]
+        assert out["rewards"] == pytest.approx([-0.5, 0.5])
+        assert out["loss_masks"] == [[1, 1, 1, 1], [0, 0, 0, 0]]
 
     def test_optional_field_rollout_log_probs_passed_through(self):
         args = make_args(rewards_normalization=False)

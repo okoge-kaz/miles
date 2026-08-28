@@ -2417,6 +2417,16 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--zero-loss-on-truncated",
+                action="store_true",
+                default=False,
+                help=(
+                    "Set the token loss mask to zero for responses that hit the generation/context limit. "
+                    "The original reward remains in prompt-group baseline and advantage computation; only "
+                    "the truncated sample's gradient contribution is removed."
+                ),
+            )
+            parser.add_argument(
                 "--search-r1-format-score",
                 type=float,
                 default=0.0,

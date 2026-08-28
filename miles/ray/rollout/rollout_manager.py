@@ -350,6 +350,7 @@ class RolloutManager:
                 data,
                 metrics,
                 has_custom_converter=self.custom_convert_samples_to_train_data_func is not None,
+                zero_loss_on_truncated=getattr(self.args, "zero_loss_on_truncated", False),
             )
             append_final_consumed_records(
                 debug_metadata,
