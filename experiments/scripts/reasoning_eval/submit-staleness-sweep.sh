@@ -42,6 +42,8 @@ RATIOS="${RATIOS:-1:7 2:6 3:5 4:4}"
 INCLUDE_COLOCATED="${INCLUDE_COLOCATED:-1}"
 TRAINING_BUFFER_QUEUE_SIZE="${TRAINING_BUFFER_QUEUE_SIZE:-1000}"
 ASYNC_MAX_CONCURRENT_SAMPLES="${ASYNC_MAX_CONCURRENT_SAMPLES:-}"
+ASYNC_RUN_SUFFIX="${ASYNC_RUN_SUFFIX:-}"
+COLOCATED_RUN_SUFFIX="${COLOCATED_RUN_SUFFIX:-}"
 
 usage() {
     cat <<'EOF'
@@ -59,8 +61,10 @@ Options:
 
 Useful environment overrides: TRAINING_ROOT or STUDY_ROOT, EVALUATION_ROOT,
 STALENESS_LEVELS, RATIOS, INCLUDE_COLOCATED, TRAINING_BUFFER_QUEUE_SIZE,
-ASYNC_MAX_CONCURRENT_SAMPLES, START_STEP, END_STEP, EVAL_MODE, TASKS,
-PARTITION, QOS, WALL, and PRINT_LIMIT.
+ASYNC_MAX_CONCURRENT_SAMPLES, ASYNC_RUN_SUFFIX, COLOCATED_RUN_SUFFIX,
+START_STEP, END_STEP, EVAL_MODE, TASKS, PARTITION, QOS, WALL, and PRINT_LIMIT.
+The run suffix overrides select training variants whose checkpoint identities
+differ from the default zero-reward-on-truncation configuration.
 SNAPSHOT_ARM_MAX_STEPS can pin an arm=max_step comma-separated snapshot; when
 set, every configured arm must be present.
 HF checkpoint directory N stores the model after learning step N+1, so the
@@ -151,6 +155,12 @@ if [[ -n "${ASYNC_MAX_CONCURRENT_SAMPLES}" ]]; then
         exit 7
     }
 fi
+for run_suffix in "${ASYNC_RUN_SUFFIX}" "${COLOCATED_RUN_SUFFIX}"; do
+    if [[ -n "${run_suffix}" && ! "${run_suffix}" =~ ^-[A-Za-z0-9._-]+$ ]]; then
+        echo "run suffixes must be empty or begin with '-' and contain only safe filename characters" >&2
+        exit 7
+    fi
+done
 declare -A SEEN_STALENESS=()
 for staleness in ${STALENESS_LEVELS}; do
     [[ "${staleness}" =~ ^[1-9][0-9]*$ ]] || {
@@ -209,6 +219,8 @@ if (( SUBMIT == 1 )); then
         printf 'INCLUDE_COLOCATED=%s\n' "${INCLUDE_COLOCATED}"
         printf 'TRAINING_BUFFER_QUEUE_SIZE=%s\n' "${TRAINING_BUFFER_QUEUE_SIZE}"
         printf "ASYNC_MAX_CONCURRENT_SAMPLES='%s'\n" "${ASYNC_MAX_CONCURRENT_SAMPLES}"
+        printf "ASYNC_RUN_SUFFIX='%s'\n" "${ASYNC_RUN_SUFFIX}"
+        printf "COLOCATED_RUN_SUFFIX='%s'\n" "${COLOCATED_RUN_SUFFIX}"
     } > "${grid_config_temporary}"
     mv "${grid_config_temporary}" "${GRID_CONFIG_PATH}"
 fi
@@ -222,6 +234,8 @@ fi
 if (( TRAINING_BUFFER_QUEUE_SIZE != 1000 )); then
     training_identity_suffix+="-tbq${TRAINING_BUFFER_QUEUE_SIZE}"
 fi
+async_run_suffix="${ASYNC_RUN_SUFFIX:--zero-trunc-rb-inflight${training_identity_suffix}}"
+colocated_run_suffix="${COLOCATED_RUN_SUFFIX:--zero-trunc}"
 for staleness in ${STALENESS_LEVELS}; do
     for ratio in ${RATIOS}; do
         train_nodes="${ratio%%:*}"
@@ -229,14 +243,14 @@ for staleness in ${STALENESS_LEVELS}; do
         arm_name="s${staleness}-t${train_nodes}r${rollout_nodes}"
         ARM_NAMES+=("${arm_name}")
         HF_ROOTS+=(
-            "${STUDY_ROOT}/async/off-policy/max-weight-staleness-${staleness}-from-prefill/${arm_name}-${RUN_NAMESPACE}-zero-trunc-rb-inflight${training_identity_suffix}/hf"
+            "${STUDY_ROOT}/async/off-policy/max-weight-staleness-${staleness}-from-prefill/${arm_name}-${RUN_NAMESPACE}${async_run_suffix}/hf"
         )
     done
 done
 if (( INCLUDE_COLOCATED == 1 )); then
     ARM_NAMES+=(s0-colocated)
     HF_ROOTS+=(
-        "${STUDY_ROOT}/colocated/on-policy/max-weight-staleness-0/s0-colocated-${RUN_NAMESPACE}-zero-trunc/hf"
+        "${STUDY_ROOT}/colocated/on-policy/max-weight-staleness-0/s0-colocated-${RUN_NAMESPACE}${colocated_run_suffix}/hf"
     )
 fi
 
@@ -410,6 +424,8 @@ printf 'grid: %d arms x %d requested steps (staleness=%s; ratios=%s; colocated=%
     "${#ARM_NAMES[@]}" "$(((END_STEP - START_STEP) / STEP_INTERVAL + 1))" \
     "${STALENESS_LEVELS}" "${RATIOS}" "${INCLUDE_COLOCATED}" \
     "${TRAINING_BUFFER_QUEUE_SIZE}" "${ASYNC_MAX_CONCURRENT_SAMPLES:-recipe-default}"
+printf 'training variant suffixes: async=%s; colocated=%s\n' \
+    "${async_run_suffix}" "${colocated_run_suffix}"
 if [[ -n "${SNAPSHOT_ARM_MAX_STEPS}" ]]; then
     printf 'snapshot arm max steps: %s\n' "${SNAPSHOT_ARM_MAX_STEPS}"
 fi

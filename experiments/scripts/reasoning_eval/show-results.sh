@@ -5,6 +5,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../../.." && pwd)"
 source "${REPO_ROOT}/experiments/env.sh"
+export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
 RUN_NAMESPACE="${RUN_NAMESPACE:-sr-20260819-212906}"
 EVAL_MODE="${EVAL_MODE:-full}"

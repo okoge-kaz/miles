@@ -45,6 +45,7 @@ SUBMIT=0
 INCLUDE_COLOCATED=0
 DISABLE_ZERO_REWARD_ON_TRUNCATED=0
 ENABLE_ZERO_LOSS_ON_TRUNCATED=0
+TOTAL_LENGTH_32K=0
 MATCH_PARTIAL_CONCURRENCY=0
 CLEAN_CHECKPOINT=0
 RESUME_MATCHED_CHAIN=0
@@ -55,6 +56,7 @@ usage() {
 usage: experiments/staleness_ratio_sweep.sh [--submit] [--include-colocated]
                                             [--disable-zero-reward-on-truncated]
                                             [--zero-loss-on-truncated]
+                                            [--total-length-32k]
                                             [--matched-partial-concurrency]
                                             [--resume-matched-chain]
                                             [--clean-checkpoint]
@@ -79,6 +81,12 @@ partial-concurrency modes.
 ZERO_LOSS_ON_TRUNCATED=1. Truncated samples retain their reward for group
 baseline computation but contribute no training loss. It cannot be combined
 with matched partial-concurrency modes.
+
+--total-length-32k keeps ZERO_REWARD_ON_TRUNCATED=1 and sets both the response
+ceiling and total prompt+response context ceiling to 32768. The inference
+request therefore receives at most 32768 - prompt_tokens new tokens, making
+the total-length ceiling authoritative. This mode is async-only and cannot be
+combined with truncation ablations or matched partial-concurrency modes.
 
 --matched-partial-concurrency creates the five-arm follow-up: one colocated
 partial-rollout arm at PARTIAL_OVER_SAMPLING_BATCH_SIZE=256, plus the
@@ -116,6 +124,10 @@ while (( $# > 0 )); do
             ;;
         --zero-loss-on-truncated)
             ENABLE_ZERO_LOSS_ON_TRUNCATED=1
+            shift
+            ;;
+        --total-length-32k)
+            TOTAL_LENGTH_32K=1
             shift
             ;;
         --matched-partial-concurrency)
@@ -162,6 +174,14 @@ if (( ENABLE_ZERO_LOSS_ON_TRUNCATED == 1 && MATCH_PARTIAL_CONCURRENCY == 1 )); t
 fi
 if (( DISABLE_ZERO_REWARD_ON_TRUNCATED == 1 && ENABLE_ZERO_LOSS_ON_TRUNCATED == 1 )); then
     echo "--disable-zero-reward-on-truncated and --zero-loss-on-truncated are mutually exclusive" >&2
+    exit 2
+fi
+if (( TOTAL_LENGTH_32K == 1 \
+      && (DISABLE_ZERO_REWARD_ON_TRUNCATED == 1 \
+          || ENABLE_ZERO_LOSS_ON_TRUNCATED == 1 \
+          || MATCH_PARTIAL_CONCURRENCY == 1 \
+          || INCLUDE_COLOCATED == 1) )); then
+    echo "--total-length-32k requires async zero-reward-on-truncated mode without colocated or matched arms" >&2
     exit 2
 fi
 if (( DISABLE_ZERO_REWARD_ON_TRUNCATED == 1 || ENABLE_ZERO_LOSS_ON_TRUNCATED == 1 )); then
@@ -246,12 +266,14 @@ ROLLOUT_BATCH="$(recipe_or_environment ROLLOUT_BATCH_SIZE)"
 SAMPLES_PER_PROMPT="$(recipe_or_environment N_SAMPLES_PER_PROMPT)"
 TENSOR_PARALLEL="$(recipe_or_environment TENSOR_PARALLEL_SIZE)"
 CONTEXT_PARALLEL="$(recipe_or_environment CONTEXT_PARALLEL_SIZE)"
+MAX_TOKENS_PER_GPU_VALUE="$(recipe_or_environment MAX_TOKENS_PER_GPU)"
 QUEUE_POLICY="$(recipe_or_environment QUEUE_TYPE)"
 TRAINING_BUFFER_QUEUE_SIZE_VALUE="$(recipe_or_environment TRAINING_BUFFER_QUEUE_SIZE)"
 STALENESS_REFERENCE_VALUE="$(recipe_or_environment STALENESS_REFERENCE)"
 NUM_ROLLOUT_VALUE="$(recipe_or_environment NUM_ROLLOUT)"
 NUM_STEPS_PER_ROLLOUT_VALUE="$(recipe_or_environment NUM_STEPS_PER_ROLLOUT)"
 MAX_RESPONSE_LEN_VALUE="$(recipe_or_environment MAX_RESPONSE_LEN)"
+ROLLOUT_MAX_CONTEXT_LEN_VALUE="$(recipe_or_environment ROLLOUT_MAX_CONTEXT_LEN)"
 ZERO_REWARD_ON_TRUNCATED_VALUE="$(recipe_or_environment ZERO_REWARD_ON_TRUNCATED)"
 ZERO_LOSS_ON_TRUNCATED_VALUE="$(recipe_or_environment ZERO_LOSS_ON_TRUNCATED)"
 USE_REPLAY_BUFFER_VALUE="$(recipe_or_environment USE_REPLAY_BUFFER)"
@@ -273,8 +295,16 @@ ASYNC_MAX_CONCURRENT_SAMPLES_VALUE="${ASYNC_MAX_CONCURRENT_SAMPLES:-}"
     echo "rollout batch and samples per prompt must be positive integers" >&2
     exit 1
 }
+[[ "${MAX_TOKENS_PER_GPU_VALUE}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "MAX_TOKENS_PER_GPU must be a positive integer" >&2
+    exit 1
+}
 [[ "${TRAINING_BUFFER_QUEUE_SIZE_VALUE}" =~ ^[1-9][0-9]*$ ]] || {
     echo "TRAINING_BUFFER_QUEUE_SIZE must be a positive integer" >&2
+    exit 1
+}
+[[ "${ROLLOUT_MAX_CONTEXT_LEN_VALUE}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "ROLLOUT_MAX_CONTEXT_LEN must be a positive integer" >&2
     exit 1
 }
 [[ "${SAMPLE_STALENESS_MAX_BIN_VALUE}" =~ ^[0-9]+$ ]] || {
@@ -320,7 +350,7 @@ if (( MATCH_PARTIAL_CONCURRENCY == 1 )); then
     matched_override_keys=(
         ADVANTAGE_ESTIMATOR ENTROPY_COEF KL_LOSS_COEF EPS_CLIP EPS_CLIP_HIGH EPS_CLIP_C
         RATIO_DENOMINATOR IS_CORRECTION TIS_CLIP TIS_CLIP_LOW MIS_PROFILE M2PO_BUDGET
-        USE_OPSM OPSM_DELTA LR MAX_RESPONSE_LEN NUM_ROLLOUT TRAIN_SEED ROLLOUT_SEED
+        USE_OPSM OPSM_DELTA LR MAX_RESPONSE_LEN ROLLOUT_MAX_CONTEXT_LEN NUM_ROLLOUT TRAIN_SEED ROLLOUT_SEED
         ROLLOUT_BATCH_SIZE N_SAMPLES_PER_PROMPT GLOBAL_BATCH_SIZE NUM_STEPS_PER_ROLLOUT
         QUEUE_TYPE QUEUE_FACTOR TRAINING_BUFFER_QUEUE_SIZE MAX_WEIGHT_STALENESS
         STALENESS_REFERENCE PAUSE_GENERATION_MODE
@@ -416,7 +446,17 @@ fi
 }
 require_setting NUM_ROLLOUT 300
 require_setting NUM_STEPS_PER_ROLLOUT 1
-require_setting MAX_RESPONSE_LEN 16384
+if (( TOTAL_LENGTH_32K == 1 )); then
+    require_setting MAX_RESPONSE_LEN 32768
+    (( MAX_TOKENS_PER_GPU_VALUE * CONTEXT_PARALLEL >= ROLLOUT_MAX_CONTEXT_LEN_VALUE )) || {
+        echo "trainer token budget is too small for the 32K total sequence: " \
+             "MAX_TOKENS_PER_GPU=${MAX_TOKENS_PER_GPU_VALUE}, CP=${CONTEXT_PARALLEL}" >&2
+        exit 1
+    }
+else
+    require_setting MAX_RESPONSE_LEN 16384
+fi
+require_setting ROLLOUT_MAX_CONTEXT_LEN 32768
 require_setting ZERO_REWARD_ON_TRUNCATED \
     "$(( 1 - DISABLE_ZERO_REWARD_ON_TRUNCATED - ENABLE_ZERO_LOSS_ON_TRUNCATED ))"
 require_setting ZERO_LOSS_ON_TRUNCATED "${ENABLE_ZERO_LOSS_ON_TRUNCATED}"
@@ -544,6 +584,9 @@ async_config_tag() {
     if (( DISABLE_ZERO_REWARD_ON_TRUNCATED == 1 )); then
         config_tag="${config_tag}-zero-reward-trunc-off"
     fi
+    if (( TOTAL_LENGTH_32K == 1 )); then
+        config_tag="${config_tag}-total32k-cp${CONTEXT_PARALLEL}"
+    fi
     printf '%s\n' "${config_tag}"
 }
 
@@ -566,15 +609,16 @@ colocated_config_tag() {
 }
 
 printf 'recipe: %s\n' "${RECIPE}"
-printf 'fixed by recipe: queue=%s, reference=%s, rollouts=%s, steps/rollout=%s, gbs=%s, tp=%s, cp=%s\n' \
+printf 'fixed by recipe: queue=%s, reference=%s, rollouts=%s, steps/rollout=%s, gbs=%s, tp=%s, cp=%s, max-tokens/gpu=%s\n' \
     "${QUEUE_POLICY}" "${STALENESS_REFERENCE_VALUE}" "${NUM_ROLLOUT_VALUE}" \
     "${NUM_STEPS_PER_ROLLOUT_VALUE}" \
-    "${GLOBAL_BATCH}" "${TENSOR_PARALLEL}" "${CONTEXT_PARALLEL}"
+    "${GLOBAL_BATCH}" "${TENSOR_PARALLEL}" "${CONTEXT_PARALLEL}" "${MAX_TOKENS_PER_GPU_VALUE}"
 printf 'completed-group buffer: %s groups (%s training batches)\n' \
     "${TRAINING_BUFFER_QUEUE_SIZE_VALUE}" \
     "$(( TRAINING_BUFFER_QUEUE_SIZE_VALUE / ROLLOUT_BATCH ))"
-printf 'fixed safety: response=%s, zero-reward-trunc=%s, zero-loss-trunc=%s, replay=%s/%s, fused-logprobs=%s, exact-segments=%s, staleness-bin=%s\n' \
-    "${MAX_RESPONSE_LEN_VALUE}" "${ZERO_REWARD_ON_TRUNCATED_VALUE}" "${ZERO_LOSS_ON_TRUNCATED_VALUE}" \
+printf 'fixed safety: response=%s, total-context=%s, zero-reward-trunc=%s, zero-loss-trunc=%s, replay=%s/%s, fused-logprobs=%s, exact-segments=%s, staleness-bin=%s\n' \
+    "${MAX_RESPONSE_LEN_VALUE}" "${ROLLOUT_MAX_CONTEXT_LEN_VALUE}" \
+    "${ZERO_REWARD_ON_TRUNCATED_VALUE}" "${ZERO_LOSS_ON_TRUNCATED_VALUE}" \
     "${USE_REPLAY_BUFFER_VALUE}" "${REPLAY_BUFFER_TYPE_VALUE}" \
     "${FUSE_ONE_STEP_ACTOR_LOGPROBS_VALUE}" "${SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS_VALUE}" \
     "${SAMPLE_STALENESS_MAX_BIN_VALUE}"
@@ -753,6 +797,7 @@ submit_chain() {
         "NUM_ROLLOUT=${NUM_ROLLOUT_VALUE}"
         "NUM_STEPS_PER_ROLLOUT=${NUM_STEPS_PER_ROLLOUT_VALUE}"
         "MAX_RESPONSE_LEN=${MAX_RESPONSE_LEN_VALUE}"
+        "ROLLOUT_MAX_CONTEXT_LEN=${ROLLOUT_MAX_CONTEXT_LEN_VALUE}"
         "ZERO_REWARD_ON_TRUNCATED=${ZERO_REWARD_ON_TRUNCATED_VALUE}"
         "ZERO_LOSS_ON_TRUNCATED=${ZERO_LOSS_ON_TRUNCATED_VALUE}"
         "USE_REPLAY_BUFFER=${USE_REPLAY_BUFFER_VALUE}"
@@ -822,6 +867,7 @@ submit_colocated_chain() {
         "NUM_ROLLOUT=${NUM_ROLLOUT_VALUE}"
         "NUM_STEPS_PER_ROLLOUT=${NUM_STEPS_PER_ROLLOUT_VALUE}"
         "MAX_RESPONSE_LEN=${MAX_RESPONSE_LEN_VALUE}"
+        "ROLLOUT_MAX_CONTEXT_LEN=${ROLLOUT_MAX_CONTEXT_LEN_VALUE}"
         "ZERO_REWARD_ON_TRUNCATED=${ZERO_REWARD_ON_TRUNCATED_VALUE}"
         "ZERO_LOSS_ON_TRUNCATED=${ZERO_LOSS_ON_TRUNCATED_VALUE}"
         "SAVE_HF=${SAVE_HF_VALUE}"

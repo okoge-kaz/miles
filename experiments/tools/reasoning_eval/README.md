@@ -94,6 +94,44 @@ writes `grid.env` under the result study; refill, summarization, and plotting
 load it automatically, so later commands only need the namespace. The legacy
 17-arm grid above remains the default when no cohort configuration is supplied.
 
+The 11-arm truncation ablation has a dedicated scanner. It covers the five
+zero-reward-off settings (one colocated setting plus staleness 8/16 crossed
+with ratios 1:7/2:6) and the six zero-loss settings (staleness 8/16/20 crossed
+with the same ratios):
+
+```bash
+PARTITION=interactive \
+experiments/scripts/reasoning_eval/submit-truncation-ablation-sweeps.sh
+
+PARTITION=interactive \
+experiments/scripts/reasoning_eval/submit-truncation-ablation-sweeps.sh \
+  --submit --max-submissions 0
+```
+
+The scanner defaults to hiso's checkpoint root and the two fixed 2026-08-27
+training namespaces. Use `--cohort reward-off` or `--cohort zero-loss` to scan
+one cohort. As with the legacy launcher, unreadable or incompletely published
+checkpoints are reported but never submitted.
+
+The generic launcher also evaluates the high-staleness follow-ups. The 16K
+response, 2:6 cohort uses the default checkpoint suffix; the total-32K, 1:7
+cohort supplies its explicit identity suffix:
+
+```bash
+TRAINING_ROOT=/path/to/checkpoints/training \
+STALENESS_LEVELS="16 20 24" RATIOS="2:6" INCLUDE_COLOCATED=0 \
+TRAINING_BUFFER_QUEUE_SIZE=6000 ASYNC_MAX_CONCURRENT_SAMPLES=4096 \
+experiments/scripts/reasoning_eval/submit-staleness-sweep.sh \
+  --namespace <16k-t2r6-training-namespace>
+
+TRAINING_ROOT=/path/to/checkpoints/training \
+STALENESS_LEVELS="16 20 24" RATIOS="1:7" INCLUDE_COLOCATED=0 \
+TRAINING_BUFFER_QUEUE_SIZE=6000 ASYNC_MAX_CONCURRENT_SAMPLES=4096 \
+ASYNC_RUN_SUFFIX=-total32k-cp1-zero-trunc-rb-inflight-concurrency-4096-tbq6000 \
+experiments/scripts/reasoning_eval/submit-staleness-sweep.sh \
+  --namespace <total32k-t1r7-training-namespace>
+```
+
 One Slurm job loads each checkpoint once and evaluates all three AIME tasks.
 Each task has its own response cache and is finalized atomically with `_SUCCESS`.
 Re-running the launcher skips completed task suites and queued/running jobs; a

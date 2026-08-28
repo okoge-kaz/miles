@@ -42,7 +42,7 @@ ROLLOUT_ARGS=(
    --rollout-batch-size "${ROLLOUT_BATCH_SIZE}"
    --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT}"
    --rollout-max-response-len "${MAX_RESPONSE_LEN}"
-   --rollout-max-context-len 32768
+   --rollout-max-context-len "${ROLLOUT_MAX_CONTEXT_LEN}"
    --rollout-temperature 1
    --rollout-top-p 1
    --rollout-top-k -1
