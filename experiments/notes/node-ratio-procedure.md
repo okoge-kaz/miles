@@ -326,6 +326,54 @@ arm also matches the colocated arm's 32-engine count and nominal 128 trajectorie
 per engine; the other ratios match global C but deliberately retain their
 placement-native engine counts.
 
+#### 2026-08-30 truncation-mode contamination and quarantine
+
+The terminal segments of two arms in namespace
+`sr-20260826-093358-p3980519` are not valid members of the intended
+zero-reward-on-truncated-only cohort. Resume allocations for these arms logged
+both `zero_reward_on_truncated=true` and `zero_loss_on_truncated=true`, and then
+performed optimizer updates:
+
+| arm | last clean checkpoint | contaminated updates | conflicting W&B run |
+|---|---:|---:|---|
+| async `s4-t1r7-c4096` | 229 | 230--259 | `20260828_084739-b906e664` |
+| colocated `s0-colocated-partial-o256` | 279 | 280--299 | `20260829_122345-nq9u7dva` |
+
+Do not use those contaminated update ranges as zero-reward-only training or as
+terminal matched-cohort checkpoints. They simultaneously changed the reward
+assigned to truncated samples and removed those samples' direct loss, so they
+cannot identify either truncation treatment. Checkpoints through 229 for t1r7
+and through 279 for partial remain useful as pre-contamination diagnostics, but
+the terminal comparison must come from a clean replacement. The t2r6, t3r5,
+and t4r4 arms reached checkpoint 299 under the intended zero-reward-only
+configuration; later processes that reported both flags loaded checkpoint 299
+but performed no optimizer update, so their saved training trajectories are not
+part of this quarantine.
+
+Rerun only the two affected arms from the original model under a fresh
+namespace; never resume either contaminated checkpoint. The dedicated command
+is:
+
+```bash
+RUN_NAMESPACE=hiso-matched-clean-t1r7-partial-20260830-v1 \
+    experiments/staleness_ratio_sweep.sh \
+    --rerun-clean-matched-arms \
+    --submit
+```
+
+This mode preserves the original matched allocation, concurrency, container,
+and training protocol while forcing `ZERO_REWARD_ON_TRUNCATED=1` and
+`ZERO_LOSS_ON_TRUNCATED=0`. It submits only async t1r7 and colocated partial,
+and the fresh namespace keeps their checkpoints separate from the quarantined
+ones. The old checkpoints should remain available for provenance, but
+evaluation and figures must select the replacement namespace for these two
+terminal arms.
+
+The CLI now declares the two truncation flags mutually exclusive. Effective
+configuration is validated again after YAML overrides, and both async and sync
+recipes reject nonzero values for both environment variables before training.
+This is a runtime setting guard; no commit-ID check is used.
+
 The content check is not an immutable source snapshot. Submit from a committed,
 clean, dedicated worktree and do not edit its runtime files until all chains
 finish. The completed colocated baseline predates the direction-specific switch
