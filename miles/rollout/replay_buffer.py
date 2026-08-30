@@ -163,15 +163,20 @@ def dataset_fingerprint(args, data_source) -> str:
         "custom_reward_post_process_path": getattr(args, "custom_reward_post_process_path", None),
         "custom_convert_samples_to_train_data_path": getattr(args, "custom_convert_samples_to_train_data_path", None),
         "tau_max_turns": getattr(args, "tau_max_turns", None),
-        "tau_user_backend": getattr(args, "tau_user_backend", None),
+        "tau_max_steps": getattr(args, "tau_max_steps", None),
+        "tau_user_provider": getattr(args, "tau_user_provider", None),
         "tau_user_model": getattr(args, "tau_user_model", None),
         "tau_user_max_tokens": getattr(args, "tau_user_max_tokens", None),
         "tau_user_temperature": getattr(args, "tau_user_temperature", None),
         "tau_user_top_p": getattr(args, "tau_user_top_p", None),
         "tau_user_request_timeout": getattr(args, "tau_user_request_timeout", None),
         "tau_user_max_retries": getattr(args, "tau_user_max_retries", None),
-        "tau_user_retry_backoff": getattr(args, "tau_user_retry_backoff", None),
         "tau_tool_call_parser": getattr(args, "tau_tool_call_parser", None),
+        "tau_overlap_db_restore_with_prefill": getattr(
+            args,
+            "tau_overlap_db_restore_with_prefill",
+            None,
+        ),
     }
     encoded = json.dumps(config, sort_keys=True, separators=(",", ":"), default=str).encode()
     return hashlib.sha256(encoded).hexdigest()

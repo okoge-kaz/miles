@@ -1,7 +1,7 @@
 # Search-R1 cluster migration and B300 qualification
 
-This is the hand-off checklist for moving the fixed-difficulty Search-R1 sync
-and async experiments to another Slurm cluster. It records the repository and
+This is the hand-off checklist for moving the fixed-difficulty Search-R1 async
+experiment to another Slurm cluster. It records the repository and
 container audit performed on 2026-08-14. The application recipes are ready to
 move, but a container is not considered B300-qualified until the target cluster
 passes the GPU smoke sequence below.
@@ -117,8 +117,7 @@ the repository commit must be recorded separately.
 ## B300 preflight gate
 
 Run these gates in order. Stop at the first failure; a fallback that silently
-changes the attention implementation would invalidate a sync/async throughput
-comparison.
+changes the attention implementation would invalidate throughput comparisons.
 
 1. **Host:** `nvidia-smi` reports eight B300 GPUs and a Release 580+ driver;
    `nvidia-smi topo -m` shows the expected NVLink topology; NVLSM is healthy.
@@ -132,16 +131,18 @@ comparison.
 4. **Attention backend:** run a short trainer forward and SGLang generation.
    The Docker image also contains a Hopper-only FA3 wheel; B300 must use a
    supported FA2/TE/SGLang path rather than force the `sm_90a` binary. The
-   Search-R1 trainer requests `--attention-backend flash`, so inspect startup
-   logs for the backend actually selected.
+   aws-pdx recipes default to `--attention-backend fused`, routed through
+   Transformer Engine on B300; inspect startup logs for the backend actually
+   selected. `TRAINING_ATTENTION_BACKEND` remains available for controlled
+   backend comparisons.
 5. **Collectives:** run `all_reduce_perf` over all eight GPUs, then a two-node
    test for the async placement. Resolve NCCL/IB/NVLink errors before Ray.
 6. **Search environment:** start the E5/FAISS retriever and require a non-empty
    real `/retrieve` response, not only `/health`.
-7. **End to end:** run one fixed-dataset sync update and confirm reward,
+7. **End to end:** run one fixed-dataset async update and confirm reward,
    checkpoint, HF export, valid-action/search metrics, and W&B project
    `async-search-r1`.
-8. **Async resume:** run one async update, confirm the replay buffer exists,
+8. **Resume:** confirm the replay buffer exists,
    stop cleanly, resume the same run identity, and verify that replay-buffer/FIFO state
    restores without a full queue refill.
 
@@ -172,19 +173,20 @@ validation; it does not rewrite `#SBATCH --gres=gpu:8`.
 Keep the in-container mounts `/root/miles`, `/data`, and `/ckpt` stable. Transfer
 or stage:
 
-- Qwen3-4B-Instruct-2507 HF and Megatron checkpoints.
+- `Qwen3-4B-Base-LR2e-5-Step4000` HF and Megatron checkpoints. The HF source
+  is the `iter_0004000` export under the step-4000 SFT run.
 - E5-base-v2, `e5_Flat.index`, and `wiki-18.jsonl`.
 - Search-R1 raw train/eval data.
 - The fixed p10-90 JSONL plus its pass-rate and metadata artifacts, only when
   model, tokenizer, retriever/index/corpus, top-k, sampling, max turns, and
   reward definition are identical.
 
-Otherwise run `experiments/setup/stage_all.sh`,
-`experiments/setup/prepare_search_r1.sbatch`, and the resumable
+Otherwise run `experiments/setup/download/stage_all.sh`,
+`experiments/setup/environments/prepare_search_r1.sbatch`, and the resumable
 `experiments/tools/difficulty_filter/run_measure_search_r1.sbatch` on the new
 environment. Verify checksums before measuring; the fixed difficulty set is
 part of the experiment definition.
 
-The destination is ready for primary experiments only after both placements
-pass the gates above. Until then the accurate status is **recipe-ready,
+The destination is ready for primary experiments only after the async recipe
+passes the gates above. Until then the accurate status is **recipe-ready,
 cluster-integration pending**, not B300-validated.

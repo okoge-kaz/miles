@@ -139,6 +139,9 @@ CONFIG_TAG="${CONFIG_TAG:-rollout-length-$(( MAX_RESPONSE_LEN / 1024 ))k-lr${LR}
 if [[ "${ZERO_REWARD_ON_TRUNCATED:-0}" != "0" ]]; then
     CONFIG_TAG="${CONFIG_TAG}-zero-trunc"
 fi
+if [[ "${ZERO_LOSS_ON_TRUNCATED:-0}" != "0" ]]; then
+    CONFIG_TAG="${CONFIG_TAG}-zero-loss-trunc"
+fi
 # Replay-buffer formats have different resume semantics and reject one another
 # at load time. Recipes that opt into this identity axis therefore cannot
 # accidentally share a checkpoint directory when only the buffer type changes.

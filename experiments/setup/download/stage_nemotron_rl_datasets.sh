@@ -18,7 +18,7 @@ has_payload() {
         -print -quit 2>/dev/null | grep -q .
 }
 
-while IFS=$'\t' read -r hf_repo local_name role; do
+while IFS=$'\t' read -r hf_repo local_name role revision; do
     [[ -z "${hf_repo}" || "${hf_repo}" == \#* ]] && continue
     if [[ "${role}" == selective_swe_* ]]; then
         printf 'selective\t%s\tuse download_swe_datasets.sbatch\t%s\n' \
@@ -34,12 +34,14 @@ while IFS=$'\t' read -r hf_repo local_name role; do
         printf 'gated\t%s\tHF_TOKEN is unset; accept the GPQA terms first\n' "${hf_repo}" >&2
         continue
     fi
+    HF_REVISION="${revision}"
+    export HF_REVISION
     job_id=$(sbatch --parsable \
         -A "${ACCOUNT}" \
         -p cpu_datamover \
         --qos=cpu-datamover \
         --job-name="dl-${local_name:0:28}" \
-        --export="USER,WANDB_MODE=disabled,HF_REPO=${hf_repo},LOCAL_NAME=${local_name}${HF_TOKEN_EXPORT}" \
+        --export="USER,WANDB_MODE=disabled,HF_REPO=${hf_repo},LOCAL_NAME=${local_name},HF_REVISION${HF_TOKEN_EXPORT}" \
         "${REPO_ROOT}/experiments/setup/download/download_dataset.sbatch")
     printf 'submitted\t%s\t%s\t%s\n' "${job_id}" "${role}" "${hf_repo}"
 done < "${MANIFEST}"

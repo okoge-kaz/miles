@@ -1,6 +1,6 @@
 # experiments/
 
-Slurm (pyxis + enroot) recipes for running miles on **cw-dfw**. Non-agentic RL
+Slurm (pyxis + enroot) recipes for running miles on **aws-pdx**. Non-agentic RL
 first: these establish that the container, the checkpoints, the rollout loop and
 the reward path all work, before anything needs a sandbox provider.
 
@@ -15,24 +15,31 @@ experiments/
   env.sh                        shared paths / account / container mounts
   status.sh                     queue + logs at a glance
   container/import_image.sbatch docker image -> dated .sqsh
-  setup/download_assets.sbatch  HF model + datasets
-  setup/convert_checkpoint.sbatch  HF -> torch_dist (Megatron)
-  setup/stage_model.sh          one model: download + convert, chained
+  setup/download/               reusable transfer + staging jobs
+  setup/models/                 HF -> torch_dist conversion jobs
+  setup/manifests/              model and dataset inventories
+  setup/datasets/               deterministic dataset preparation
+  setup/environments/           pinned environment assets/dependencies
   sweep.py                      submit a grid of runs; sweeps/ holds the grids
-  configs/eval_math.yaml        multi-benchmark eval (--eval-config)
+  configs/eval_aime.yaml        AIME benchmark eval (--eval-config)
+  configs/eval_math500.yaml     MATH-500 benchmark eval
   common/run_identity.sh        run name, config tag, checkpoint path
   common/placement.sh           derive + validate the GPU split, before srun
   common/ray_cluster.sh         multi-node ray bring-up
   scripts/math/sync/<dataset>/          colocated single-turn math recipes
   scripts/math/async/<dataset>/         fully-async single-turn math recipes
+  search_r1/async/<dataset>/            fully-async multi-turn retrieval recipe
+  search_r1/evaluation/                 held-out multi-turn retrieval evaluation
   tools/difficulty_filter/              reusable dataset filtering tools
   tools/difficulty_filter/dapo-math/    DAPO-Math filtering orchestration
   notes/                        reference notes + notes/agents/ work log
   outputs/                      job logs (git-ignored)
 ```
 
-A recipe is `<task>/<mode>/<dataset>/<model>/` below `scripts/`, e.g.
-`math/sync/dapo-math-p10-90/qwen3-4b/`. The task and mode directories fix the
+A recipe is `<task>/<mode>/<dataset>/<model>/`, e.g.
+`math/sync/dapo-math-p10-90/qwen3-4b/`. Most recipes are below `scripts/`;
+Search-R1 is kept together under `search_r1/` because its training, retriever,
+and held-out evaluation share one lifecycle. The task and mode directories fix the
 RL setup (rollout mode, reward, generate function),
 the dataset directory fixes the prompt file and the eval benchmarks, and the
 model directory fixes the weights, the parallelism and the batch shape.
@@ -216,7 +223,7 @@ filtered prompt file, a tuning job.
 The dump directory follows the same path.
 
 wandb is always on: math uses project `off-policy-<dataset>` (e.g.
-`off-policy-dapo-math-p10-90`), while both Search-R1 placements use
+`off-policy-dapo-math-p10-90`), while the Search-R1 async recipe uses
 `async-search-r1`; the group is `RUN_NAME`. `run.sbatch` fails at submit time if
 `WANDB_API_KEY` is unset rather than quietly running without logging; `env.sh`
 resolves it from `~/.netrc`.
@@ -236,26 +243,28 @@ every AIME year at `n=16` and a 32768 generation budget, run against the HF
 snapshots `--save-hf` leaves behind, in a separate job that costs the training run
 nothing. See `scripts/math/async/dapo-math-p10-90/README.md` §2.
 
-Search-R1 uses the analogous
-`experiments/src/offline_eval/run_search_r1_eval.sbatch`.  Its dedicated client
-reuses the training multi-turn generation/reward functions, runs the local
-wiki-18 retriever, and reports both exact match and interaction cost (search
-calls, LLM turns, and masked observation tokens).  The Search-R1 recipe exports
-HF snapshots every 20 rollouts and leaves in-run evaluation off by default.
+The maintained Search-R1 recipe exports HF snapshots every 20 rollouts and
+leaves in-run evaluation off by default. Its checkpoint evaluator is
+`search_r1/evaluation/run.sbatch`; it uses the held-out QA JSONL files and the
+same multi-turn retrieval/reward path as training. The lower-level
+`tools/difficulty_filter/measure_search_r1.py` is shared with difficulty
+measurement, but a training-set pass-rate output must not be reported as a
+held-out evaluation.
 
 Everything listed must already be in `prompt`/`label` shape, since the global
-`--input-key`/`--label-key` apply to eval too. `setup/build_math_jsonl.py`
+`--input-key`/`--label-key` apply to eval too.
+`setup/datasets/build_math_jsonl.py`
 converts a raw `problem`/`answer` file into that shape; AIME-2025 and MATH-500
 were converted with it.
 
 Per-dataset settings (a cheaper `n` for a 500-problem set, a different verifier)
 are not expressible as pairs and need `--eval-config`, which **overrides**
-`--eval-prompt-data` entirely. `configs/eval_math.yaml` is that config, adding
-MATH-500 at `n=4`; a recipe that wants it replaces its `--eval-prompt-data`
-lines with `--eval-config /root/miles/experiments/configs/eval_math.yaml`.
+`--eval-prompt-data` entirely. Configs are named after their benchmark; for
+example, use `--eval-config /root/miles/experiments/configs/eval_aime.yaml` or
+`eval_math500.yaml`.
 
-Eval shares the engines with training rollout, so its cost is real: that config
-is 2960 generations per eval interval.
+Eval shares the engines with training rollout, so its cost is real. Reportable
+evaluation therefore runs against saved checkpoints outside the training path.
 
 ### Telemetry
 
@@ -364,10 +373,10 @@ up in a commit.
 | Purpose | Host path | In container |
 |---|---|---|
 | Datasets | `/lustre/fsw/portfolios/coreai/users/kfujii/datasets` | `/data` |
-| HF weights | `…/checkpoints/hf` | `/ckpt/hf` |
+| HF weights | `…/checkpoints/huggingface` | `/ckpt/hf` |
 | Megatron (`torch_dist`) weights | `…/checkpoints/megatron` | `/ckpt/megatron` |
 | Training checkpoints | `…/checkpoints/training` | `/ckpt/training` |
-| Container images | `…/container` | — |
+| Container images | `…/containers` | — |
 | Caches (HF, enroot, JIT) | `…/cache` | `/root/.cache` |
 | miles checkout | `…/src/miles` | `/root/miles` |
 
@@ -395,15 +404,17 @@ A corrupt entry after a killed job surfaces as a JIT or JSON decode error
 ```bash
 export ACC=coreai_horizon_dilations
 
-# 1. Image (CPU node, ~30-60 min). Writes miles-latest-YYYYMMDD.sqsh and
-#    repoints the miles-latest.sqsh symlink.
-sbatch -A $ACC experiments/container/import_image.sbatch
+# 1. An aws-pdx B300 image is already staged and selected by env.sh. Import a
+#    replacement only when the pinned image is absent or intentionally updated.
 
-# 2. Model + datasets (CPU node).
-sbatch -A $ACC experiments/setup/download_assets.sbatch
+# 2. Download DAPO-Math if missing, then convert the three existing SFT models.
+sbatch -A $ACC -p cpu --qos=cpu-interactive \
+  --export=ALL,HF_REPO=zhuzilin/dapo-math-17k,LOCAL_NAME=dapo-math-17k \
+  experiments/setup/download/download_dataset.sbatch
+experiments/setup/models/stage_sft_checkpoints.sh --submit
 
-# 3. HF -> torch_dist (GPU node, ~10 min).
-sbatch -A $ACC experiments/setup/convert_checkpoint.sbatch
+# 3. Measure policy-specific DAPO-Math difficulty windows.
+experiments/tools/difficulty_filter/dapo-math/submit_sft_models.sh --submit
 ```
 
 Adding one more model later does not need the whole list re-staged.
@@ -411,7 +422,7 @@ Adding one more model later does not need the whole list re-staged.
 it; both halves are skipped if already done.
 
 ```bash
-experiments/setup/stage_model.sh Qwen3-4B-Instruct-2507
+experiments/setup/download/stage_model.sh Qwen3-4B-Instruct-2507
 ```
 
 Then the training recipes:
@@ -428,8 +439,8 @@ A fast smoke variant (a few rollouts, short responses), for checking a change
 before spending a slot on a full run:
 
 ```bash
-sbatch -A $ACC -p interactive --time=01:00:00 \
-  --export=ALL,NUM_ROLLOUT=3,ROLLOUT_BATCH_SIZE=8,N_SAMPLES_PER_PROMPT=8,GLOBAL_BATCH_SIZE=64,MAX_RESPONSE_LEN=1024 \
+sbatch -A $ACC -p batch --qos=interactive --nodes=1 --time=01:00:00 \
+  --export=ALL,WANDB_MODE=offline,ACTOR_NUM_NODES=1,NUM_ROLLOUT=1,ROLLOUT_BATCH_SIZE=4,N_SAMPLES_PER_PROMPT=2,GLOBAL_BATCH_SIZE=8,MAX_RESPONSE_LEN=512 \
   experiments/scripts/math/sync/dapo-math-p10-90/qwen3-4b/run.sbatch
 ```
 
@@ -446,36 +457,23 @@ deliberately off-policy, and the assert is what stops it happening by accident.
 
 ## Cluster facts these scripts assume
 
-Measured on cw-dfw, 2026-08-03:
+Measured on aws-pdx, 2026-08-21:
 
-- GPU partitions all serve the same `pool0-*` nodes: **H100 x8, 128 CPUs, 2 TB RAM**.
-  The partition also selects the QoS (`batch_short` -> `p_batch_short`), so
-  `--qos` is never passed explicitly — **choosing the partition is the only
-  scheduling lever**:
+- GPU partitions are `batch` (4 h) and `batch_long` (7 d); nodes advertise
+  eight GPUs and 192 CPUs.
+- CPU work uses partition `cpu` (7 d).
+- Scheduling class is a separate QoS. Use `batch` + `interactive` for GPU
+  bring-up, `batch`/`batch_long` + `normal` for production, and `cpu` +
+  `cpu-interactive` for setup. All combinations were checked with
+  `sbatch --test-only`.
+- The runtime is Enroot/Pyxis (`srun --container-image`).
 
-  | partition | MaxTime | node cap |
-  |---|---|---|
-  | `interactive` | 4 h | **2** (GPU 16) |
-  | `batch_short` | 2 h | 4 |
-  | `batch` | 4 h | 768 |
-  | `batch_long` | 8 h | 768 |
-  | `batch_large_long` | 14 d | 768 |
-
-  **Default to `interactive`.** Every recipe here is single-node and 4 h, which
-  is exactly what it covers, and it schedules far ahead of `batch`. Reach for
-  `batch_long` / `batch_large_long` only when a run genuinely needs more than
-  4 h, and for `batch` only above 2 nodes.
-- CPU partitions (`cpu` 1d, `cpu_long` 7d): 96 CPUs, no GPU. `cpu_interactive`
-  (1 d) is the fast lane for downloads and image imports.
-- **No docker and no apptainer**; `enroot` + pyxis (`srun --container-image`) only.
-  `/etc/subuid` is empty, so nested rootless docker / `--fakeroot` is not an option.
-- Compute nodes have egress (huggingface.co, ghcr.io, app.daytona.io all reachable).
-- `/tmp` is RAM-backed — never point enroot scratch at it (see `import_image.sbatch`).
+See `notes/cluster.md` for the live audit commands and complete allowed-QoS list.
 
 ## Optional
 
-- **wandb**: set `WANDB_API_KEY` (and optionally `WANDB_PROJECT`) in the
-  submitting shell; `--export=ALL` carries it in. Without it, wandb stays off.
+- **wandb**: set `WANDB_API_KEY` for online logging. For validation, set
+  `WANDB_MODE=offline`; no API key is required.
 - **Docker Hub rate limits**: if `enroot import` returns HTTP 429, put
   credentials in `$ENROOT_CONFIG_PATH/.credentials`
   (`machine auth.docker.io login <user> password <token>`).
@@ -484,6 +482,5 @@ Measured on cw-dfw, 2026-08-03:
 
 These two recipes need no sandbox. The agentic recipes in `examples/`
 (Harbor, OpenEnv, NeMo-Gym) each need a container runtime or an external sandbox
-service; on this cluster that means the internal OpenSandbox service, which is
-reachable from cw-dfw compute nodes (verified: HTTP 401 without a key). See
+service. See
 `docs/user-guide/environments.md` for how the connectors plug in.

@@ -134,9 +134,10 @@ Consequences:
 - `weight_version/mixed_version_ratio` and `dump/mixed_version_frac` are
   `len(set(weight_versions)) > 1` (`ray/rollout/metrics.py:101`,
   `dashboard/dump_reader.py:456`). With one call per sample the list has length 1,
-  so **both are structurally 0 for every run in this study**. They measure
-  multi-turn and partial-rollout resume, neither of which fully-async does
-  (`arguments.py:54` rejects partial rollout).
+  so **both are structurally 0 for every run in this study**. They can measure
+  generators that make multiple policy calls, such as AReaL Tau2 multi-turn
+  rollouts, and partial-rollout resume. The math recipes in this study make one
+  call per sample; fully async still rejects `--partial-rollout`.
 - `in_place` also means the continuation attends to a KV cache built by the
   previous weights — the mismatch VCPO and PipelineRL are about — and that is
   filed under staleness 0.

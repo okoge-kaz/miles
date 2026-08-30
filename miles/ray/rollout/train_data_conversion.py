@@ -115,7 +115,10 @@ def convert_samples_to_train_data(
         assert (
             len(sample.loss_mask) == sample.response_length
         ), f"loss mask length {len(sample.loss_mask)} != response length {sample.response_length}"
-        if sample.remove_sample:
+        if sample.remove_sample or (
+            getattr(args, "zero_loss_on_truncated", False)
+            and sample.status == Sample.Status.TRUNCATED
+        ):
             sample.loss_mask = [0] * sample.response_length
         loss_masks.append(sample.loss_mask)
     train_data["loss_masks"] = loss_masks
@@ -197,7 +200,13 @@ def _post_process_rewards(
     if (f := custom_reward_post_process_func) is not None:
         return f(args, samples)
 
-    raw_rewards = [sample.get_reward_value(args) for sample in samples]
+    zero_truncated_rewards = getattr(args, "zero_reward_on_truncated", False)
+    raw_rewards = [
+        0.0
+        if zero_truncated_rewards and sample.status == Sample.Status.TRUNCATED
+        else sample.get_reward_value(args)
+        for sample in samples
+    ]
     if args.advantage_estimator in ["grpo", "gspo", "reinforce_plus_plus_baseline"] and args.rewards_normalization:
         # group norm
         rewards = torch.tensor(raw_rewards, dtype=torch.float)

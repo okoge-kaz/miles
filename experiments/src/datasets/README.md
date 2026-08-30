@@ -9,6 +9,8 @@ Nemotron schema handling in the generic data loader.
 
 - `common`: streaming I/O, structural audit, and deterministic merge utilities;
 - `nemotron`: Nemotron schema adapters, conversion, and Nano restoration;
-- `calendar`, `workplace`, `tool_call`, `tau_bench`: environment-specific data
+- `calendar`, `workplace`, `tool_call_pivot`, `tau_bench`: environment-specific data
   preparation;
+- `areal_tau2`: pinned 1,982-row RL-only Task/DB preparation for the Tau2
+  user-simulator training environment;
 - `search_r1`: Search-R1 evaluation-data preparation.

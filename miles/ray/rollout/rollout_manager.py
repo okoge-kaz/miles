@@ -12,6 +12,7 @@ from miles.ray.rollout.addr_allocator import PortCursors
 from miles.ray.rollout.debug_data import RolloutDataInjectionUtil, load_debug_rollout_data, save_debug_rollout_data
 from miles.ray.rollout.metrics import (
     log_eval_rollout_data,
+    log_replay_resume_checkpoint,
     log_rollout_batch_consumption,
     log_rollout_data,
     log_rollout_pipeline_throughput,
@@ -48,6 +49,7 @@ from miles.rollout.replay_buffer import (
     rollout_batch_token,
     save_replay_buffer,
 )
+from miles.rollout.replay_resume_metrics import checkpoint_resume_metrics, replay_load_metrics
 from miles.utils import object_store
 from miles.utils.async_utils import run
 from miles.utils.audit_utils.event_analyzer import analyzer as event_analyzer
@@ -125,6 +127,7 @@ class RolloutManager:
         self.rollout_id = -1
         self._fully_async_consumption_snapshots: dict[int, dict] = {}
         self._fully_async_inflight_training: dict[int, tuple[int | None, int, int | None]] = {}
+        self._resume_benchmark_load_metrics: dict[str, float] = {}
 
         self._metric_checker = MetricChecker.maybe_create(args)
 
@@ -336,6 +339,9 @@ class RolloutManager:
                     call_rollout_fn, self.generate_rollout, self.args, rollout_id, self.data_source, evaluation=False
                 )
             metrics = data.metrics
+            if self._resume_benchmark_load_metrics:
+                metrics = {**(metrics or {}), **self._resume_benchmark_load_metrics}
+                self._resume_benchmark_load_metrics = {}
             debug_metadata = data.debug_metadata
             data = data.samples
             if getattr(self.args, "use_replay_buffer", False):
@@ -381,36 +387,84 @@ class RolloutManager:
     # -------------------------- rollout persistence -----------------------
 
     async def save(self, rollout_id):
+        replay_state = None
+        replay_capture_seconds = 0.0
+        replay_write_seconds = 0.0
+        replay_total_seconds = 0.0
+        replay_size_bytes = 0
         if getattr(self.args, "use_replay_buffer", False):
             replay_buffer_start = time.monotonic()
-            state = await asyncio.to_thread(run, self.generate_rollout.replay_buffer_state(rollout_id))
-            capture_seconds = time.monotonic() - replay_buffer_start
+            replay_state = await asyncio.to_thread(run, self.generate_rollout.replay_buffer_state(rollout_id))
+            replay_capture_seconds = time.monotonic() - replay_buffer_start
             write_start = time.monotonic()
-            path, size = await asyncio.to_thread(
+            path, replay_size_bytes = await asyncio.to_thread(
                 save_replay_buffer,
                 self.args.save,
                 rollout_id,
-                state,
+                replay_state,
             )
-            write_seconds = time.monotonic() - write_start
+            replay_write_seconds = time.monotonic() - write_start
+            replay_total_seconds = time.monotonic() - replay_buffer_start
             logger.info(
                 "Published replay buffer %s "
                 "(%d bytes, capture %.3f seconds, write %.3f seconds, total %.3f seconds)",
                 path,
-                size,
-                capture_seconds,
-                write_seconds,
-                time.monotonic() - replay_buffer_start,
+                replay_size_bytes,
+                replay_capture_seconds,
+                replay_write_seconds,
+                replay_total_seconds,
             )
         elif self.args.rollout_global_dataset:
             self.data_source.save(rollout_id)
+        checkpoint_metrics = None
+        if getattr(self.args, "log_replay_resume_metrics", False) or getattr(
+            self.args,
+            "debug_fail_after_rollout",
+            None,
+        ) is not None:
+            data_source_state = (
+                replay_state["data_source"]
+                if replay_state is not None
+                else self.data_source.checkpoint_state()
+            )
+            checkpoint_metrics = checkpoint_resume_metrics(
+                rollout_id=rollout_id,
+                rollout_batch_size=self.args.rollout_batch_size,
+                n_samples_per_prompt=self.args.n_samples_per_prompt,
+                data_source_state=data_source_state,
+                replay_state=replay_state,
+            )
+            checkpoint_metrics.update(
+                {
+                    "resume/benchmark/checkpoint/replay_size_bytes": float(replay_size_bytes),
+                    "resume/benchmark/checkpoint/replay_capture_seconds": replay_capture_seconds,
+                    "resume/benchmark/checkpoint/replay_write_seconds": replay_write_seconds,
+                    "resume/benchmark/checkpoint/replay_total_seconds": replay_total_seconds,
+                }
+            )
+            if getattr(self.args, "log_replay_resume_metrics", False):
+                log_replay_resume_checkpoint(rollout_id, self.args, checkpoint_metrics)
         if not getattr(self.args, "use_replay_buffer", False):
             event_logger_checkpoint.snapshot(self.args, rollout_id)
+        return checkpoint_metrics
 
     async def load(self, rollout_id=None):
         if not getattr(self.args, "use_replay_buffer", False):
             ensure_no_replay_buffer(self.args.load, rollout_id)
+            load_start = time.monotonic()
             self.data_source.load(rollout_id)
+            if (
+                getattr(self.args, "log_replay_resume_metrics", False)
+                and rollout_id is not None
+                and rollout_id >= 0
+            ):
+                total_seconds = time.monotonic() - load_start
+                self._resume_benchmark_load_metrics = replay_load_metrics(
+                    replay_type=None,
+                    read_seconds=total_seconds,
+                    restore_seconds=0.0,
+                    total_seconds=total_seconds,
+                )
             return
         if self.args.load is None or rollout_id is None or rollout_id < 0:
             return
@@ -426,6 +480,14 @@ class RolloutManager:
         restore_start = time.monotonic()
         await asyncio.to_thread(run, self.generate_rollout.restore_replay_buffer_state(state))
         restore_seconds = time.monotonic() - restore_start
+        total_seconds = time.monotonic() - load_start
+        if getattr(self.args, "log_replay_resume_metrics", False):
+            self._resume_benchmark_load_metrics = replay_load_metrics(
+                replay_type=self.args.replay_buffer_type,
+                read_seconds=read_seconds,
+                restore_seconds=restore_seconds,
+                total_seconds=total_seconds,
+            )
         logger.info(
             "Loaded replay buffer from %s at rollout %d "
             "(read %.3f seconds, restore %.3f seconds, total %.3f seconds)",
@@ -433,7 +495,7 @@ class RolloutManager:
             rollout_id,
             read_seconds,
             restore_seconds,
-            time.monotonic() - load_start,
+            total_seconds,
         )
 
     async def get_restored_applied_weight_version(self) -> int | None:

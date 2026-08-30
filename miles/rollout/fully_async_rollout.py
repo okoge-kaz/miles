@@ -302,7 +302,7 @@ def _decode_inflight_item(state: dict[str, Any]) -> _InflightReplayItem:
     prompt_group = _flat_prompt_group(decode_group(state["prompt_group"]))
     generation_group = decode_group(state["generation_group"])
     if any(isinstance(item, list) for item in generation_group):
-        raise RuntimeError("Inflight replay currently requires a flat single-turn generation group")
+        raise RuntimeError("Inflight replay currently requires a flat generation group")
     if not _group_requires_continuation(generation_group):
         raise RuntimeError("Inflight replay item has no unfinished sample")
     return _InflightReplayItem(prompt_group=prompt_group, generation_group=generation_group)
@@ -810,7 +810,7 @@ class FullyAsyncRolloutFn:
             raise RuntimeError(f"Inflight prompt group {group_id} is absent from the pending ledger")
         generation_group = item[1]
         if any(isinstance(sample, list) for sample in generation_group):
-            raise RuntimeError("Inflight replay currently requires flat single-turn generation groups")
+            raise RuntimeError("Inflight replay currently requires flat generation groups")
         return _InflightReplayItem(
             prompt_group=prompt_group,
             generation_group=generation_group,

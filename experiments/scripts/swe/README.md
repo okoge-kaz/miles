@@ -19,9 +19,10 @@ The recipe exists, but it is not yet a claim that SWE RL is training-ready.
 - Real source-image probes passed for SWE-Gym (`306206`), R2E-Gym (`306215`),
   and SWE-ReBench-V2 (`306242`). These prove the selected image/runtime paths,
   not live hosted-E2B admission of every source row.
-- `E2B_API_KEY` is currently unset. No row has completed live E2B semantic
-  admission, `/data/miles-swe/admitted` has no promoted training dataset, and
-  no 4-node RL or downstream SWE result exists.
+- No row has completed live E2B semantic admission in the checked artifacts,
+  `/data/miles-swe/admitted` has no promoted training dataset, and no 4-node RL
+  or downstream SWE result exists. Admission requires the E2B credential only
+  in the separate Harbor controller job.
 - Replay is deliberately disabled. Do not enable it until fresh and resumed
   live E2B jobs both pass; inflight replay additionally requires exact sandbox
   snapshot restoration.
@@ -33,8 +34,9 @@ They are candidate counts, not admitted training-row counts.
 ## Training contract
 
 The asynchronous recipe is under
-`async/r2e-gym-swe-rebench-v2/qwen3-4b-instruct-2507/`. Its default selector is
-the filtered ReBench candidate, but `train.sh` accepts only a finalized
+`async/swe-rebench-v2-swe-gym/qwen3-4b/`. It uses the Step4000 Qwen3-4B SFT
+checkpoint and defaults to the full pinned SWE-ReBench V2 source; `SWE_DATASET`
+can select SWE-Gym. `train.sh` accepts only a finalized
 `/data/miles-swe/admitted/<selector>-train.jsonl` plus its digest-bound admission
 summary. A normalized or dry-materialized file cannot bypass that gate.
 

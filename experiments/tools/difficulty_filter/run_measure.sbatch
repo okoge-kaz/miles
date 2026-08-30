@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=passrate
-#SBATCH --partition=interactive
+#SBATCH --partition=batch
+#SBATCH --qos=interactive
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=128
@@ -16,8 +17,8 @@
 #     experiments/tools/difficulty_filter/run_measure.sbatch
 #
 # Knobs (all --export=ALL environment variables):
-#   MODEL_NAME       policy/artifact name                 (Qwen3-4B-Instruct-2507)
-#   HF_MODEL_NAME    HF dir under /ckpt/hf                (defaults to MODEL_NAME)
+#   MODEL_NAME       policy/artifact name        (Qwen3-4B-Base-LR2e-5-Step4000)
+#   HF_MODEL_NAME    HF dir under /ckpt/hf                 (iter_0004000)
 #   PROMPT_DATA      in-container prompt jsonl
 #   OUTPUT           in-container output jsonl (resumable)
 #   N_SAMPLES        samples per prompt                    (8, matches training)
@@ -42,6 +43,7 @@
 #   CONCURRENCY      prompts in flight                     (96)
 #   TOP_P / TOP_K    sampling cutoffs                      (1.0 / -1)
 #   MAX_RUNNING_REQUESTS  sequences admitted per replica    (96)
+#   SERVER_TP_SIZE / SERVER_DP_SIZE SGLang layout            (1 / 8)
 #   SGLANG_LOG_LEVEL sglang verbosity                      (info)
 #                    Keep at info: the Decode-batch lines carry token usage,
 #                    running-req and gen throughput, which are the only way to
@@ -56,9 +58,8 @@
 # Inference only: this reads the HF weights that SGLang serves and never touches
 # the torch_dist checkpoint, so it can run before or in parallel with training.
 #
-# Partition: `interactive` (4 h, up to 2 nodes / 16 GPUs) is the fast lane and
-# this job needs one node, so it is the default. The partition selects the QoS
-# on this cluster (interactive -> p_interactive), so no --qos is needed.
+# `batch` with QoS `interactive` is the GPU fast lane on aws-pdx. The partition
+# owns the B300 nodes; the QoS supplies the interactive scheduling policy.
 #
 # Resumable by design. The output jsonl is appended and flushed per prompt and a
 # rerun skips indices already present, so hitting the 4 h wall just means
@@ -67,10 +68,18 @@
 set -euo pipefail
 
 REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
+: "${HF_CKPT_DIR:=${QWEN3_4B_BASE_HF_ROOT:-/lustre/fsw/portfolios/coreai/users/kfujii/checkpoints/huggingface/Qwen3-4B-Base/LR2.0e-5-SEQ32768-GBS128-MBS1-TP1-PP1-CP1-EP1-PACK1-standard-cp-STEPS4000}}"
+export HF_CKPT_DIR
 source "${REPO_ROOT}/experiments/env.sh"
 
-MODEL_NAME="${MODEL_NAME:-Qwen3-4B-Instruct-2507}"
-HF_MODEL_NAME="${HF_MODEL_NAME:-${MODEL_NAME}}"
+MODEL_NAME="${MODEL_NAME:-Qwen3-4B-Base-LR2e-5-Step4000}"
+if [[ -z "${HF_MODEL_NAME:-}" ]]; then
+    if [[ "${MODEL_NAME}" == Qwen3-4B-Base-LR2e-5-Step4000 ]]; then
+        HF_MODEL_NAME=iter_0004000
+    else
+        HF_MODEL_NAME="${MODEL_NAME}"
+    fi
+fi
 PROMPT_DATA="${PROMPT_DATA:-/data/dapo-math-17k/dapo-math-17k.jsonl}"
 OUTPUT="${OUTPUT:-/data/difficulty/dapo-math-17k.${MODEL_NAME}.passrate.jsonl}"
 N_SAMPLES="${N_SAMPLES:-8}"
@@ -86,6 +95,13 @@ CONCURRENCY="${CONCURRENCY:-96}"
 # CONCURRENCY * N_SAMPLES spread over GPUS_PER_NODE replicas, i.e.
 # CONCURRENCY sequences each. Sized against the KV budget below.
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-96}"
+SERVER_TP_SIZE="${SERVER_TP_SIZE:-1}"
+SERVER_DP_SIZE="${SERVER_DP_SIZE:-$(( GPUS_PER_NODE / SERVER_TP_SIZE ))}"
+if (( SERVER_TP_SIZE * SERVER_DP_SIZE != GPUS_PER_NODE )); then
+    echo "SERVER_TP_SIZE * SERVER_DP_SIZE must equal GPUS_PER_NODE:" \
+         "${SERVER_TP_SIZE} * ${SERVER_DP_SIZE} != ${GPUS_PER_NODE}" >&2
+    exit 1
+fi
 RM_TYPE="${RM_TYPE:-math}"
 ZERO_TRUNCATED_ARG=""
 [[ "${ZERO_REWARD_ON_TRUNCATED:-0}" != 0 ]] && ZERO_TRUNCATED_ARG="--zero-reward-on-truncated"
@@ -121,14 +137,14 @@ if [[ "${OUTPUT}" == /data/* ]]; then
     fi
 fi
 
-# This job can be submitted by a small CPU coordinator via --export=ALL.  Slurm
-# then leaves the coordinator's SLURM_MEM_PER_NODE / SLURM_CPUS_PER_TASK in the
-# batch environment even though this allocation owns the full GPU node.  If the
-# nested step inherits those stale values, SGLang is cgroup-limited to 2 GiB and
-# one of its DP workers is SIGKILLed while CUDA graphs are captured.  Command-line
-# resource requests take precedence over the stale environment values.
+# This job can be submitted by a small CPU coordinator via --export=ALL. Use the
+# GPU job's requested CPUs and reset memory explicitly so a nested step cannot
+# inherit the coordinator's small cgroup. On aws-pdx an exclusive node has 192
+# CPUs while this job requests 128; asking the step for all 192 produces a Slurm
+# warning because the per-task allocation is still 128.
+STEP_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-1}"
 srun \
-    --cpus-per-task="${SLURM_JOB_CPUS_PER_NODE:-1}" \
+    --cpus-per-task="${STEP_CPUS_PER_TASK}" \
     --mem=0 \
     --container-image="${SQSH_IMAGE}" \
     --container-mounts="${CONTAINER_MOUNTS}" \
@@ -156,20 +172,17 @@ if [[ -n "\${EXTRA_PIP:-}" ]]; then
 fi
 
 if [[ ${SKIP_MEASUREMENT} == 0 ]]; then
-    # dp-size 8: eight independent replicas behind one endpoint. Qwen3-4B fits on a
-    # single H100, so data parallelism beats tensor parallelism here -- no
-    # cross-GPU collectives on the critical path of a pure-inference sweep.
+    # On B300, all three target checkpoints fit in one GPU, so the default is
+    # eight independent replicas behind one endpoint. SERVER_TP_SIZE remains an
+    # escape hatch for a larger checkpoint without changing this worker.
     #
-    # KV budget per replica: mem-fraction-static 0.85 * 80 GB = 68 GB, minus ~8 GB
-    # of bf16 weights, leaves ~60 GB. Qwen3-4B keeps 36 layers * 8 KV heads * 128
-    # dims * 2 (K,V) * 2 bytes = 144 KB per token, so ~410k tokens fit. Measured
-    # mean response is ~4.1k tokens, hence ~96 concurrent sequences per replica.
-    # Oversubscribing does not fail loudly -- SGLang retracts and re-prefills
-    # requests, which burns compute silently (1635 retractions at 384x8=3072).
+    # MAX_RUNNING_REQUESTS is deliberately explicit because oversubscribing does
+    # not fail loudly: SGLang retracts and re-prefills requests, which burns
+    # compute silently. Re-tune it only after checking KV usage in the B300 log.
     python3 -m sglang.launch_server \
         --model-path /ckpt/hf/${HF_MODEL_NAME} \
         --host 127.0.0.1 --port ${SERVER_PORT} \
-        --dp-size ${GPUS_PER_NODE} --tp-size 1 \
+        --dp-size ${SERVER_DP_SIZE} --tp-size ${SERVER_TP_SIZE} \
         --mem-fraction-static 0.85 \
         --max-running-requests ${MAX_RUNNING_REQUESTS} \
         --log-level ${SGLANG_LOG_LEVEL:-info} &
@@ -191,7 +204,7 @@ if [[ ${SKIP_MEASUREMENT} == 0 ]]; then
         gpu_processes=\$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | sed '/^[[:space:]]*\$/d' | wc -l)
         (( gpu_processes > max_gpu_processes )) && max_gpu_processes=\${gpu_processes}
         if (( max_gpu_processes >= ${GPUS_PER_NODE} && gpu_processes < ${GPUS_PER_NODE} )); then
-            echo \"sglang lost a DP worker during startup: expected=${GPUS_PER_NODE} current=\${gpu_processes}\" >&2
+            echo \"sglang lost a GPU worker during startup: expected=${GPUS_PER_NODE} current=\${gpu_processes}\" >&2
             exit 1
         fi
         sleep 10

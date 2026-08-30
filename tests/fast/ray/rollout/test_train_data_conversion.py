@@ -81,6 +81,52 @@ class TestConvertSamplesToTrainData:
         )
         assert out["loss_masks"][0] == [0, 0, 0, 0]
 
+    def test_zero_loss_on_truncated_masks_only_truncated_trajectory(self):
+        args = make_args(
+            rewards_normalization=False,
+            zero_loss_on_truncated=True,
+        )
+        truncated = make_sample(
+            response_length=4,
+            reward=1.0,
+            status=Sample.Status.TRUNCATED,
+        )
+        completed = make_sample(
+            response_length=4,
+            reward=1.0,
+            status=Sample.Status.COMPLETED,
+        )
+
+        out = convert_samples_to_train_data(
+            args,
+            [truncated, completed],
+            metadata={},
+            custom_convert_samples_to_train_data_func=None,
+            custom_reward_post_process_func=None,
+        )
+
+        assert out["loss_masks"] == [[0, 0, 0, 0], [1, 1, 1, 1]]
+        assert out["raw_reward"] == [1.0, 1.0]
+
+    def test_zero_reward_on_truncated_applies_to_custom_generator_reward(self):
+        args = make_args(
+            rewards_normalization=False,
+            zero_reward_on_truncated=True,
+        )
+        truncated = make_sample(reward=1.0, status=Sample.Status.TRUNCATED)
+        completed = make_sample(reward=1.0, status=Sample.Status.COMPLETED)
+
+        out = convert_samples_to_train_data(
+            args,
+            [truncated, completed],
+            metadata={},
+            custom_convert_samples_to_train_data_func=None,
+            custom_reward_post_process_func=None,
+        )
+
+        assert out["raw_reward"] == [0.0, 1.0]
+        assert out["rewards"] == [0.0, 1.0]
+
     def test_loss_mask_length_mismatch_asserts(self):
         args = make_args(rewards_normalization=False)
         s = make_sample(response_length=4)

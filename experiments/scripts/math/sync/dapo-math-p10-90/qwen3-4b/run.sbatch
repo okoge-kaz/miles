@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=miles-dapo-math-p10-90-qwen3-4b
 #SBATCH --partition=batch
+#SBATCH --qos=normal
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:8
@@ -14,14 +15,16 @@ REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../
 export HF_CKPT_DIR="${QWEN3_4B_BASE_HF_ROOT:-/lustre/fsw/portfolios/coreai/users/kfujii/checkpoints/huggingface/Qwen3-4B-Base/LR2.0e-5-SEQ32768-GBS128-MBS1-TP1-PP1-CP1-EP1-PACK1-standard-cp-STEPS4000}"
 source "${REPO_ROOT}/experiments/env.sh"
 
-: "${WANDB_API_KEY:?set WANDB_API_KEY, or put an api.wandb.ai entry in ~/.netrc}"
+if [[ "${WANDB_MODE:-online}" != offline && "${WANDB_MODE:-online}" != disabled ]]; then
+    : "${WANDB_API_KEY:?set WANDB_API_KEY, use WANDB_MODE=offline, or disable wandb}"
+fi
 
 # run identity
-MODEL_NAME=Qwen3-4B-Base-LR2e-5-Step4000
-HF_MODEL_NAME=iter_0004000
+: "${MODEL_NAME:=Qwen3-4B-Base-LR2e-5-Step4000}"
+: "${HF_MODEL_NAME:=iter_0004000}"
 PLACEMENT=colocated
-DATASET_TAG=dapo-math-p10-90-qwen3-4b-base-lr2e-5-step4000
-PROMPT_DATA=/data/dapo-math-p10-90-qwen3-4b-base-lr2e-5-step4000/dapo-math-p10-90-qwen3-4b-base-lr2e-5-step4000.jsonl
+: "${DATASET_TAG:=dapo-math-p10-90-qwen3-4b-base-lr2e-5-step4000}"
+: "${PROMPT_DATA:=/data/dapo-math-p10-90-qwen3-4b-base-lr2e-5-step4000/dapo-math-p10-90-qwen3-4b-base-lr2e-5-step4000.jsonl}"
 
 # rl algorithm: these derive RL_ALGORITHM in common/run_identity.sh, and every
 # one of them is turned into a flag by train.sh

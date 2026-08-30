@@ -170,21 +170,20 @@ republished the aggregate result. Both tasks scored exact match 0;
 not effective retrieval use. Full seven-benchmark evaluation and current GPU
 RL/resume remain separate gates.
 
-## Tau and tool-call evaluators
+## Tau and static `tool_call_pivot` evaluators
 
-Tau and exact tool action have dedicated entry points:
+Tau and exact tool action diagnostics have dedicated entry points:
 
 - `experiments/scripts/tau_bench/evaluate.sbatch`
-- `experiments/scripts/tool_call/evaluate.sbatch`
+- `experiments/scripts/tool_call_pivot/evaluate.sbatch`
 
-Tau can use either the local policy or the Gemini user simulator, whose checked-
-in default is `gemini-2.5-flash-lite`. Credentials must be present at the Slurm
-job boundary; the Python evaluator/environment does not parse dotenv files.
-Current-SFT local-policy job 307463 attempted eight episodes, then correctly
-failed the evaluation because all eight ended in errors before reaching a
-terminal state. Its `mean_reward=0` is therefore not an accuracy measurement.
-The Gemini downstream path and current-SFT exact tool-call held-out evaluator
-still require successful execution evidence.
+Tau three is the primary downstream benchmark for the conversational tool-use
+Pivot training recipe. It accepts only the held-out v1.0.1 test split and uses
+either the verified NVIDIA-hosted Gemini user simulator or direct Gemini.
+Credentials are allowlisted at the Slurm job boundary; the Python evaluator does
+not parse dotenv files. The exact tool-action evaluator remains a training-domain
+diagnostic and is not the reported downstream benchmark. Both evaluation paths
+still require successful current-checkpoint GPU execution evidence.
 
 ## Validation checklist
 

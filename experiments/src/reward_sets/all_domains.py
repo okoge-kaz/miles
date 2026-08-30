@@ -12,7 +12,7 @@ from experiments.src.environments.competitive_programming.verifier import (
 from experiments.src.environments.competitive_programming.verifier import code_exec_reward
 from experiments.src.environments.instruction_following.verifier import score_ifeval_sample
 from experiments.src.environments.reasoning_gym.verifier import score_reasoning_gym_sample
-from experiments.src.environments.tool_call.verifier import parse_tool_calls, score_tool_call_sample
+from experiments.src.environments.tool_call_pivot.verifier import parse_tool_calls, score_tool_call_sample
 from experiments.src.environments.workplace.verifier import score_action_trajectory
 from experiments.src.protocols.openai_responses import expected_action_signature
 from experiments.src.reward_sets._common import (

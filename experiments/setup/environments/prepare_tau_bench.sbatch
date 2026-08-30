@@ -1,98 +1,95 @@
 #!/bin/bash
-#SBATCH --job-name=prep-tau-bench
+#SBATCH --job-name=prepare-tau3
 #SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=cpu_datamover
-#SBATCH --qos=cpu-datamover
+#SBATCH --partition=cpu
+#SBATCH --qos=cpu-interactive
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
-#SBATCH --time=02:00:00
+#SBATCH --time=01:00:00
 #SBATCH --output=experiments/outputs/download/%x-%j.log
 
-# Convert the pinned Tau Bench tasks and create a balanced training file from
-# reward-verified retail environment tasks plus the same number of rows from
-# each of two Nemotron 3 agentic datasets. The raw 500 Tau tasks are retained
-# for audit. No package installation mutates the training image.
+# Materialize only the official Tau three v1.0.1 held-out test split. The
+# converter validates train/test/base disjointness in memory, but intentionally
+# leaves no Tau training artifact on disk.
 
 set -euo pipefail
 
 REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
 source "${REPO_ROOT}/experiments/env.sh"
 
-readonly TAU_COMMIT=09c26a85efd1d65168cfb57865ca2ca278c8153d
 readonly TAU_DIR="${DATASET_DIR}/tau-bench"
-readonly TAU_SRC="${WS}/src/tau-bench"
-[[ -d "${TAU_SRC}/.git" ]] || {
-    echo "missing pinned Tau checkout: ${TAU_SRC}" >&2
-    exit 1
-}
-[[ "$(git -C "${TAU_SRC}" rev-parse HEAD)" == "${TAU_COMMIT}" ]] || {
-    echo "Tau checkout is not pinned to ${TAU_COMMIT}" >&2
-    exit 1
-}
+TAU3_SQSH_IMAGE="${TAU3_SQSH_IMAGE:-${CONTAINER_DIR}/miles-staleness-weight-boundaries-f994b9aed-efa-1.49.0-tau3-1.0.1.sqsh}"
+DOTENV_MASK="${REPO_ROOT}/experiments/common/dotenv.disabled"
+[[ -r "${TAU3_SQSH_IMAGE}" ]] || { echo "Tau three image not found: ${TAU3_SQSH_IMAGE}" >&2; exit 1; }
+[[ -r "${DOTENV_MASK}" ]] || { echo "dotenv mask not found: ${DOTENV_MASK}" >&2; exit 1; }
 mkdir -p "${TAU_DIR}"
 
 srun \
-    --container-image="${SQSH_IMAGE}" \
-    --container-mounts="${CONTAINER_MOUNTS},${TAU_SRC}:/root/tau-bench" \
+    --container-image="${TAU3_SQSH_IMAGE}" \
+    --container-mounts="${CONTAINER_MOUNTS},${DOTENV_MASK}:/root/miles/.env:ro" \
     --container-writable \
     --no-container-mount-home \
-    --export=ALL \
+    --export=USER \
     bash -lc '
 set -euo pipefail
 cd /root/miles
-export PYTHONPATH=/root/tau-bench:/root/miles
-python3 -m experiments.src.datasets.tau_bench.prepare \
-    --output-dir /data/tau-bench \
-    --conv-tooluse /data/nemotron-rl-conv-tooluse/miles-train.jsonl \
-    --fncall-pivot /data/nemotron-rl-fncall-pivot/miles-train.jsonl \
-    --expected-tau-rows 500 \
-    --seed 42
+export PATH=/opt/tau3/.venv/bin:${PATH}
+export PYTHONPATH=/root/miles
+/opt/tau3/.venv/bin/python -m experiments.src.datasets.tau_bench.prepare \
+    --output-dir /data/tau-bench
 
-python3 - <<"PY"
+/opt/tau3/.venv/bin/python - <<"PY"
 import json
+from pathlib import Path
 
+root = Path("/data/tau-bench")
 expected = {
-    "/data/tau-bench/tau1-retail-train-miles.jsonl": 500,
-    "/data/tau-bench/tau1-retail-test-miles.jsonl": 115,
-    "/data/tau-bench/tau1-airline-test-miles.jsonl": 50,
+    "tau3-retail-test-miles.jsonl": 40,
+    "tau3-airline-test-miles.jsonl": 20,
+    "tau3-telecom-test-miles.jsonl": 40,
+    "tau3-test-miles.jsonl": 100,
 }
-loaded = {}
-for path, expected_count in expected.items():
-    with open(path, encoding="utf-8") as handle:
-        loaded[path] = [json.loads(line) for line in handle if line.strip()]
-    assert len(loaded[path]) == expected_count, (path, len(loaded[path]))
-with open("/data/tau-bench/prepare-summary.json", encoding="utf-8") as handle:
-    summary = json.loads(next(line for line in handle if line.strip()))
-verified_count = summary["tau_reward_audit"]["accepted"]
-rejected_count = summary["tau_reward_audit"]["rejected"]
-assert verified_count > 0
-assert rejected_count > 0
-assert verified_count + rejected_count == 500
-verified_path = "/data/tau-bench/tau1-retail-train-reward-verified-miles.jsonl"
-mixed_path = "/data/tau-bench/nemotron3-agentic-tau-retail-train.jsonl"
-for path, expected_count in ((verified_path, verified_count), (mixed_path, 3 * verified_count)):
-    with open(path, encoding="utf-8") as handle:
-        loaded[path] = [json.loads(line) for line in handle if line.strip()]
-    assert len(loaded[path]) == expected_count, (path, len(loaded[path]))
-mixed = loaded[mixed_path]
-assert not any(row["metadata"].get("eval_only") is True for row in mixed)
-tau_rows = [row for row in mixed if row["metadata"].get("verifier") == "tau_bench_environment"]
-assert len(tau_rows) == verified_count
-assert all(row["metadata"].get("tau_reward_verified") is True for row in tau_rows)
-print(
-    f"Tau data assertions: raw=500 verified={verified_count} rejected={rejected_count} "
-    f"retail-test=115 airline-test=50 mixed={len(mixed)}"
+for name, expected_count in expected.items():
+    rows = [json.loads(line) for line in (root / name).read_text().splitlines() if line]
+    assert len(rows) == expected_count, (name, len(rows))
+    assert all(row["metadata"]["eval_only"] is True for row in rows)
+summary = json.loads((root / "prepare-summary.json").read_text())
+assert summary["evaluation_policy"]["benchmark_split"] == "test"
+assert summary["evaluation_policy"]["train_and_base_materialized"] is False
+assert summary["evaluation_policy"]["training_dataset"] == "inclusionAI/AReaL-tau2-data"
+assert summary["evaluation_policy"]["training_split"] == "tau2_rl_train.jsonl"
+assert summary["evaluation_policy"]["training_environment"] == (
+    "stateful_multi_turn_user_simulator_environment"
 )
+for domain in ("retail", "airline", "telecom"):
+    for split in ("train", "base"):
+        assert not (root / f"tau3-{domain}-{split}-miles.jsonl").exists()
+for split in ("train", "base"):
+    assert not (root / f"tau3-{split}-miles.jsonl").exists()
+print("Tau three evaluation conversion: held-out-test=100; train/base not materialized")
 PY
 '
 
-for f in \
-    tau1-retail-train-miles.jsonl \
-    tau1-retail-train-reward-verified-miles.jsonl \
-    tau1-retail-test-miles.jsonl \
-    tau1-airline-test-miles.jsonl \
-    nemotron3-agentic-tau-retail-train.jsonl; do
-    [[ -s "${TAU_DIR}/${f}" ]] || { echo "MISSING ${TAU_DIR}/${f}"; exit 1; }
-    printf "  %-26s %6s rows\n" "${f}" "$(wc -l < "${TAU_DIR}/${f}")"
-done
+# These exact files are Tau v1 artifacts. Removal occurs only after every Tau
+# three output above has passed its count and contamination checks.
+rm -f -- \
+    "${TAU_DIR}/airline_test_tasks.jsonl" \
+    "${TAU_DIR}/retail_dev_tasks.jsonl" \
+    "${TAU_DIR}/retail_test_tasks.jsonl" \
+    "${TAU_DIR}/retail_train_tasks.jsonl" \
+    "${TAU_DIR}/tau1_airline_test.jsonl" \
+    "${TAU_DIR}/tau1_retail_test.jsonl" \
+    "${TAU_DIR}/tau1_train.jsonl" \
+    "${TAU_DIR}/tau1-retail-train-miles.jsonl" \
+    "${TAU_DIR}/tau1-retail-train-reward-verified-miles.jsonl" \
+    "${TAU_DIR}/tau1-retail-test-miles.jsonl" \
+    "${TAU_DIR}/tau1-airline-test-miles.jsonl" \
+    "${TAU_DIR}/nemotron3-agentic-tau-retail-train.jsonl"
+
+if find "${TAU_DIR}" -maxdepth 1 -type f -name 'tau1*' -print -quit | grep -q .; then
+    echo "Tau v1 artifact remains under ${TAU_DIR}" >&2
+    exit 1
+fi
+
+echo "Tau evaluation artifacts prepared; Tau train/base outputs are absent."

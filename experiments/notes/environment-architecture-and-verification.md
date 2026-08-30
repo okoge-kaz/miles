@@ -66,16 +66,16 @@ so scalar reward calls cannot bypass the subprocess cap. Calendar is an in-
 memory constraint check. MCQA, IF, schema, and math do not maintain episode
 state.
 
-The checked-in Workplace runtime/verifier is suitable for correctness tests, but
-it is not yet a Miles rollout environment:
+The checked-in Workplace generator/runtime/verifier implements a local Miles
+rollout environment for one user request and multiple model/tool steps:
 
 - `experiments.src.environments.workplace.runtime._load_resource_functions` is
   cached per Python process, but every
   future rollout worker would still load pinned modules and fixtures;
 - runtime helpers create pandas/CSV-backed databases and expose 27 tool
   functions in process;
-- no `experiments.src.environments.workplace.generator` entry point is checked
-  in, so the policy/tool loop is not currently wired to Miles;
+- `experiments.src.environments.workplace.generator` wires the bounded step loop
+  to Miles, but it has no conversational user simulator;
 - there is no cross-worker environment backpressure, health endpoint, lease,
   cleanup retry, or isolation from a crashing resource module.
 
@@ -111,10 +111,10 @@ Implementation shape and GPU admission are separate:
   each established one optimizer update only.
 - Exact tool action jobs 306920/306921 completed an inflight replay fresh/resume
   pair, but used the now-prohibited Qwen3-4B-Instruct-2507 recipe. They validate
-  the verifier/replay mechanism historically, not a currently submittable SFT
-  recipe. Tau current-SFT local-policy jobs 307433/307434 completed a rollout-
-  replay fresh/resume sequence through iteration 2; the replacement SFT recipe
-  is not yet checked in and the downstream evaluator has no successful episode.
+  the verifier/replay mechanism historically. The replacement Step4000 recipe
+  trains on conversational tool-use Pivot data. AReaL Tau2 user-simulator RL is
+  a separate recipe with multi-turn `inflight` event-log replay, and Tau v3 is
+  held out for downstream evaluation.
 - IFEvalG jobs 306686/306687 completed the current 4-node, 16K, n=16 inflight-
   replay fresh/resume gate. The second job restored iteration 0 and its replay
   state, trained step 1, and published iteration 1 plus `replay_buffer_1`.
@@ -136,8 +136,7 @@ Implementation shape and GPU admission are separate:
   audited the full 500-row MATH-500, three 30-row AIME, and all three GPQA
   prepared-data/scorer contracts; those are data/config evidence, not additional
   model evaluations.
-  Tau downstream job 307463 failed all eight local-policy episodes before a
-  terminal state, while the exact tool-call held-out evaluator still lacks a
+  The Tau three held-out evaluator and exact tool-call diagnostic still lack a
   current-SFT execution result.
 - Full SWE has no live-admitted E2B rows and no 4-node RL/downstream result.
 
@@ -230,20 +229,19 @@ prompt pass. Both are deterministic; neither needs Gemini.
 
 ### Tau Bench
 
-Tau rows use the pinned Tau v1 retail state. Every train task is audited
-so its gold action trajectory scores one and a no-op scores zero. The custom
-generator repeatedly obtains an action, executes the pinned environment tool,
-appends the observation as loss-masked tokens, and uses the terminal environment
-reward. Current-SFT local-policy jobs 307433/307434 completed rollout replay and
-resume through iteration 2; the second job restored six pending, two ready, and
-two active groups plus one prepared batch. The checked-in code also supports
-`TAU_USER_BACKEND=gemini` when its credential is present at the Slurm job
-boundary; Python environment modules do not parse dotenv files. That backend has
-not completed current RL and held-out evaluation validation. Downstream local-
-policy job 307463 failed all eight episodes before reaching a terminal state,
-so its zero reward is a fail-closed evaluation failure rather than an
-effectiveness measurement. Local-policy results are not directly comparable to
-a leaderboard using a different LLM user simulator.
+The training path uses the external AReaL Tau2 RL split: 1,982 serialized tasks
+and nine DB snapshots. A thin `AgentGymEnv` extension injects each task and a
+deep-copied DB into the pinned official user-simulator/orchestrator lifecycle.
+Terminal reward follows the task-declared DB, environment assertion, action,
+and communication basis. Natural-language-judge reward is rejected. Stateful
+inflight replay stores the policy prefix and official message history, replays
+mutating tool calls, and validates the restored DB hashes before generation
+continues.
+
+Tau v3 v1.0.1 remains the downstream evaluator. It runs all 100 held-out retail,
+airline, and telecom test tasks through the official DB-backed environment.
+Official Tau v3 train/base tasks are used transiently to validate the split
+contract and are not materialized or used for training.
 
 ### Calendar and Workplace
 
@@ -256,9 +254,10 @@ grader was recorded, so this establishes local constraint consistency only.
 Workplace's checked-in runtime exposes email, calendar, analytics, project-
 management, and CRM tools, and its verifier uses the pinned upstream
 `is_correct` final-state comparison. It does not import or run NeMo Gym, but
-reuses pinned Workplace resource modules and data from a Gym checkout. There is
-not yet a checked-in custom-generate loop, so multi-call policy execution and
-terminal reward are a design target rather than an admitted training path.
+reuses pinned Workplace resource modules and data from a Gym checkout. Its
+custom generator performs multiple model/tool steps for one fixed user request;
+without a user simulator, it is explicitly single-turn multi-step rather than
+conversational multi-turn.
 
 ### Static conversational/function tool actions
 

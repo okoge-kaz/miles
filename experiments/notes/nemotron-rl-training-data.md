@@ -37,7 +37,7 @@ successful gated download.
 | `BytedTsinghua-SIA/DAPO-Math-17k` / `dapo-math-17k-byted` | 1,791,700 physical Parquet rows | Policy RLVR, math verifier |
 | `Skywork/Skywork-OR1-RL-Data` / `skywork-or1-rl` | 105,055 math + 14,057 code | Math and sandboxed-code RLVR; 10 math rows have empty published labels |
 | `nvidia/Nemotron-Math-Proofs-v1` / `nemotron-math-proofs-v1` | 1,376,663 | Lean SFT ready; Lean RL needs a compiler sandbox |
-| `nvidia/Nemotron-RL-Agentic-Conversational-Tool-Use-v1` / `nemotron-rl-conv-tooluse` | 96,968 | Single expert-action RLVR |
+| `nvidia/Nemotron-RL-Agentic-Conversational-Tool-Use-Pivot-v1` / `nemotron-rl-conv-tooluse-pivot` | 96,968 | Single expert-action RLVR: 65,559 function calls and 31,409 message actions |
 | `nvidia/Nemotron-RL-Agentic-SWE-Pivot-v1` / `nemotron-rl-swe-pivot` | 50,661 | Single expert-action RLVR; not full SWE execution |
 | `nvidia/Nemotron-RL-Identity-Following-v1` / `nemotron-rl-identity-following` | 21,660 | Principle-only rows; GenRM/judge required |
 | `nvidia/Nemotron-RL-Instruction-Following-Adversarial-v1` / `nemotron-rl-ifollow-adversarial` | 1,000 | Rubric judge required |
@@ -206,8 +206,8 @@ At minimum, a recipe-specific file uses:
 ```
 
 The current recipe modules are `code`, `stem`, `math_code_stem`,
-`instruction_following`, `tool_call`, and `tau`. Each rejects verifier ids that
-are outside its audited dataset contract. The broad
+`instruction_following`, and `tool_call_pivot`. Each rejects verifier ids that are
+outside its audited dataset contract. The broad
 `experiments.src.reward_sets.all_domains.blend_reward` remains for converter
 smoke tests and diagnostics, not as a new training-job entry point. Code-bearing
 mixtures also need the Bubblewrap mount shown above. Workplace rows remain in a
@@ -231,12 +231,13 @@ iteration 1 plus `replay_buffer_1`. Math+Code+STEM jobs 306793/306796 also passe
 the resume restored iteration 0 and 15 pending, 3 ready, and 6 inflight groups
 plus one prepared batch, then published iteration 1 plus `replay_buffer_1`.
 Exact-tool jobs 306920/306921 passed replay/resume only on the retired
-Qwen3-4B-Instruct-2507 checkpoint; no current-SFT recipe is admitted. Tau
-current-SFT local-policy jobs 307433/307434 restored rollout replay and advanced
-through iteration 2, but the replacement recipe is not checked in and downstream
-job 307463 failed every episode before terminal state. Older Tau jobs that
-imported removed module layouts remain historical checkpoint-mechanism evidence
-only.
+Qwen3-4B-Instruct-2507 checkpoint. A Step4000 Qwen3-4B replacement recipe now
+uses the pinned Pivot source, but its fresh/resume and held-out GPU checks are
+still pending. Tau v3 remains evaluation-only. The maintained stateful training
+path uses the external AReaL Tau2 RL split with multi-turn `inflight` event-log
+replay; it restores active episodes at an agent boundary and still needs a
+current fresh/resume GPU proof. Older Tau jobs remain historical checkpoint-
+mechanism evidence outside that recipe.
 Structured output, Calendar, and Workplace have CPU verifier evidence but no
 dedicated current GPU forward/backward+resume pair. Conversion success must not
 be reported as this missing evidence. `BrokenPipeError` lines at the end of the

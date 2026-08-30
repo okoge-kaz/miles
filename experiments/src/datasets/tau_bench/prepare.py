@@ -1,147 +1,106 @@
-"""Prepare held-out Tau Bench tasks and a Nemotron agentic training blend."""
+"""Materialize the pinned held-out Tau three evaluation split."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import os
-import random
 import tempfile
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from experiments.src.environments.tau_bench.compat import install_litellm_import_stub
 from experiments.src.environments.tau_bench.task_identity import (
     TAU_COMMIT,
-    _task_digest,
-    _task_dict,
-    validate_task_identity,
+    TAU_DOMAINS,
+    TAU_RELEASE,
+    TAU_VERIFIER,
+    task_digest,
+    task_dict,
 )
 
-TAU_SPLITS = (("retail", "train"), ("retail", "test"), ("airline", "test"))
+EXPECTED_COUNTS = {
+    ("retail", "train"): 74,
+    ("retail", "test"): 40,
+    ("retail", "base"): 114,
+    ("airline", "train"): 30,
+    ("airline", "test"): 20,
+    ("airline", "base"): 50,
+    ("telecom", "train"): 74,
+    ("telecom", "test"): 40,
+    ("telecom", "base"): 114,
+}
+
+NON_EVAL_OUTPUTS = tuple(
+    [
+        f"tau3-{domain}-{split}-miles.jsonl"
+        for domain in TAU_DOMAINS
+        for split in ("train", "base")
+    ]
+    + [f"tau3-{split}-miles.jsonl" for split in ("train", "base")]
+)
 
 
-def load_tau_rows(env_name: str, split: str, *, eval_only: bool) -> list[dict[str, Any]]:
-    """Load one official Tau split through its pinned environment package."""
+def _load_tasks(domain: str, split: str) -> list[Any]:
+    # Tau three is an optional, container-pinned runtime dependency.
+    from tau2.runner.helpers import load_tasks
 
-    install_litellm_import_stub()
-    from tau_bench.envs import get_env
+    return load_tasks(task_set_name=domain, task_split_name=split)
 
-    env = get_env(
-        env_name=env_name,
-        user_strategy="human",
-        user_model="offline",
-        task_split=split,
-        task_index=0,
-    )
-    rows = []
-    for index, task in enumerate(env.tasks):
-        task_data = _task_dict(task)
-        rows.append(
-            {
-                "prompt": [
-                    {
-                        "role": "user",
-                        "content": f"Run the stateful Tau Bench {env_name} task {index}.",
-                    }
-                ],
-                "label": "official Tau Bench state transition and output checks",
-                "metadata": {
-                    "source": f"tau-bench-{env_name}",
-                    "verifier": "tau_bench_environment",
-                    "tau_env": env_name,
-                    "tau_split": split,
-                    "tau_task_index": index,
-                    "tau_task_sha256": _task_digest(task_data),
-                    "tau_commit": TAU_COMMIT,
-                    "eval_only": eval_only,
-                },
-            }
+
+def load_tau_rows(domain: str, split: str) -> list[dict[str, Any]]:
+    """Load one official split and convert it to Miles prompt metadata."""
+
+    tasks = _load_tasks(domain, split)
+    expected = EXPECTED_COUNTS[(domain, split)]
+    if len(tasks) != expected:
+        raise ValueError(
+            f"Tau three {domain}/{split} has {len(tasks)} tasks, expected {expected}; "
+            "update the release pin and count contract together"
         )
-    return rows
-
-
-def _reset_environment(env: Any, task_index: int) -> Any:
-    task = env.tasks[task_index]
-    env.task_index = task_index
-    env.task = task
-    env.data = env.data_load_func()
-    env.actions = []
-    return task
-
-
-def _official_reward(env: Any, task_index: int, actions: Iterable[Any]) -> float:
-    _reset_environment(env, task_index)
-    for action in actions:
-        env.step(action)
-    return float(env.calculate_reward().reward)
-
-
-def partition_reward_verified_rows(
-    rows: Iterable[dict[str, Any]], env: Any
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Keep tasks whose official reward accepts ground truth but rejects no-op."""
-
-    verified = []
-    rejected = []
-    for row in rows:
-        metadata = row.get("metadata") or {}
-        task_index = int(metadata["tau_task_index"])
-        task = env.tasks[task_index]
-        validate_task_identity(metadata, task)
-
-        no_op_reward = _official_reward(env, task_index, ())
-        ground_truth_reward = _official_reward(env, task_index, task.actions)
-        reward_audit = {
-            "no_op_reward": no_op_reward,
-            "ground_truth_reward": ground_truth_reward,
+    eval_only = split == "test"
+    return [
+        {
+            "prompt": [
+                {
+                    "role": "user",
+                    "content": f"Run the stateful Tau three {domain} task {task.id}.",
+                }
+            ],
+            "label": "official Tau three terminal reward",
+            "metadata": {
+                "source": f"tau3-{domain}",
+                "verifier": TAU_VERIFIER,
+                "tau_domain": domain,
+                "tau_split": split,
+                "tau_task_id": str(task.id),
+                "tau_task_sha256": task_digest(task_dict(task)),
+                "tau_release": TAU_RELEASE,
+                "tau_commit": TAU_COMMIT,
+                "eval_only": eval_only,
+                "official_compat_only": split == "base",
+            },
         }
-        if ground_truth_reward != 1.0:
-            raise ValueError(f"Tau task {task_index} rejects its official ground-truth trajectory")
-        if no_op_reward != 0.0:
-            rejected.append({"task_index": task_index, **reward_audit})
-            continue
+        for task in tasks
+    ]
 
-        verified_metadata = {
-            **metadata,
-            "tau_reward_verified": True,
-            "tau_reward_audit": reward_audit,
+
+def validate_split_contract(rows_by_split: dict[tuple[str, str], list[dict[str, Any]]]) -> None:
+    """Ensure held-out task IDs are disjoint and base is their exact union."""
+
+    for domain in TAU_DOMAINS:
+        ids = {
+            split: {
+                str(row["metadata"]["tau_task_id"])
+                for row in rows_by_split[(domain, split)]
+            }
+            for split in ("train", "test", "base")
         }
-        verified.append({**row, "metadata": verified_metadata})
-    return verified, rejected
-
-
-def _read_jsonl(path: Path) -> Iterator[dict[str, Any]]:
-    with path.open(encoding="utf-8") as handle:
-        for line_number, line in enumerate(handle, start=1):
-            if not line.strip():
-                continue
-            row = json.loads(line)
-            if not isinstance(row, dict):
-                raise ValueError(f"{path}:{line_number}: expected a JSON object")
-            yield row
-
-
-def reservoir_sample(path: Path, count: int, seed: int) -> list[dict[str, Any]]:
-    """Select a reproducible unbiased sample without loading the source file."""
-
-    rng = random.Random(seed)
-    selected: list[dict[str, Any]] = []
-    seen = 0
-    for seen, row in enumerate(_read_jsonl(path), start=1):
-        metadata = row.get("metadata") or {}
-        if metadata.get("eval_only") is True:
-            raise ValueError(f"training source contains eval_only row: {path}:{seen}")
-        if len(selected) < count:
-            selected.append(row)
-            continue
-        replacement = rng.randrange(seen)
-        if replacement < count:
-            selected[replacement] = row
-    if seen < count:
-        raise ValueError(f"{path} has {seen} rows; cannot sample {count}")
-    return selected
+        overlap = ids["train"] & ids["test"]
+        if overlap:
+            raise ValueError(f"Tau three {domain} train/test overlap: {sorted(overlap)}")
+        if ids["base"] != ids["train"] | ids["test"]:
+            raise ValueError(f"Tau three {domain} base is not the train/test union")
 
 
 def _write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> int:
@@ -162,81 +121,72 @@ def _write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> int:
     return count
 
 
-def prepare(args: argparse.Namespace) -> dict[str, Any]:
-    output_dir = Path(args.output_dir)
-    split_rows: dict[tuple[str, str], list[dict[str, Any]]] = {}
+def _write_json(path: Path, value: dict[str, Any]) -> None:
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_name, path)
+    except BaseException:
+        Path(temporary_name).unlink(missing_ok=True)
+        raise
+
+
+def _remove_non_eval_outputs(output_dir: Path) -> None:
+    """Remove exact Tau train/base artifacts from the evaluation directory."""
+
+    for name in NON_EVAL_OUTPUTS:
+        (output_dir / name).unlink(missing_ok=True)
+
+
+def prepare(output_dir: Path) -> dict[str, Any]:
+    """Validate all official splits, but write only held-out test tasks."""
+
+    rows_by_split = {
+        (domain, split): load_tau_rows(domain, split)
+        for domain in TAU_DOMAINS
+        for split in ("train", "test", "base")
+    }
+    validate_split_contract(rows_by_split)
+    _remove_non_eval_outputs(output_dir)
+
     counts: dict[str, int] = {}
-    for env_name, split in TAU_SPLITS:
-        rows = load_tau_rows(env_name, split, eval_only=split != "train")
-        split_rows[(env_name, split)] = rows
-        output = output_dir / f"tau1-{env_name}-{split}-miles.jsonl"
-        counts[output.name] = _write_jsonl(output, rows)
-
-    tau_train = split_rows[("retail", "train")]
-    if len(tau_train) != args.expected_tau_rows:
-        raise ValueError(
-            f"Tau retail train has {len(tau_train)} rows, expected {args.expected_tau_rows}; "
-            "change --expected-tau-rows explicitly if the pinned task set changes"
-        )
-
-    install_litellm_import_stub()
-    from tau_bench.envs import get_env
-
-    retail_env = get_env(
-        env_name="retail",
-        user_strategy="human",
-        user_model="offline",
-        task_split="train",
-        task_index=0,
-    )
-    verified_tau_train, rejected_tau_train = partition_reward_verified_rows(tau_train, retail_env)
-    verified_output = output_dir / "tau1-retail-train-reward-verified-miles.jsonl"
-    counts[verified_output.name] = _write_jsonl(verified_output, verified_tau_train)
-
-    rows_per_source = len(verified_tau_train)
-    if rows_per_source == 0:
-        raise ValueError("no Tau retail tasks passed official reward verification")
-    conv_rows = reservoir_sample(Path(args.conv_tooluse), rows_per_source, args.seed)
-    fncall_rows = reservoir_sample(Path(args.fncall_pivot), rows_per_source, args.seed + 1)
-    mixed_rows = [*verified_tau_train, *conv_rows, *fncall_rows]
-    random.Random(args.seed + 2).shuffle(mixed_rows)
-    mixed_output = output_dir / "nemotron3-agentic-tau-retail-train.jsonl"
-    counts[mixed_output.name] = _write_jsonl(mixed_output, mixed_rows)
+    for domain in TAU_DOMAINS:
+        path = output_dir / f"tau3-{domain}-test-miles.jsonl"
+        rows = rows_by_split[(domain, "test")]
+        counts[path.name] = _write_jsonl(path, rows)
+    combined = [row for domain in TAU_DOMAINS for row in rows_by_split[(domain, "test")]]
+    path = output_dir / "tau3-test-miles.jsonl"
+    counts[path.name] = _write_jsonl(path, combined)
 
     summary = {
+        "tau_release": TAU_RELEASE,
         "tau_commit": TAU_COMMIT,
-        "expected_tau_rows": args.expected_tau_rows,
-        "rows_per_source": rows_per_source,
-        "seed": args.seed,
         "counts": counts,
-        "tau_reward_audit": {
-            "accepted": rows_per_source,
-            "rejected": len(rejected_tau_train),
-            "rejected_tasks": rejected_tau_train,
-        },
-        "mixed_sources": {
-            "tau-bench-retail-reward-verified": rows_per_source,
-            "nemotron-conversational-tool-use": len(conv_rows),
-            "nemotron-function-calling-pivot": len(fncall_rows),
+        "evaluation_policy": {
+            "benchmark_split": "test",
+            "base_contains_training_tasks": True,
+            "train_and_base_materialized": False,
+            "training_dataset": "inclusionAI/AReaL-tau2-data",
+            "training_split": "tau2_rl_train.jsonl",
+            "training_environment": "stateful_multi_turn_user_simulator_environment",
         },
     }
-    summary_path = output_dir / "prepare-summary.json"
-    _write_jsonl(summary_path, [summary])
+    _write_json(output_dir / "prepare-summary.json", summary)
     return summary
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--conv-tooluse", required=True)
-    parser.add_argument("--fncall-pivot", required=True)
-    parser.add_argument("--expected-tau-rows", type=int, default=500)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--output-dir", type=Path, required=True)
     return parser.parse_args()
 
 
 def main() -> None:
-    summary = prepare(parse_args())
+    summary = prepare(parse_args().output_dir)
     print(json.dumps(summary, indent=2, sort_keys=True))
 
 

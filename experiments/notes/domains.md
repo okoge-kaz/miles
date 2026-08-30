@@ -11,7 +11,7 @@ or as evidence for the current Qwen3-4B Base recipes.
 | Shape | Current tasks | What runs after generation | Replay implication |
 |---|---|---|---|
 | Static local verifier | Math, MCQA/GPQA, Reasoning Gym, IFEvalG, JSON Schema, exact next tool action, Calendar | deterministic parser/scorer; code additionally launches a local sandbox | inflight replay can be considered after a real fresh/resume proof |
-| Stateful local environment | Tau | a policy action changes episode state and produces a loss-masked observation before generation resumes | begin with completed-rollout replay; inflight state requires explicit environment snapshot semantics |
+| Stateful local environment | AReaL Tau2 training; Tau v3 evaluation | a policy action changes episode state and produces a user/tool observation before generation resumes | AReaL serializes an agent-boundary event log for `inflight` continuation; Tau v3 is evaluation-only |
 | External execution sandbox/service | full SWE; future Lean/browser/desktop work | repository/compiler/VM state plus a clean terminal grader | replay must pin the image, task, grader, and any restorable environment artifact |
 
 Search-R1 is multi-turn but read-only: an action issues a retrieval query and the
@@ -33,11 +33,12 @@ remain static single-step RLVR.
 | STEM | Knowledge-MCQA + Reasoning Gym; `experiments.src.reward_sets.stem.reward` permits `gpqa`, `mcqa_regex`, and `reasoning_gym` | per-row MCQA regex/letter scoring or the pinned Reasoning Gym task scorer | jobs 306790/306792 completed the current same-identity fresh+resume gate: iteration 0 plus `replay_buffer_0` was restored, optimizer step 1 ran, and iteration 1 plus `replay_buffer_1` was published |
 | Math+Code+STEM | balanced JSONL; `experiments.src.reward_sets.math_code_stem.reward` permits only `math`, `python_code`, `mcqa_regex`, and `reasoning_gym` | route each row by `metadata.verifier`, group a reward batch by verifier, score groups concurrently, and restore original order | jobs 306793/306796 completed the current 4-node, 16K, n=16 fresh/resume gate. The resume restored iteration 0 and replay state (15 pending, 3 ready, 6 inflight groups, and one prepared batch), trained step 1, and published iteration 1 plus `replay_buffer_1` |
 | IFEvalG | Nemotron instruction following; `experiments.src.reward_sets.instruction_following.reward` | pinned Open-Instruct IFEvalG registry, hidden-thinking removal, mean constraint satisfaction | current jobs 306686/306687 completed a 4-node, 16K, n=16 fresh+resume pair with inflight replay; iteration 0 restored and iteration 1 advanced |
-| Exact tool action | balanced function-call-only split; `experiments.src.reward_sets.tool_call.reward` | exactly one expected tool call, exact tool and argument keys, normalized scalar values | jobs 306920/306921 proved 16K, n=16 inflight replay/resume for the verifier, but used the retired Qwen3-4B-Instruct-2507 checkpoint. That recipe is now fail-closed, so the current SFT model still needs a replacement recipe, fresh/resume validation, and held-out evaluation |
-| Tau Bench | pinned Tau v1 task identities; `experiments.src.environments.tau_bench.generator.generate` plus `experiments.src.reward_sets.tau.reward` | execute official state transitions, append user/tool observations with loss mask zero, use the terminal environment reward | current-SFT local-policy jobs 307433/307434 completed 16K, n=16 rollout replay/resume: the second restored iteration 1 plus 6 pending, 2 ready, 2 regenerated active groups, and one prepared batch, then saved iteration 2. The replacement SFT recipe is not yet committed, and downstream evaluation still fails, so Tau is not an effectiveness result |
+| `tool_call_pivot` (static single-turn) | 63,559 NVIDIA conversational tool-use Pivot function calls; `experiments.src.reward_sets.tool_call_pivot.reward` | exactly one expected tool call, exact tool and argument keys, normalized scalar values; no tool execution or environment transition | Step4000 Qwen3-4B, 16K, n=16, four-node recipe and 2,000-row held-out evaluator are implemented; current-SFT fresh/resume and downstream GPU evidence remain pending |
+| AReaL Tau2 | 1,982 external RL tasks plus nine DB snapshots; `experiments.src.environments.areal_tau2.generator.generate` | official user simulator, isolated live DB, and terminal DB/environment/action/communication reward according to each task | CPU job 331861 passed 328 tests, all-row identity checks, and real mutating event-log/DB-hash restoration; six-epoch/RBS-63/n=16 GPU fresh/resume proof remains pending |
+| Tau v3 | held-out v1.0.1 test tasks; `experiments.src.evaluators.tau_bench` | execute official DB state transitions with the user simulator and use the terminal environment reward | evaluation-only; official Tau v3 train/base artifacts remain absent |
 | Calendar | converted expected calendar state; `experiments.src.environments.calendar.verifier.score_calendar_response` | require the complete event set, exact durations, allowed windows/constraints, and global non-overlap | job 305108 solved and locally verified all 9,915 converted rows; official-grader parity and GPU RL are not proved |
-| Workplace | `experiments.src.environments.workplace.runtime` and `.verifier` | isolated fixture state, multiple tool calls, terminal state comparison | runtime/verifier correctness tests exist, but no Workplace custom-generate entry point is checked in; GPU training, resume, and production lifecycle are therefore unverified |
-| Full SWE | Harbor/E2B candidates and source-specific graders | agent edits in one sandbox; apply the captured patch and run task tests in a separate clean grader sandbox | implementation/contracts exist, but zero rows have passed live E2B admission and no 4-node RL/downstream result exists |
+| Workplace (single-turn multi-step) | `experiments.src.environments.workplace.generator`, `.runtime`, and `.verifier` | one user request, multiple model/tool steps in an isolated fixture, and final-state comparison | local generator/runtime/verifier tests exist; GPU training, resume, and production lifecycle are unverified |
+| Full SWE | 32,033 normalized SWE-ReBench V2 and 2,438 SWE-Gym candidates plus source-specific graders | agent edits in one sandbox; apply the captured patch and run task tests in a separate clean grader sandbox | Step4000 Qwen3-4B recipe and admission contracts exist, but zero rows have passed live E2B admission and no 4-node RL/downstream result exists |
 
 Recipe-specific reward modules reject unexpected verifier ids. The broad
 `experiments.src.reward_sets.all_domains` module is for conversion diagnostics,
@@ -81,26 +82,25 @@ it is not an independent CPU environment worker pool.
 
 ## Tau and the user simulator
 
-The checked-in Tau generator supports two user-simulator backends:
+Training uses only the pinned 1,982-row AReaL Tau2 RL split, not official Tau v3
+train/base tasks. Each rollout creates the row's DB snapshot, runs the official
+Tau2 user simulator, executes policy tool calls, and scores the completed
+trajectory against its task criteria. The training adapter rejects natural-
+language-judge reward and permits only deterministic DB, environment assertion,
+expert action, and communication components. `REPLAY_BUFFER_TYPE=inflight`
+stores the policy token prefix plus the official message history, DB hashes,
+and step/error counters. Resume replays mutating calls, verifies history and DB
+identity, restores prior simulator history, and prefills the policy prefix.
 
-- `TAU_USER_BACKEND=local-policy` uses the same local SGLang checkpoint and
-  needs no external API key;
-- `TAU_USER_BACKEND=gemini` defaults to `gemini-2.5-flash-lite` and requires
-  `GEMINI_API_KEY` to be exported into the submitted job environment.
+Tau v3 remains the held-out downstream evaluation. Its evaluator accepts only
+official `test` rows. Both paths use either the verified NVIDIA-hosted Gemini
+endpoint or direct Gemini, selected by `TAU_USER_PROVIDER`; credentials are
+allowlisted at the Slurm job boundary. Official Tau v3 train/base tasks are not
+materialized or accepted by the evaluator.
 
-Secrets must be present at the Slurm job boundary; the Python environment code
-does not discover or parse dotenv files. The local-policy backend is sufficient
-for cluster bring-up and controlled pre/post comparisons, but it is not directly
-comparable with a Tau leaderboard run that uses a different user simulator. The
-Gemini path exists in the checked-in generator and evaluator; it must not be
-called validated until both an evaluation and an RL optimizer update actually
-complete with that backend.
-
-Jobs 307433/307434 used the local-policy backend. Downstream job 307463 attempted
-eight episodes and rejected the result because all eight failed before reaching
-a terminal state (`mean_reward=0`). This is a fail-closed evaluator result, not a
-zero-quality benchmark score. It proves neither Tau effectiveness nor that a
-specialized SFT is unnecessary.
+The static NVIDIA conversational tool-use Pivot recipe remains a separate
+single-step next-action experiment. It does not execute Tau tools or update a
+Tau database.
 
 IFBench does not require Gemini. Its released 300-prompt test set is generated
 with the policy checkpoint and scored offline by the pinned IFBench constraints.

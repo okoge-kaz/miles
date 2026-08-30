@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=miles-import-image
-#SBATCH --partition=cpu_interactive
+#SBATCH --partition=cpu
+#SBATCH --qos=cpu-interactive
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32

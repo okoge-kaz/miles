@@ -14,13 +14,15 @@ RECIPES = (
     "experiments/scripts/instruction_following/async/nemotron3-nano-ifevalg/qwen3-4b",
     "experiments/scripts/multi_env/async/math-code-stem/qwen3-4b",
     "experiments/scripts/stem/async/nemotron3-nano-knowledge-mcqa-reasoning-gym/qwen3-4b",
+    "experiments/scripts/tool_call_pivot/async/nemotron-agentic-conv-tooluse-pivot/qwen3-4b",
 )
-RECIPE_IDS = ("code", "instruction-following", "math-code-stem", "stem")
+RECIPE_IDS = ("code", "instruction-following", "math-code-stem", "stem", "tool_call_pivot")
 CUSTOM_RM_PATHS = {
     RECIPES[0]: "experiments.src.reward_sets.code.reward",
     RECIPES[1]: "experiments.src.reward_sets.instruction_following.reward",
     RECIPES[2]: "experiments.src.reward_sets.math_code_stem.reward",
     RECIPES[3]: "experiments.src.reward_sets.stem.reward",
+    RECIPES[4]: "experiments.src.reward_sets.tool_call_pivot.reward",
 }
 
 
@@ -238,6 +240,24 @@ def test_domain_recipe_keeps_runtime_safety_contracts(recipe_dir: str):
         "bash /root/miles/experiments/common/run_with_efa_env.sh",
     ):
         assert efa_contract in run_script
+
+
+def test_tool_call_pivot_recipe_uses_current_sft_and_pinned_dataset() -> None:
+    recipe_dir = RECIPES[4]
+    run_script = _read(f"{recipe_dir}/run.sbatch")
+    train_script = _read(f"{recipe_dir}/train.sh")
+
+    assert "TASK_FAMILY=tool_call_pivot" in run_script
+    assert "readonly ROLLOUT_SEMANTICS=static_single_turn_pivot" in run_script
+    assert "tool_call_pivot rejects custom multi-turn generation" in train_script
+    assert "--custom-generate-function-path" not in train_script
+    assert "Qwen3-4B-Instruct-2507" not in run_script
+    assert 'MODEL_NAME:=Qwen3-4B-Base-LR2e-5-Step4000' in run_script
+    assert 'HF_MODEL_NAME:=iter_0004000' in run_script
+    assert (
+        "PROMPT_DATA=/data/nemotron-agentic-conv-tooluse-pivot/"
+        "nemotron-agentic-conv-tooluse-pivot-train.jsonl"
+    ) in run_script
 
 
 @pytest.mark.parametrize(

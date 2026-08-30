@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=merge-pr-qwen3-4b-step4000
-#SBATCH --partition=cpu_interactive
+#SBATCH --partition=cpu
+#SBATCH --qos=cpu-interactive
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8

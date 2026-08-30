@@ -64,6 +64,9 @@ for split, expected_rows, eval_only in (("train", 1255, False), ("validation", 5
             row = json.loads(line)
             metadata = row["metadata"]
             assert metadata["verifier"] == "workplace_environment", (path, line_number)
+            assert metadata["interaction_mode"] == "single_turn_multi_step_environment", (path, line_number)
+            assert metadata["conversation_turns"] == 1, (path, line_number)
+            assert metadata["stateful_environment"] is True, (path, line_number)
             assert metadata["eval_only"] is eval_only, (path, line_number)
             assert json.loads(row["label"]) == metadata["expected_actions"]
             assert row["tools"]

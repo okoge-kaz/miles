@@ -7,7 +7,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from experiments.src.reward_sets import code, instruction_following, math_code_stem, stem, tau, tool_call
+from experiments.src.reward_sets import (
+    code,
+    instruction_following,
+    math_code_stem,
+    stem,
+    tool_call_pivot,
+)
 from miles.utils.types import Sample
 
 
@@ -43,7 +49,7 @@ def test_stem_reward_supports_scalar_and_mixed_batch_in_input_order(monkeypatch)
 
 @pytest.mark.parametrize(
     "reward_module",
-    [code, instruction_following, math_code_stem, stem, tau, tool_call],
+    [code, instruction_following, math_code_stem, stem, tool_call_pivot],
 )
 def test_each_reward_set_preserves_scalar_and_batch_contract(monkeypatch, reward_module):
     verifier = next(iter(reward_module.ALLOWED_VERIFIERS))
@@ -67,8 +73,7 @@ def test_each_reward_set_preserves_scalar_and_batch_contract(monkeypatch, reward
         (instruction_following.reward, {"ifeval_g"}),
         (math_code_stem.reward, {"math", "python_code", "mcqa_regex", "reasoning_gym"}),
         (stem.reward, {"mcqa_regex", "reasoning_gym", "gpqa"}),
-        (tau.reward, {"expert_action"}),
-        (tool_call.reward, {"expert_action"}),
+        (tool_call_pivot.reward, {"expert_action"}),
     ],
 )
 def test_reward_sets_fail_closed_before_calling_a_handler(monkeypatch, reward_function, allowed_verifiers):
@@ -92,9 +97,12 @@ def test_reward_sets_fail_closed_before_calling_a_handler(monkeypatch, reward_fu
     assert called is False
 
 
-def test_tool_call_reward_accepts_only_exact_function_call():
+def test_tool_call_pivot_reward_accepts_only_exact_function_call():
     metadata = {
         "verifier": "expert_action",
+        "source": "conv-tooluse-pivot",
+        "interaction_mode": "static_single_turn_pivot",
+        "stateful_environment": False,
         "expected_action": {"type": "function_call", "name": "search", "arguments": '{"q":"miles"}'},
     }
     correct = Sample(
@@ -106,7 +114,27 @@ def test_tool_call_reward_accepts_only_exact_function_call():
         metadata=metadata,
     )
 
-    assert _run_reward(tool_call.reward, [correct, wrong]) == [1.0, 0.0]
+    assert _run_reward(tool_call_pivot.reward, [correct, wrong]) == [1.0, 0.0]
+
+
+def test_tool_call_pivot_reward_rejects_stateful_samples():
+    sample = Sample(
+        response='<tool_call>{"name":"search","arguments":{"q":"miles"}}</tool_call>',
+        metadata={
+            "verifier": "expert_action",
+            "source": "conv-tooluse-pivot",
+            "interaction_mode": "static_single_turn_pivot",
+            "stateful_environment": True,
+            "expected_action": {
+                "type": "function_call",
+                "name": "search",
+                "arguments": '{"q":"miles"}',
+            },
+        },
+    )
+
+    with pytest.raises(ValueError, match="rejects stateful"):
+        _run_reward(tool_call_pivot.reward, sample)
 
 
 @pytest.mark.parametrize(
@@ -148,17 +176,7 @@ def test_tool_call_reward_accepts_only_exact_function_call():
             ),
         ),
         (
-            "experiments.src.reward_sets.tool_call",
-            (
-                "experiments.src.environments.competitive_programming.verifier",
-                "experiments.src.environments.instruction_following.verifier",
-                "experiments.src.environments.reasoning_gym.verifier",
-                "experiments.src.environments.calendar.verifier",
-                "experiments.src.environments.workplace.runtime",
-            ),
-        ),
-        (
-            "experiments.src.reward_sets.tau",
+            "experiments.src.reward_sets.tool_call_pivot",
             (
                 "experiments.src.environments.competitive_programming.verifier",
                 "experiments.src.environments.instruction_following.verifier",

@@ -369,7 +369,10 @@ def test_swe_evaluator_rejects_conflicting_duplicate_digest(tmp_path) -> None:
 
 def test_swe_slurm_exports_only_fixed_required_environment_names() -> None:
     repository = Path(__file__).parents[3]
-    recipe = repository / "experiments/scripts/swe/async/r2e-gym-swe-rebench-v2/qwen3-4b-instruct-2507/run.sbatch"
+    recipe = (
+        repository
+        / "experiments/scripts/swe/async/swe-rebench-v2-swe-gym/qwen3-4b/run.sbatch"
+    )
     train = recipe.with_name("train.sh")
     evaluation = repository / "experiments/scripts/swe/eval/swebench-verified/run.sbatch"
     recipe_text = recipe.read_text(encoding="utf-8")
@@ -428,10 +431,12 @@ def test_swe_slurm_exports_only_fixed_required_environment_names() -> None:
 def test_swe_rebench_selector_does_not_silently_alias_full_to_filtered() -> None:
     recipe = (
         Path(__file__).parents[3]
-        / "experiments/scripts/swe/async/r2e-gym-swe-rebench-v2/qwen3-4b-instruct-2507/run.sbatch"
+        / "experiments/scripts/swe/async/swe-rebench-v2-swe-gym/qwen3-4b/run.sbatch"
     ).read_text(encoding="utf-8")
 
-    assert ': "${SWE_DATASET:=swe-rebench-v2-filtered-verified}"' in recipe
+    assert ': "${SWE_DATASET:=swe-rebench-v2}"' in recipe
+    assert "Qwen3-4B-Instruct-2507" not in recipe
+    assert "MODEL_NAME=Qwen3-4B-Base-LR2e-5-Step4000" in recipe
     assert re.search(
         r"swe-rebench-v2\)\s+DATASET_TAG=swe-rebench-v2\s+;;",
         recipe,

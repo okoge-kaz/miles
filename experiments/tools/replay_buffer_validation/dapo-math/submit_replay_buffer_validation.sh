@@ -124,7 +124,7 @@ submit_phase() {
     [[ -n "${dependency_job}" ]] && dependency=(--dependency="afterok:${dependency_job}")
     sbatch --parsable \
         -A "${ACCOUNT}" \
-        -p interactive \
+        -p batch --qos=interactive \
         --nodes=2 \
         --time="${wall}" \
         --job-name="${job_name}" \
@@ -156,7 +156,7 @@ manifest="${manifest_dir}/${VALIDATION_NAMESPACE}.jobs"
 summary="${manifest_dir}/${VALIDATION_NAMESPACE}.md"
 summary_job="$(sbatch --parsable \
     -A "${ACCOUNT}" \
-    -p cpu_interactive \
+    -p cpu --qos=cpu-interactive \
     --dependency="afterany:${inflight_resume_job}" \
     --job-name=rbv-summary \
     --export="ALL,VALIDATION_MANIFEST=${manifest},VALIDATION_SUMMARY=${summary}" \

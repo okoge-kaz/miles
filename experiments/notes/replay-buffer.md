@@ -43,9 +43,18 @@ token boundary is consistent before prefill.
 This is semantic continuation, not bitwise continuation. The resumed request
 has a fresh KV cache and inference RNG state, and can run after a policy-weight
 update. Its existing token provenance is retained and new provenance is
-appended. `inflight` is therefore currently restricted to the built-in
-single-turn generate function; custom generate functions fail argument
-validation. Use `rollout` for Search-R1 and other custom generators.
+appended. The built-in generator supports this contract directly. A custom
+generator is accepted only when it explicitly declares
+`supports_inflight_replay=True`; that declaration makes the generator
+responsible for serializing and validating any environment state that is not
+already represented by the `Sample` token prefix.
+
+The AReaL Tau2 generator is the stateful custom implementation. It captures at
+an agent boundary, stores the official message event log plus DB hashes and
+orchestrator counters, replays mutating DB calls through the pinned Tau2
+runtime, reconstructs old user/agent histories, and then prefills the saved
+policy prefix. Custom generators without such a continuation contract still
+fail argument validation; Search-R1 therefore remains on `rollout` replay.
 
 ## Failure and commit semantics
 
@@ -136,8 +145,8 @@ CONFIG_TAG=my-run-replay USE_REPLAY_BUFFER=1 REPLAY_BUFFER_TYPE=rollout sbatch \
   experiments/scripts/math/async/dapo-math-p10-90/qwen3-4b/run.sbatch
 ```
 
-Use `REPLAY_BUFFER_TYPE=inflight` for token-prefix continuation with the
-built-in single-turn generator. There is no maintained
+Use `REPLAY_BUFFER_TYPE=inflight` for the built-in token-prefix path or an
+explicitly capable custom generator. There is no maintained
 `experiments/verify_resume.sh`; validate a recipe with two real GPU jobs using
 the same deterministic identity. The first must update and save, and the second
 must restore the model, optimizer/RNG state, and matching replay artifact before

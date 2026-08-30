@@ -21,13 +21,16 @@ tests/slurm/       persistent cluster/container integration tests
 
 | File | Purpose |
 | --- | --- |
-| `download/download_dataset.sbatch` | Download one Hugging Face dataset and reject README-only gated downloads. |
+| `download/download_dataset.sbatch` | Download one optionally revision-pinned Hugging Face dataset, record provenance, and reject README-only gated downloads. |
 | `download/download_model.sbatch` | Download one Hugging Face model and write a completion marker. |
 | `download/download_git_dependency.sbatch` | Clone and optionally pin an external source checkout. |
 | `download/stage_all.sh` | Stage the generic model and dataset manifests. |
 | `download/stage_model.sh` | Download and convert one model from the model manifest. |
 | `download/stage_nemotron_rl_datasets.sh` | Stage the role-annotated Nemotron dataset manifest. |
+| `download/download_areal_tau2.sbatch` | Download only the pinned AReaL Tau2 RL tasks and nine DB snapshots. |
+| `download/stage_areal_tau2.sh` | Stage and validate the complete AReaL Tau2 user-simulator training input. |
 | `download/download_swe_datasets.sbatch` | Selectively fetch pinned Super SWE2, Ultra SWE, R2E-Gym, SWE-rebench V2, SWE-Gym, or SWE-bench Verified without downloading complete Nemotron blends. |
+| `download/stage_swe_tool_rl_datasets.sh` | Verify or stage the exact SWE-ReBench V2, SWE-Gym, and NVIDIA conversational tool-use Pivot revisions used by the RL recipes. |
 | `download/download_swe_verifiers.sbatch` | Fetch and checksum-pin the official R2E-Gym and SWE-rebench V2 parser modules. |
 
 The old `download_assets.sbatch` was removed. It hard-coded one model and two
@@ -57,7 +60,8 @@ datasets and was fully superseded by these manifest-driven jobs.
 | `datasets/prepare_performance_transfer_blends.sbatch` | Benchmark-safe competitive-code and STEM training blends. |
 | `datasets/prepare_math_code_stem_blend.sbatch` | Balanced Math/Code/STEM multi-environment blend. |
 | `datasets/prepare_math500.sbatch` | Convert the held-out MATH-500 split to canonical Miles JSONL. |
-| `datasets/prepare_tool_call_env.sbatch` | Disjoint function-call-only train/evaluation splits. |
+| `datasets/prepare_tool_call_pivot_env.sbatch` | Disjoint function-call-only Pivot train/evaluation splits. |
+| `datasets/prepare_agentic_tool_use_pivot.sbatch` | Convert the pinned conversational tool-use Pivot source, reserve 2,000 exact-action rows, and use all remaining eligible calls for RL. |
 | `datasets/build_math_jsonl.py` | Legacy raw-math JSONL adapter used by the math preparation job. |
 | `datasets/prepare_swe_rl.sbatch` | Split pinned SWE sources by executable schema into gold-free rows plus owner-only Harbor manifests; unsupported R2E/SWE-Gym rows remain quarantined. |
 
@@ -71,7 +75,8 @@ explicitly marked legacy math adapter is the remaining migration target.
 | --- | --- |
 | `environments/prepare_calendar_env.sbatch` | Convert Calendar v2 rows and preflight the local constraint verifier. |
 | `environments/prepare_workplace_local_env.sbatch` | Convert Workplace rows against pinned resource fixtures. |
-| `environments/prepare_tau_bench.sbatch` | Pin and convert Tau v1 tasks and build the Tau/Nemotron blend. |
+| `environments/prepare_tau_bench.sbatch` | Validate Tau three v1.0.1 splits and materialize only the held-out test tasks for evaluation. |
+| `environments/prepare_areal_tau2.sbatch` | Validate all 1,982 external Tau2 RL tasks/DBs and precompute gold terminal states. |
 | `environments/prepare_ifbench.sbatch` | Pin IFBench dependencies and build held-out evaluation data. |
 | `environments/prepare_search_r1.sbatch` | Assemble Search-R1 index, corpus, encoder, and benchmark data. |
 | `environments/prepare_ifeval_dependencies.sbatch` | Pin the IFEvalG dependency closure. |

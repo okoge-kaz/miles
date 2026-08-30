@@ -11,6 +11,7 @@ from typing import Any
 from experiments.src.datasets.common.io import read_rows, write_jsonl
 from experiments.src.environments.workplace.runtime import WORKPLACE_RESOURCE_COMMIT
 from experiments.src.protocols.openai_responses import to_chat_messages, to_chat_tools
+from experiments.src.protocols.workplace import WORKPLACE_INTERACTION_MODE
 
 
 def adapt_workplace(row: dict[str, Any], *, eval_only: bool) -> dict[str, Any]:
@@ -27,6 +28,9 @@ def adapt_workplace(row: dict[str, Any], *, eval_only: bool) -> dict[str, Any]:
         "metadata": {
             "source": "nemotron-workplace-assistant",
             "verifier": "workplace_environment",
+            "interaction_mode": WORKPLACE_INTERACTION_MODE,
+            "conversation_turns": 1,
+            "stateful_environment": True,
             "expected_actions": expected_actions,
             "task_id": row.get("id"),
             "category": row.get("category"),

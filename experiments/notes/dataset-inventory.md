@@ -89,13 +89,15 @@ out benchmark. Conversion jobs reject rows marked `metadata.eval_only=true`.
 | `/data/nemotron-performance-transfer/nemotron3-nano-knowledge-mcqa-reasoning-gym-train.jsonl` | 632,020 rows: 617,020 MCQA + 15,000 Reasoning Gym | `experiments.src.reward_sets.stem.reward` | jobs 306790/306792 completed the current same-identity fresh+resume gate, restoring iteration 0 and `replay_buffer_0`, advancing optimizer step 1, and publishing iteration 1 plus `replay_buffer_1` |
 | `/data/nemotron-performance-transfer/math-code-stem-balanced-train.jsonl` | 32,673 rows, exactly 10,891 per domain; STEM slice is 10,578 MCQA + 313 Reasoning Gym | `experiments.src.reward_sets.math_code_stem.reward` | jobs 306793/306796 completed the current 4-node, 16K, n=16 fresh/resume gate. The second restored iteration 0 plus 15 pending, 3 ready, and 6 inflight groups and one prepared batch, then published iteration 1 plus `replay_buffer_1` |
 | `/data/nemotron-rl-ifollow/miles-train.jsonl` | 46,391 IFEvalG rows | `experiments.src.reward_sets.instruction_following.reward` | jobs 306686/306687 completed a current-code fresh+resume pair with inflight replay; iteration 0 was restored and iteration 1 was trained/saved |
-| `/data/nemotron-agentic-tool-call/nemotron-agentic-tool-call-train.jsonl` | 9,400 exact-function-call rows, balanced 4,700 per source | `experiments.src.reward_sets.tool_call.reward` | jobs 306920/306921 completed 16K, n=16 inflight replay/resume, but on retired Qwen3-4B-Instruct-2507. The fail-closed legacy recipe is not current-SFT training evidence |
-| `/data/tau-bench/nemotron3-agentic-tau-retail-train.jsonl` | official Tau retail episodes plus deterministic Nemotron action rows | `experiments.src.reward_sets.tau.reward` and `experiments.src.environments.tau_bench.generator.generate` | current-SFT local-policy jobs 307433/307434 completed 16K, n=16 rollout replay/resume through iteration 2. The replacement SFT recipe is not yet committed and downstream evaluation has no successful episode |
+| `/data/nemotron-agentic-conv-tooluse-pivot/nemotron-agentic-conv-tooluse-pivot-train.jsonl` | Pinned NVIDIA conversational tool-use Pivot: 63,559 exact function-call rows after reserving 2,000 held-out calls; 31,409 message actions are excluded | `experiments.src.reward_sets.tool_call_pivot.reward` | Step4000 Qwen3-4B, 16K, n=16, four-node recipe is implemented; current-SFT fresh/resume and held-out GPU evidence remain pending |
+| `/data/areal-tau2-data/miles-tau2-rl-train.jsonl` | Pinned AReaL Tau2 RL-only split: 1,982 rows (1,148 airline, 563 retail, 271 telecom) plus nine source DB snapshots | `experiments.src.environments.areal_tau2.generator.generate` | CPU job 331861 passed 328 tests, all-row Task/DB checks, and real mutating event-log/DB-hash restore; six-epoch/RBS-63/n=16 recipe schedules 189 updates and 190,512 trajectories with `inflight` replay, but GPU fresh/resume evidence remains pending |
 
-The tool-call preparation job 306572 also wrote a disjoint 400-row held-out file
-at `/data/nemotron-agentic-tool-call/nemotron-agentic-tool-call-heldout.jsonl`
-(200 per source, zero overlap). Message-action rows are intentionally excluded
-because the current exact-action verifier cannot establish their semantics.
+The pinned Pivot source contains 96,968 rows: 65,559 exact function calls and
+31,409 free-form message actions. Preparation writes a deterministic,
+zero-overlap 2,000-row held-out file at
+`/data/nemotron-agentic-conv-tooluse-pivot/nemotron-agentic-conv-tooluse-pivot-heldout.jsonl`.
+Message-action rows are intentionally excluded because the exact-action
+verifier cannot establish their semantics.
 
 The maintained production-shaped recipes use four `batch` nodes with
 `qos=interactive`, a four-hour wall clock, 16,384 maximum response tokens, 192
@@ -135,13 +137,13 @@ IFBench, at each task's smoke repeat count. These are runner contracts, not full
 benchmark estimates; neither job establishes the current 64-repeat AIME default.
 See [offline-eval.md](offline-eval.md).
 
-Tau has its own held-out evaluator at
-`experiments/scripts/tau_bench/evaluate.sbatch`. It supports a local-policy user
-simulator and an explicitly selected Gemini backend. Current canonical Tau RL
-evidence used the local-policy backend. Python environment/evaluator modules do
-not parse dotenv files; credentials must be made available at the Slurm job
-boundary. Do not claim Gemini-based downstream comparability until both its RL
-and held-out evaluator jobs complete.
+Tau three v1.0.1 has its own held-out evaluator at
+`experiments/scripts/tau_bench/evaluate.sbatch`. Preparation validates the
+official train/test/base split contract but materializes only 100 test tasks
+(retail 40, airline 20, telecom 40). The runner accepts only these `eval_only`
+test rows. Official Tau v3 train/base artifacts remain absent. The separate
+training recipe uses only the external AReaL Tau2 RL split and its source DB
+snapshots; it does not consume the held-out Tau v3 evaluation file.
 
 ## Implemented but not admitted end to end
 
@@ -149,9 +151,9 @@ and held-out evaluator jobs complete.
 |---|---|---|
 | Structured output | JSON Schema converter and `reward_sets.structured_output` CPU checks | dedicated GPU forward/backward and resume |
 | Calendar | local converter, deterministic solver, and constraint verifier | official-grader parity is not established; GPU RL/replay/resume not run |
-| Workplace assistant | local runtime/verifier using pinned resource modules; no checked-in custom-generate entry point | implement the Miles policy/tool loop, add a bounded environment service/pool, and obtain GPU fresh/resume/replay evidence |
+| Workplace assistant (single-turn multi-step) | local policy/tool generator and runtime/verifier using pinned resource modules | add a bounded environment service/pool and obtain GPU fresh/resume evidence; it must not be reported as conversational multi-turn RL |
 | Search-R1 | consolidated dataset/retrieval environment code; job 307366 generated a two-prompt NQ/HotpotQA smoke and 307427 revalidated its data/services/protocol-matched artifacts | fixed-dataset current GPU training and a policy baseline that actually issues search calls; the smoke scored zero with no searches |
-| Full SWE | candidate normalization, Harbor/E2B admission and evaluator code | no rows have passed live E2B admission; no 4-node RL or official-comparable downstream result |
+| Full SWE | pinned SWE-ReBench V2 and SWE-Gym payloads, candidate normalization, Harbor/E2B admission and evaluator code | 32,033 ReBench and 2,438 SWE-Gym tasks normalized, but no rows have passed live E2B admission; no 4-node RL or official-comparable downstream result |
 | Lean proofs | 1,376,663 rows staged for proof data | pinned Lean/Mathlib execution sandbox, compile reward, GPU/replay validation |
 | Identity/adversarial IF/MultiTurnChat | source data staged | pinned judge/GenRM semantics and multi-turn loop where applicable |
 | Safety/GenRM/RLHF | source data staged | separate RM/DPO/GenRM pipeline; must not be relabeled as exact-match RLVR |

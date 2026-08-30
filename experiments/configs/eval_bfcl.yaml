@@ -1,0 +1,14 @@
+# BFCL AST evaluation. Stateful and live-API categories remain excluded.
+
+eval:
+  defaults:
+    n_samples_per_eval_prompt: 1
+    max_response_len: 16384
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+    tool_key: tools
+
+  datasets:
+    - name: bfcl_ast
+      path: /data/bfcl/bfcl-ast-miles.jsonl

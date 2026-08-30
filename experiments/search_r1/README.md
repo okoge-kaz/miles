@@ -4,38 +4,72 @@ For a destination-cluster checklist, including the B300/CUDA 13 and Enroot
 `.sqsh` qualification procedure, see
 [`CLUSTER_MIGRATION.md`](CLUSTER_MIGRATION.md).
 
-This directory contains the shared worker for two Qwen3-4B-Instruct-2507
-recipes:
+The maintained 4B recipe starts from the user's step-4000 SFT checkpoint:
 
-- `search_r1_sync/nq-hotpotqa-p10-90/qwen3-4b-instruct-2507`: one-node colocated
-  generation and training.
-- `search_r1_async/nq-hotpotqa-p10-90/qwen3-4b-instruct-2507`: one 8-GPU actor node
-  plus one 8-GPU rollout node, with TIS and replay-buffer resume enabled.
+- `search_r1/async/nq-hotpotqa-p10-90/qwen3-4b`: one 8-GPU actor
+  node plus one 8-GPU rollout node, with TIS and replay-buffer resume enabled.
 
-Both log to the W&B project `async-search-r1` and use the same prompt data,
-retriever, sampling settings, reward, optimizer, and TIS correction defaults.
-Submit them with:
+It logs to the W&B project `async-search-r1`. Submit it with:
 
 ```bash
 experiments/submit_training.sh \
-  search_r1_sync/nq-hotpotqa-p10-90/qwen3-4b-instruct-2507 search-r1-sync
-
-experiments/submit_training.sh \
-  search_r1_async/nq-hotpotqa-p10-90/qwen3-4b-instruct-2507 search-r1-async
+  search_r1/async/nq-hotpotqa-p10-90/qwen3-4b search-r1-async \
+  --qos=interactive
 ```
+
+All Search-R1 experiment entrypoints live in this directory; no compatibility
+copies are maintained elsewhere.
+
+For an end-to-end training validation on interactive nodes with no W&B network
+traffic, keep the production environment/reward path but limit the optimizer
+work to one accepted rollout batch:
+
+```bash
+experiments/submit_training.sh \
+  search_r1/async/nq-hotpotqa-p10-90/qwen3-4b search-r1-offline-smoke \
+  --qos=interactive --time=04:00:00 \
+  --export=ALL,WANDB_MODE=offline,NUM_ROLLOUT=1,ROLLOUT_BATCH_SIZE=4,N_SAMPLES_PER_PROMPT=2,GLOBAL_BATCH_SIZE=8,SAVE_INTERVAL=1
+```
+
+This still requires the fixed p10-90 prompt file; a smoke must not silently
+fall back to the raw, policy-dependent training population.
+
+## Held-out evaluation
+
+The evaluator under `evaluation/` reuses the training multi-turn generator,
+the local E5/FAISS retriever, and outcome-normalized exact match. It records
+exact match together with search calls, turns, truncation, generated tokens,
+and loss-masked observation tokens. Evaluation runs against immutable HF
+checkpoints outside the optimizer loop and forces W&B offline mode.
+
+Validate NQ and HotpotQA on two prompts each on an interactive node:
+
+```bash
+sbatch -A coreai_horizon_dilations -p batch --qos=interactive \
+  --export=ALL,WANDB_MODE=offline,EVAL_MODE=smoke \
+  experiments/search_r1/evaluation/run.sbatch
+```
+
+Set `EVAL_MODE=full` to run NQ, HotpotQA, TriviaQA, PopQA,
+2WikiMultiHopQA, MuSiQue, and Bamboogle. For a trained policy, point
+`MODEL_PATH` at its exported HF snapshot under `/ckpt/training`. Results and
+sampling provenance are written under `experiments/outputs/evaluation/search_r1`
+by default;
+the top-level `summary.json` contains per-benchmark and macro exact match plus
+the interaction-cost metrics. Reusing `RESULT_ROOT` resumes completed prompts;
+the provenance sidecar rejects a checkpoint or sampling mismatch.
 
 ## Current decision record
 
-| Axis | Committed default |
+| Axis | Maintained default |
 |---|---|
 | Tracking | W&B project `async-search-r1`; run name is the group |
-| Prompt population | One immutable Qwen3-4B-Instruct-2507 p10-90 offline-filtered set |
+| Prompt population | One immutable step-4000 SFT-policy p10-90 offline-filtered set |
 | Online filtering | None; no dynamic sampling, reward top-up, or abort-only top-up |
 | Optimizer | Adam, LR `5e-7`; first sweep `3e-7` / `5e-7` / `1e-6` |
 | Batch | 32 prompts, 8 samples per prompt, 256 trajectories per update |
 | Budget | 200-update gate, 1,600-update primary run, conditional extension to 3,000 |
 | Reward | Outcome normalized EM; format score 0; retrieved tokens loss-masked |
-| Sync placement | One 8-GPU colocated node |
 | Async placement | One 8-GPU trainer plus one 8-GPU rollout node, TIS enabled |
 | Async log-probs | Fused actor denominator; no reference forward at KL 0; behavior log-probs retained for TIS/alignment |
 | Async resume | Replay buffer (type `rollout`) is mandatory |
@@ -45,25 +79,27 @@ experiments/submit_training.sh \
 ## Fixed offline difficulty set
 
 Search-R1 does **not** use dynamic sampling or reward-dependent online
-filtering. Both placements read the same immutable
-`/data/searchr1-nq-hotpotqa/searchr1-nq-hotpotqa-p10-90.jsonl`; neither recipe
-passes `--dynamic-sampling-filter-path`. This keeps prompt distribution,
+filtering. The recipe reads the immutable
+`/data/searchr1-nq-hotpotqa/searchr1-nq-hotpotqa-p10-90-qwen3-4b-base-lr2e-5-step4000.jsonl`
+and does not pass
+`--dynamic-sampling-filter-path`. This keeps prompt distribution,
 generated trajectories per update, and rollout cost independent of the policy
 being compared.
 
-The filter matches the math convention. Run Qwen3-4B-Instruct-2507 eight times
-per raw prompt using the training protocol (temperature/top-p 1, 512 tokens per
-action, three turns, E5 top-k 3, outcome-only EM), then keep inclusive pass rate
-0.1--0.9. With eight samples this is exactly 1/8--7/8: only all-wrong and
-all-correct prompts are dropped. Difficulty is a property of this complete
-policy/sampling/retrieval tuple, so changing the model, max turns, retriever, or
-group size requires a new measured dataset tag.
+The filter matches the math convention. Run
+`Qwen3-4B-Base-LR2e-5-Step4000` eight times per raw prompt using the training
+protocol (temperature/top-p 1, 512 tokens per action, three turns, E5 top-k 3,
+outcome-only EM), then keep inclusive pass rate 0.1--0.9. With eight samples
+this is exactly 1/8--7/8: only all-wrong and all-correct prompts are dropped.
+Difficulty is a property of this complete policy/sampling/retrieval tuple, so
+changing the model, max turns, retriever, or group size requires a new measured
+dataset tag.
 
 Prepare the assets, validate the measurement path on 64 prompts, then run the
 resumable full measurement:
 
 ```bash
-sbatch -A coreai_horizon_dilations experiments/setup/prepare_search_r1.sbatch
+sbatch -A coreai_horizon_dilations experiments/setup/environments/prepare_search_r1.sbatch
 
 sbatch -A coreai_horizon_dilations --export=ALL,LIMIT=64 \
   experiments/tools/difficulty_filter/run_measure_search_r1.sbatch
@@ -98,7 +134,7 @@ using the raw 5,300-step value:
 
 ```bash
 source experiments/env.sh
-N=$(wc -l < "${DATASET_DIR}/searchr1-nq-hotpotqa/searchr1-nq-hotpotqa-p10-90.jsonl")
+N=$(wc -l < "${DATASET_DIR}/searchr1-nq-hotpotqa/searchr1-nq-hotpotqa-p10-90-qwen3-4b-base-lr2e-5-step4000.jsonl")
 echo "filtered rows=${N}, one-pass updates=$(( (N + 31) / 32 ))"
 ```
 
@@ -205,8 +241,8 @@ The recipes are ready for another Slurm cluster that provides Pyxis/Enroot,
 eight GPUs per requested node, a shared filesystem, and routable TCP between
 nodes. Override `SHARED_WS`, `WS`, `SQSH_IMAGE`, `SLURM_ACCOUNT_NAME`, and, when
 needed, `GPUS_PER_NODE` before submission. Stage assets with
-`experiments/setup/stage_all.sh` and
-`experiments/setup/prepare_search_r1.sbatch`, then materialize the policy-specific
+`experiments/setup/download/stage_all.sh` and
+`experiments/setup/environments/prepare_search_r1.sbatch`, then materialize the policy-specific
 fixed dataset with `experiments/tools/difficulty_filter/run_measure_search_r1.sbatch`.
 Copying the resulting JSONL and its pass-rate/meta artifacts is sufficient when
 the other cluster uses the same policy, tokenizer, E5 index/corpus, and sampling
@@ -221,8 +257,8 @@ only when imports are missing.
 
 An arbitrary non-Slurm or non-Pyxis cluster is not turnkey yet. It needs a
 launcher adapter that preserves `/root/miles`, `/data`, and `/ckpt` mounts, Ray
-head/worker discovery, the retriever port, one-node sync vs. two-node async GPU
-placement, and durable shared storage for the replay buffer. Before a long run,
+head/worker discovery, the retriever port, two-node async GPU placement, and
+durable shared storage for the replay buffer. Before a long run,
 perform a one-update smoke and verify the retriever's real `/retrieve` probe,
 valid tagged actions, non-empty search observations, W&B project, checkpoint,
 and replay-buffer restore.

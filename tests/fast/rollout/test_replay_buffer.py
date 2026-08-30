@@ -1269,15 +1269,16 @@ def test_dataset_fingerprint_includes_model_tokenizer_and_chat_template(tmp_path
     ("argument", "changed_value"),
     (
         ("tau_max_turns", 12),
-        ("tau_user_backend", "gemini"),
+        ("tau_max_steps", 80),
+        ("tau_user_provider", "gemini"),
         ("tau_user_model", "gemini-2.5-flash-lite"),
         ("tau_user_max_tokens", 256),
         ("tau_user_temperature", 0.5),
         ("tau_user_top_p", 0.9),
         ("tau_user_request_timeout", 30.0),
         ("tau_user_max_retries", 2),
-        ("tau_user_retry_backoff", 0.5),
         ("tau_tool_call_parser", "qwen25"),
+        ("tau_overlap_db_restore_with_prefill", True),
     ),
 )
 def test_dataset_fingerprint_includes_tau_environment_configuration(

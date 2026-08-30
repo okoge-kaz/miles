@@ -35,6 +35,9 @@ def test_workplace_conversion_is_deterministic_and_preserves_state_target():
 
     assert first == second
     assert first["metadata"]["verifier"] == "workplace_environment"
+    assert first["metadata"]["interaction_mode"] == "single_turn_multi_step_environment"
+    assert first["metadata"]["conversation_turns"] == 1
+    assert first["metadata"]["stateful_environment"] is True
     assert first["metadata"]["expected_actions"] == row["ground_truth"]
     assert first["metadata"]["workplace_resource_commit"] == WORKPLACE_RESOURCE_COMMIT
     assert first["metadata"]["runtime_dependency"] == (

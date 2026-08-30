@@ -23,10 +23,10 @@ HALF_PROMPTS=$(( TOTAL_PROMPTS / 2 ))
 
 submit_convert() {
     sbatch --parsable \
-        -A "${ACCOUNT}" -p interactive --time=04:00:00 \
+        -A "${ACCOUNT}" -p batch --qos=interactive --time=04:00:00 \
         --job-name=cv-qwen3-4b-base-step4000 \
         --export="ALL,HF_CKPT_DIR=${HF_CKPT_DIR},MODEL_NAME=${MODEL_NAME},HF_MODEL_NAME=${HF_MODEL_NAME},MEGATRON_MODEL_TYPE=qwen3-4B" \
-        experiments/setup/convert_checkpoint.sbatch
+        experiments/setup/models/convert_checkpoint.sbatch
 }
 
 filter_exports() {
@@ -42,7 +42,7 @@ submit_smoke() {
     local smoke_output="/data/difficulty/smoke/dapo-math-17k.${MODEL_NAME}.n16-len16384-zero-trunc.passrate.jsonl"
     local smoke_audit="/data/difficulty/smoke/dapo-math-17k.${MODEL_NAME}.n16-len16384-zero-trunc.audit.jsonl"
     sbatch --parsable \
-        -A "${ACCOUNT}" -p interactive --time=01:00:00 \
+        -A "${ACCOUNT}" -p batch --qos=interactive --time=01:00:00 \
         --job-name=smoke-pr-qwen3-4b-base-step4000 \
         --export="$(filter_exports "${smoke_output}" "LIMIT=32,DUMP_RESPONSES=${smoke_audit},DUMP_LIMIT=8")" \
         experiments/tools/difficulty_filter/run_measure.sbatch
@@ -59,7 +59,7 @@ submit_shard_round() {
     [[ -n "${previous_job}" ]] && dependency=(--dependency="afterany:${previous_job}")
 
     sbatch --parsable \
-        -A "${ACCOUNT}" -p interactive --time=04:00:00 \
+        -A "${ACCOUNT}" -p batch --qos=interactive --time=04:00:00 \
         --job-name="pr${shard}-qwen3-4b-step4000" \
         "${dependency[@]}" \
         --export="$(filter_exports "${output}" "START_INDEX=${start_index},END_INDEX=${end_index},DUMP_RESPONSES=${audit},DUMP_LIMIT=8")" \

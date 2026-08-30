@@ -46,6 +46,20 @@ def log_rollout_pipeline_throughput(
     return log_dict
 
 
+def log_replay_resume_checkpoint(
+    rollout_id: int,
+    args,
+    metrics: dict[str, float],
+) -> dict[str, float | int]:
+    """Log sample conservation at a restartable checkpoint."""
+
+    log_dict: dict[str, float | int] = dict(metrics)
+    logger.info(f"replay resume checkpoint {rollout_id}: {log_dict}")
+    log_dict["rollout/step"] = compute_rollout_step(args, rollout_id)
+    tracking.log(args, log_dict, step_key="rollout/step")
+    return log_dict
+
+
 def log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any] | None = None):
     if (x := args.custom_eval_rollout_log_function_path) is not None:
         custom_log_func = load_function(x)

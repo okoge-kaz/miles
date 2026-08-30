@@ -441,8 +441,8 @@ def test_server_lifetime_and_training_readiness_are_production_shaped() -> None:
         / "scripts"
         / "swe"
         / "async"
-        / "r2e-gym-swe-rebench-v2"
-        / "qwen3-4b-instruct-2507"
+        / "swe-rebench-v2-swe-gym"
+        / "qwen3-4b"
         / "run.sbatch"
     ).read_text(encoding="utf-8")
 
@@ -911,7 +911,7 @@ def test_credential_capable_swe_containers_mask_repository_dotenv() -> None:
     ]
     for path in (
         root
-        / "experiments/scripts/swe/async/r2e-gym-swe-rebench-v2/qwen3-4b-instruct-2507/run.sbatch",
+        / "experiments/scripts/swe/async/swe-rebench-v2-swe-gym/qwen3-4b/run.sbatch",
         root / "experiments/scripts/swe/eval/swebench-verified/run.sbatch",
         root / "experiments/setup/datasets/prepare_swe_rl.sbatch",
         root / "experiments/setup/environments/materialize_harbor_swe_tasks.sbatch",

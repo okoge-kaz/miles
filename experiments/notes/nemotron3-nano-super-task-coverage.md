@@ -31,12 +31,12 @@ public blend cannot reproduce the complete NVIDIA recipe by itself.
 | Competitive code | Sandboxed reward; Code jobs 306787/306788 restored iteration 0 plus `replay_buffer_0`, trained step 1, and published iteration 1 plus `replay_buffer_1` | Current replay/resume gate passed; downstream effectiveness remains unverified |
 | IFollow / IFEvalG | All 48 registry IDs and correct/wrong probes pass; jobs 306686/306687 completed a current 4-node, 16K, n=16 inflight replay fresh+resume pair and advanced iteration 0 to 1 | Current replay gate passed; held-out IFBench pre/post effectiveness remains a separate requirement |
 | Structured outputs | JSON Schema reward verified on CPU | Add a dedicated GPU smoke before describing this component as end-to-end verified |
-| Workplace assistant | Standalone runtime and final-state verifier implemented without importing or serving NeMo Gym; current source release converted to 1,255 train + 545 validation rows; resource/tool correctness tests pass | Add a checked-in Miles custom-generate loop behind a bounded environment worker/service pool, then run fresh and replay GPU validation |
+| Workplace assistant | Single-turn multi-step generator, standalone runtime, and final-state verifier implemented without importing or serving NeMo Gym; current source release converted to 1,255 train + 545 validation rows; resource/tool correctness tests pass | Add a bounded environment worker/service pool, then run fresh GPU validation; do not classify it as conversational multi-turn |
 
 Nano's static components now have implementation paths, but this is not the same
 as end-to-end admission. Structured output still lacks a dedicated GPU run, and
-Workplace has no checked-in custom-generate loop and is not admitted for
-production-scale or replay training. The standalone Workplace runtime imports
+Workplace has a checked-in local custom-generate loop but is not admitted for
+production-scale training. The standalone Workplace runtime imports
 only pinned resource modules and fixtures from the NeMo
 Gym checkout at commit `48d5b9c01e3fc59a49f19674d0034a6f06396074`; it has no
 NeMo Gym package or server dependency. Two Skywork source rows have empty
@@ -49,13 +49,13 @@ zero.
 |---|---|---|
 | DAPO/Skywork math, competitive code, knowledge MCQA, Reasoning Gym | Deterministic rewards implemented; corresponding Math/Code/STEM paths exercised | Preserve verifier pins and sandbox policy |
 | IFollow and structured outputs | Deterministic rewards implemented; current IFollow jobs 306686/306687 completed fresh+resume inflight replay validation | Dedicated structured-output GPU fresh/resume smoke |
-| Conversational tool use and function-calling pivot | Exact single function-call verifier, deterministic 9,400/400 train/eval split, and offline action evaluator implemented; jobs 306920/306921 completed replay/resume on Qwen3-4B-Instruct-2507 | The old recipe is now fail-closed. Add a current-SFT recipe and repeat fresh/resume plus held-out evaluation; free-form message actions remain excluded until a semantic judge is pinned |
+| Conversational tool use and function-calling pivot | Pinned conversational Pivot payload, 63,559/2,000 exact-call train/eval split, Step4000 Qwen3-4B 16K/n=16 recipe, replay configuration, and offline action evaluator implemented | Run current-SFT fresh/resume plus held-out evaluation; 31,409 free-form message actions remain excluded until a semantic judge is pinned |
 | SWE Pivot | Exact single expert-action verifier implemented | This is next-action imitation/RLVR, not repository-level SWE execution |
 | Lean proof | 1,376,663 Lean rows staged; no Gym dependency is necessary in principle | Build a pinned NeMo-Skills Lean/Mathlib compiler sandbox, expose a small execute service, add timeout/cache and compiler-result reward, then GPU/replay validation |
 | Identity following | Principle-only rows staged | Pinned judge/GenRM service, calibration set, judge version telemetry, and stored judge outputs |
 | Adversarial IF and MultiTurnChat | Rubric rows staged | Multi-turn generator plus a pinned rubric judge; validate judge drift and deterministic replay artifacts |
 | Calendar | Standalone deterministic verifier implemented; local job 305108 found a feasible schedule for all 9,915 converted rows | Official-grader parity is not established; add dedicated GPU fresh/resume validation, and use a service only if future Calendar data becomes genuinely interactive |
-| Workplace assistant | Standalone runtime and the pinned upstream `is_correct` final-state comparator are wired through local resource modules; no checked-in Miles generator exists | Implement the policy/tool loop, bounded worker/service pool, health/reset/cleanup telemetry, and 4-node fresh/rollout-replay validation; no independent parity audit has been recorded |
+| Workplace assistant | Single-turn multi-step generator, standalone runtime, and the pinned upstream `is_correct` final-state comparator are wired through local resource modules | Add a bounded worker/service pool, health/reset/cleanup telemetry, and 4-node fresh validation; no independent parity audit has been recorded |
 | Safety | Preference/RM data staged | Separate RM or DPO pipeline; do not convert pairwise labels into an exact-match policy reward |
 | GenRM | Generative reward-model corpus staged | GenRM training/serving recipe, calibration, versioned inference, and failure policy |
 | SWE 1/2 (R2E-Gym and SWE-Gym) | Native Harbor-to-E2B execution, dataset normalization, live semantic admission, task materialization, pinned graders, and a fail-closed 4-node recipe are implemented. The public Super split normalizes to 1,172 R2E-Gym and 272 SWE-Gym candidates. Offline contracts have passed, but zero rows have completed live E2B admission. | Finish the E2B/template pin and full-scale cost gate, admit empty=0 and oracle=1 tasks with a live `E2B_API_KEY`, then run 4-node fresh RL and an external downstream evaluation. Replay remains disabled. |
@@ -114,34 +114,11 @@ pipeline on that checkpoint; it is not a post-RL improvement claim. Current-SFT
 smoke job 307365 also completed two prompts x eight samples with accuracy 0 and
 four length-finished empty responses. That is runner evidence only.
 
-Tau Bench is not itself a Nemotron dataset. The raw 500-task retail train split
-is retained for audit. Before mixing, every task is checked with the pinned
-official reward: its ground-truth trajectory must score one and an empty
-trajectory must score zero. Five published tasks (indices 161, 214, 229, 288,
-and 349) fail the latter condition because their published gift-card action is
-rejected for insufficient balance, leaving the database unchanged. They are not
-safe binary-RL examples and are excluded. The local balanced training file thus
-combines 495 reward-verified Tau retail tasks, 495 Nemotron conversational
-tool-use rows, and 495 Nemotron function-calling rows. Tau rows run in the
-official stateful retail environment; Nemotron rows retain their single
-expert-action verifier. The user simulator is a loss-masked local-policy turn
-generator, so no external model key is required for cluster smoke tests.
-
-Jobs 299793--299795 and summary job 299801 are historical replay-mechanism
-evidence: they imported the since-removed `experiments.src.nemo_blends` and
-`experiments.src.tau_bench` layouts. Their recorded staleness and replay metrics
-must not be attributed to the current generator. Current canonical job 305093
-used `experiments.src.environments.tau_bench.generator.generate` and
-`experiments.src.reward_sets.tau.reward`, with the local-policy user simulator
-and replay disabled, and completed one optimizer update. Current-SFT local-policy
-jobs 307433/307434 subsequently completed a 16K, n=16 rollout-replay fresh/resume
-sequence through iteration 2. The second restored 6 pending, 2 ready, and 2
-active groups plus one prepared batch in 0.349 seconds. The replacement SFT
-recipe is not yet checked in, so this is runtime evidence rather than a complete
-maintained recipe admission. CPU audit jobs 306786/306797 each completed 20
-replay/guard tests. The initial n=2 job 306809 was canceled; jobs 306813/306814
-later completed but used the now-prohibited Qwen3-4B-Instruct-2507 checkpoint and
-are historical evidence only.
+Tau v3 v1.0.1 is pinned as a downstream benchmark, and preparation materializes
+only its 100 held-out test tasks. Official Tau v3 train/base artifacts remain
+absent. Stateful training is a distinct inflight-replay path over the external 1,982-
+row AReaL Tau2 RL split and its nine DB snapshots; it does not train on Tau v3
+test rows. Historical Tau jobs are not evidence for this current contract.
 
 For STEM, CPU job 306819 completed with exit code 0 after 121 passing tests and
 official Reasoning Gym correct/wrong probes (`correct=1`, `wrong=0`). Fresh GPU
@@ -149,28 +126,18 @@ job 306790 completed optimizer step 0, `replay_buffer_0`, and the iteration-0
 checkpoint. Resume 306792 restored that state, trained step 1, and published
 iteration 1 plus `replay_buffer_1`; both jobs exited 0.
 
-The checked-in code also supports a Gemini user simulator, defaulting to
-`gemini-2.5-flash-lite`, when `TAU_USER_BACKEND=gemini` and `GEMINI_API_KEY` are
-available at the Slurm job boundary. Python environment/evaluator modules do not
-parse dotenv files. This backend still needs both RL and held-out evaluation
-execution evidence before it can support a comparability claim. Local-policy
-downstream job 307463 rejected its result because all eight episodes failed
-before a terminal state; `mean_reward=0` there is not a model-quality score.
-
-The pinned Tau v1 environment is retained for the first Miles compatibility
-run. Its own repository now labels the airline/retail tasks outdated and points
-to Tau three. A production migration requires replacing the compatibility layer
-and task converter with the current Gym interface, pinning a Tau-three release,
-adding its `retail`, `airline`, `telecom`, and optional `banking_knowledge`
-domains, and re-running reward-equivalence and replay tests. Voice mode is an
-evaluation modality and is out of scope for text RL.
+The Tau evaluator supports the verified NVIDIA-hosted Gemini user simulator and
+direct Gemini through allowlisted job-boundary credentials. It runs the official
+DB-backed multi-turn environment and terminal reward, but never contributes
+optimizer samples. Voice mode remains out of scope for this text evaluation.
 
 ## Replay eligibility
 
 | Reward/generator class | Eligible replay mode | Admission rule |
 |---|---|---|
 | Static deterministic reward, including IFEvalG | `inflight` or `rollout` | Admit only after fresh and resumed GPU jobs show optimizer updates and restore telemetry |
-| Tau stateful custom generator | `rollout` only | Runtime fresh/resume passed in 307433/307434; keep the mode limited to completed trajectories, commit the replacement recipe/tests, and do not reconstruct an inflight environment halfway through a turn |
+| AReaL Tau2 user-simulator RL | `inflight` | Store the policy prefix and official message/DB event log, restore at an agent boundary, and reject history or DB-hash drift; require a current GPU fresh/resume pair before admission |
+| Tau v3 | Not applicable | Held-out evaluation only; it contributes no optimizer samples |
 | Judge/GenRM reward | `rollout` only initially | Store judge output, model/version, rubric hash, and failure status with the sample |
 | Workplace environment | `rollout` only initially | Store environment version and deterministic seed/reset identity; first move execution behind a bounded lifecycle |
 | Calendar static constraint reward | `inflight` or `rollout` in principle | First pass dedicated GPU fresh/resume validation and record verifier version; current CPU evidence is not replay admission |
@@ -190,12 +157,11 @@ optimizer step 1, and published iteration 1 plus `replay_buffer_1`. Both exited
 0; their teardown `BrokenPipeError` messages likewise followed durable
 publication. STEM jobs 306790/306792 also passed the current gate by restoring
 iteration 0 and `replay_buffer_0`, training step 1, and publishing iteration 1
-plus `replay_buffer_1`. Tau current-SFT jobs 307433/307434 restored completed-
-rollout replay and advanced through iteration 2, but the replacement recipe is
-not yet committed and downstream evaluation has no successful episode. The older IFEvalG
-299318/299319 and Tau 299794/299795 pairs used removed import layouts and are
-historical checkpoint-mechanism evidence only. Tau `inflight` remains prohibited
-because its environment cannot be reconstructed from a partial token prefix.
+plus `replay_buffer_1`. Tau jobs 307433/307434 and 299794/299795 are historical
+checkpoint-mechanism evidence only. The maintained AReaL Tau2 optimizer path is
+configured for multi-turn `inflight` event-log replay but still lacks its own
+fresh/resume GPU admission pair. Older IFEvalG jobs 299318/299319 likewise used
+removed import layouts.
 
 ## E2B SWE implementation and admission boundary
 

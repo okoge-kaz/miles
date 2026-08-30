@@ -89,26 +89,19 @@ The current-code evidence is narrower:
 | Code | `experiments.src.reward_sets.code.reward` | job 306787 completed optimizer step 0 and published iteration 0 plus `replay_buffer_0` | job 306788 restored model iteration 0 and replay state, completed optimizer step 1, and published iteration 1 plus `replay_buffer_1`; current fresh/resume gate passed |
 | STEM | `experiments.src.reward_sets.stem.reward` | job 306790 completed optimizer step 0 and published iteration 0 plus `replay_buffer_0` | job 306792 restored model iteration 0 and replay state, completed optimizer step 1, and published iteration 1 plus `replay_buffer_1`; current fresh/resume gate passed |
 | Math+Code+STEM | `experiments.src.reward_sets.math_code_stem.reward` | job 306793 completed optimizer step 0 and published iteration 0 plus `replay_buffer_0` | job 306796 restored model iteration 0 and replay state, completed optimizer step 1, and published iteration 1 plus `replay_buffer_1`; current fresh/resume gate passed |
-| Exact tool action | `experiments.src.reward_sets.tool_call.reward` | job 306920 completed optimizer step 0 and published iteration 0 plus `replay_buffer_0` | job 306921 restored replay and advanced to iteration 1, but both jobs used the retired Qwen3-4B-Instruct-2507 recipe; current-SFT admission is still missing |
-| Tau | `experiments.src.reward_sets.tau.reward` plus `experiments.src.environments.tau_bench.generator.generate` | current-SFT local-policy job 307433 trained through iteration 1 with rollout replay | job 307434 restored iteration 1 plus replay state and advanced to iteration 2; the replacement SFT recipe is not yet committed, so this is runtime evidence rather than a complete checked-in recipe admission |
+| Exact tool action | `experiments.src.reward_sets.tool_call_pivot.reward` | job 306920 completed optimizer step 0 and published iteration 0 plus `replay_buffer_0` | job 306921 restored replay and advanced to iteration 1, but both jobs used the retired Qwen3-4B-Instruct-2507 recipe; current-SFT admission is still missing |
 
-Tau is stateful and its current recipe accepts only completed `rollout` replay
-when replay is explicitly enabled; `inflight` is rejected because a partial
-environment cannot yet be restored. Jobs 307433/307434 now provide fresh/resume
-runtime evidence for completed-rollout replay, but the replacement current-SFT
-recipe still has to be committed with its tests before the path is a maintained
-submission entry point. The old 299801 statistics must not be reported as
-results of the current Tau implementation.
-
-CPU audit jobs 306786 and 306797 both completed with exit code 0. Each logged
-seven Tau resume-contract tests, twelve selected replay-buffer tests, and one
-`train_async` replay integration test as passing; 306797 repeated the audit after
-the reward allowlist correction. These establish CPU serialization and guard
-behavior only. The earlier n=2 GPU submission 306809 was canceled because it did
-not use the required n=16 training shape. Jobs 306813/306814 later completed a
-fresh/resume pair, but used the now-prohibited Qwen3-4B-Instruct-2507
-checkpoint. They remain historical mechanism evidence and cannot substitute for
-the current-SFT 307433/307434 result.
+Tau v3 is evaluation-only and has no replay admission. The separate AReaL Tau2
+training recipe now fixes `REPLAY_BUFFER_TYPE=inflight`. Its custom generator
+stores the policy prefix and official message/DB event log, replays mutating
+tool calls, and fails closed on message-history or DB-hash drift. CPU job 331861
+passed 328 tests and restored a real mutating AReaL airline trajectory into a
+fresh DB with identical history digest, agent/user DB hashes, and step/error
+counters without regenerating old user turns. Its current-code fresh/resume GPU
+proof is still pending, so this is environment-continuation evidence rather
+than replay admission.
+Historical Tau replay jobs do not apply to the maintained conversational
+tool-use Pivot training recipe.
 
 Both IFEvalG jobs ran with EFA and exited successfully. `BrokenPipeError` lines
 appear during final Ray teardown only after the optimizer update and durable
@@ -135,13 +128,9 @@ pending, 3 ready, 6 inflight groups / 467,826 inflight tokens, and one prepared
 batch). It applied optimizer step 1 and published iteration 1 plus
 `replay_buffer_1`.
 
-Tau current-SFT local-policy jobs 307433/307434 completed with exit code 0. The
-fresh job trained steps 0 and 1 and saved `replay_buffer_1`; the second loaded
-model iteration 1, restored the buffer in 0.349 seconds (6 pending, 2 ready, 2
-active groups for regeneration, and one prepared batch), applied optimizer step
-2, and published iteration 2 plus `replay_buffer_2`. This admits the local-policy
-runtime's completed-rollout replay mechanism; it does not establish a successful
-downstream Tau episode or a committed replacement recipe.
+Tau replay evidence from jobs 307433/307434 is historical. The maintained
+configuration now trains only on the static conversational tool-use Pivot data
+with inflight replay and reserves Tau three for held-out evaluation.
 
 ## Replay buffer serialization benchmark
 

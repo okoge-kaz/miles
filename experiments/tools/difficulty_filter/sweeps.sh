@@ -23,15 +23,18 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && p
 cd "${REPO_ROOT}"
 
 ACCOUNT="${SLURM_ACCOUNT_NAME:-coreai_horizon_dilations}"
-MODEL="${MODEL_NAME:-Qwen3-4B-Instruct-2507}"
-NB="experiments.src.nemo_blends"
+PARTITION="${GPU_PARTITION:-batch}"
+QOS="${INTERACTIVE_GPU_QOS:-interactive}"
+MODEL="${MODEL_NAME:-Qwen3-4B-Base-LR2e-5-Step4000}"
+ENV="experiments.src.environments"
+REWARDS="experiments.src.reward_sets.all_domains"
 
 # name | prompt file (in-container) | verifier | extra exports
 #
 # Verifier column: `rm:<x>` selects a built-in --rm-type, anything else is a
 # dotted --custom-rm-path.
 #
-# mmlu-pro, bfcl and gpqa-diamond are eval sets. They are here for the untrained
+# mmlu-pro and gpqa-diamond are eval sets. They are here for the untrained
 # baseline and to prove the verifier works, not to be filtered and trained on --
 # cutting a difficulty window out of an eval set is how a benchmark stops meaning
 # anything.
@@ -42,25 +45,28 @@ nemotron-math-v2       | /data/nemotron-rl-math-v2/nemotron-rl-math-v2-miles.jso
 knowledge-mcqa         | /data/nemotron-rl-mcqa/knowledge-mcqa-miles-20k.jsonl                    | rm:gpqa                      |
 mmlu-pro               | /data/mmlu-pro/mmlu-pro-miles-2k.jsonl                                   | rm:gpqa                      |
 gpqa-diamond           | /data/gpqa/gpqa-diamond-miles.jsonl                                      | rm:gpqa                      |
-reasoning-gym          | /data/nemotron-rl-reasoninggym/reasoning-gym-miles.jsonl                 | ${NB}.rewards.reasoning_gym_reward      |
-structured-outputs     | /data/nemotron-rl-ifollow-struct/structured-outputs-miles.jsonl          | ${NB}.rewards.structured_output_reward  |
-instruction-following  | /data/nemotron-rl-ifollow/instruction-following-miles-20k.jsonl          | ${NB}.ifeval_g.ifeval_reward | EXTRA_PIP=nltk+langdetect+immutabledict+absl-py
-fncall-pivot           | /data/nemotron-rl-fncall-pivot/fncall-pivot-miles.jsonl                  | ${NB}.rewards.tool_call_match_reward    |
-conv-tooluse           | /data/nemotron-rl-conv-tooluse/conv-tooluse-miles-20k.jsonl              | ${NB}.rewards.tool_call_match_reward    |
-swe-pivot              | /data/nemotron-rl-swe-pivot/swe-pivot-miles-20k.jsonl                    | ${NB}.rewards.tool_call_match_reward    |
-bfcl                   | /data/bfcl/bfcl-ast-miles.jsonl                                          | ${NB}.grid_and_ast.bfcl_ast_reward      |
-arc-agi                | /data/nemotron-rl-arc-agi/arc-agi-train-miles.jsonl                      | ${NB}.grid_and_ast.arc_agi_reward       |
-competitive-coding     | /data/nemotron-rl-comp-coding/competitive-coding-miles.jsonl             | ${NB}.code_exec.code_exec_reward        |
+reasoning-gym          | /data/nemotron-rl-reasoninggym/reasoning-gym-miles.jsonl                 | ${ENV}.reasoning_gym.verifier.reasoning_gym_reward |
+structured-outputs     | /data/nemotron-rl-ifollow-struct/structured-outputs-miles.jsonl          | ${REWARDS}.structured_output_reward     |
+instruction-following  | /data/nemotron-rl-ifollow/instruction-following-miles-20k.jsonl          | ${ENV}.instruction_following.verifier.ifeval_reward | EXTRA_PIP=nltk+langdetect+immutabledict+absl-py
+fncall-pivot           | /data/nemotron-rl-fncall-pivot/fncall-pivot-miles.jsonl                  | ${REWARDS}.tool_call_match_reward       |
+conv-tooluse           | /data/nemotron-rl-conv-tooluse/conv-tooluse-miles-20k.jsonl              | ${REWARDS}.tool_call_match_reward       |
+swe-pivot              | /data/nemotron-rl-swe-pivot/swe-pivot-miles-20k.jsonl                    | ${REWARDS}.tool_call_match_reward       |
+competitive-coding     | /data/nemotron-rl-comp-coding/competitive-coding-miles.jsonl             | ${ENV}.competitive_programming.verifier.code_exec_reward |
 EOF
+
+# BFCL and ARC-AGI are intentionally absent from SWEEPS. Their former
+# `grid_and_ast` targets never existed in this repository, so
+# submitting them only failed after allocating a GPU. Re-add each row after a
+# canonical environment verifier and a correct/wrong preflight are implemented.
 
 # Datasets whose answer is a short string, not a chain of thought. 24k tokens of
 # budget is right for math; a tool call or a letter needs a fraction of it, and
 # the cap is what bounds wall-clock on a 20k-row sweep.
 declare -A MAX_TOKENS=(
     [knowledge-mcqa]=4096  [mmlu-pro]=4096  [gpqa-diamond]=4096
-    [fncall-pivot]=4096    [conv-tooluse]=4096  [swe-pivot]=4096  [bfcl]=4096
+    [fncall-pivot]=4096    [conv-tooluse]=4096  [swe-pivot]=4096
     [structured-outputs]=8192  [instruction-following]=8192
-    [arc-agi]=16384        [competitive-coding]=16384
+    [competitive-coding]=16384
 )
 
 mode="${1:-list}"
@@ -107,7 +113,8 @@ while IFS='|' read -r name data verifier extra; do
     [[ -n "${extra}" ]] && exports="${exports},${extra}"
     [[ -n "${limits}" ]] && exports="${exports},${limits}"
 
-    id=$(sbatch --parsable -A "${ACCOUNT}" --job-name="${job}" \
+    id=$(sbatch --parsable -A "${ACCOUNT}" -p "${PARTITION}" --qos="${QOS}" \
+        --job-name="${job}" \
         --export="${exports}" \
         experiments/tools/difficulty_filter/run_measure.sbatch)
     printf "%-22s %s  job=%s\n" "${name}" "${mode}" "${id}"

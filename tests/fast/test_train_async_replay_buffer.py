@@ -3,6 +3,7 @@ from tests.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=10, suite="stage-a-cpu", labels=[])
 
 import asyncio
+import json
 import sys
 from argparse import Namespace
 from types import ModuleType
@@ -37,8 +38,9 @@ class _RemoteMethod:
 
 
 class _RolloutManager:
-    def __init__(self, events):
+    def __init__(self, events, checkpoint_metrics=None):
         self.events = events
+        self.checkpoint_metrics = checkpoint_metrics
         self.generate = _RemoteMethod(self._generate)
         self.record_batch_consumption = _RemoteMethod(self._record_batch_consumption)
         self.record_batch_trained = _RemoteMethod(self._record_batch_trained)
@@ -70,6 +72,7 @@ class _RolloutManager:
 
     def _save(self, rollout_id):
         self.events.append(("rollout_save", rollout_id))
+        return self.checkpoint_metrics
 
     def _mark_committed(self, rollout_id):
         self.events.append(("prune", rollout_id))
@@ -115,6 +118,14 @@ def _args(**overrides):
         "hf_save_interval": None,
         "update_weights_interval": 1,
         "debug_exit_after_rollout": None,
+        "debug_fail_after_rollout": None,
+        "debug_failure_marker": None,
+        "debug_failure_min_outstanding_groups": 0,
+        "debug_failure_min_completed_groups": 0,
+        "debug_failure_min_inflight_groups": 0,
+        "debug_failure_min_inflight_tokens": 0,
+        "debug_failure_min_regenerate_groups": 0,
+        "save": None,
     }
     values.update(overrides)
     return Namespace(**values)
@@ -195,6 +206,54 @@ async def test_legacy_checkpoint_order_and_async_save_semantics_are_unchanged(mo
     model_event = ("model", 0, False, True, False)
     assert model_event in events
     assert events.index(model_event) < events.index(("rollout_save", 0))
+
+
+async def test_debug_failure_requires_committed_replay_work_and_writes_marker(monkeypatch, tmp_path):
+    events = []
+    metrics = {
+        "resume/benchmark/checkpoint/outstanding_groups": 4.0,
+        "resume/benchmark/checkpoint/completed_groups_reused": 3.0,
+        "resume/benchmark/checkpoint/partial_groups_continued": 1.0,
+        "resume/benchmark/checkpoint/partial_response_tokens_continued": 128.0,
+        "resume/benchmark/checkpoint/groups_to_regenerate": 0.0,
+    }
+    manager = _RolloutManager(events, checkpoint_metrics=metrics)
+    actor = _ActorModel(events)
+    _patch_runtime(monkeypatch, manager, actor)
+
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    (checkpoint / "latest_checkpointed_iteration.txt").write_text("0\n", encoding="utf-8")
+    marker = checkpoint / "intentional-failure.json"
+
+    class InjectedFailure(Exception):
+        pass
+
+    monkeypatch.setattr(
+        train_async,
+        "_terminate_for_debug_failure",
+        lambda: (_ for _ in ()).throw(InjectedFailure()),
+    )
+    with pytest.raises(InjectedFailure):
+        await train_async.train(
+            _args(
+                num_rollout=2,
+                debug_fail_after_rollout=1,
+                debug_failure_marker=str(marker),
+                debug_failure_min_outstanding_groups=3,
+                debug_failure_min_completed_groups=3,
+                debug_failure_min_inflight_groups=1,
+                debug_failure_min_inflight_tokens=64,
+                save=str(checkpoint),
+            )
+        )
+
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert payload["event"] == "intentional_whole_job_failure"
+    assert payload["rollout_id"] == 0
+    assert payload["checkpoint"]["tracker_iteration"] == 0
+    assert events.index(("model", 0, True, True, False)) < events.index(("prune", 0))
+    assert not any(event[0] == "update_weights" and event[1] == 0 for event in events)
 
 
 async def test_queue_recycle_prefetches_next_batch_before_its_weight_update(monkeypatch):

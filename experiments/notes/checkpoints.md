@@ -219,7 +219,6 @@ in jobs 306793/306796. The second loaded iteration 0, restored 15 pending, 3
 ready, and 6 inflight groups plus one prepared batch in 0.868 seconds, performed
 optimizer step 1, and published iteration 1 plus `replay_buffer_1`.
 
-Tau local-policy runtime jobs 307433/307434 also restored completed-rollout
-replay and advanced from iteration 1 to 2. This is not yet a complete maintained
-recipe result: the current-SFT replacement recipe and its tests still have to be
-committed, and the held-out evaluator has no successful terminal episode.
+Tau local-policy runtime jobs 307433/307434 are historical replay evidence only.
+The maintained agentic recipe now uses conversational tool-use Pivot training
+and holds Tau three out exclusively for downstream evaluation.

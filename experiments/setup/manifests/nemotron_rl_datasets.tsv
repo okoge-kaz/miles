@@ -1,4 +1,4 @@
-# hf_repo<TAB>local_name<TAB>role
+# hf_repo<TAB>local_name<TAB>role<TAB>optional pinned revision
 nvidia/Nemotron-3-Nano-RL-Training-Blend	nemotron-3-nano-rl-training-blend	train_blend
 livecodebench/code_generation_lite	livecodebench-lite	eval_only
 Idavidrein/gpqa	gpqa	eval_only
@@ -6,6 +6,7 @@ BytedTsinghua-SIA/DAPO-Math-17k	dapo-math-17k-byted	train_static
 Skywork/Skywork-OR1-RL-Data	skywork-or1-rl	train_static
 nvidia/Nemotron-Math-Proofs-v1	nemotron-math-proofs-v1	train_lean
 nvidia/Nemotron-RL-Agentic-Conversational-Tool-Use-v1	nemotron-rl-conv-tooluse	train_static
+nvidia/Nemotron-RL-Agentic-Conversational-Tool-Use-Pivot-v1	nemotron-rl-conv-tooluse-pivot	train_static	9643c8103d7bfbc2d7fc4d15991d6739c612ff58
 nvidia/Nemotron-RL-Agentic-SWE-Pivot-v1	nemotron-rl-swe-pivot	train_pivot
 nvidia/Nemotron-RL-Identity-Following-v1	nemotron-rl-identity-following	judge_required
 nvidia/Nemotron-RL-Instruction-Following-Adversarial-v1	nemotron-rl-ifollow-adversarial	judge_required

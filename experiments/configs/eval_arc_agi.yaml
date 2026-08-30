@@ -12,7 +12,9 @@ eval:
   defaults:
     n_samples_per_eval_prompt: 4
     max_response_len: 16384
+    temperature: 1.0
     top_p: 1.0
+    top_k: -1
 
   datasets:
     - name: arc_agi_val

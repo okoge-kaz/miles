@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=continue-pr-qwen3-4b-step4000
-#SBATCH --partition=cpu_interactive
+#SBATCH --partition=cpu
+#SBATCH --qos=cpu-interactive
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
@@ -70,7 +71,7 @@ submit_shard() {
     local audit="${AUDIT_OUTPUT%.jsonl}.shard-${shard}-of-2.jsonl"
 
     sbatch --parsable \
-        -A "${ACCOUNT}" -p interactive --time=04:00:00 \
+        -A "${ACCOUNT}" -p batch --qos=interactive --time=04:00:00 \
         --job-name="pr${shard}-qwen3-4b-step4000" \
         --export="$(filter_exports "${output}" "START_INDEX=${start_index},END_INDEX=${end_index},DUMP_RESPONSES=${audit},DUMP_LIMIT=8")" \
         experiments/tools/difficulty_filter/run_measure.sbatch
@@ -80,7 +81,7 @@ submit_tail() {
     local audit="${AUDIT_OUTPUT%.jsonl}.shard-0-tail-${TAIL_START_INDEX}-of-${HALF_PROMPTS}.jsonl"
 
     sbatch --parsable \
-        -A "${ACCOUNT}" -p interactive --time=04:00:00 \
+        -A "${ACCOUNT}" -p batch --qos=interactive --time=04:00:00 \
         --job-name="pr0tail-qwen3-4b-step4000" \
         --export="$(filter_exports "${TAIL_OUTPUT}" "START_INDEX=${TAIL_START_INDEX},END_INDEX=${HALF_PROMPTS},DUMP_RESPONSES=${audit},DUMP_LIMIT=8")" \
         experiments/tools/difficulty_filter/run_measure.sbatch

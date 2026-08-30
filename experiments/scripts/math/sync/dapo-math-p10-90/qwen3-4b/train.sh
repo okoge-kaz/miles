@@ -4,6 +4,9 @@ set -ex
 
 export PYTHONBUFFERED=16
 export HF_HOME=/root/.cache/huggingface
+if [[ "${WANDB_MODE:-online}" == offline || "${WANDB_MODE:-online}" == disabled ]]; then
+   unset WANDB_API_KEY
+fi
 
 NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
 HAS_NVLINK=$([ "$NVLINK_COUNT" -gt 0 ] && echo 1 || echo 0)
@@ -168,15 +171,17 @@ MISC_ARGS=(
    --hidden-dropout 0.0
    --accumulate-allreduce-grads-in-fp32
    --attention-softmax-in-fp32
-   --attention-backend flash
+   --attention-backend "${TRAINING_ATTENTION_BACKEND}"
 )
 
 WANDB_ARGS=(
    --use-wandb
    --wandb-project "${WANDB_PROJECT:-off-policy-${DATASET_TAG}}"
    --wandb-group "${RUN_NAME}"
-   --wandb-key "${WANDB_API_KEY}"
 )
+if [[ -n "${WANDB_API_KEY:-}" ]]; then
+   WANDB_ARGS+=(--wandb-key "${WANDB_API_KEY}")
+fi
 
 RUNTIME_ENV_JSON=$(cat <<JSON
 {
@@ -184,6 +189,7 @@ RUNTIME_ENV_JSON=$(cat <<JSON
     "PYTHONPATH": "/root/Megatron-LM/:/root/miles",
     "CUDA_DEVICE_MAX_CONNECTIONS": "1",
     "NCCL_NVLS_ENABLE": "${HAS_NVLINK}",
+    "WANDB_MODE": "${WANDB_MODE:-online}",
     "no_proxy": "127.0.0.1"
   }
 }

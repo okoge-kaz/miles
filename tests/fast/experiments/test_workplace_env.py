@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-from experiments.src.datasets.workplace.prepare import adapt_workplace
+import argparse
+
 import pytest
 
+from experiments.src.datasets.workplace.prepare import adapt_workplace
+from experiments.src.environments.workplace.generator import _add_arguments
 from experiments.src.environments.workplace.runtime import (
     DEFAULT_RESOURCE_ROOT,
     create_tool_environment,
@@ -29,10 +32,22 @@ def test_workplace_adapter_preserves_multistep_state_target():
     }
     converted = adapt_workplace(row, eval_only=False)
     assert converted["metadata"]["verifier"] == "workplace_environment"
+    assert converted["metadata"]["interaction_mode"] == "single_turn_multi_step_environment"
+    assert converted["metadata"]["conversation_turns"] == 1
+    assert converted["metadata"]["stateful_environment"] is True
     assert converted["metadata"]["expected_actions"] == row["ground_truth"]
     assert converted["metadata"]["runtime_dependency"] == (
         "pinned-standalone-resource-modules-no-nemo-gym-server"
     )
+
+
+def test_workplace_cli_uses_step_not_turn_terminology():
+    parser = argparse.ArgumentParser()
+    _add_arguments(parser)
+    args = parser.parse_args([])
+    assert args.workplace_max_steps == 6
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--workplace-max-turns", "6"])
 
 
 def test_workplace_local_environment_and_state_match():

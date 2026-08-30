@@ -66,9 +66,10 @@ def test_current_status_notes_name_the_recorded_validation_boundaries() -> None:
     offline_eval = (NOTES_ROOT / "offline-eval.md").read_text(encoding="utf-8")
 
     assert "jobs 306793/306796 completed" in domains
-    assert "current-SFT local-policy jobs 307433/307434 completed" in domains
-    assert "replacement SFT recipe is not yet committed" in domains
-    assert "all eight failed before reaching" in domains
+    assert "Training uses only the pinned 1,982-row AReaL Tau2 RL split" in domains
+    assert "Official Tau v3 train/base tasks are not" in domains
+    assert "Workplace (single-turn multi-step)" in domains
+    assert "conversational tool-use Pivot" in domains
     assert "Job 307365 completed the current unified runner" in offline_eval
     assert "Job 307366 generated" in offline_eval
     assert "Job 307427 completed" in offline_eval

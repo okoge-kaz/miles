@@ -46,7 +46,7 @@ measurement no longer describes it.
 | `apply_filter.py` | the cheap half: turn a measurement + a window into a prompt file |
 | `run_measure.sbatch` | Slurm entry point (SGLang on 8 GPUs, then the driver) |
 | `run_measure_search_r1.sbatch` | Search-R1 entry point: E5 retrieval plus multi-turn generation |
-| `measure_search_r1_job.sh` | container-side Search-R1 server/measurement worker |
+| `../../search_r1/common/run_measurement.sh` | shared container-side Search-R1 server/measurement worker |
 
 ## Relationship to the built-in filters
 

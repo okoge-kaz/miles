@@ -16,6 +16,7 @@ source "${REPO_ROOT}/experiments/env.sh"
 : "${STALENESS_LEVELS:=1 2 4 8}"
 : "${RATIOS:=1:7 2:6 3:5 4:4}"
 : "${PARTITION:=batch}"
+: "${QOS:=normal}"
 : "${WALL:=04:00:00}"
 : "${CHAIN_JOBS:=10}"
 WANDB_PROJECT=async-rl-dapo-math
@@ -48,7 +49,7 @@ grid therefore contains 16 async arms plus one colocated arm. With
 exact derived checkpoint directory before starting.
 
 Useful environment overrides: TOTAL_NODES, STALENESS_LEVELS, RATIOS,
-CHAIN_JOBS, PARTITION, WALL, and RUN_NAMESPACE.
+CHAIN_JOBS, PARTITION, QOS, WALL, and RUN_NAMESPACE.
 EOF
 }
 
@@ -308,6 +309,7 @@ submit_chain() {
             "${dependency[@]}" \
             -A "${ACCOUNT}" \
             --partition="${PARTITION}" \
+            --qos="${QOS}" \
             --nodes="${TOTAL_NODES}" \
             --time="${WALL}" \
             --job-name="${run_name}" \
@@ -361,6 +363,7 @@ submit_colocated_chain() {
             "${dependency[@]}" \
             -A "${ACCOUNT}" \
             --partition="${PARTITION}" \
+            --qos="${QOS}" \
             --nodes="${TOTAL_NODES}" \
             --time="${WALL}" \
             --job-name="${run_name}" \

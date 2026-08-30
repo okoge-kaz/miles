@@ -13,6 +13,7 @@ from experiments.src.protocols.openai_responses import (
     to_chat_messages,
     to_chat_tools,
 )
+from experiments.src.protocols.tool_call_pivot import TOOL_CALL_PIVOT_INTERACTION_MODE
 
 BOXED_INSTRUCTION = (
     "Solve the following math problem step by step. The last line of your response "
@@ -277,14 +278,26 @@ def adapt_ifbench(row: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
-def _adapt_expert_action(row: dict[str, Any], source: str) -> dict[str, Any] | None:
+def _adapt_expert_action(
+    row: dict[str, Any],
+    source: str,
+    *,
+    interaction_mode: str = "static_single_turn_expert_action",
+) -> dict[str, Any] | None:
     prompt = _chat_from_params(row)
     expected = row.get("expected_action")
     signature = expected_action_signature(expected)
     if not prompt or signature is None:
         return None
     metadata = _base_metadata(row, source=source, verifier="expert_action")
-    metadata.update({"expected_action": expected, "expected_kind": signature["kind"]})
+    metadata.update(
+        {
+            "expected_action": expected,
+            "expected_kind": signature["kind"],
+            "interaction_mode": interaction_mode,
+            "stateful_environment": False,
+        }
+    )
     converted = {
         "prompt": prompt,
         "label": signature.get("name") or signature["kind"],
@@ -297,12 +310,28 @@ def adapt_conv_tooluse(row: dict[str, Any]) -> dict[str, Any] | None:
     return _adapt_expert_action(row, source="conv-tooluse")
 
 
+def adapt_conv_tooluse_pivot(row: dict[str, Any]) -> dict[str, Any] | None:
+    return _adapt_expert_action(
+        row,
+        source="conv-tooluse-pivot",
+        interaction_mode=TOOL_CALL_PIVOT_INTERACTION_MODE,
+    )
+
+
 def adapt_fncall_pivot(row: dict[str, Any]) -> dict[str, Any] | None:
-    return _adapt_expert_action(row, source="fncall-pivot")
+    return _adapt_expert_action(
+        row,
+        source="fncall-pivot",
+        interaction_mode=TOOL_CALL_PIVOT_INTERACTION_MODE,
+    )
 
 
 def adapt_swe_pivot(row: dict[str, Any]) -> dict[str, Any] | None:
-    return _adapt_expert_action(row, source="swe-pivot")
+    return _adapt_expert_action(
+        row,
+        source="swe-pivot",
+        interaction_mode=TOOL_CALL_PIVOT_INTERACTION_MODE,
+    )
 
 
 def adapt_competitive_coding(row: dict[str, Any]) -> dict[str, Any] | None:
@@ -495,6 +524,7 @@ def adapt_nano(row: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
 ADAPTERS = {
     "competitive-coding": adapt_competitive_coding,
     "conv-tooluse": adapt_conv_tooluse,
+    "conv-tooluse-pivot": adapt_conv_tooluse_pivot,
     "dapo-math": adapt_dapo_math,
     "fncall-pivot": adapt_fncall_pivot,
     "gpqa": adapt_gpqa,

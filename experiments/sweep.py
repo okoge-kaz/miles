@@ -88,6 +88,14 @@ TAG_ABBREV = {
     "ROLLOUT_SEED": "rseed",
 }
 
+
+def resolve_recipe_path(recipe: str) -> Path:
+    """Resolve a public recipe name to its canonical directory."""
+    if recipe.startswith("search_r1/async/"):
+        return EXPERIMENTS / "search_r1" / recipe.removeprefix("search_r1/")
+    return EXPERIMENT_SCRIPTS / recipe
+
+
 _SAFE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
@@ -192,7 +200,7 @@ def main() -> int:
 
     recipes = []
     for rel in args.recipe:
-        path = EXPERIMENT_SCRIPTS / rel
+        path = resolve_recipe_path(rel)
         if not (path / "run.sbatch").is_file():
             sys.exit(f"no such recipe: {rel}")
         recipes.append((rel, path))

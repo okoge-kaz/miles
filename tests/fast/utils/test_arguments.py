@@ -155,7 +155,7 @@ def test_use_replay_buffer_accepts_replay_validated_multi_env_reward(monkeypatch
 
 def test_use_replay_buffer_accepts_replay_validated_tool_call_reward(monkeypatch):
     monkeypatch.setattr("miles.utils.arguments.enable_experimental_rollout_refactor", lambda: True)
-    args = _replay_buffer_args(custom_rm_path="experiments.src.reward_sets.tool_call.reward")
+    args = _replay_buffer_args(custom_rm_path="experiments.src.reward_sets.tool_call_pivot.reward")
     _resolve_rollout_functions(args)
     assert args.rollout_function_path == "miles.rollout.fully_async_rollout.FullyAsyncRolloutFn"
 
@@ -167,14 +167,36 @@ def test_use_replay_buffer_rejects_broad_all_domain_reward(monkeypatch):
         _resolve_rollout_functions(args)
 
 
-def test_inflight_replay_buffer_rejects_custom_generate_function(monkeypatch):
+def test_inflight_replay_buffer_rejects_custom_generate_function_without_capability(monkeypatch):
     monkeypatch.setattr("miles.utils.arguments.enable_experimental_rollout_refactor", lambda: True)
+
+    async def custom_generate(_input):
+        return None
+
     args = _replay_buffer_args(
         replay_buffer_type="inflight",
         custom_generate_function_path="custom.generate",
     )
-    with pytest.raises(ValueError, match="built-in single-turn"):
+    with function_registry.temporary("custom.generate", custom_generate):
+        with pytest.raises(ValueError, match="supports_inflight_replay=True"):
+            _resolve_rollout_functions(args)
+
+
+def test_inflight_replay_buffer_accepts_capable_custom_generate_function(monkeypatch):
+    monkeypatch.setattr("miles.utils.arguments.enable_experimental_rollout_refactor", lambda: True)
+
+    async def custom_generate(_input):
+        return None
+
+    custom_generate.supports_inflight_replay = True
+    args = _replay_buffer_args(
+        replay_buffer_type="inflight",
+        custom_generate_function_path="custom.generate",
+    )
+    with function_registry.temporary("custom.generate", custom_generate):
         _resolve_rollout_functions(args)
+
+    assert args.rollout_function_path == "miles.rollout.fully_async_rollout.FullyAsyncRolloutFn"
 
 
 def test_inflight_replay_buffer_requires_opt_in(monkeypatch):
@@ -211,15 +233,33 @@ def test_replay_buffer_cli_is_opt_in_with_rollout_as_the_default_type():
     assert inflight.replay_buffer_type == "inflight"
 
 
-def test_zero_reward_on_truncated_cli_is_opt_in():
+def test_replay_resume_metrics_cli_is_opt_in():
     parser = argparse.ArgumentParser()
     get_miles_extra_args_provider()(parser)
 
     defaults = parser.parse_args(REQUIRED_ARGS)
-    assert not defaults.zero_reward_on_truncated
+    enabled = parser.parse_args(["--log-replay-resume-metrics"] + REQUIRED_ARGS)
 
-    enabled = parser.parse_args(["--zero-reward-on-truncated"] + REQUIRED_ARGS)
-    assert enabled.zero_reward_on_truncated
+    assert not defaults.log_replay_resume_metrics
+    assert enabled.log_replay_resume_metrics
+
+
+@pytest.mark.parametrize(
+    ("flag", "attribute"),
+    (
+        ("--zero-reward-on-truncated", "zero_reward_on_truncated"),
+        ("--zero-loss-on-truncated", "zero_loss_on_truncated"),
+    ),
+)
+def test_truncated_handling_cli_is_opt_in(flag: str, attribute: str):
+    parser = argparse.ArgumentParser()
+    get_miles_extra_args_provider()(parser)
+
+    defaults = parser.parse_args(REQUIRED_ARGS)
+    assert not getattr(defaults, attribute)
+
+    enabled = parser.parse_args([flag] + REQUIRED_ARGS)
+    assert getattr(enabled, attribute)
 
 
 def make_class_with_add_arguments():

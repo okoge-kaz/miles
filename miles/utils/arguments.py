@@ -36,8 +36,7 @@ _REPLAY_BUFFER_VALIDATED_CUSTOM_RM_PATHS = frozenset(
         "experiments.src.reward_sets.instruction_following.reward",
         "experiments.src.reward_sets.math_code_stem.reward",
         "experiments.src.reward_sets.stem.reward",
-        "experiments.src.reward_sets.tau.reward",
-        "experiments.src.reward_sets.tool_call.reward",
+        "experiments.src.reward_sets.tool_call_pivot.reward",
     }
 )
 
@@ -117,11 +116,20 @@ def _validate_replay_buffer(args) -> None:
         if not valid:
             raise ValueError(f"--use-replay-buffer requires {requirement}")
 
-    if (
-        replay_buffer_type == REPLAY_BUFFER_INFLIGHT
-        and getattr(args, "custom_generate_function_path", None) is not None
-    ):
-        raise ValueError("--replay-buffer-type inflight currently requires the built-in single-turn generate function")
+    custom_generate_path = getattr(args, "custom_generate_function_path", None)
+    if replay_buffer_type == REPLAY_BUFFER_INFLIGHT and custom_generate_path is not None:
+        try:
+            custom_generate = load_function(custom_generate_path)
+        except (AttributeError, ImportError, ValueError) as error:
+            raise ValueError(
+                "--replay-buffer-type inflight could not load the custom generate function "
+                f"{custom_generate_path!r}"
+            ) from error
+        if getattr(custom_generate, "supports_inflight_replay", False) is not True:
+            raise ValueError(
+                "--replay-buffer-type inflight requires the built-in generate function or a custom "
+                "generate function declaring supports_inflight_replay=True"
+            )
 
 
 def _resolve_rollout_functions(args) -> None:
@@ -577,6 +585,15 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "Number of recent replay buffers to retain. Checkpoints selected by "
                     "--save-retain-interval are retained in addition to these recent buffers."
+                ),
+            )
+            parser.add_argument(
+                "--log-replay-resume-metrics",
+                action="store_true",
+                default=False,
+                help=(
+                    "Log checkpoint sample conservation and resume state-load timing. "
+                    "This is intended for controlled replay-buffer ablations."
                 ),
             )
             parser.add_argument(
@@ -1062,6 +1079,51 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 type=int,
                 default=None,
                 help="Exit training after this many rollouts (for testing checkpoint resume with consistent scheduler params).",
+            )
+            parser.add_argument(
+                "--debug-fail-after-rollout",
+                type=int,
+                default=None,
+                help=(
+                    "Send SIGKILL to the training driver after this many rollouts, but only after a "
+                    "distributed checkpoint has committed. Intended for whole-job resume validation."
+                ),
+            )
+            parser.add_argument(
+                "--debug-failure-marker",
+                type=str,
+                default=None,
+                help="Durable JSON marker written immediately before --debug-fail-after-rollout terminates the driver.",
+            )
+            parser.add_argument(
+                "--debug-failure-min-outstanding-groups",
+                type=int,
+                default=0,
+                help="Minimum outstanding prompt groups required at the injected-failure checkpoint.",
+            )
+            parser.add_argument(
+                "--debug-failure-min-completed-groups",
+                type=int,
+                default=0,
+                help="Minimum completed replay groups required at the injected-failure checkpoint.",
+            )
+            parser.add_argument(
+                "--debug-failure-min-inflight-groups",
+                type=int,
+                default=0,
+                help="Minimum partial inflight groups required at the injected-failure checkpoint.",
+            )
+            parser.add_argument(
+                "--debug-failure-min-inflight-tokens",
+                type=int,
+                default=0,
+                help="Minimum saved partial response tokens required at the injected-failure checkpoint.",
+            )
+            parser.add_argument(
+                "--debug-failure-min-regenerate-groups",
+                type=int,
+                default=0,
+                help="Minimum prompt groups requiring regeneration at the injected-failure checkpoint.",
             )
             parser.add_argument(
                 "--num-epoch",
@@ -2389,6 +2451,17 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "Assign scalar reward 0 to responses that hit the generation/context limit, "
                     "without invoking the configured reward model. Off by default to preserve "
                     "the existing behavior of grading the truncated response text."
+                ),
+            )
+            parser.add_argument(
+                "--zero-loss-on-truncated",
+                action="store_true",
+                default=False,
+                help=(
+                    "Set the response loss mask to zero for trajectories that hit the "
+                    "generation/context limit. Their scalar reward remains available for "
+                    "logging and advantage normalization; only their own policy-gradient "
+                    "contribution is removed."
                 ),
             )
             parser.add_argument(

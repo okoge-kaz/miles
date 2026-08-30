@@ -16,7 +16,8 @@
 #     --export=USER,HF_REPO=SWE-Gym/SWE-Gym,LOCAL_NAME=swe-gym,HF_TOKEN \
 #     experiments/setup/download/download_dataset.sbatch
 #
-# Idempotent: hf download verifies existing files instead of refetching them.
+# Set HF_REVISION to a commit when the result will feed training. Idempotent:
+# hf download verifies existing files instead of refetching them.
 #
 # Gated repos (Idavidrein/gpqa) need an exported HF_TOKEN and the terms accepted
 # by that token's account. Repository-local `.env` files are never read. Without
@@ -35,6 +36,8 @@ source "${REPO_ROOT}/experiments/env.sh"
 
 : "${HF_REPO:?set HF_REPO, e.g. SWE-Gym/SWE-Gym}"
 : "${LOCAL_NAME:?set LOCAL_NAME, e.g. swe-gym}"
+HF_REVISION="${HF_REVISION:-main}"
+export HF_REVISION
 
 srun \
     --container-image="${SQSH_IMAGE}" \
@@ -46,7 +49,11 @@ srun \
 set -euo pipefail
 export HF_HOME=/root/.cache/huggingface
 echo "downloading dataset ${HF_REPO} -> /data/${LOCAL_NAME}"
-time hf download --repo-type dataset "${HF_REPO}" --local-dir "/data/${LOCAL_NAME}"
+time hf download \
+    --repo-type dataset \
+    --revision "${HF_REVISION}" \
+    "${HF_REPO}" \
+    --local-dir "/data/${LOCAL_NAME}"
 du -sh "/data/${LOCAL_NAME}"
 find "/data/${LOCAL_NAME}" -maxdepth 2 -type f | head -20
 
@@ -65,4 +72,6 @@ if [[ "${_payload}" -eq 0 ]]; then
     fi
     exit 1
 fi
+printf "repo=%s\nrevision=%s\n" "${HF_REPO}" "${HF_REVISION}" \
+    >"/data/${LOCAL_NAME}/MILES_SOURCE_PROVENANCE"
 '
