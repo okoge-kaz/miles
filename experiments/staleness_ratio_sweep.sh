@@ -84,11 +84,12 @@ ZERO_LOSS_ON_TRUNCATED=1. Truncated samples retain their reward for group
 baseline computation but contribute no training loss. It cannot be combined
 with matched partial-concurrency modes.
 
---total-length-32k keeps ZERO_REWARD_ON_TRUNCATED=1 and sets both the response
-ceiling and total prompt+response context ceiling to 32768. The inference
-request therefore receives at most 32768 - prompt_tokens new tokens, making
-the total-length ceiling authoritative. This mode is async-only and cannot be
-combined with truncation ablations or matched partial-concurrency modes.
+--total-length-32k keeps ZERO_REWARD_ON_TRUNCATED=1 and sets the response
+ceiling to 32768. The effective prompt+response ceiling is 32767 so SGLang can
+reserve the final position in the model's 32768-token context window. The
+inference request therefore receives at most 32767 - prompt_tokens new tokens.
+This mode is async-only and cannot be combined with truncation ablations or
+matched partial-concurrency modes.
 
 --matched-partial-concurrency creates the five-arm follow-up: one colocated
 partial-rollout arm at PARTIAL_OVER_SAMPLING_BATCH_SIZE=256, plus the
@@ -471,6 +472,7 @@ require_setting NUM_ROLLOUT 300
 require_setting NUM_STEPS_PER_ROLLOUT 1
 if (( TOTAL_LENGTH_32K == 1 )); then
     require_setting MAX_RESPONSE_LEN 32768
+    require_setting ROLLOUT_MAX_CONTEXT_LEN 32767
     (( MAX_TOKENS_PER_GPU_VALUE * CONTEXT_PARALLEL >= ROLLOUT_MAX_CONTEXT_LEN_VALUE )) || {
         echo "trainer token budget is too small for the 32K total sequence: " \
              "MAX_TOKENS_PER_GPU=${MAX_TOKENS_PER_GPU_VALUE}, CP=${CONTEXT_PARALLEL}" >&2
@@ -478,8 +480,8 @@ if (( TOTAL_LENGTH_32K == 1 )); then
     }
 else
     require_setting MAX_RESPONSE_LEN 16384
+    require_setting ROLLOUT_MAX_CONTEXT_LEN 32768
 fi
-require_setting ROLLOUT_MAX_CONTEXT_LEN 32768
 require_setting ZERO_REWARD_ON_TRUNCATED \
     "$(( 1 - DISABLE_ZERO_REWARD_ON_TRUNCATED - ENABLE_ZERO_LOSS_ON_TRUNCATED ))"
 require_setting ZERO_LOSS_ON_TRUNCATED "${ENABLE_ZERO_LOSS_ON_TRUNCATED}"
