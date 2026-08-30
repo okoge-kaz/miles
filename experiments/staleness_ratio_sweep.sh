@@ -48,6 +48,7 @@ ENABLE_ZERO_LOSS_ON_TRUNCATED=0
 TOTAL_LENGTH_32K=0
 MATCH_PARTIAL_CONCURRENCY=0
 CLEAN_CHECKPOINT=0
+RESUME_CHAIN=0
 RESUME_MATCHED_CHAIN=0
 declare -a REQUESTED_POINTS=()
 
@@ -58,6 +59,7 @@ usage: experiments/staleness_ratio_sweep.sh [--submit] [--include-colocated]
                                             [--zero-loss-on-truncated]
                                             [--total-length-32k]
                                             [--matched-partial-concurrency]
+                                            [--resume-chain]
                                             [--resume-matched-chain]
                                             [--clean-checkpoint]
                                             [--point M:T:R ...]
@@ -97,6 +99,11 @@ identities, and cannot be combined with --include-colocated or
 protocol, this mode fixes TOTAL_NODES=8, PARTITION=batch, WALL=04:00:00, and
 CHAIN_JOBS=10.
 
+--resume-chain appends CHAIN_JOBS new allocations per selected arm to an
+existing namespace. Set RUN_NAMESPACE to the original namespace. Every
+selected arm must already have a checkpoint, and this option never removes
+checkpoints. CHAIN_JOBS counts only the newly submitted allocations.
+
 --resume-matched-chain resumes an existing matched-partial-concurrency
 namespace from its saved checkpoints and submits exactly nine chained jobs per
 arm. Set RUN_NAMESPACE to the original namespace. This option never removes
@@ -132,6 +139,10 @@ while (( $# > 0 )); do
             ;;
         --matched-partial-concurrency)
             MATCH_PARTIAL_CONCURRENCY=1
+            shift
+            ;;
+        --resume-chain)
+            RESUME_CHAIN=1
             shift
             ;;
         --resume-matched-chain)
@@ -192,6 +203,18 @@ if (( ENABLE_ZERO_LOSS_ON_TRUNCATED == 1 )); then
 fi
 if (( MATCH_PARTIAL_CONCURRENCY == 1 && CLEAN_CHECKPOINT == 1 )); then
     echo "--matched-partial-concurrency requires fresh identities; do not use --clean-checkpoint" >&2
+    exit 2
+fi
+if (( RESUME_CHAIN == 1 && MATCH_PARTIAL_CONCURRENCY == 1 )); then
+    echo "--resume-chain cannot be combined with matched partial-concurrency modes" >&2
+    exit 2
+fi
+if (( RESUME_CHAIN == 1 && RUN_NAMESPACE_WAS_EXPLICIT == 0 )); then
+    echo "--resume-chain requires an explicit RUN_NAMESPACE" >&2
+    exit 2
+fi
+if (( RESUME_CHAIN == 1 && CLEAN_CHECKPOINT == 1 )); then
+    echo "--resume-chain never removes checkpoints; do not use --clean-checkpoint" >&2
     exit 2
 fi
 if (( RESUME_MATCHED_CHAIN == 1 && RUN_NAMESPACE_WAS_EXPLICIT == 0 )); then
@@ -671,6 +694,29 @@ if (( INCLUDE_COLOCATED == 1 || MATCH_PARTIAL_CONCURRENCY == 1 )); then
     if (( MATCH_PARTIAL_CONCURRENCY == 1 )); then
         printf 'global C is matched; only t4r4 also matches colocated engine count and nominal C/engine\n'
     fi
+fi
+
+if (( RESUME_CHAIN == 1 )); then
+    missing_resume_checkpoint=0
+    for point in "${POINTS[@]}"; do
+        read -r staleness train_nodes rollout_nodes _ <<<"${point}"
+        config_tag="$(async_config_tag "${staleness}" "${train_nodes}" "${rollout_nodes}")"
+        resume_checkpoint="$(find "${TRAIN_CKPT_DIR}" -type d -name "*${config_tag}*" -print -quit 2>/dev/null)"
+        if [[ -z "${resume_checkpoint}" ]]; then
+            echo "resume checkpoint not found for $(async_run_name "${staleness}" "${train_nodes}" "${rollout_nodes}")" >&2
+            missing_resume_checkpoint=1
+        fi
+    done
+    if (( INCLUDE_COLOCATED == 1 )); then
+        config_tag="$(colocated_config_tag)"
+        resume_checkpoint="$(find "${TRAIN_CKPT_DIR}" -type d -name "*${config_tag}*" -print -quit 2>/dev/null)"
+        if [[ -z "${resume_checkpoint}" ]]; then
+            echo "resume checkpoint not found for $(colocated_run_name)" >&2
+            missing_resume_checkpoint=1
+        fi
+    fi
+    (( missing_resume_checkpoint == 0 )) || exit 1
+    unset missing_resume_checkpoint config_tag resume_checkpoint
 fi
 
 if (( MATCH_PARTIAL_CONCURRENCY == 1 )); then

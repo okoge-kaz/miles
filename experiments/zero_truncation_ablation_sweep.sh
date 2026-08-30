@@ -11,6 +11,7 @@ SWEEP_PATH="${REPO_ROOT}/experiments/staleness_ratio_sweep.sh"
 usage() {
     cat <<'EOF'
 usage: experiments/zero_truncation_ablation_sweep.sh [--submit]
+                                                     [--resume-chain]
                                                      [--clean-checkpoint]
 
 Without --submit, print the exact five-arm grid. This launcher uses the same
@@ -22,14 +23,25 @@ ZERO_REWARD_ON_TRUNCATED=0 and fixes:
   max weight staleness 16: trainer:rollout nodes 1:7, 2:6
 
 Useful environment overrides: CHAIN_JOBS, PARTITION, WALL, and RUN_NAMESPACE.
+With --resume-chain, only the four async arms are resumed; the colocated arm is
+not submitted. RUN_NAMESPACE must name the existing study and CHAIN_JOBS
+defaults to nine new allocations per async arm. Existing checkpoints are
+preserved.
 EOF
 }
 
 declare -a FORWARD_ARGS=()
+RESUME_CHAIN=0
 while (( $# > 0 )); do
     case "$1" in
         --submit|--clean-checkpoint)
             FORWARD_ARGS+=("$1")
+            shift
+            ;;
+        --resume-chain)
+            RESUME_CHAIN=1
+            FORWARD_ARGS+=("$1")
+            [[ -v CHAIN_JOBS ]] || export CHAIN_JOBS=9
             shift
             ;;
         --help|-h)
@@ -47,11 +59,15 @@ done
 export TOTAL_NODES=8
 export STALENESS_LEVELS="8 16"
 export RATIOS="1:7 2:6"
+if (( RESUME_CHAIN == 1 )) && [[ ! -v RUN_NAMESPACE ]]; then
+    echo "--resume-chain requires the original RUN_NAMESPACE" >&2
+    exit 2
+fi
 if [[ ! -v RUN_NAMESPACE ]]; then
     export RUN_NAMESPACE="zero-trunc-off-$(date +%Y%m%d-%H%M%S)-p$$"
 fi
 
-exec "${SWEEP_PATH}" \
-    --disable-zero-reward-on-truncated \
-    --include-colocated \
-    "${FORWARD_ARGS[@]}"
+declare -a SWEEP_ARGS=(--disable-zero-reward-on-truncated)
+(( RESUME_CHAIN == 1 )) || SWEEP_ARGS+=(--include-colocated)
+
+exec "${SWEEP_PATH}" "${SWEEP_ARGS[@]}" "${FORWARD_ARGS[@]}"
