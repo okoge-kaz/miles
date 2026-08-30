@@ -38,6 +38,11 @@
 : "${ASYNC_MAX_CONCURRENT_SAMPLES:=}"
 : "${TRAINING_BUFFER_QUEUE_SIZE:=1000}"
 
+if [[ "${ZERO_REWARD_ON_TRUNCATED:-0}" != "0" && "${ZERO_LOSS_ON_TRUNCATED:-0}" != "0" ]]; then
+    echo "ZERO_REWARD_ON_TRUNCATED and ZERO_LOSS_ON_TRUNCATED are mutually exclusive" >&2
+    exit 2
+fi
+
 [[ "${PARTIAL_ROLLOUT}" =~ ^[01]$ ]] ||
     { echo "PARTIAL_ROLLOUT must be 0 or 1" >&2; exit 1; }
 [[ "${MASK_OFFPOLICY_IN_PARTIAL_ROLLOUT}" =~ ^[01]$ ]] ||

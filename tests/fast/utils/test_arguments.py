@@ -12,6 +12,7 @@ from miles.utils.arguments import (
     _maybe_apply_dumper_overrides,
     _resolve_ft_components,
     _resolve_rollout_functions,
+    _validate_truncation_behavior,
     get_miles_extra_args_provider,
     miles_validate_args,
     validate_async_off_policy_correction,
@@ -212,6 +213,39 @@ def test_zero_loss_on_truncated_cli_is_opt_in():
 
     enabled = parser.parse_args(["--zero-loss-on-truncated"] + REQUIRED_ARGS)
     assert enabled.zero_loss_on_truncated
+
+
+def test_truncation_behavior_cli_flags_are_mutually_exclusive():
+    parser = argparse.ArgumentParser()
+    get_miles_extra_args_provider()(parser)
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["--zero-reward-on-truncated", "--zero-loss-on-truncated"] + REQUIRED_ARGS
+        )
+
+
+@pytest.mark.parametrize(
+    ("zero_reward", "zero_loss"),
+    [(False, False), (True, False), (False, True)],
+)
+def test_truncation_behavior_validation_accepts_non_conflicting_modes(zero_reward, zero_loss):
+    args = SimpleNamespace(
+        zero_reward_on_truncated=zero_reward,
+        zero_loss_on_truncated=zero_loss,
+    )
+
+    _validate_truncation_behavior(args)
+
+
+def test_truncation_behavior_validation_rejects_config_override_conflict():
+    args = SimpleNamespace(
+        zero_reward_on_truncated=True,
+        zero_loss_on_truncated=True,
+    )
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _validate_truncation_behavior(args)
 
 
 def test_colocate_switch_telemetry_cli_is_opt_in():

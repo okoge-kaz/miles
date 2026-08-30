@@ -50,6 +50,7 @@ MATCH_PARTIAL_CONCURRENCY=0
 CLEAN_CHECKPOINT=0
 RESUME_CHAIN=0
 RESUME_MATCHED_CHAIN=0
+RERUN_CLEAN_MATCHED_ARMS=0
 declare -a REQUESTED_POINTS=()
 
 usage() {
@@ -59,6 +60,7 @@ usage: experiments/staleness_ratio_sweep.sh [--submit] [--include-colocated]
                                             [--zero-loss-on-truncated]
                                             [--total-length-32k]
                                             [--matched-partial-concurrency]
+                                            [--rerun-clean-matched-arms]
                                             [--resume-chain]
                                             [--resume-matched-chain]
                                             [--clean-checkpoint]
@@ -100,6 +102,12 @@ identities, and cannot be combined with --include-colocated or
 protocol, this mode fixes TOTAL_NODES=8, PARTITION=batch, WALL=04:00:00, and
 CHAIN_JOBS=10.
 
+--rerun-clean-matched-arms creates a fresh two-arm replacement for the
+colocated partial-rollout and async t1r7 arms from the matched cohort. These
+are the two arms whose old terminal segments used contradictory truncation
+flags. This mode retains the matched protocol, forces zero reward on truncated
+on and zero loss on truncated off, and requires a fresh RUN_NAMESPACE.
+
 --resume-chain appends CHAIN_JOBS new allocations per selected arm to an
 existing namespace. Set RUN_NAMESPACE to the original namespace. Every
 selected arm must already have a checkpoint, and this option never removes
@@ -140,6 +148,11 @@ while (( $# > 0 )); do
             ;;
         --matched-partial-concurrency)
             MATCH_PARTIAL_CONCURRENCY=1
+            shift
+            ;;
+        --rerun-clean-matched-arms)
+            MATCH_PARTIAL_CONCURRENCY=1
+            RERUN_CLEAN_MATCHED_ARMS=1
             shift
             ;;
         --resume-chain)
@@ -220,6 +233,10 @@ if (( RESUME_CHAIN == 1 && CLEAN_CHECKPOINT == 1 )); then
 fi
 if (( RESUME_MATCHED_CHAIN == 1 && RUN_NAMESPACE_WAS_EXPLICIT == 0 )); then
     echo "--resume-matched-chain requires an explicit RUN_NAMESPACE" >&2
+    exit 2
+fi
+if (( RERUN_CLEAN_MATCHED_ARMS == 1 && RESUME_MATCHED_CHAIN == 1 )); then
+    echo "--rerun-clean-matched-arms requires a fresh namespace and cannot resume a matched chain" >&2
     exit 2
 fi
 if (( RESUME_MATCHED_CHAIN == 1 )); then
@@ -504,6 +521,8 @@ fi
 declare -a RAW_POINTS=()
 if (( ${#REQUESTED_POINTS[@]} > 0 )); then
     RAW_POINTS=("${REQUESTED_POINTS[@]}")
+elif (( RERUN_CLEAN_MATCHED_ARMS == 1 )); then
+    RAW_POINTS=("4:1:7")
 elif (( MATCH_PARTIAL_CONCURRENCY == 1 )); then
     # Literal rather than RATIOS: matched mode must stay a five-arm cohort even
     # when a caller has a RATIOS override in its shell.
@@ -556,9 +575,13 @@ for point in "${RAW_POINTS[@]}"; do
 done
 (( ${#POINTS[@]} > 0 )) || { echo "no sweep points selected" >&2; exit 1; }
 if (( MATCH_PARTIAL_CONCURRENCY == 1 )); then
-    expected_matched_points=("4 1 7 4" "4 2 6 8" "4 3 5 12" "4 4 4 16")
+    if (( RERUN_CLEAN_MATCHED_ARMS == 1 )); then
+        expected_matched_points=("4 1 7 4")
+    else
+        expected_matched_points=("4 1 7 4" "4 2 6 8" "4 3 5 12" "4 4 4 16")
+    fi
     (( ${#POINTS[@]} == ${#expected_matched_points[@]} )) || {
-        echo "matched mode requires exactly the four ratios 1:7, 2:6, 3:5, and 4:4" >&2
+        echo "matched mode selected an unexpected async arm set" >&2
         exit 1
     }
     for expected_point in "${expected_matched_points[@]}"; do
@@ -655,8 +678,13 @@ printf 'generation: rbs=%s groups, n=%s, async in-flight=%s trajectories\n' \
     "${ROLLOUT_BATCH}" "${SAMPLES_PER_PROMPT}" \
     "${ASYNC_MAX_CONCURRENT_SAMPLES_VALUE:-${DEFAULT_ASYNC_CONCURRENCY}}"
 if (( MATCH_PARTIAL_CONCURRENCY == 1 )); then
-    printf 'matched protocol: colocated partial O=%s groups; async C=%s trajectories; max staleness=4\n' \
-        "${PARTIAL_OVER_SAMPLING_BATCH_SIZE}" "${ASYNC_MAX_CONCURRENT_SAMPLES_VALUE}"
+    if (( RERUN_CLEAN_MATCHED_ARMS == 1 )); then
+        printf 'clean matched rerun: colocated partial plus t1r7; O=%s groups; async C=%s trajectories; max staleness=4\n' \
+            "${PARTIAL_OVER_SAMPLING_BATCH_SIZE}" "${ASYNC_MAX_CONCURRENT_SAMPLES_VALUE}"
+    else
+        printf 'matched protocol: colocated partial O=%s groups; async C=%s trajectories; max staleness=4\n' \
+            "${PARTIAL_OVER_SAMPLING_BATCH_SIZE}" "${ASYNC_MAX_CONCURRENT_SAMPLES_VALUE}"
+    fi
     printf 'causal warning: versus the old colocated baseline, both partial rollout and O change\n'
 fi
 if (( RUN_NAMESPACE_WAS_EXPLICIT == 1 )); then
@@ -694,7 +722,11 @@ if (( INCLUDE_COLOCATED == 1 || MATCH_PARTIAL_CONCURRENCY == 1 )); then
         "$(( GLOBAL_BATCH / COLOCATED_DATA_PARALLEL ))" "${colocated_inflight}" \
         "${colocated_engines}" "${colocated_inflight}/${colocated_engines}" "${colocated_name}"
     if (( MATCH_PARTIAL_CONCURRENCY == 1 )); then
-        printf 'global C is matched; only t4r4 also matches colocated engine count and nominal C/engine\n'
+        if (( RERUN_CLEAN_MATCHED_ARMS == 1 )); then
+            printf 'global C is matched; t1r7 retains the original async engine topology\n'
+        else
+            printf 'global C is matched; only t4r4 also matches colocated engine count and nominal C/engine\n'
+        fi
     fi
 fi
 
@@ -776,6 +808,7 @@ if (( MATCH_PARTIAL_CONCURRENCY == 1 )); then
         printf 'key\tvalue\n'
         printf 'namespace\t%s\n' "${RUN_NAMESPACE}"
         printf 'resume_matched_chain\t%s\n' "${RESUME_MATCHED_CHAIN}"
+        printf 'rerun_clean_matched_arms\t%s\n' "${RERUN_CLEAN_MATCHED_ARMS}"
         if (( RESUME_MATCHED_CHAIN == 1 )); then
             printf 'resume_of_manifest\t%s\n' "${LOG_DIR}/${RUN_NAMESPACE}.manifest.tsv"
         fi

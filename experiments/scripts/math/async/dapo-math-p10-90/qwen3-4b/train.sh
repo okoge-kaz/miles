@@ -6,6 +6,11 @@ export PYTHONBUFFERED=16
 export HF_HOME=/root/.cache/huggingface
 export MILES_EXPERIMENTAL_ROLLOUT_REFACTOR=1
 
+if [[ "${ZERO_REWARD_ON_TRUNCATED:-0}" != "0" && "${ZERO_LOSS_ON_TRUNCATED:-0}" != "0" ]]; then
+   echo "ZERO_REWARD_ON_TRUNCATED and ZERO_LOSS_ON_TRUNCATED are mutually exclusive" >&2
+   exit 2
+fi
+
 NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
 HAS_NVLINK=$([ "$NVLINK_COUNT" -gt 0 ] && echo 1 || echo 0)
 

@@ -113,6 +113,10 @@ fi
 : "${RM_TYPE:=deepscaler}"
 : "${ZERO_REWARD_ON_TRUNCATED:=1}"
 : "${ZERO_LOSS_ON_TRUNCATED:=0}"
+if [[ "${ZERO_REWARD_ON_TRUNCATED}" != "0" && "${ZERO_LOSS_ON_TRUNCATED}" != "0" ]]; then
+    echo "ZERO_REWARD_ON_TRUNCATED and ZERO_LOSS_ON_TRUNCATED are mutually exclusive" >&2
+    exit 2
+fi
 
 # evaluation during training; the reported numbers come from src/offline_eval
 : "${EVAL_INTERVAL:=0}"       # 0 disables in-run eval; score HF exports offline

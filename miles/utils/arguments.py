@@ -2406,7 +2406,8 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 default=None,
                 help="Type of the reward model",
             )
-            parser.add_argument(
+            truncation_behavior = parser.add_mutually_exclusive_group()
+            truncation_behavior.add_argument(
                 "--zero-reward-on-truncated",
                 action="store_true",
                 default=False,
@@ -2416,7 +2417,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "the existing behavior of grading the truncated response text."
                 ),
             )
-            parser.add_argument(
+            truncation_behavior.add_argument(
                 "--zero-loss-on-truncated",
                 action="store_true",
                 default=False,
@@ -2978,7 +2979,19 @@ def should_run_actor_logprob_forward(args: argparse.Namespace) -> bool:
     return not args.use_rollout_logprobs or args.get_mismatch_metrics
 
 
+def _validate_truncation_behavior(args: argparse.Namespace) -> None:
+    """Reject contradictory handling of generation-truncated samples."""
+    zero_reward = getattr(args, "zero_reward_on_truncated", False)
+    zero_loss = getattr(args, "zero_loss_on_truncated", False)
+    if zero_reward and zero_loss:
+        raise ValueError(
+            "--zero-reward-on-truncated and --zero-loss-on-truncated are mutually exclusive; "
+            "select exactly one truncation behavior or leave both disabled"
+        )
+
+
 def miles_validate_args(args):
+    _validate_truncation_behavior(args)
     validate_dashboard_args(args)
 
     args.ft_components = _resolve_ft_components(args)
@@ -3563,6 +3576,10 @@ def miles_validate_args(args):
             if hasattr(args, k):
                 logger.info(f"Warning: Argument {k} is already set to {getattr(args, k)}, will override with {v}.")
             setattr(args, k, v)
+
+    # A custom config is applied after parsing and can bypass argparse's
+    # mutually-exclusive group, so validate the effective values again.
+    _validate_truncation_behavior(args)
 
     if args.use_rollout_indexer_replay:
         args.use_indexer_replay = True
