@@ -21,6 +21,9 @@ ZERO_REWARD_ON_TRUNCATED=0, ZERO_LOSS_ON_TRUNCATED=1, and fixes:
   max weight staleness 16: trainer:rollout nodes 1:7, 2:6
   max weight staleness 20: trainer:rollout nodes 1:7, 2:6
 
+The shared staleness policy fixes TRAINING_BUFFER_QUEUE_SIZE=6000 for every
+arm in this launcher because all selected staleness bounds are at least 8.
+
 Useful environment overrides: CHAIN_JOBS, PARTITION, WALL, and RUN_NAMESPACE.
 With --resume-chain, RUN_NAMESPACE must name the existing study and CHAIN_JOBS
 defaults to nine new allocations per arm. Existing checkpoints are preserved.

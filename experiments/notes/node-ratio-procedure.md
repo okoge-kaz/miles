@@ -369,6 +369,41 @@ ones. The old checkpoints should remain available for provenance, but
 evaluation and figures must select the replacement namespace for these two
 terminal arms.
 
+#### 2026-08-31 high-staleness queue-capacity correction
+
+All async arms with `MAX_WEIGHT_STALENESS >= 8` must use
+`TRAINING_BUFFER_QUEUE_SIZE=6000`. A 1000-group queue can constrain producer
+admission before the configured weight-staleness bound becomes the active
+limit, so it is not a controlled setting for the intended `s8+` comparisons.
+The sweep launcher derives this value per arm, including mixed grids, and the
+async DAPO math recipe rejects any `s8+` job that reaches runtime with another
+value.
+
+The queue argument counts completed prompt groups, not trajectories. For a
+global batch of `G` trajectories, `n` samples per prompt, and bound `S`, the
+minimum capacity enforced by this experiment is
+`ceil(G * S / n)` groups. With `G=3072` and `n=16`, the requirements for
+`S={8,16,20,24,28}` are `{1536,3072,3840,4608,5376}` groups, respectively, so
+6000 covers the current grid. `S=32` would require 6144 groups and therefore
+fails before submission instead of silently running queue-bound.
+
+Fourteen earlier async checkpoints are quarantined by this correction: the
+four `s8` ratio arms in `sr-20260819-212906`, all six arms in
+`hiso-zero-loss-trunc-s8-16-20-r12-20260827-v1`, and the four async arms in
+`hiso-reward-off-trunc-coloc-s8-16-r12-20260827-v1`. The colocated arm in the
+last namespace is not affected because the async training-buffer queue does not
+apply to it. Use `experiments/cleanup_tbq1000_staleness_checkpoints.sh` to audit
+the exact paths and its explicit `--delete` mode only after reviewing the dry
+run. Corrected runs must use fresh namespaces so their W&B groups and offline
+evaluation outputs cannot be confused with the quarantined runs.
+
+The completed zero-reward `s8` four-ratio cohort is retained for exploratory
+analysis and deferred until the pre-publication controlled rerun. The immediate
+correction targets only the ten incomplete truncation-ablation arms; select it
+with `--cohort truncation-ablations`. `--cohort baseline-s8` is a separate,
+explicit cleanup target so the completed reference cannot be removed by the
+current correction command.
+
 The CLI now declares the two truncation flags mutually exclusive. Effective
 configuration is validated again after YAML overrides, and both async and sync
 recipes reject nonzero values for both environment variables before training.

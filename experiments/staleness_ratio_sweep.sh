@@ -11,6 +11,7 @@ RECIPE_PATH="${REPO_ROOT}/${RECIPE}"
 COLOCATED_RECIPE="experiments/scripts/math/sync/dapo-math-p10-90/qwen3-4b/run.sbatch"
 COLOCATED_RECIPE_PATH="${REPO_ROOT}/${COLOCATED_RECIPE}"
 source "${REPO_ROOT}/experiments/env.sh"
+source "${REPO_ROOT}/experiments/common/staleness_buffer_policy.sh"
 
 # The completed staleness-ratio cohort used this image. Matched mode resolves
 # aliases before comparing, so the fsw/fs1 spelling may differ but the image
@@ -120,6 +121,11 @@ checkpoints.
 
 Useful environment overrides: TOTAL_NODES, STALENESS_LEVELS, RATIOS,
 TRAINING_BUFFER_QUEUE_SIZE, CHAIN_JOBS, PARTITION, WALL, and RUN_NAMESPACE.
+TRAINING_BUFFER_QUEUE_SIZE controls arms below max weight staleness 8. Arms at
+max weight staleness 8 or above always use 6000 completed groups.
+Every async arm also requires at least
+ceil(GLOBAL_BATCH_SIZE * max_weight_staleness / N_SAMPLES_PER_PROMPT)
+completed groups and fails before submission when that capacity is unavailable.
 --resume-matched-chain ignores CHAIN_JOBS and always uses nine.
 EOF
 }
@@ -611,6 +617,27 @@ fi
 SETTING_COUNT=$(( ${#POINTS[@]} + INCLUDE_COLOCATED + MATCH_PARTIAL_CONCURRENCY ))
 DEFAULT_ASYNC_CONCURRENCY=$(( ROLLOUT_BATCH * SAMPLES_PER_PROMPT ))
 
+training_buffer_queue_size_for_staleness() {
+    local max_weight_staleness="$1"
+    local queue_size
+    queue_size="$(staleness_training_buffer_queue_size \
+        "${max_weight_staleness}" \
+        "${TRAINING_BUFFER_QUEUE_SIZE_VALUE}")" || return 1
+    require_staleness_training_buffer_queue_size \
+        "${max_weight_staleness}" \
+        "${queue_size}" \
+        "${GLOBAL_BATCH}" \
+        "${SAMPLES_PER_PROMPT}" || return 1
+    printf '%s\n' "${queue_size}"
+}
+
+required_training_buffer_queue_size_for_staleness() {
+    staleness_required_training_buffer_queue_size \
+        "$1" \
+        "${GLOBAL_BATCH}" \
+        "${SAMPLES_PER_PROMPT}"
+}
+
 async_run_name() {
     local staleness="$1"
     local train_nodes="$2"
@@ -638,6 +665,28 @@ async_config_tag() {
     printf '%s\n' "${config_tag}"
 }
 
+find_async_resume_checkpoint() {
+    local staleness="$1"
+    local train_nodes="$2"
+    local rollout_nodes="$3"
+    local config_tag expected_queue_size
+    config_tag="$(async_config_tag "${staleness}" "${train_nodes}" "${rollout_nodes}")"
+    expected_queue_size="$(training_buffer_queue_size_for_staleness "${staleness}")"
+
+    if [[ "${expected_queue_size}" == 1000 ]]; then
+        find "${TRAIN_CKPT_DIR}" \
+            -type d \
+            -name "${config_tag}*" \
+            ! -name '*-tbq*' \
+            -print -quit 2>/dev/null
+    else
+        find "${TRAIN_CKPT_DIR}" \
+            -type d \
+            -name "${config_tag}*-tbq${expected_queue_size}" \
+            -print -quit 2>/dev/null
+    fi
+}
+
 colocated_run_name() {
     if (( MATCH_PARTIAL_CONCURRENCY == 1 )); then
         printf 's0-colocated-partial-o%s-%s\n' "${PARTIAL_OVER_SAMPLING_BATCH_SIZE}" "${RUN_NAMESPACE}"
@@ -661,9 +710,12 @@ printf 'fixed by recipe: queue=%s, reference=%s, rollouts=%s, steps/rollout=%s, 
     "${QUEUE_POLICY}" "${STALENESS_REFERENCE_VALUE}" "${NUM_ROLLOUT_VALUE}" \
     "${NUM_STEPS_PER_ROLLOUT_VALUE}" \
     "${GLOBAL_BATCH}" "${TENSOR_PARALLEL}" "${CONTEXT_PARALLEL}" "${MAX_TOKENS_PER_GPU_VALUE}"
-printf 'completed-group buffer: %s groups (%s training batches)\n' \
+printf 'completed-group buffer policy: below s%s=%s groups; s%s and above=%s groups\n' \
+    "${MILES_HIGH_STALENESS_THRESHOLD}" \
     "${TRAINING_BUFFER_QUEUE_SIZE_VALUE}" \
-    "$(( TRAINING_BUFFER_QUEUE_SIZE_VALUE / ROLLOUT_BATCH ))"
+    "${MILES_HIGH_STALENESS_THRESHOLD}" \
+    "${MILES_HIGH_STALENESS_TRAINING_BUFFER_QUEUE_SIZE}"
+printf 'capacity invariant: buffer >= ceil(gbs * max-staleness / samples-per-prompt) groups\n'
 printf 'fixed safety: response=%s, total-context=%s, zero-reward-trunc=%s, zero-loss-trunc=%s, replay=%s/%s, fused-logprobs=%s, exact-segments=%s, staleness-bin=%s\n' \
     "${MAX_RESPONSE_LEN_VALUE}" "${ROLLOUT_MAX_CONTEXT_LEN_VALUE}" \
     "${ZERO_REWARD_ON_TRUNCATED_VALUE}" "${ZERO_LOSS_ON_TRUNCATED_VALUE}" \
@@ -693,18 +745,22 @@ else
     namespace_source=automatic
 fi
 printf 'namespace: %s (%s)\n\n' "${RUN_NAMESPACE}" "${namespace_source}"
-printf '  %-10s %-4s %-3s %-3s %-4s %-8s %-8s %-8s %-10s %s\n' \
-    mode max T R dp gbs/dp inflight engines C/engine run
+printf '  %-10s %-4s %-3s %-3s %-4s %-8s %-8s %-8s %-10s %-7s %-8s %s\n' \
+    mode max T R dp gbs/dp inflight engines C/engine buffer required run
 for point in "${POINTS[@]}"; do
     read -r staleness train_nodes rollout_nodes data_parallel <<<"${point}"
     run_name="$(async_run_name "${staleness}" "${train_nodes}" "${rollout_nodes}")"
     async_engines=$(( rollout_nodes * GPUS_PER_NODE / ASYNC_GPUS_PER_ENGINE ))
-    printf '  %-10s %-4s %-3s %-3s %-4s %-8s %-8s %-8s %-10s %s\n' \
+    point_training_buffer_queue_size="$(training_buffer_queue_size_for_staleness "${staleness}")"
+    required_training_buffer_queue_size="$(required_training_buffer_queue_size_for_staleness "${staleness}")"
+    printf '  %-10s %-4s %-3s %-3s %-4s %-8s %-8s %-8s %-10s %-7s %-8s %s\n' \
         async "${staleness}" "${train_nodes}" "${rollout_nodes}" "${data_parallel}" \
         "$(( GLOBAL_BATCH / data_parallel ))" \
         "${ASYNC_MAX_CONCURRENT_SAMPLES_VALUE:-${DEFAULT_ASYNC_CONCURRENCY}}" \
         "${async_engines}" \
         "${ASYNC_MAX_CONCURRENT_SAMPLES_VALUE:-${DEFAULT_ASYNC_CONCURRENCY}}/${async_engines}" \
+        "${point_training_buffer_queue_size}" \
+        "${required_training_buffer_queue_size}" \
         "${run_name}"
 done
 if (( INCLUDE_COLOCATED == 1 || MATCH_PARTIAL_CONCURRENCY == 1 )); then
@@ -717,10 +773,10 @@ if (( INCLUDE_COLOCATED == 1 || MATCH_PARTIAL_CONCURRENCY == 1 )); then
         colocated_inflight="${DEFAULT_ASYNC_CONCURRENCY}"
     fi
     colocated_engines=$(( TOTAL_NODES * GPUS_PER_NODE / COLOCATED_GPUS_PER_ENGINE ))
-    printf '  %-10s %-4s %-3s %-3s %-4s %-8s %-8s %-8s %-10s %s\n' \
+    printf '  %-10s %-4s %-3s %-3s %-4s %-8s %-8s %-8s %-10s %-7s %-8s %s\n' \
         "${colocated_mode}" none "${TOTAL_NODES}" 0 "${COLOCATED_DATA_PARALLEL}" \
         "$(( GLOBAL_BATCH / COLOCATED_DATA_PARALLEL ))" "${colocated_inflight}" \
-        "${colocated_engines}" "${colocated_inflight}/${colocated_engines}" "${colocated_name}"
+        "${colocated_engines}" "${colocated_inflight}/${colocated_engines}" 1000 n/a "${colocated_name}"
     if (( MATCH_PARTIAL_CONCURRENCY == 1 )); then
         if (( RERUN_CLEAN_MATCHED_ARMS == 1 )); then
             printf 'global C is matched; t1r7 retains the original async engine topology\n'
@@ -734,8 +790,12 @@ if (( RESUME_CHAIN == 1 )); then
     missing_resume_checkpoint=0
     for point in "${POINTS[@]}"; do
         read -r staleness train_nodes rollout_nodes _ <<<"${point}"
-        config_tag="$(async_config_tag "${staleness}" "${train_nodes}" "${rollout_nodes}")"
-        resume_checkpoint="$(find "${TRAIN_CKPT_DIR}" -type d -name "*${config_tag}*" -print -quit 2>/dev/null)"
+        resume_checkpoint="$(
+            find_async_resume_checkpoint \
+                "${staleness}" \
+                "${train_nodes}" \
+                "${rollout_nodes}"
+        )"
         if [[ -z "${resume_checkpoint}" ]]; then
             echo "resume checkpoint not found for $(async_run_name "${staleness}" "${train_nodes}" "${rollout_nodes}")" >&2
             missing_resume_checkpoint=1
@@ -750,7 +810,7 @@ if (( RESUME_CHAIN == 1 )); then
         fi
     fi
     (( missing_resume_checkpoint == 0 )) || exit 1
-    unset missing_resume_checkpoint config_tag resume_checkpoint
+    unset missing_resume_checkpoint resume_checkpoint
 fi
 
 if (( MATCH_PARTIAL_CONCURRENCY == 1 )); then
@@ -843,6 +903,9 @@ if (( MATCH_PARTIAL_CONCURRENCY == 1 )); then
         printf 'partial_over_sampling_groups_effective\t%s\n' "${PARTIAL_OVER_SAMPLING_BATCH_SIZE}"
         printf 'async_max_concurrent_samples\t%s\n' "${ASYNC_MAX_CONCURRENT_SAMPLES_VALUE}"
         printf 'training_buffer_queue_size\t%s\n' "${TRAINING_BUFFER_QUEUE_SIZE_VALUE}"
+        printf 'high_staleness_threshold\t%s\n' "${MILES_HIGH_STALENESS_THRESHOLD}"
+        printf 'high_staleness_training_buffer_queue_size\t%s\n' \
+            "${MILES_HIGH_STALENESS_TRAINING_BUFFER_QUEUE_SIZE}"
         printf 'sample_staleness_max_bin\t%s\n' "${SAMPLE_STALENESS_MAX_BIN_VALUE}"
         printf 'max_weight_staleness\t4\n'
         printf 'switch_metric_contract\t%s\n' "${MATCHED_SWITCH_METRIC_CONTRACT}"
@@ -858,6 +921,8 @@ submit_chain() {
     run_name="$(async_run_name "${staleness}" "${train_nodes}" "${rollout_nodes}")"
     local config_tag
     config_tag="$(async_config_tag "${staleness}" "${train_nodes}" "${rollout_nodes}")"
+    local training_buffer_queue_size
+    training_buffer_queue_size="$(training_buffer_queue_size_for_staleness "${staleness}")"
     local base_exports_csv exports_csv raw_job_id job_id chain_index clean_value
     local -a dependency=()
     local -a exports=(
@@ -865,7 +930,7 @@ submit_chain() {
         "RUN_NAME=${run_name}"
         "CONFIG_TAG=${config_tag}"
         "MAX_WEIGHT_STALENESS=${staleness}"
-        "TRAINING_BUFFER_QUEUE_SIZE=${TRAINING_BUFFER_QUEUE_SIZE_VALUE}"
+        "TRAINING_BUFFER_QUEUE_SIZE=${training_buffer_queue_size}"
         "ACTOR_NUM_NODES=${train_nodes}"
         "ROLLOUT_NUM_GPUS=$(( rollout_nodes * GPUS_PER_NODE ))"
         "ASYNC_MAX_CONCURRENT_SAMPLES=${ASYNC_MAX_CONCURRENT_SAMPLES_VALUE}"

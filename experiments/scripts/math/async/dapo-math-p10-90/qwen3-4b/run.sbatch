@@ -17,6 +17,7 @@ REPO_ROOT="${MILES_REPO:-${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURC
 # parent directly so both SGLang and the tokenizer read iter_0004000 in place.
 export HF_CKPT_DIR="${QWEN3_4B_BASE_HF_ROOT:-/lustre/fsw/portfolios/coreai/users/kfujii/checkpoints/huggingface/Qwen3-4B-Base/LR2.0e-5-SEQ32768-GBS128-MBS1-TP1-PP1-CP1-EP1-PACK1-standard-cp-STEPS4000}"
 source "${REPO_ROOT}/experiments/env.sh"
+source "${REPO_ROOT}/experiments/common/staleness_buffer_policy.sh"
 
 : "${WANDB_API_KEY:?set WANDB_API_KEY, or put an api.wandb.ai entry in ~/.netrc}"
 
@@ -70,6 +71,16 @@ if [[ "${QUEUE_TYPE}" == queue-drop ]]; then
    unset MAX_WEIGHT_STALENESS
 else
    : "${MAX_WEIGHT_STALENESS:=8}"
+   TRAINING_BUFFER_QUEUE_SIZE="$(
+      staleness_training_buffer_queue_size \
+         "${MAX_WEIGHT_STALENESS}" \
+         "${TRAINING_BUFFER_QUEUE_SIZE}"
+   )"
+   require_staleness_training_buffer_queue_size \
+      "${MAX_WEIGHT_STALENESS}" \
+      "${TRAINING_BUFFER_QUEUE_SIZE}" \
+      "${GLOBAL_BATCH_SIZE}" \
+      "${N_SAMPLES_PER_PROMPT}"
 fi
 : "${STALENESS_REFERENCE:=prefill}"   # completion | submission | prefill
 : "${PAUSE_GENERATION_MODE:=in_place}"
