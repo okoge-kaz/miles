@@ -9,6 +9,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from loguru import logger
+
 from experiments.src.environments.tau_bench.continuation import task_with_continuation
 from experiments.src.environments.tau_bench.runtime import TauSession, TauUserConfig, verify_tau_runtime
 from experiments.src.environments.tau_bench.task_identity import TAU_COMMIT, TAU_PACKAGE_VERSION
@@ -152,6 +154,52 @@ def _user_message_from_assistant(assistant_message: Any) -> Any:
     )
 
 
+def _assistant_message_has_payload(assistant_message: Any) -> bool:
+    """Return whether a generated user turn has text or tool calls."""
+
+    content = assistant_message.content
+    return bool(isinstance(content, str) and content.strip()) or bool(
+        assistant_message.tool_calls
+    )
+
+
+def _generate_user_message(
+    generate_fn: Any,
+    *,
+    model: str,
+    messages: list[Any],
+    tools: list[Any] | None,
+    llm_args: dict[str, Any],
+) -> Any:
+    """Retry semantically empty provider responses before constructing a user turn."""
+
+    empty_retries = int(llm_args.get("num_retries", 0))
+    if empty_retries < 0:
+        raise ValueError("Tau user simulator retries must be non-negative")
+    base_seed = llm_args.get("seed")
+    for attempt in range(empty_retries + 1):
+        request_args = dict(llm_args)
+        if attempt and isinstance(base_seed, int):
+            request_args["seed"] = base_seed + attempt
+        assistant_message = generate_fn(
+            model=model,
+            messages=messages,
+            tools=tools,
+            call_name="user_simulator_response",
+            **request_args,
+        )
+        if _assistant_message_has_payload(assistant_message):
+            return _user_message_from_assistant(assistant_message)
+        if attempt < empty_retries:
+            logger.warning(
+                "Tau user simulator returned an empty response; retrying ({}/{})",
+                attempt + 1,
+                empty_retries,
+            )
+
+    return _user_message_from_assistant(assistant_message)
+
+
 @lru_cache(maxsize=1)
 def _user_simulator_type() -> type[Any]:
     """Return the pinned Tau simulator with atomic tool-call construction."""
@@ -173,14 +221,13 @@ def _user_simulator_type() -> type[Any]:
             elif message.has_content() or message.is_tool_call():
                 state.messages.append(message)
 
-            assistant_message = generate(
+            return _generate_user_message(
+                generate,
                 model=self.llm,
                 messages=state.system_messages + state.flip_roles(),
                 tools=self.tools,
-                call_name="user_simulator_response",
-                **self.llm_args,
+                llm_args=self.llm_args,
             )
-            return _user_message_from_assistant(assistant_message)
 
     return AReaLTau2UserSimulator
 

@@ -13,6 +13,7 @@ from experiments.src.datasets.areal_tau2.prepare import _schedule_summary, adapt
 from experiments.src.environments.areal_tau2.generator import generate
 from experiments.src.environments.areal_tau2.runtime import (
     AReaLTau2Session,
+    _generate_user_message,
     _user_message_from_assistant,
     _validate_metadata,
     canonical_digest,
@@ -290,6 +291,40 @@ def test_user_simulator_preserves_tool_call_only_response_atomically() -> None:
     assert user_message.tool_calls[0].name == "lookup_account"
     assert user_message.tool_calls[0].arguments == {"account_id": "123"}
     assert user_message.tool_calls[0].requestor == "user"
+
+
+def test_user_simulator_retries_empty_responses_with_deterministic_seeds() -> None:
+    calls = []
+    responses = iter(
+        (
+            SimpleNamespace(content=None, tool_calls=None),
+            SimpleNamespace(content="  ", tool_calls=[]),
+            SimpleNamespace(
+                content="I found it.",
+                tool_calls=None,
+                cost=0.0,
+                usage=None,
+                raw_data=None,
+            ),
+        )
+    )
+
+    def fake_generate(**kwargs):
+        calls.append(kwargs)
+        return next(responses)
+
+    user_message = _generate_user_message(
+        fake_generate,
+        model="openai/user-model",
+        messages=["history"],
+        tools=None,
+        llm_args={"num_retries": 4, "seed": 42, "temperature": 0.7},
+    )
+
+    assert user_message.content == "I found it."
+    assert [call["seed"] for call in calls] == [42, 43, 44]
+    assert all(call["num_retries"] == 4 for call in calls)
+    assert all(call["call_name"] == "user_simulator_response" for call in calls)
 
 
 def test_areal_generator_uses_dedicated_session(monkeypatch: pytest.MonkeyPatch) -> None:
