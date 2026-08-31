@@ -312,6 +312,18 @@ readonly VERIFIED_GENERATOR=experiments.src.environments.areal_tau2.generator.ge
 : "${DEBUG_FAILURE_MIN_INFLIGHT_TOKENS:=0}"
 : "${DEBUG_FAILURE_MIN_REGENERATE_GROUPS:=0}"
 : "${REPLAY_RESUME_EXPECT_FAILURE_ROLLOUT_ID:=}"
+[[ "${SAVE_INTERVAL}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "SAVE_INTERVAL must be a positive integer" >&2
+    exit 1
+}
+[[ "${SAVE_RETAIN_INTERVAL}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "SAVE_RETAIN_INTERVAL must be a positive integer" >&2
+    exit 1
+}
+((SAVE_RETAIN_INTERVAL % SAVE_INTERVAL == 0)) || {
+    echo "SAVE_RETAIN_INTERVAL=${SAVE_RETAIN_INTERVAL} must be a multiple of SAVE_INTERVAL=${SAVE_INTERVAL}" >&2
+    exit 1
+}
 [[ "${EVAL_INTERVAL}" == 0 ]] || {
     echo "Tau three evaluation is held out and offline; EVAL_INTERVAL must be 0" >&2
     exit 1
