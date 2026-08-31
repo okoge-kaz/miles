@@ -13,6 +13,7 @@ from experiments.src.datasets.areal_tau2.prepare import _schedule_summary, adapt
 from experiments.src.environments.areal_tau2.generator import generate
 from experiments.src.environments.areal_tau2.runtime import (
     AReaLTau2Session,
+    _user_message_from_assistant,
     _validate_metadata,
     canonical_digest,
 )
@@ -263,6 +264,32 @@ def test_runtime_metadata_fails_closed() -> None:
     del broken["tau_expected_agent_db_hash"]
     with pytest.raises(ValueError, match="missing"):
         _validate_metadata(broken)
+
+
+def test_user_simulator_preserves_tool_call_only_response_atomically() -> None:
+    from tau2.data_model.message import AssistantMessage, ToolCall
+
+    assistant_message = AssistantMessage(
+        role="assistant",
+        content=None,
+        tool_calls=[
+            ToolCall(
+                id="call-1",
+                name="lookup_account",
+                arguments={"account_id": "123"},
+                requestor="assistant",
+            )
+        ],
+    )
+
+    user_message = _user_message_from_assistant(assistant_message)
+
+    assert user_message.content is None
+    assert len(user_message.tool_calls) == 1
+    assert user_message.tool_calls[0].id == "call-1"
+    assert user_message.tool_calls[0].name == "lookup_account"
+    assert user_message.tool_calls[0].arguments == {"account_id": "123"}
+    assert user_message.tool_calls[0].requestor == "user"
 
 
 def test_areal_generator_uses_dedicated_session(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -126,6 +126,65 @@ def load_task(task_data: dict[str, Any]) -> Any:
     return task
 
 
+def _user_message_from_assistant(assistant_message: Any) -> Any:
+    """Atomically preserve a Tau user simulator's text or tool calls."""
+
+    from tau2.data_model.message import ToolCall, UserMessage
+
+    tool_calls = None
+    if assistant_message.tool_calls:
+        tool_calls = [
+            ToolCall(
+                id=tool_call.id,
+                name=tool_call.name,
+                arguments=tool_call.arguments,
+                requestor="user",
+            )
+            for tool_call in assistant_message.tool_calls
+        ]
+    return UserMessage(
+        role="user",
+        content=assistant_message.content,
+        tool_calls=tool_calls,
+        cost=assistant_message.cost,
+        usage=assistant_message.usage,
+        raw_data=assistant_message.raw_data,
+    )
+
+
+@lru_cache(maxsize=1)
+def _user_simulator_type() -> type[Any]:
+    """Return the pinned Tau simulator with atomic tool-call construction."""
+
+    from tau2.data_model.message import AssistantMessage, MultiToolMessage, ToolMessage
+    from tau2.user.user_simulator import UserSimulator
+    from tau2.utils.llm_utils import generate
+
+    class AReaLTau2UserSimulator(UserSimulator):
+        def _generate_next_message(self, message: Any, state: Any) -> Any:
+            if isinstance(message, AssistantMessage) and message.is_audio:
+                raise ValueError(
+                    "Assistant message cannot be audio. Use VoiceUserSimulator instead."
+                )
+            if isinstance(message, MultiToolMessage):
+                state.messages.extend(message.tool_messages)
+            elif isinstance(message, ToolMessage):
+                state.messages.append(message)
+            elif message.has_content() or message.is_tool_call():
+                state.messages.append(message)
+
+            assistant_message = generate(
+                model=self.llm,
+                messages=state.system_messages + state.flip_roles(),
+                tools=self.tools,
+                call_name="user_simulator_response",
+                **self.llm_args,
+            )
+            return _user_message_from_assistant(assistant_message)
+
+    return AReaLTau2UserSimulator
+
+
 def compute_expected_state(
     task_data: dict[str, Any],
     *,
@@ -296,10 +355,10 @@ def _create_gym_environment(
 ) -> Any:
     from tau2.gym.gym_agent import AgentGymEnv, GymAgent
     from tau2.orchestrator.orchestrator import Orchestrator
-    from tau2.user.user_simulator import UserSimulator
 
     domain = str(metadata["tau_domain"])
     dataset_root = DEFAULT_AREAL_TAU2_ROOT
+    user_simulator_type = _user_simulator_type()
 
     class AReaLTau2GymEnv(AgentGymEnv):
         def _get_task(self) -> Any:
@@ -318,7 +377,7 @@ def _create_gym_environment(
                 user_tools = environment.get_user_tools(include=task.user_tools) or None
             except ValueError:
                 user_tools = None
-            user = UserSimulator(
+            user = user_simulator_type(
                 tools=user_tools,
                 instructions=task.user_scenario,
                 llm=self.user_llm,
