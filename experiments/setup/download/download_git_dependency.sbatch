@@ -1,14 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=miles-download-git-dependency
-#SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=cpu_datamover
-#SBATCH --qos=cpu-datamover
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=2
-#SBATCH --time=02:00:00
-#SBATCH --output=experiments/outputs/download/%x-%j.log
-#SBATCH --export=NIL
+#PBS -N miles-download-git-dependency
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=32:mpiprocs=1
+#PBS -l place=scatter
+#PBS -l walltime=02:00:00
+#PBS -j oe
 
 set -euo pipefail
 
@@ -17,7 +13,7 @@ USER="${USER:-$(id -un)}"
 WANDB_MODE=disabled
 export PATH USER WANDB_MODE
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
+REPO_ROOT="${PBS_O_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
 source "${REPO_ROOT}/experiments/env.sh"
 
 : "${GIT_REPO:?set GIT_REPO}"

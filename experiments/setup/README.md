@@ -5,6 +5,140 @@ Runtime environments and rewards do not live here: their implementations are
 under `experiments/src/environments`, dataset adapters under
 `experiments/src/datasets`, and persistent cluster tests under `tests/slurm`.
 
+## Unified entrypoint
+
+Use `experiments/setup.sh` for the common one-time workspace operations. Asset
+actions run in preview mode by default. The standalone `sft` preview validates
+that its source checkpoints exist; the `all` preview reports missing external
+SFT exports without stopping so a fresh workspace can display the complete
+plan. Add `--submit` only when the commands should be submitted to PBS.
+
+```bash
+# Create directories and inspect what is already present.
+experiments/setup.sh init
+experiments/setup.sh status
+experiments/setup.sh list
+
+# Preview one group or the complete setup.
+experiments/setup.sh container
+experiments/setup.sh models
+experiments/setup.sh datasets
+experiments/setup.sh sft
+experiments/setup.sh all
+
+# Submit the complete PBS dependency graph.
+experiments/setup.sh all --submit
+
+# Build the SIF and download training datasets using CPU jobs only.
+experiments/setup.sh datasets --submit
+```
+
+`all --submit` validates every SFT checkpoint source before queueing its first
+job, so a missing external SFT export cannot leave a partially submitted setup.
+It also includes CUDA/NCCL checkpoint conversion. Use `datasets --submit` when
+only the SIF and dataset assets should be prepared: the container build and all
+download/materialization jobs explicitly select the CPU-only reservation
+profile (`R9920261300`, `RTYPE=rt_HC`, no requested GPUs).
+
+| Group | Delegated worker or inventory |
+| --- | --- |
+| `container` | `experiments/container/import_image.sbatch` |
+| `models` | `download/stage_all.sh models` and `manifests/models.txt` |
+| `datasets` | `download/stage_all.sh datasets` and `manifests/datasets.txt` |
+| `sft` | `models/stage_sft_checkpoints.sh` and `manifests/sft_checkpoints.txt` |
+| `all` | Submit the container first, then make model, dataset, and SFT jobs depend on it. |
+
+Change `MILES_WORKSPACE_ROOT` in the environment, or its default in
+`experiments/env.sh`, to move the complete persistent layout. The derived
+checkpoint, container, dataset, and cache paths can still be overridden
+individually for exceptional runs. The default layout is:
+
+```text
+$MILES_WORKSPACE_ROOT/
+  checkpoints/{hf,megatron,training}/
+  containers/
+  datasets/{pre-train,rl,sft}/
+  cache/
+  src/
+```
+
+PBS project flags are deliberately omitted from reusable scripts and
+`pbs_submit`; an operator can pass `-P gai51740` to a manual direct `qsub`
+command. Default walltimes are 30 minutes for container imports, eight hours for
+preparation and checkpoint conversion, and 24 hours for downloads. Override `PBS_CONTAINER_WALLTIME`,
+`PBS_PREP_WALLTIME`, or `PBS_DOWNLOAD_WALLTIME` before submitting. The
+corresponding `SETUP_*_WALLTIME` variables provide a narrower override for
+setup commands only.
+
+The generic `datasets` group covers `manifests/datasets.txt`. Pinned or
+workflow-specific staging remains selectable through the entrypoints printed by
+`experiments/setup.sh list`, including Nemotron RL, SWE/tool-use RL, and AReaL
+Tau2 assets. Bulk manifest submission waits one second between `qsub` calls to
+avoid scheduler bursts; override `SETUP_SUBMIT_DELAY_SECONDS` only when the
+site's submission limits are known.
+
+A dataset is complete only when it has both a nonempty
+`MILES_SOURCE_PROVENANCE` marker and a recursively discovered payload file.
+Interrupted Hugging Face downloads are resumed with two workers and up to five
+attempts by default. Tune `HF_DOWNLOAD_MAX_WORKERS`, `HF_DOWNLOAD_ATTEMPTS`, and
+`HF_DOWNLOAD_RETRY_DELAY_SECONDS` when the Hub or site policy requires it.
+
+## Container build and permissions
+
+The `container` action submits `experiments/container/import_image.sbatch` as a
+CPU-only reservation job with the 30-minute container walltime. The job builds the configured
+OCI source through `experiments/container/miles.def` using Singularity
+`--fakeroot --fix-perms`; it does not use a bare OCI-to-SIF pull.
+
+For PBS builds, build output, unpack temp files, and the build-time OCI layer
+cache must live below `/local/<job-id>`; a `PBS_LOCALDIR` value is accepted only
+when it is itself below `/local`. The job fails instead of building on shared
+storage when that node-local path is unavailable. Manual non-PBS builds may
+fall back to `TMPDIR`/`/tmp`. After validation, the job moves the SIF via a
+hidden staging name into `$CONTAINER_DIR` and publishes it. The Singularity
+definition is copied to the local build directory with mode `0644` and checksum
+validated before fakeroot starts, avoiding shared-checkout traversal inside the
+builder. Publication writes checksum and provenance sidecars before updating
+`miles.sif`.
+
+This wrapper is required because the runtime preserves the submitting UID, but
+the OCI image installs Miles, Megatron, Tau, and SGLang below paths that are
+normally reachable only through `/root`. The definition file:
+
+- makes `/root` traversable without making the baked tree generally writable;
+- makes the baked code trees readable and traversable by the runtime UID;
+- checks out and tests the pinned Miles SGLang revision that reports
+  scheduler-authoritative policy provenance for asynchronous training;
+- installs and verifies the pinned Tau v1.0.1 runtime formerly carried by a
+  separate derived image;
+- creates static dataset, checkpoint, cache, evaluation, and file bind targets;
+- keeps `/tmp` and `/var/tmp` suitable for job-local writes.
+
+After the build, the same job first executes the candidate without code binds
+or a writable overlay and recursively checks the baked `/root` code permissions
+as the ordinary user. It then runs with `--no-eval`, `--no-home`,
+`--writable-tmpfs`, and the actual `CONTAINER_MOUNTS` to check imports, the
+nested `.env` mask, and read/write access. Only then is the candidate moved into
+its dated final path and `$CONTAINER_DIR/miles.sif` updated. A failed test cannot
+replace the stable image.
+
+To submit only this job without the unified entrypoint:
+
+```bash
+source experiments/env.sh
+source experiments/common/pbs.sh
+pbs_submit --profile=cpu --time="${PBS_CONTAINER_WALLTIME}" \
+  experiments/container/import_image.sbatch
+```
+
+If `--fakeroot` is unavailable on a build node, treat that as a cluster
+configuration problem. Do not build the shared SIF as host root.
+
+Set `DOCKER_IMAGE` to `repository@sha256:<digest>` when the SIF must be exactly
+reproducible. Mutable tags such as the development default `latest` are allowed,
+but the build warns about them and records the supplied OCI reference in the
+provenance sidecar.
+
 ## Layout
 
 ```text
@@ -15,6 +149,7 @@ experiments/setup/
   datasets/       deterministic dataset conversion and blend construction
   environments/   pinned environment assets and external dependencies
 tests/slurm/       persistent cluster/container integration tests
+experiments/setup.sh  unified dry-run/PBS submission entrypoint
 ```
 
 ### Download and staging
@@ -45,7 +180,7 @@ datasets and was fully superseded by these manifest-driven jobs.
 | `manifests/models.txt` | Model source, Megatron type, conversion overrides, and node count. |
 | `manifests/datasets.txt` | General Hugging Face dataset inventory. |
 | `manifests/nemotron_rl_datasets.tsv` | Nemotron inputs annotated by training/evaluation/environment role. |
-| `manifests/sft_checkpoints.txt` | Existing Hugging Face-format SFT checkpoints to convert. |
+| `manifests/sft_checkpoints.txt` | Existing Hugging Face-format SFT checkpoints to convert; source directories are relative to `HF_CKPT_DIR`. |
 
 ### Dataset preparation
 

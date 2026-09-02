@@ -1,14 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=dl-areal-tau2-rl
-#SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=cpu_datamover
-#SBATCH --qos=cpu-datamover
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --time=02:00:00
-#SBATCH --output=experiments/outputs/download/%x-%j.log
-#SBATCH --export=NIL
+#PBS -N dl-areal-tau2-rl
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=32:mpiprocs=1
+#PBS -l place=scatter
+#PBS -l walltime=02:00:00
+#PBS -j oe
 
 # Fetch only the AReaL RL task file and its nine DB snapshots. The 33,531-row
 # SFT file is intentionally excluded from this RL-only training path.
@@ -20,19 +16,24 @@ USER="${USER:-$(id -un)}"
 WANDB_MODE=disabled
 export PATH USER WANDB_MODE
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
+REPO_ROOT="${PBS_O_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
 source "${REPO_ROOT}/experiments/env.sh"
+source "${REPO_ROOT}/experiments/common/singularity.sh"
 
 readonly HF_REPO=inclusionAI/AReaL-tau2-data
 readonly HF_REVISION=1322eae337f836fe0e19bae14dab1eefc26bc983
 readonly LOCAL_NAME=areal-tau2-data
 export HF_REPO HF_REVISION LOCAL_NAME
+[[ -r "${CONTAINER_IMAGE}" ]] || {
+    echo "missing CONTAINER_IMAGE=${CONTAINER_IMAGE}; run experiments/setup.sh container --submit" >&2
+    exit 1
+}
 
-srun \
-    --container-image="${SQSH_IMAGE}" \
-    --container-mounts="${CONTAINER_MOUNTS}" \
-    --container-writable \
-    --no-container-mount-home \
+miles_srun \
+    --image="${CONTAINER_IMAGE}" \
+    --bind="${CONTAINER_MOUNTS}" \
+    --writable-tmpfs \
+    --no-home \
     --export=USER,WANDB_MODE,HF_REPO,HF_REVISION,LOCAL_NAME \
     bash -lc '
 set -euo pipefail

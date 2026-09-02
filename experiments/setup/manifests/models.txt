@@ -7,10 +7,12 @@
 # Sizes are the HF download; the torch_dist output is roughly the same again.
 #
 # --- RL experiment workhorses (experiments/scripts/math/{sync,async}) ---
-# Qwen3-4B (hybrid thinking) is already staged and is the model the first math
-# runs used. It sits at its post-training RLVR fixed point on math: raw_reward
+# Qwen3-4B (hybrid thinking) is the public fallback for bringing up math RL
+# when the external SFT export is unavailable. Earlier runs found its
+# post-training RLVR fixed point on math: raw_reward
 # 0.84 flat over 46 steps, 21.6/32 groups zero-variance, AIME24 avg@16 0.70 ->
 # 0.68. Usable as a collapse detector, not as a model with headroom.
+Qwen3-4B                          | Qwen/Qwen3-4B                                  | qwen3-4B
 #
 # Qwen3-4B-Instruct-2507 is the non-thinking instruct: same architecture (its
 # MODEL_ARGS file just re-sources qwen3-4B.sh with rotary base 5e6), so it is a
@@ -59,9 +61,9 @@ Qwen3-32B                         | Qwen/Qwen3-32B                              
 # gpt-oss-20b                     | openai/gpt-oss-20b                             | gpt-oss-20b | --no-bias-dropout-fusion
 #
 # --- >= 80B: the scales the SWE-RL / agentic examples actually use ---
-# Conversion defaults to one 8xB300 node. The 355B entry remains two-node
-# because its qualified PP=4, EP=4 topology uses 16 ranks; raw HBM is no longer
-# the limiting reason on aws-pdx.
+# Conversion defaults to one eight-GPU node. The 355B entry remains two-node
+# because its PP=4, EP=4 topology uses 16 ranks; validate memory headroom on the
+# current queue before changing that topology.
 Qwen3-Next-80B-A3B-Instruct       | Qwen/Qwen3-Next-80B-A3B-Instruct               | qwen3-next-80B-A3B
 GLM-4.5-Air                       | zai-org/GLM-4.5-Air                            | glm4.5-106B-A12B
 Qwen3-235B-A22B                   | Qwen/Qwen3-235B-A22B                           | qwen3-235B-A22B | --pipeline-model-parallel-size 2 --expert-model-parallel-size 4

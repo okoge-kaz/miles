@@ -1,19 +1,14 @@
 #!/bin/bash
-#SBATCH --job-name=miles-convert-ckpt
-#SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=batch
-#SBATCH --qos=interactive
-#SBATCH --nodes=1
-#SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:8
-#SBATCH --exclusive
-#SBATCH --time=01:00:00
-#SBATCH --output=experiments/outputs/convert/%x-%j.log
-#SBATCH --export=NIL
+#PBS -N miles-convert-ckpt
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=192:ngpus=8:mpiprocs=1
+#PBS -l place=scatter:excl
+#PBS -l walltime=08:00:00
+#PBS -j oe
 
 # Convert the HuggingFace checkpoint into the torch_dist format Megatron loads.
 #
-#   sbatch -A coreai_horizon_dilations experiments/setup/models/convert_checkpoint.sbatch
+#   pbs_submit --profile gpu experiments/setup/models/convert_checkpoint.sbatch
 #
 #   $HF_CKPT_DIR/$HF_MODEL_NAME  ->  $MEGATRON_CKPT_DIR/${MODEL_NAME}_torch_dist
 #
@@ -27,10 +22,7 @@ USER="${USER:-$(id -un)}"
 WANDB_MODE=disabled
 export PATH USER WANDB_MODE
 
-# sbatch copies this script into Slurm's spool directory, so BASH_SOURCE does
-# not point at the repo. Resolve through the submit directory (submit from the
-# repo root), falling back to the path for a direct `bash` invocation.
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
+REPO_ROOT="${MILES_SUBMIT_DIR:-${PBS_O_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}}"
 source "${REPO_ROOT}/experiments/env.sh"
 
 MODEL_NAME="${MODEL_NAME:-Qwen3-4B}"
@@ -39,8 +31,13 @@ MEGATRON_MODEL_TYPE="${MEGATRON_MODEL_TYPE:-qwen3-4B}"   # scripts/models/<type>
 # Per-model overrides from models.txt, e.g. parallelism for large MoE or a
 # fusion flag a given architecture cannot use.
 CONVERT_EXTRA_ARGS="${CONVERT_EXTRA_ARGS:-}"
-NODES="${SLURM_JOB_NUM_NODES:-1}"
-MASTER_NODE=$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | head -1)
+NODES="${MILES_JOB_NUM_NODES:-1}"
+if [[ -n "${PBS_NODEFILE:-}" && -r "${PBS_NODEFILE}" ]]; then
+    read -r MASTER_NODE < "${PBS_NODEFILE}"
+else
+    MASTER_NODE="$(hostname -s)"
+fi
+MASTER_NODE="${MASTER_NODE%%.*}"
 MASTER_PORT="${MASTER_PORT:-29517}"
 echo "converting ${HF_MODEL_NAME} -> ${MODEL_NAME}_torch_dist (${MEGATRON_MODEL_TYPE}) on ${NODES} node(s); extra: ${CONVERT_EXTRA_ARGS:-none}"
 
@@ -57,11 +54,11 @@ fi
 
 # One task per node; torchrun then forks 8 ranks locally. Multi-node uses the
 # static rendezvous so no extra service is needed.
-srun --nodes="${NODES}" --ntasks-per-node=1 \
-    --container-image="${SQSH_IMAGE}" \
-    --container-mounts="${CONTAINER_MOUNTS}" \
-    --container-writable \
-    --no-container-mount-home \
+miles_srun --nodes="${NODES}" --ntasks="${NODES}" --ntasks-per-node=1 \
+    --image="${CONTAINER_IMAGE}" \
+    --bind="${CONTAINER_MOUNTS}" \
+    --writable-tmpfs \
+    --no-home \
     --export=ALL \
     bash -lc "
 set -euo pipefail
@@ -73,7 +70,7 @@ source scripts/models/${MEGATRON_MODEL_TYPE}.sh
 # /root/miles is on the path too: Qwen3.5/3.6 MODEL_ARGS reference specs that
 # live in miles_plugins (--spec miles_plugins.models.qwen3_5 ...).
 PYTHONPATH=/root/Megatron-LM:/root/miles torchrun \
-    --nnodes ${NODES} --node-rank \${SLURM_NODEID:-0} \
+    --nnodes ${NODES} --node-rank \${MILES_NODE_RANK:-0} \
     --master-addr ${MASTER_NODE} --master-port ${MASTER_PORT} \
     --nproc-per-node ${GPUS_PER_NODE} \
     tools/convert_hf_to_torch_dist.py \

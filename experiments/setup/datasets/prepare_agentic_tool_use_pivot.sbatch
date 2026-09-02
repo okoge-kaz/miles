@@ -1,14 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=prepare-agentic-tool-pivot
-#SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=cpu
-#SBATCH --qos=cpu-interactive
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16
-#SBATCH --time=02:00:00
-#SBATCH --output=experiments/outputs/download/%x-%j.log
-#SBATCH --export=NIL
+#PBS -N prepare-agentic-tool-pivot
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=32:mpiprocs=1
+#PBS -l place=scatter
+#PBS -l walltime=02:00:00
+#PBS -j oe
 
 # Convert the pinned NVIDIA behavior-cloning pivots and reserve a deterministic
 # held-out split. Only exact function-call actions enter RL; free-form message
@@ -16,7 +12,7 @@
 
 set -euo pipefail
 
-readonly REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
+readonly REPO_ROOT="${PBS_O_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 USER="$(id -un)"
 WANDB_MODE=offline
@@ -37,11 +33,11 @@ grep -Fxq "revision=${EXPECTED_REVISION}" "${SOURCE_PROVENANCE}"
 printf '%s  %s\n' "${EXPECTED_SHA256}" "${SOURCE_ROOT}/train.jsonl" \
     | sha256sum --check --status
 
-srun \
-    --container-image="${SQSH_IMAGE}" \
-    --container-mounts="${CONTAINER_MOUNTS}" \
-    --container-writable \
-    --no-container-mount-home \
+miles_srun \
+    --image="${CONTAINER_IMAGE}" \
+    --bind="${CONTAINER_MOUNTS}" \
+    --writable-tmpfs \
+    --no-home \
     --export=NONE \
     env -i PATH="${PATH}" PYTHONDONTWRITEBYTECODE=1 WANDB_MODE=offline \
     bash --noprofile --norc -c '

@@ -4,9 +4,13 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)"
+cd "${REPO_ROOT}"
 source "${REPO_ROOT}/experiments/env.sh"
+source "${REPO_ROOT}/experiments/common/pbs.sh"
 
-ACCOUNT="${SLURM_ACCOUNT_NAME:-coreai_horizon_dilations}"
+SETUP_DOWNLOAD_WALLTIME="${SETUP_DOWNLOAD_WALLTIME:-${PBS_DOWNLOAD_WALLTIME:-24:00:00}}"
+SETUP_PREP_WALLTIME="${SETUP_PREP_WALLTIME:-${PBS_PREP_WALLTIME:-08:00:00}}"
+SETUP_PATH_EXPORTS="MILES_WORKSPACE_ROOT,MILES_REPO,CHECKPOINT_ROOT,HF_CKPT_DIR,MEGATRON_CKPT_DIR,TRAIN_CKPT_DIR,DATASET_ROOT,PRETRAIN_DATASET_DIR,RL_DATASET_DIR,SFT_DATASET_DIR,DATASET_DIR,CONTAINER_DIR,CACHE_DIR,CONTAINER_IMAGE"
 RAW="${DATASET_DIR}/areal-tau2-data/tau2_rl_train.jsonl"
 PREPARED="${DATASET_DIR}/areal-tau2-data/miles-tau2-rl-train.jsonl"
 SUMMARY="${DATASET_DIR}/areal-tau2-data/miles-tau2-rl-summary.json"
@@ -45,7 +49,8 @@ if [[ -r "${RAW}" ]] && (cd "${DATASET_DIR}/areal-tau2-data" && \
     sha256sum --status --check "${REPO_ROOT}/experiments/setup/manifests/areal_tau2_rl.sha256"); then
     echo "present AReaL Tau2 RL source"
 else
-    DOWNLOAD_JOB="$(sbatch --parsable -A "${ACCOUNT}" --export=NIL \
+    DOWNLOAD_JOB="$(pbs_submit --parsable --profile=cpu \
+        --time="${SETUP_DOWNLOAD_WALLTIME}" --export="${SETUP_PATH_EXPORTS}" \
         "${REPO_ROOT}/experiments/setup/download/download_areal_tau2.sbatch")"
     echo "submitted download ${DOWNLOAD_JOB}"
 fi
@@ -57,6 +62,7 @@ fi
 
 DEPENDENCY=()
 [[ -z "${DOWNLOAD_JOB}" ]] || DEPENDENCY=(--dependency="afterok:${DOWNLOAD_JOB}")
-PREPARE_JOB="$(sbatch --parsable -A "${ACCOUNT}" --export=NIL "${DEPENDENCY[@]}" \
+PREPARE_JOB="$(pbs_submit --parsable --profile=cpu \
+    --time="${SETUP_PREP_WALLTIME}" --export="${SETUP_PATH_EXPORTS}" "${DEPENDENCY[@]}" \
     "${REPO_ROOT}/experiments/setup/environments/prepare_areal_tau2.sbatch")"
 echo "submitted prepare ${PREPARE_JOB}"

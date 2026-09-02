@@ -1,13 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=miles-download-swe
-#SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=cpu_datamover
-#SBATCH --qos=cpu-datamover
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --time=08:00:00
-#SBATCH --output=experiments/outputs/download/%x-%j.log
+#PBS -N miles-download-swe
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=32:mpiprocs=1
+#PBS -l place=scatter
+#PBS -l walltime=24:00:00
+#PBS -j oe
 
 # Selectively stage one pinned SWE source.  In particular, this avoids pulling
 # the complete 26.8 GB Super or 17.1 GB Ultra blend when only SWE is needed.
@@ -15,8 +12,9 @@
 
 set -euo pipefail
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
+REPO_ROOT="${PBS_O_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
 source "${REPO_ROOT}/experiments/env.sh"
+source "${REPO_ROOT}/experiments/common/singularity.sh"
 
 : "${SWE_SOURCE:?set SWE_SOURCE; see the case list in this file}"
 case "${SWE_SOURCE}" in
@@ -69,11 +67,15 @@ case "${SWE_SOURCE}" in
 esac
 
 export HF_REPO HF_REVISION LOCAL_NAME HF_INCLUDE
-srun \
-    --container-image="${SQSH_IMAGE}" \
-    --container-mounts="${CONTAINER_MOUNTS}" \
-    --container-writable \
-    --no-container-mount-home \
+[[ -r "${CONTAINER_IMAGE}" ]] || {
+    echo "missing CONTAINER_IMAGE=${CONTAINER_IMAGE}; run experiments/setup.sh container --submit" >&2
+    exit 1
+}
+miles_srun \
+    --image="${CONTAINER_IMAGE}" \
+    --bind="${CONTAINER_MOUNTS}" \
+    --writable-tmpfs \
+    --no-home \
     --export=ALL \
     env -u BASH_ENV -u ENV bash --noprofile --norc -c '
 set -euo pipefail

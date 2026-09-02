@@ -9,7 +9,7 @@
 # and would submit a conversion for every entry that is not already converted.
 #
 # Both steps are idempotent and skipped when already done:
-#   * download  — skipped if $HF_CKPT_DIR/<name>/.download_complete exists
+#   * download  — skipped if $HF_CKPT_DIR/<name>/.download_complete is nonempty
 #   * convert   — skipped if the torch_dist tracker file reads "release"
 # The convert job additionally re-checks the tracker itself
 # (convert_checkpoint.sbatch), so a race with a concurrent stage is harmless.
@@ -23,11 +23,30 @@ MODEL_NAME="${1:?usage: stage_model.sh <MODEL_NAME>   (a name from experiments/s
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)"
 cd "${REPO_ROOT}"
 source experiments/env.sh
+source experiments/common/pbs.sh
 
-ACCOUNT="${SLURM_ACCOUNT_NAME:-coreai_horizon_dilations}"
+SETUP_CONVERT_WALLTIME="${SETUP_CONVERT_WALLTIME:-${PBS_PREP_WALLTIME:-08:00:00}}"
+SETUP_DOWNLOAD_WALLTIME="${SETUP_DOWNLOAD_WALLTIME:-${PBS_DOWNLOAD_WALLTIME:-24:00:00}}"
+HF_DOWNLOAD_MAX_WORKERS="${HF_DOWNLOAD_MAX_WORKERS:-2}"
+HF_DOWNLOAD_ATTEMPTS="${HF_DOWNLOAD_ATTEMPTS:-5}"
+HF_DOWNLOAD_RETRY_DELAY_SECONDS="${HF_DOWNLOAD_RETRY_DELAY_SECONDS:-60}"
+[[ "${HF_DOWNLOAD_MAX_WORKERS}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "HF_DOWNLOAD_MAX_WORKERS must be a positive integer" >&2
+    exit 2
+}
+[[ "${HF_DOWNLOAD_ATTEMPTS}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "HF_DOWNLOAD_ATTEMPTS must be a positive integer" >&2
+    exit 2
+}
+[[ "${HF_DOWNLOAD_RETRY_DELAY_SECONDS}" =~ ^[0-9]+$ ]] || {
+    echo "HF_DOWNLOAD_RETRY_DELAY_SECONDS must be a non-negative integer" >&2
+    exit 2
+}
+SETUP_PATH_EXPORTS="MILES_WORKSPACE_ROOT,MILES_REPO,CHECKPOINT_ROOT,HF_CKPT_DIR,MEGATRON_CKPT_DIR,TRAIN_CKPT_DIR,DATASET_ROOT,PRETRAIN_DATASET_DIR,RL_DATASET_DIR,SFT_DATASET_DIR,DATASET_DIR,CONTAINER_DIR,CACHE_DIR,CONTAINER_IMAGE"
 MODELS_TXT="experiments/setup/manifests/models.txt"
 HF_TOKEN_EXPORT=""
 [[ -z "${HF_TOKEN:-}" ]] || HF_TOKEN_EXPORT=",HF_TOKEN"
+export HF_DOWNLOAD_MAX_WORKERS HF_DOWNLOAD_ATTEMPTS HF_DOWNLOAD_RETRY_DELAY_SECONDS
 
 # Pull the one row out of models.txt. Comments and blank lines are dropped
 # first so a commented-out (disabled) model cannot be staged by accident.
@@ -60,12 +79,13 @@ echo "nodes   ${nodes}"
 echo
 
 dl_dep=""
-if [[ -f "${HF_CKPT_DIR}/${name}/.download_complete" ]]; then
+if [[ -s "${HF_CKPT_DIR}/${name}/.download_complete" ]]; then
     echo "skip download: ${HF_CKPT_DIR}/${name} already complete"
 else
-    dl=$(sbatch --parsable -A "${ACCOUNT}" \
+    dl=$(pbs_submit --parsable --profile=cpu \
          --job-name="dl-${name}" \
-         --export="USER,WANDB_MODE=disabled,HF_REPO=${repo},MODEL_NAME=${name}${HF_TOKEN_EXPORT}" \
+         --time="${SETUP_DOWNLOAD_WALLTIME}" \
+         --export="${SETUP_PATH_EXPORTS},USER,WANDB_MODE=disabled,HF_DOWNLOAD_MAX_WORKERS,HF_DOWNLOAD_ATTEMPTS,HF_DOWNLOAD_RETRY_DELAY_SECONDS,HF_REPO=${repo},MODEL_NAME=${name}${HF_TOKEN_EXPORT}" \
          experiments/setup/download/download_model.sbatch)
     dl_dep="--dependency=afterok:${dl}"
     echo "download  ${dl}"
@@ -77,12 +97,11 @@ if [[ -z "${dl_dep}" && -f "${tracker}" && "$(cat "${tracker}" 2>/dev/null)" == 
     exit 0
 fi
 
-cv=$(sbatch --parsable -A "${ACCOUNT}" \
+cv=$(pbs_submit --parsable --profile=gpu \
      --job-name="cv-${name}" \
      ${dl_dep} \
-     -p "${GPU_PARTITION}" --qos="${INTERACTIVE_GPU_QOS}" \
-     --time=04:00:00 --nodes="${nodes}" \
-     --export="USER,WANDB_MODE=disabled,MODEL_NAME=${name},MEGATRON_MODEL_TYPE=${type},CONVERT_EXTRA_ARGS=${extra}" \
+     --time="${SETUP_CONVERT_WALLTIME}" --nodes="${nodes}" \
+     --export="${SETUP_PATH_EXPORTS},USER,WANDB_MODE=disabled,MODEL_NAME=${name},MEGATRON_MODEL_TYPE=${type},CONVERT_EXTRA_ARGS=${extra}" \
      experiments/setup/models/convert_checkpoint.sbatch)
 echo "convert   ${cv}${dl_dep:+  (waits on ${dl})}"
 echo

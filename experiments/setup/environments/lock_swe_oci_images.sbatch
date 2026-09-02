@@ -1,14 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=lock-swe-oci-images
-#SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=cpu
-#SBATCH --qos=cpu-interactive
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --time=04:00:00
-#SBATCH --output=experiments/outputs/validation/%x-%j.log
-#SBATCH --export=NIL
+#PBS -N lock-swe-oci-images
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=32:mpiprocs=1
+#PBS -l place=scatter
+#PBS -l walltime=04:00:00
+#PBS -j oe
 
 # Dataset-independent OCI provenance stage for private SWE task manifests.
 # Optional Docker Hub credentials are read only from the submitting process
@@ -18,7 +14,7 @@
 set -euo pipefail
 umask 077
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
+REPO_ROOT="${PBS_O_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 USER="$(id -un)"
 export PATH USER

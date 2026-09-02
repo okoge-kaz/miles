@@ -1,14 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=prepare-swe-rl
-#SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=cpu
-#SBATCH --qos=cpu-normal
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16
-#SBATCH --time=04:00:00
-#SBATCH --output=experiments/outputs/download/%x-%j.log
-#SBATCH --export=NIL
+#PBS -N prepare-swe-rl
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=32:mpiprocs=1
+#PBS -l place=scatter
+#PBS -l walltime=04:00:00
+#PBS -j oe
 
 # Normalize one pinned SWE source into gold-free Miles rows and owner-only task
 # manifests.  Schema-normalized candidates remain under a clearly marked
@@ -19,7 +15,7 @@
 
 set -euo pipefail
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
+REPO_ROOT="${PBS_O_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 USER="$(id -un)"
 export PATH USER
@@ -43,11 +39,11 @@ SWE_CONTAINER_MOUNTS="${CONTAINER_MOUNTS},${DOTENV_MASK}:/root/miles/.env:ro"
 export PYTHON_DOTENV_DISABLED=1 PYTHONDONTWRITEBYTECODE=1
 export SWE_SOURCE WANDB_DISABLED=true WANDB_MODE=offline
 
-srun \
-    --container-image="${SQSH_IMAGE}" \
-    --container-mounts="${SWE_CONTAINER_MOUNTS}" \
-    --container-writable \
-    --no-container-mount-home \
+miles_srun \
+    --image="${CONTAINER_IMAGE}" \
+    --bind="${SWE_CONTAINER_MOUNTS}" \
+    --writable-tmpfs \
+    --no-home \
     --export=PATH,PYTHON_DOTENV_DISABLED,PYTHONDONTWRITEBYTECODE,SWE_SOURCE,WANDB_DISABLED,WANDB_MODE \
     env -u BASH_ENV -u ENV bash --noprofile --norc -c '
 set -euo pipefail

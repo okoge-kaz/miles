@@ -1,14 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=materialize-harbor-swe
-#SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=cpu
-#SBATCH --qos=cpu-interactive
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16
-#SBATCH --time=04:00:00
-#SBATCH --output=experiments/outputs/validation/%x-%j.log
-#SBATCH --export=NIL
+#PBS -N materialize-harbor-swe
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=32:mpiprocs=1
+#PBS -l place=scatter
+#PBS -l walltime=04:00:00
+#PBS -j oe
 
 # Materialize only live-admitted SWE tasks, emit exact task-tree evidence, then
 # join that evidence into a separate admitted/*-train.jsonl. Inspection-only
@@ -17,7 +13,7 @@
 
 set -euo pipefail
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
+REPO_ROOT="${PBS_O_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 USER="$(id -un)"
 export PATH USER
@@ -34,11 +30,11 @@ SWE_CONTAINER_MOUNTS="${CONTAINER_MOUNTS},${DOTENV_MASK}:/root/miles/.env:ro"
 : "${SWE_TASKSET:?set SWE_TASKSET to an admitted SWE task-set name}"
 export SWE_TASKSET
 
-srun \
-    --container-image="${SQSH_IMAGE}" \
-    --container-mounts="${SWE_CONTAINER_MOUNTS}" \
-    --container-writable \
-    --no-container-mount-home \
+miles_srun \
+    --image="${CONTAINER_IMAGE}" \
+    --bind="${SWE_CONTAINER_MOUNTS}" \
+    --writable-tmpfs \
+    --no-home \
     --export=SWE_ADMITTED_OUTPUT,SWE_ADMITTED_SUMMARY,SWE_CANDIDATE_DATASET,SWE_FINALIZE_ALLOW_SUBSET,SWE_MATERIALIZATION_EVIDENCE,SWE_MATERIALIZE_DRY_RUN,SWE_MATERIALIZE_LIMIT,SWE_R2E_ADMITTED_MANIFEST,SWE_SEMANTIC_ADMISSION_MANIFEST,SWE_TASKSET,SWE_TASK_IDS_OUTPUT,SWE_TASK_MANIFEST,SWE_TASK_OUTPUT \
     env -u BASH_ENV -u ENV bash --noprofile --norc -c '
 set -euo pipefail

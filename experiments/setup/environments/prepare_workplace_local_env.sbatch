@@ -1,20 +1,17 @@
 #!/bin/bash
-#SBATCH --job-name=prep-workplace-local-env
-#SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=cpu
-#SBATCH --qos=cpu-interactive
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=32
-#SBATCH --time=01:00:00
-#SBATCH --output=experiments/outputs/download/%x-%j.log
+#PBS -N prep-workplace-local-env
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=32:mpiprocs=1
+#PBS -l place=scatter
+#PBS -l walltime=01:00:00
+#PBS -j oe
 
 # Convert Workplace rows while using only the resource-specific modules and CSV
 # fixtures from the pinned source tree. No NeMo Gym package or server is used.
 
 set -euo pipefail
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
+REPO_ROOT="${PBS_O_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
 source "${REPO_ROOT}/experiments/env.sh"
 
 readonly WORKPLACE_COMMIT=48d5b9c01e3fc59a49f19674d0034a6f06396074
@@ -24,8 +21,8 @@ readonly RESOURCE_ROOT="${DATASET_DIR}/nemo-gym-code"
     exit 1
 }
 
-srun --container-image="${SQSH_IMAGE}" --container-mounts="${CONTAINER_MOUNTS}" \
-    --container-writable --no-container-mount-home --export=ALL \
+miles_srun --image="${CONTAINER_IMAGE}" --bind="${CONTAINER_MOUNTS}" \
+    --writable-tmpfs --no-home --export=ALL \
     bash -lc '
 set -euo pipefail
 cd /root/miles

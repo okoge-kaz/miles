@@ -1,27 +1,24 @@
 #!/bin/bash
-#SBATCH --job-name=prep-ifeval-deps
-#SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=cpu_datamover
-#SBATCH --qos=cpu-datamover
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
-#SBATCH --time=01:00:00
-#SBATCH --output=experiments/outputs/download/%x-%j.log
+#PBS -N prep-ifeval-deps
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=32:mpiprocs=1
+#PBS -l place=scatter
+#PBS -l walltime=01:00:00
+#PBS -j oe
 
 # Stage the small, pinned IFEvalG-only dependency closure in shared storage.
-# This keeps GPU jobs offline and avoids mutating an immutable SQSH at launch.
+# This keeps GPU jobs offline and avoids mutating an immutable SIF at launch.
 
 set -euo pipefail
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
+REPO_ROOT="${PBS_O_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
 source "${REPO_ROOT}/experiments/env.sh"
 
-srun \
-    --container-image="${SQSH_IMAGE}" \
-    --container-mounts="${CONTAINER_MOUNTS}" \
-    --container-writable \
-    --no-container-mount-home \
+miles_srun \
+    --image="${CONTAINER_IMAGE}" \
+    --bind="${CONTAINER_MOUNTS}" \
+    --writable-tmpfs \
+    --no-home \
     --export=ALL \
     bash -lc '
 set -euo pipefail
@@ -37,7 +34,7 @@ fi
     exit 1
 }
 
-TEMP_TARGET="/data/.open-instruct-deps-${SLURM_JOB_ID}"
+TEMP_TARGET="/data/.open-instruct-deps-${MILES_JOB_ID}"
 cleanup() {
     case "${TEMP_TARGET}" in
         /data/.open-instruct-deps-*) rm -rf -- "${TEMP_TARGET}" ;;

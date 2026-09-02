@@ -1,18 +1,15 @@
 #!/bin/bash
-#SBATCH --job-name=prep-nemotron-rl-math-v2
-#SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=cpu_datamover
-#SBATCH --qos=cpu-datamover
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16
-#SBATCH --time=04:00:00
-#SBATCH --output=experiments/outputs/download/%x-%j.log
+#PBS -N prep-nemotron-rl-math-v2
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=32:mpiprocs=1
+#PBS -l place=scatter
+#PBS -l walltime=04:00:00
+#PBS -j oe
 
 # Restore nvidia/Nemotron-RL-Math-v2 and convert it to the prompt JSONL the
 # recipes read.
 #
-#   sbatch -A coreai_horizon_dilations \
+#   pbs_submit --profile cpu \
 #     experiments/setup/datasets/prepare_nemotron_rl_math.sbatch
 #
 # The released file masks every row that came from a public source: 3984 of 7732
@@ -26,16 +23,16 @@
 
 set -euo pipefail
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
+REPO_ROOT="${PBS_O_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
 source "${REPO_ROOT}/experiments/env.sh"
 
 LOCAL_NAME="${LOCAL_NAME:-nemotron-rl-math-v2}"
 
-srun \
-    --container-image="${SQSH_IMAGE}" \
-    --container-mounts="${CONTAINER_MOUNTS}" \
-    --container-writable \
-    --no-container-mount-home \
+miles_srun \
+    --image="${CONTAINER_IMAGE}" \
+    --bind="${CONTAINER_MOUNTS}" \
+    --writable-tmpfs \
+    --no-home \
     --export=ALL \
     bash -lc "
 set -euo pipefail

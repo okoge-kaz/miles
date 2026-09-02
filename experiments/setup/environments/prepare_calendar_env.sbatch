@@ -1,25 +1,22 @@
 #!/bin/bash
-#SBATCH --job-name=prep-calendar-local-env
-#SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=cpu
-#SBATCH --qos=cpu-interactive
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=32
-#SBATCH --time=01:00:00
-#SBATCH --output=experiments/outputs/download/%x-%j.log
+#PBS -N prep-calendar-local-env
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=32:mpiprocs=1
+#PBS -l place=scatter
+#PBS -l walltime=01:00:00
+#PBS -j oe
 
 # Convert every Calendar v2 row and solve it once with the local verifier. This
 # job does not install, import, or start NeMo Gym.
 
 set -euo pipefail
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
+REPO_ROOT="${PBS_O_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
 source "${REPO_ROOT}/experiments/env.sh"
 
 CALENDAR_ROOT="${DATASET_DIR}/nemotron-rl-ifollow-calendar-v2"
-srun --container-image="${SQSH_IMAGE}" --container-mounts="${CONTAINER_MOUNTS}" \
-    --container-writable --no-container-mount-home --export=ALL \
+miles_srun --image="${CONTAINER_IMAGE}" --bind="${CONTAINER_MOUNTS}" \
+    --writable-tmpfs --no-home --export=ALL \
     bash -lc '
 set -euo pipefail
 cd /root/miles

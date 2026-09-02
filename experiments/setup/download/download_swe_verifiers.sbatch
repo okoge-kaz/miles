@@ -1,14 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=miles-download-swe-verifiers
-#SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=cpu_datamover
-#SBATCH --qos=cpu-datamover
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=2
-#SBATCH --time=00:30:00
-#SBATCH --output=experiments/outputs/download/%x-%j.log
-#SBATCH --export=NIL
+#PBS -N miles-download-swe-verifiers
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=32:mpiprocs=1
+#PBS -l place=scatter
+#PBS -l walltime=00:30:00
+#PBS -j oe
 
 # Fetch the exact upstream verifier modules accepted by materialize.py.
 # Checksums are mandatory; repository-local .env files and credentials are not
@@ -16,7 +12,7 @@
 
 set -euo pipefail
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
+REPO_ROOT="${PBS_O_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 USER="$(id -un)"
 export PATH USER
@@ -32,11 +28,11 @@ DOTENV_MASK="${REPO_ROOT}/experiments/common/dotenv.disabled"
 }
 SWE_CONTAINER_MOUNTS="${CONTAINER_MOUNTS},${DOTENV_MASK}:/root/miles/.env:ro"
 
-srun \
-    --container-image="${SQSH_IMAGE}" \
-    --container-mounts="${SWE_CONTAINER_MOUNTS}" \
-    --container-writable \
-    --no-container-mount-home \
+miles_srun \
+    --image="${CONTAINER_IMAGE}" \
+    --bind="${SWE_CONTAINER_MOUNTS}" \
+    --writable-tmpfs \
+    --no-home \
     --export=NONE \
     env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     WANDB_MODE=offline WANDB_DISABLED=true PYTHON_DOTENV_DISABLED=1 \

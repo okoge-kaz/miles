@@ -1,20 +1,17 @@
 #!/bin/bash
-#SBATCH --job-name=prep-ifbench
-#SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=cpu_datamover
-#SBATCH --qos=cpu-datamover
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --time=01:00:00
-#SBATCH --output=experiments/outputs/download/%x-%j.log
+#PBS -N prep-ifbench
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=32:mpiprocs=1
+#PBS -l place=scatter
+#PBS -l walltime=01:00:00
+#PBS -j oe
 
 # Pin the official held-out IFBench checkout, stage its Python dependency
 # closure, and convert all 300 prompts to an eval-only Miles JSONL file.
 
 set -euo pipefail
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
+REPO_ROOT="${PBS_O_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
 source "${REPO_ROOT}/experiments/env.sh"
 
 readonly IFBENCH_COMMIT=db69a6f05689830b0068b8f1529ebcfd2f3b164c
@@ -30,11 +27,11 @@ readonly IFBENCH_DEPS_DIR="${DATASET_DIR}/ifbench-deps"
     exit 1
 }
 
-srun \
-    --container-image="${SQSH_IMAGE}" \
-    --container-mounts="${CONTAINER_MOUNTS}" \
-    --container-writable \
-    --no-container-mount-home \
+miles_srun \
+    --image="${CONTAINER_IMAGE}" \
+    --bind="${CONTAINER_MOUNTS}" \
+    --writable-tmpfs \
+    --no-home \
     --export=ALL \
     bash -lc '
 set -euo pipefail
@@ -46,7 +43,7 @@ if [[ ! -f "${marker}" ]]; then
         echo "refusing to replace unmarked IFBench dependency directory: ${target}" >&2
         exit 1
     }
-    readonly temp_target="/data/.ifbench-deps-${SLURM_JOB_ID}"
+    readonly temp_target="/data/.ifbench-deps-${MILES_JOB_ID}"
     cleanup() {
         case "${temp_target}" in
             /data/.ifbench-deps-*) rm -rf -- "${temp_target}" ;;

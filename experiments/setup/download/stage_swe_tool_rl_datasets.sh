@@ -5,7 +5,14 @@ set -euo pipefail
 
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly REPO_ROOT="$(realpath "${SCRIPT_DIR}/../../..")"
+cd "${REPO_ROOT}"
 source "${REPO_ROOT}/experiments/env.sh"
+source "${REPO_ROOT}/experiments/common/pbs.sh"
+SETUP_DOWNLOAD_WALLTIME="${SETUP_DOWNLOAD_WALLTIME:-${PBS_DOWNLOAD_WALLTIME:-24:00:00}}"
+SETUP_PATH_EXPORTS="MILES_WORKSPACE_ROOT,MILES_REPO,CHECKPOINT_ROOT,HF_CKPT_DIR,MEGATRON_CKPT_DIR,TRAIN_CKPT_DIR,DATASET_ROOT,PRETRAIN_DATASET_DIR,RL_DATASET_DIR,SFT_DATASET_DIR,DATASET_DIR,CONTAINER_DIR,CACHE_DIR,CONTAINER_IMAGE"
+export HF_DOWNLOAD_MAX_WORKERS="${HF_DOWNLOAD_MAX_WORKERS:-2}"
+export HF_DOWNLOAD_ATTEMPTS="${HF_DOWNLOAD_ATTEMPTS:-5}"
+export HF_DOWNLOAD_RETRY_DELAY_SECONDS="${HF_DOWNLOAD_RETRY_DELAY_SECONDS:-60}"
 
 readonly SWE_REBENCH_REVISION=475dd5e8703bb5fb22dd3c60b5d038b019eba1e0
 readonly SWE_REBENCH_SHA256=0e0bf9355f892ad74ae98d4e1c404f39fd6654a8e351ee3e6ab162e4a64cd3ad
@@ -22,7 +29,7 @@ has_pinned_payload() {
     [[ -s "${provenance}" ]] || return 1
     grep -Fxq "repo=${repository}" "${provenance}" || return 1
     grep -Fxq "revision=${revision}" "${provenance}" || return 1
-    find "${target}" -maxdepth 2 -type f \
+    find "${target}" -type f \
         ! -path '*/.cache/*' ! -name README.md ! -name .gitattributes \
         ! -name MILES_SOURCE_PROVENANCE -print -quit | grep -q .
 }
@@ -42,9 +49,9 @@ stage_swe() {
         return
     fi
     local submission job_id
-    submission="$(sbatch --parsable \
-        --chdir="${REPO_ROOT}" \
-        --export="USER,SWE_SOURCE=${selector}" \
+    submission="$(pbs_submit --parsable --profile=cpu \
+        --time="${SETUP_DOWNLOAD_WALLTIME}" \
+        --export="${SETUP_PATH_EXPORTS},USER,SWE_SOURCE=${selector}" \
         "${SCRIPT_DIR}/download_swe_datasets.sbatch")"
     job_id="${submission%%;*}"
     printf 'submitted\t%s\t%s\n' "${selector}" "${job_id}"
@@ -61,9 +68,9 @@ stage_tool_pivot() {
         return
     fi
     local submission job_id
-    submission="$(sbatch --parsable \
-        --chdir="${REPO_ROOT}" \
-        --export="USER,HF_REPO=${repository},LOCAL_NAME=${local_name},HF_REVISION=${TOOL_PIVOT_REVISION}" \
+    submission="$(pbs_submit --parsable --profile=cpu \
+        --time="${SETUP_DOWNLOAD_WALLTIME}" \
+        --export="${SETUP_PATH_EXPORTS},USER,HF_REPO=${repository},LOCAL_NAME=${local_name},HF_REVISION=${TOOL_PIVOT_REVISION},HF_DOWNLOAD_MAX_WORKERS,HF_DOWNLOAD_ATTEMPTS,HF_DOWNLOAD_RETRY_DELAY_SECONDS" \
         "${SCRIPT_DIR}/download_dataset.sbatch")"
     job_id="${submission%%;*}"
     printf 'submitted\tconv-tooluse-pivot\t%s\n' "${job_id}"

@@ -1,13 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=prepare-tau3
-#SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=cpu
-#SBATCH --qos=cpu-interactive
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16
-#SBATCH --time=01:00:00
-#SBATCH --output=experiments/outputs/download/%x-%j.log
+#PBS -N prepare-tau3
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=32:mpiprocs=1
+#PBS -l place=scatter
+#PBS -l walltime=01:00:00
+#PBS -j oe
 
 # Materialize only the official Tau three v1.0.1 held-out test split. The
 # converter validates train/test/base disjointness in memory, but intentionally
@@ -15,21 +12,21 @@
 
 set -euo pipefail
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
+REPO_ROOT="${PBS_O_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
 source "${REPO_ROOT}/experiments/env.sh"
 
 readonly TAU_DIR="${DATASET_DIR}/tau-bench"
-TAU3_SQSH_IMAGE="${TAU3_SQSH_IMAGE:-${CONTAINER_DIR}/miles-staleness-weight-boundaries-f994b9aed-efa-1.49.0-tau3-1.0.1.sqsh}"
+TAU3_CONTAINER_IMAGE="${TAU3_CONTAINER_IMAGE:-${CONTAINER_IMAGE}}"
 DOTENV_MASK="${REPO_ROOT}/experiments/common/dotenv.disabled"
-[[ -r "${TAU3_SQSH_IMAGE}" ]] || { echo "Tau three image not found: ${TAU3_SQSH_IMAGE}" >&2; exit 1; }
+[[ -r "${TAU3_CONTAINER_IMAGE}" ]] || { echo "Tau three image not found: ${TAU3_CONTAINER_IMAGE}" >&2; exit 1; }
 [[ -r "${DOTENV_MASK}" ]] || { echo "dotenv mask not found: ${DOTENV_MASK}" >&2; exit 1; }
 mkdir -p "${TAU_DIR}"
 
-srun \
-    --container-image="${TAU3_SQSH_IMAGE}" \
-    --container-mounts="${CONTAINER_MOUNTS},${DOTENV_MASK}:/root/miles/.env:ro" \
-    --container-writable \
-    --no-container-mount-home \
+miles_srun \
+    --image="${TAU3_CONTAINER_IMAGE}" \
+    --bind="${CONTAINER_MOUNTS},${DOTENV_MASK}:/root/miles/.env:ro" \
+    --writable-tmpfs \
+    --no-home \
     --export=USER \
     bash -lc '
 set -euo pipefail

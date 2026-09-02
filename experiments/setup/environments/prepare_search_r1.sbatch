@@ -1,17 +1,14 @@
 #!/bin/bash
-#SBATCH --job-name=prep-search-r1
-#SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=cpu_datamover
-#SBATCH --qos=cpu-datamover
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=32
-#SBATCH --time=08:00:00
-#SBATCH --output=experiments/outputs/download/%x-%j.log
+#PBS -N prep-search-r1
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=32:mpiprocs=1
+#PBS -l place=scatter
+#PBS -l walltime=08:00:00
+#PBS -j oe
 
 # Assemble the Search-R1 retrieval assets into the shapes the retriever wants.
 #
-#   sbatch -A coreai_horizon_dilations experiments/setup/environments/prepare_search_r1.sbatch
+#   pbs_submit --profile cpu experiments/setup/environments/prepare_search_r1.sbatch
 #
 # The three downloads land in forms nothing can read directly:
 #   wiki18-e5-index   split into part_aa (43 GB) + part_ab (22 GB); FAISS needs
@@ -25,7 +22,7 @@
 
 set -euo pipefail
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
+REPO_ROOT="${PBS_O_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
 source "${REPO_ROOT}/experiments/env.sh"
 
 SEARCH_DIR="${DATASET_DIR}/search-r1"
@@ -87,9 +84,9 @@ E5="${HF_CKPT_DIR}/e5-base-v2"
 if [[ -f "${E5}/.download_complete" ]]; then
     echo "skip e5-base-v2: already downloaded"
 else
-    srun --container-image="${SQSH_IMAGE}" \
-         --container-mounts="${CONTAINER_MOUNTS}" \
-         --container-writable --no-container-mount-home --export=ALL \
+    miles_srun --image="${CONTAINER_IMAGE}" \
+         --bind="${CONTAINER_MOUNTS}" \
+         --writable-tmpfs --no-home --export=ALL \
          bash -lc '
 set -euo pipefail
 export HF_HOME=/root/.cache/huggingface

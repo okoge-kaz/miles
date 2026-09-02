@@ -1,14 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=materialize-swebench-verified-hardened
-#SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=cpu
-#SBATCH --qos=cpu-interactive
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16
-#SBATCH --time=04:00:00
-#SBATCH --output=experiments/outputs/validation/%x-%j.log
-#SBATCH --export=NIL
+#PBS -N materialize-swebench-verified-hardened
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=32:mpiprocs=1
+#PBS -l place=scatter
+#PBS -l walltime=04:00:00
+#PBS -j oe
 
 # Materialize only live-admitted SWE-bench Verified tasks, then bind gold-free
 # rows to an immutable, hardened-local Harbor evaluator. Its path policy makes
@@ -17,7 +13,7 @@
 
 set -euo pipefail
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
+REPO_ROOT="${PBS_O_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 USER="$(id -un)"
 export PATH USER
@@ -33,11 +29,11 @@ DOTENV_MASK="${REPO_ROOT}/experiments/common/dotenv.disabled"
 [[ -f "${DOTENV_MASK}" && ! -L "${DOTENV_MASK}" ]] || exit 2
 SWE_CONTAINER_MOUNTS="${CONTAINER_MOUNTS},${DOTENV_MASK}:/root/miles/.env:ro"
 
-srun \
-    --container-image="${SQSH_IMAGE}" \
-    --container-mounts="${SWE_CONTAINER_MOUNTS}" \
-    --container-writable \
-    --no-container-mount-home \
+miles_srun \
+    --image="${CONTAINER_IMAGE}" \
+    --bind="${SWE_CONTAINER_MOUNTS}" \
+    --writable-tmpfs \
+    --no-home \
     --export=SWE_EVAL_ALLOW_SUBSET,SWE_EVAL_CANDIDATE,SWE_EVAL_INPUT,SWE_EVAL_INPUT_SUMMARY,SWE_EVAL_MATERIALIZATION_EVIDENCE,SWE_EVAL_SEMANTIC_ADMISSION,SWE_EVAL_TASK_IDS,SWE_EVAL_TASK_MANIFEST,SWE_EVAL_TASK_OUTPUT,SWE_MATERIALIZE_DRY_RUN,SWE_MATERIALIZE_LIMIT \
     env -u BASH_ENV -u ENV bash --noprofile --norc -c '
 set -euo pipefail

@@ -1,20 +1,17 @@
 #!/bin/bash
-#SBATCH --job-name=prep-gpqa
-#SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=cpu
-#SBATCH --qos=cpu-normal
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --time=01:00:00
-#SBATCH --output=experiments/outputs/download/%x-%j.log
+#PBS -N prep-gpqa
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=32:mpiprocs=1
+#PBS -l place=scatter
+#PBS -l walltime=01:00:00
+#PBS -j oe
 
 # Convert GPQA from either an already downloaded HF CSV payload or the existing
 # user-owned NeMo Skills copy that was prepared from Idavidrein/gpqa. A fresh HF
 # download remains gated and belongs in download_dataset.sbatch on data-mover
 # QoS; this job is CPU conversion only.
 #
-#   sbatch -A coreai_horizon_dilations experiments/setup/datasets/prepare_gpqa.sbatch
+#   pbs_submit --profile cpu experiments/setup/datasets/prepare_gpqa.sbatch
 #
 # Produces three splits under $DATASET_DIR/gpqa:
 #   gpqa-diamond-miles.jsonl   198 questions, the split every model card reports
@@ -26,14 +23,14 @@
 
 set -euo pipefail
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
+REPO_ROOT="${PBS_O_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
 source "${REPO_ROOT}/experiments/env.sh"
 
-srun \
-    --container-image="${SQSH_IMAGE}" \
-    --container-mounts="${CONTAINER_MOUNTS}" \
-    --container-writable \
-    --no-container-mount-home \
+miles_srun \
+    --image="${CONTAINER_IMAGE}" \
+    --bind="${CONTAINER_MOUNTS}" \
+    --writable-tmpfs \
+    --no-home \
     --export=ALL \
     bash -lc '
 set -euo pipefail
