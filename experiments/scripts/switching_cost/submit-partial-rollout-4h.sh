@@ -84,33 +84,27 @@ select_model_assets() {
     case "$1" in
         qwen3-4b)
             DATASET_NAME=dapo-math-p10-90-qwen3-4b-base-lr2e-5-step4000
-            PASSRATE_NAME=dapo-math-17k.Qwen3-4B-Base-LR2e-5-Step4000.n16-len16384-zero-trunc.passrate.jsonl
             SFT_HF_RELATIVE=Qwen3-4B-Base/LR2.0e-5-SEQ32768-GBS128-MBS1-TP1-PP1-CP1-EP1-PACK1-standard-cp-STEPS4000/iter_0004000
             SFT_MEGATRON_RELATIVE=Qwen3-4B-Base-LR2e-5-Step4000_torch_dist
             ;;
         qwen3-8b)
             DATASET_NAME=dapo-math-p10-90-qwen3-8b-base-lr1.5e-5-step4000
-            PASSRATE_NAME=dapo-math-17k.Qwen3-8B-Base-LR1.5e-5-Step4000.n16-len16384-zero-trunc.passrate.jsonl
             SFT_HF_RELATIVE=Qwen3-8B-Base/LR1.5e-5-SEQ32768-GBS128-MBS1-TP2-PP1-CP1-EP1-PACK1-standard-cp-STEPS4000
             SFT_MEGATRON_RELATIVE=Qwen3-8B-Base-LR1.5e-5-Step4000_torch_dist
             ;;
         qwen3-30b-a3b)
             DATASET_NAME=dapo-math-p10-90-qwen3-30b-a3b-base-lr2.0e-5-step4000
-            PASSRATE_NAME=dapo-math-17k.Qwen3-30B-A3B-Base-LR2.0e-5-Step4000.n16-len16384-zero-trunc.passrate.jsonl
             SFT_HF_RELATIVE=Qwen3-30B-A3B-Base/LR2.0e-5-SEQ32768-GBS128-MBS1-TP1-PP1-CP2-EP8-PACK1-standard-cp-STEPS4000
             SFT_MEGATRON_RELATIVE=Qwen3-30B-A3B-Base-LR2.0e-5-Step4000_torch_dist
             ;;
     esac
     PROMPT_DATA="/data/${DATASET_NAME}/${DATASET_NAME}.jsonl"
-    PROMPT_HOST="${DATASET_DIR}/${DATASET_NAME}/${DATASET_NAME}.jsonl"
-    PASSRATE_HOST="${DATASET_DIR}/difficulty/${PASSRATE_NAME}"
     HF_CHECKPOINT_HOST="${SFT_HF_ROOT}/${SFT_HF_RELATIVE}"
     MEGATRON_CHECKPOINT_HOST="${MEGATRON_CKPT_DIR}/${SFT_MEGATRON_RELATIVE}"
 }
 
 validate_model_assets() {
     local model_variant=$1
-    local passrate_lines prompt_lines
 
     select_model_assets "${model_variant}"
     [[ -s "${HF_CHECKPOINT_HOST}/config.json" ]] || {
@@ -127,31 +121,14 @@ validate_model_assets() {
         echo "${model_variant}: incomplete Megatron checkpoint: ${MEGATRON_CHECKPOINT_HOST}" >&2
         return 1
     }
-    [[ -s "${PASSRATE_HOST}" && -f "${PASSRATE_HOST}.complete" ]] || {
-        echo "${model_variant}: difficulty measurement is incomplete: ${PASSRATE_HOST}" >&2
-        return 1
-    }
-    passrate_lines=$(wc -l < "${PASSRATE_HOST}")
-    [[ "${passrate_lines}" -eq 17398 ]] || {
-        echo "${model_variant}: expected 17398 pass-rate rows, found ${passrate_lines}: ${PASSRATE_HOST}" >&2
-        return 1
-    }
-
-    [[ -s "${PROMPT_HOST}" ]] || {
-        echo "${model_variant}: filtered prompt file is missing or empty: ${PROMPT_HOST}" >&2
-        return 1
-    }
-    prompt_lines=$(wc -l < "${PROMPT_HOST}")
-    (( prompt_lines >= ROLLOUT_BATCH_SIZE )) || {
-        echo "${model_variant}: filtered prompt file has only ${prompt_lines} rows: ${PROMPT_HOST}" >&2
-        return 1
-    }
-    echo "validated ${model_variant}: checkpoints=ready, pass-rate=${passrate_lines}, filtered=${prompt_lines}, prompt=${PROMPT_DATA}"
+    echo "validated ${model_variant}: checkpoints=ready, prompt=${PROMPT_DATA}"
 }
 
 for model_variant in "${MODEL_VARIANTS[@]}"; do
     validate_model_assets "${model_variant}"
 done
+
+echo "warning: difficulty-filter outputs are not checked at submission; they must be complete before each job starts" >&2
 
 for model_variant in "${MODEL_VARIANTS[@]}"; do
     select_model_assets "${model_variant}"

@@ -26,11 +26,13 @@ experiments/scripts/switching_cost/submit-partial-rollout-4h.sh       # validate
 experiments/scripts/switching_cost/submit-partial-rollout-4h.sh --submit
 ```
 
-It requires each policy-specific pass-rate measurement to contain all 17,398
-prompts and carry its completion marker before it submits any model. Each arm
-uses eight nodes with a four-hour limit, accepts 192 prompts from an
-oversampling batch of 256 under `--partial-rollout`, and logs online to the
-`colcoated-switching-cost` W&B project.
+Submission validates the matching Hugging Face and Megatron checkpoints, but
+deliberately does not gate on difficulty-filter completion so the jobs can wait
+in the Slurm queue while filtering finishes. The policy-specific filtered file
+must be complete before its allocation starts. Each arm uses eight nodes with a
+four-hour limit, accepts 192 prompts from an oversampling batch of 256 under
+`--partial-rollout`, and logs online to the `colcoated-switching-cost` W&B
+project.
 
 Submit all three four-hour production measurements after their policy-specific
 difficulty datasets are ready:
