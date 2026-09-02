@@ -18,6 +18,20 @@ ENABLE_DUMP_DETAILS=0          # synchronous event JSONL writes; diagnostic-only
 RAY_DEDUP_LOGS=1               # keep Ray log deduplication enabled
 ```
 
+The matched partial-rollout comparison across 4B, 8B, and 30B-A3B has a
+dedicated submission wrapper:
+
+```bash
+experiments/scripts/switching_cost/submit-partial-rollout-4h.sh       # validate and print commands
+experiments/scripts/switching_cost/submit-partial-rollout-4h.sh --submit
+```
+
+It requires each policy-specific pass-rate measurement to contain all 17,398
+prompts and carry its completion marker before it submits any model. Each arm
+uses eight nodes with a four-hour limit, accepts 192 prompts from an
+oversampling batch of 256 under `--partial-rollout`, and logs online to the
+`colcoated-switching-cost` W&B project.
+
 Submit all three four-hour production measurements after their policy-specific
 difficulty datasets are ready:
 
