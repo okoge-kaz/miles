@@ -507,6 +507,7 @@ class FSDPTrainRayActor(TrainRayActor):
                             "ref_log_probs",
                             "rollout_log_probs",
                             "sample_staleness",
+                            "truncated",
                             "sample_indices",
                             "sample_group_indices",
                             "generation_attempt_numbers",

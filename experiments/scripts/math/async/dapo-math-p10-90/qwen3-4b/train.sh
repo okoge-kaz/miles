@@ -6,6 +6,8 @@ export PYTHONBUFFERED=16
 export HF_HOME=/root/.cache/huggingface
 export MILES_EXPERIMENTAL_ROLLOUT_REFACTOR=1
 
+: "${USE_STALENESS_AWARE_LOSS:=0}"
+: "${SAFE_TRAINING_STALENESS:=2}"
 if [[ "${ZERO_REWARD_ON_TRUNCATED:-0}" != "0" && "${ZERO_LOSS_ON_TRUNCATED:-0}" != "0" ]]; then
    echo "ZERO_REWARD_ON_TRUNCATED and ZERO_LOSS_ON_TRUNCATED are mutually exclusive" >&2
    exit 2
@@ -62,6 +64,12 @@ if [[ "${ZERO_REWARD_ON_TRUNCATED}" != "0" ]]; then
 fi
 if [[ "${ZERO_LOSS_ON_TRUNCATED}" != "0" ]]; then
    ROLLOUT_ARGS+=(--zero-loss-on-truncated)
+fi
+if [[ "${USE_STALENESS_AWARE_LOSS}" != "0" ]]; then
+   ROLLOUT_ARGS+=(--use-staleness-aware-loss --safe-training-staleness "${SAFE_TRAINING_STALENESS}")
+   if [[ "${LOG_STALENESS_AWARE_LOSS_DETAILS:-0}" != "0" ]]; then
+      ROLLOUT_ARGS+=(--log-staleness-aware-loss-details)
+   fi
 fi
 if [[ "${QUEUE_TYPE}" == queue-drop ]]; then
    ROLLOUT_ARGS+=(--fully-async-queue-factor "${QUEUE_FACTOR}")

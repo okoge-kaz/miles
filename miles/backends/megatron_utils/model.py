@@ -476,6 +476,7 @@ def train_one_step(
                 "returns",
                 "rollout_log_probs",
                 "sample_staleness",
+                "truncated",
                 "sample_indices",
                 "sample_group_indices",
                 "generation_attempt_numbers",

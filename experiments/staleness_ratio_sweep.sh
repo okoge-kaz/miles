@@ -52,6 +52,7 @@ CLEAN_CHECKPOINT=0
 RESUME_CHAIN=0
 RESUME_MATCHED_CHAIN=0
 RERUN_CLEAN_MATCHED_ARMS=0
+S12_T1R7_BASELINE=0
 declare -a REQUESTED_POINTS=()
 
 usage() {
@@ -64,6 +65,7 @@ usage: experiments/staleness_ratio_sweep.sh [--submit] [--include-colocated]
                                             [--rerun-clean-matched-arms]
                                             [--resume-chain]
                                             [--resume-matched-chain]
+                                            [--s12-t1r7-baseline]
                                             [--clean-checkpoint]
                                             [--point M:T:R ...]
 
@@ -119,6 +121,11 @@ namespace from its saved checkpoints and submits exactly nine chained jobs per
 arm. Set RUN_NAMESPACE to the original namespace. This option never removes
 checkpoints.
 
+--s12-t1r7-baseline selects only the missing max-weight-staleness 12,
+trainer:rollout 1:7 arm under the original zero-reward truncation objective.
+It explicitly disables staleness-aware scaling and cannot be combined with a
+truncation ablation, 32K mode, colocated/matched mode, or --point.
+
 Useful environment overrides: TOTAL_NODES, STALENESS_LEVELS, RATIOS,
 TRAINING_BUFFER_QUEUE_SIZE, CHAIN_JOBS, PARTITION, WALL, and RUN_NAMESPACE.
 TRAINING_BUFFER_QUEUE_SIZE controls arms below max weight staleness 8. Arms at
@@ -170,6 +177,10 @@ while (( $# > 0 )); do
             RESUME_MATCHED_CHAIN=1
             shift
             ;;
+        --s12-t1r7-baseline)
+            S12_T1R7_BASELINE=1
+            shift
+            ;;
         --clean-checkpoint)
             CLEAN_CHECKPOINT=1
             shift
@@ -190,6 +201,41 @@ while (( $# > 0 )); do
             ;;
     esac
 done
+
+if (( S12_T1R7_BASELINE == 1 )); then
+    if (( INCLUDE_COLOCATED == 1 \
+          || DISABLE_ZERO_REWARD_ON_TRUNCATED == 1 \
+          || ENABLE_ZERO_LOSS_ON_TRUNCATED == 1 \
+          || TOTAL_LENGTH_32K == 1 \
+          || MATCH_PARTIAL_CONCURRENCY == 1 \
+          || ${#REQUESTED_POINTS[@]} > 0 )); then
+        echo "--s12-t1r7-baseline selects one zero-reward 16K async arm and cannot be combined with other selectors" >&2
+        exit 2
+    fi
+    if [[ "${USE_STALENESS_AWARE_LOSS:-0}" != 0 ]]; then
+        echo "--s12-t1r7-baseline requires USE_STALENESS_AWARE_LOSS=0" >&2
+        exit 2
+    fi
+    MILES_REPO="${REPO_ROOT}"
+    MAX_RESPONSE_LEN=16384
+    ROLLOUT_MAX_CONTEXT_LEN=32768
+    CONTEXT_PARALLEL_SIZE=1
+    MAX_TOKENS_PER_GPU=32768
+    TRAINING_BUFFER_QUEUE_SIZE=6000
+    ASYNC_MAX_CONCURRENT_SAMPLES=4096
+    ZERO_REWARD_ON_TRUNCATED=1
+    ZERO_LOSS_ON_TRUNCATED=0
+    IS_CORRECTION=tis
+    TIS_CLIP=2.0
+    TIS_CLIP_LOW=0
+    RATIO_DENOMINATOR=actor
+    USE_STALENESS_AWARE_LOSS=0
+    LOG_STALENESS_AWARE_LOSS_DETAILS=0
+    REQUESTED_POINTS=("12:1:7")
+    if (( RUN_NAMESPACE_WAS_EXPLICIT == 0 )); then
+        RUN_NAMESPACE="zero-reward-trunc-s12-t1r7-$(date +%Y%m%d-%H%M%S)-p$$"
+    fi
+fi
 
 if (( INCLUDE_COLOCATED == 1 && MATCH_PARTIAL_CONCURRENCY == 1 )); then
     echo "--include-colocated and --matched-partial-concurrency are mutually exclusive" >&2
@@ -323,6 +369,9 @@ MAX_RESPONSE_LEN_VALUE="$(recipe_or_environment MAX_RESPONSE_LEN)"
 ROLLOUT_MAX_CONTEXT_LEN_VALUE="$(recipe_or_environment ROLLOUT_MAX_CONTEXT_LEN)"
 ZERO_REWARD_ON_TRUNCATED_VALUE="$(recipe_or_environment ZERO_REWARD_ON_TRUNCATED)"
 ZERO_LOSS_ON_TRUNCATED_VALUE="$(recipe_or_environment ZERO_LOSS_ON_TRUNCATED)"
+USE_STALENESS_AWARE_LOSS_VALUE="$(recipe_or_environment USE_STALENESS_AWARE_LOSS)"
+SAFE_TRAINING_STALENESS_VALUE="$(recipe_or_environment SAFE_TRAINING_STALENESS)"
+LOG_STALENESS_AWARE_LOSS_DETAILS_VALUE="$(recipe_or_environment LOG_STALENESS_AWARE_LOSS_DETAILS)"
 USE_REPLAY_BUFFER_VALUE="$(recipe_or_environment USE_REPLAY_BUFFER)"
 REPLAY_BUFFER_TYPE_VALUE="$(recipe_or_environment REPLAY_BUFFER_TYPE)"
 FUSE_ONE_STEP_ACTOR_LOGPROBS_VALUE="$(recipe_or_environment FUSE_ONE_STEP_ACTOR_LOGPROBS)"
@@ -358,6 +407,33 @@ ASYNC_MAX_CONCURRENT_SAMPLES_VALUE="${ASYNC_MAX_CONCURRENT_SAMPLES:-}"
     echo "SAMPLE_STALENESS_MAX_BIN must be a nonnegative integer" >&2
     exit 1
 }
+[[ "${USE_STALENESS_AWARE_LOSS_VALUE}" =~ ^[01]$ ]] || {
+    echo "USE_STALENESS_AWARE_LOSS must be 0 or 1" >&2
+    exit 1
+}
+[[ "${SAFE_TRAINING_STALENESS_VALUE}" =~ ^[0-9]+$ ]] || {
+    echo "SAFE_TRAINING_STALENESS must be a nonnegative integer" >&2
+    exit 1
+}
+[[ "${LOG_STALENESS_AWARE_LOSS_DETAILS_VALUE}" =~ ^[01]$ ]] || {
+    echo "LOG_STALENESS_AWARE_LOSS_DETAILS must be 0 or 1" >&2
+    exit 1
+}
+if [[ "${LOG_STALENESS_AWARE_LOSS_DETAILS_VALUE}" == 1 \
+      && "${USE_STALENESS_AWARE_LOSS_VALUE}" == 0 ]]; then
+    echo "LOG_STALENESS_AWARE_LOSS_DETAILS requires USE_STALENESS_AWARE_LOSS=1" >&2
+    exit 1
+fi
+if [[ "${USE_STALENESS_AWARE_LOSS_VALUE}" == 1 ]]; then
+    [[ "${ZERO_REWARD_ON_TRUNCATED_VALUE}" == 1 && "${ZERO_LOSS_ON_TRUNCATED_VALUE}" == 0 ]] || {
+        echo "USE_STALENESS_AWARE_LOSS requires zero-reward truncation feedback without zero-loss filtering" >&2
+        exit 1
+    }
+    (( INCLUDE_COLOCATED == 0 && MATCH_PARTIAL_CONCURRENCY == 0 )) || {
+        echo "USE_STALENESS_AWARE_LOSS is async-only and cannot include colocated or matched arms" >&2
+        exit 1
+    }
+fi
 if [[ -n "${ASYNC_MAX_CONCURRENT_SAMPLES_VALUE}" ]]; then
     [[ "${ASYNC_MAX_CONCURRENT_SAMPLES_VALUE}" =~ ^[1-9][0-9]*$ ]] || {
         echo "ASYNC_MAX_CONCURRENT_SAMPLES must be a positive integer" >&2
@@ -406,7 +482,8 @@ if (( MATCH_PARTIAL_CONCURRENCY == 1 )); then
         TENSOR_PARALLEL_SIZE CONTEXT_PARALLEL_SIZE EXPERT_PARALLEL_SIZE
         MAX_TOKENS_PER_GPU LOG_PROBS_CHUNK_SIZE RECOMPUTE_GRANULARITY OVERLAP_COMM
         ROLLOUT_NUM_GPUS_PER_ENGINE SGLANG_MEM_FRACTION RM_TYPE
-        ZERO_REWARD_ON_TRUNCATED ZERO_LOSS_ON_TRUNCATED
+        ZERO_REWARD_ON_TRUNCATED ZERO_LOSS_ON_TRUNCATED USE_STALENESS_AWARE_LOSS
+        SAFE_TRAINING_STALENESS LOG_STALENESS_AWARE_LOSS_DETAILS
         EVAL_INTERVAL N_SAMPLES_PER_EVAL_PROMPT EVAL_MAX_RESPONSE_LEN SKIP_EVAL_BEFORE_TRAIN
         SAVE_INTERVAL SAVE_RETAIN_INTERVAL SAVE_HF HF_SAVE_INTERVAL DUMP_TRAIN_DATA
         DUMP_POLICY_LOSS_DEBUG OBSERVE_TRAINING_ENTROPY FUSE_ONE_STEP_ACTOR_LOGPROBS
@@ -722,6 +799,9 @@ printf 'fixed safety: response=%s, total-context=%s, zero-reward-trunc=%s, zero-
     "${USE_REPLAY_BUFFER_VALUE}" "${REPLAY_BUFFER_TYPE_VALUE}" \
     "${FUSE_ONE_STEP_ACTOR_LOGPROBS_VALUE}" "${SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS_VALUE}" \
     "${SAMPLE_STALENESS_MAX_BIN_VALUE}"
+printf 'staleness-aware loss: enabled=%s, safe-training-staleness=%s, detail-logging=%s\n' \
+    "${USE_STALENESS_AWARE_LOSS_VALUE}" "${SAFE_TRAINING_STALENESS_VALUE}" \
+    "${LOG_STALENESS_AWARE_LOSS_DETAILS_VALUE}"
 printf 'fixed checkpoints: save-hf=%s, hf interval=%s; settings=%s; clean=%s\n' \
     "${SAVE_HF_VALUE}" "${HF_SAVE_INTERVAL_VALUE}" "${SETTING_COUNT}" "${CLEAN_CHECKPOINT}"
 printf 'submission: %s nodes, %s, %s, %s chained job(s), wandb=%s\n' \
@@ -946,6 +1026,9 @@ submit_chain() {
         "ROLLOUT_MAX_CONTEXT_LEN=${ROLLOUT_MAX_CONTEXT_LEN_VALUE}"
         "ZERO_REWARD_ON_TRUNCATED=${ZERO_REWARD_ON_TRUNCATED_VALUE}"
         "ZERO_LOSS_ON_TRUNCATED=${ZERO_LOSS_ON_TRUNCATED_VALUE}"
+        "USE_STALENESS_AWARE_LOSS=${USE_STALENESS_AWARE_LOSS_VALUE}"
+        "SAFE_TRAINING_STALENESS=${SAFE_TRAINING_STALENESS_VALUE}"
+        "LOG_STALENESS_AWARE_LOSS_DETAILS=${LOG_STALENESS_AWARE_LOSS_DETAILS_VALUE}"
         "USE_REPLAY_BUFFER=${USE_REPLAY_BUFFER_VALUE}"
         "REPLAY_BUFFER_TYPE=${REPLAY_BUFFER_TYPE_VALUE}"
         "FUSE_ONE_STEP_ACTOR_LOGPROBS=${FUSE_ONE_STEP_ACTOR_LOGPROBS_VALUE}"
@@ -1016,6 +1099,9 @@ submit_colocated_chain() {
         "ROLLOUT_MAX_CONTEXT_LEN=${ROLLOUT_MAX_CONTEXT_LEN_VALUE}"
         "ZERO_REWARD_ON_TRUNCATED=${ZERO_REWARD_ON_TRUNCATED_VALUE}"
         "ZERO_LOSS_ON_TRUNCATED=${ZERO_LOSS_ON_TRUNCATED_VALUE}"
+        "USE_STALENESS_AWARE_LOSS=0"
+        "SAFE_TRAINING_STALENESS=${SAFE_TRAINING_STALENESS_VALUE}"
+        "LOG_STALENESS_AWARE_LOSS_DETAILS=0"
         "SAVE_HF=${SAVE_HF_VALUE}"
         "HF_SAVE_INTERVAL=${HF_SAVE_INTERVAL_VALUE}"
         "MAX_WEIGHT_STALENESS="

@@ -215,6 +215,56 @@ def test_zero_loss_on_truncated_cli_is_opt_in():
     assert enabled.zero_loss_on_truncated
 
 
+def test_staleness_aware_loss_cli_is_opt_in_with_safe_default():
+    parser = argparse.ArgumentParser()
+    get_miles_extra_args_provider()(parser)
+
+    defaults = parser.parse_args(REQUIRED_ARGS)
+    enabled = parser.parse_args(
+        [
+            "--use-staleness-aware-loss",
+            "--safe-training-staleness",
+            "4",
+            "--log-staleness-aware-loss-details",
+        ]
+        + REQUIRED_ARGS
+    )
+
+    assert not defaults.use_staleness_aware_loss
+    assert defaults.safe_training_staleness == 2
+    assert not defaults.log_staleness_aware_loss_details
+    assert enabled.use_staleness_aware_loss
+    assert enabled.safe_training_staleness == 4
+    assert enabled.log_staleness_aware_loss_details
+
+
+def test_staleness_aware_loss_detail_logging_requires_scaling():
+    args = SimpleNamespace(
+        zero_reward_on_truncated=True,
+        zero_loss_on_truncated=False,
+        use_staleness_aware_loss=False,
+        log_staleness_aware_loss_details=True,
+        safe_training_staleness=2,
+    )
+
+    with pytest.raises(ValueError, match="requires --use-staleness-aware-loss"):
+        _validate_truncation_behavior(args)
+
+
+def test_staleness_aware_loss_detail_logging_requires_tis():
+    args = SimpleNamespace(
+        zero_reward_on_truncated=True,
+        zero_loss_on_truncated=False,
+        use_staleness_aware_loss=True,
+        log_staleness_aware_loss_details=True,
+        safe_training_staleness=2,
+        use_tis=False,
+    )
+
+    with pytest.raises(ValueError, match="requires --use-tis"):
+        _validate_truncation_behavior(args)
+
+
 def test_truncation_behavior_cli_flags_are_mutually_exclusive():
     parser = argparse.ArgumentParser()
     get_miles_extra_args_provider()(parser)
@@ -246,6 +296,56 @@ def test_truncation_behavior_validation_rejects_config_override_conflict():
 
     with pytest.raises(ValueError, match="mutually exclusive"):
         _validate_truncation_behavior(args)
+
+
+def test_staleness_aware_loss_validation_accepts_truncation_feedback_mode():
+    args = SimpleNamespace(
+        zero_reward_on_truncated=True,
+        zero_loss_on_truncated=False,
+        use_staleness_aware_loss=True,
+        safe_training_staleness=2,
+        fully_async=True,
+        loss_type="policy_loss",
+        custom_reward_post_process_path=None,
+        custom_convert_samples_to_train_data_path=None,
+    )
+
+    _validate_truncation_behavior(args)
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"zero_reward_on_truncated": False}, "requires --zero-reward-on-truncated"),
+        (
+            {"zero_reward_on_truncated": False, "zero_loss_on_truncated": True},
+            "overlong filtering",
+        ),
+        ({"fully_async": False}, "requires --fully-async"),
+        ({"safe_training_staleness": -1}, "must be non-negative"),
+        ({"loss_type": "value_loss"}, "built-in policy loss"),
+        ({"custom_reward_post_process_path": "custom.reward"}, "built-in reward post-processing"),
+        (
+            {"custom_convert_samples_to_train_data_path": "custom.convert"},
+            "built-in sample-to-train-data conversion",
+        ),
+    ],
+)
+def test_staleness_aware_loss_validation_rejects_unsupported_modes(override, message):
+    values = {
+        "zero_reward_on_truncated": True,
+        "zero_loss_on_truncated": False,
+        "use_staleness_aware_loss": True,
+        "safe_training_staleness": 2,
+        "fully_async": True,
+        "loss_type": "policy_loss",
+        "custom_reward_post_process_path": None,
+        "custom_convert_samples_to_train_data_path": None,
+    }
+    values.update(override)
+
+    with pytest.raises(ValueError, match=message):
+        _validate_truncation_behavior(SimpleNamespace(**values))
 
 
 def test_colocate_switch_telemetry_cli_is_opt_in():

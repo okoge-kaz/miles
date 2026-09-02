@@ -2428,6 +2428,37 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--use-staleness-aware-loss",
+                action="store_true",
+                default=False,
+                help=(
+                    "Attenuate the policy-gradient loss from truncated zero-reward samples according to "
+                    "their training staleness. The sample multiplier is "
+                    "1 / (1 + max(0, training_staleness - safe_training_staleness)). Requires "
+                    "--fully-async and --zero-reward-on-truncated; incompatible with "
+                    "--zero-loss-on-truncated."
+                ),
+            )
+            parser.add_argument(
+                "--safe-training-staleness",
+                type=int,
+                default=2,
+                help=(
+                    "Largest per-sample training staleness receiving full truncation-feedback weight when "
+                    "--use-staleness-aware-loss is enabled (default: 2)."
+                ),
+            )
+            parser.add_argument(
+                "--log-staleness-aware-loss-details",
+                action="store_true",
+                default=False,
+                help=(
+                    "Log the absolute post-TIS policy-gradient objective mass before and after "
+                    "staleness-aware scaling. Off by default because it adds tokenwise diagnostic "
+                    "reductions. Requires --use-staleness-aware-loss and --use-tis."
+                ),
+            )
+            parser.add_argument(
                 "--search-r1-format-score",
                 type=float,
                 default=0.0,
@@ -2983,11 +3014,39 @@ def _validate_truncation_behavior(args: argparse.Namespace) -> None:
     """Reject contradictory handling of generation-truncated samples."""
     zero_reward = getattr(args, "zero_reward_on_truncated", False)
     zero_loss = getattr(args, "zero_loss_on_truncated", False)
+    use_staleness_aware_loss = getattr(args, "use_staleness_aware_loss", False)
+    log_staleness_aware_loss_details = getattr(args, "log_staleness_aware_loss_details", False)
+    safe_training_staleness = getattr(args, "safe_training_staleness", 2)
     if zero_reward and zero_loss:
         raise ValueError(
             "--zero-reward-on-truncated and --zero-loss-on-truncated are mutually exclusive; "
             "select exactly one truncation behavior or leave both disabled"
         )
+    if not isinstance(safe_training_staleness, int) or isinstance(safe_training_staleness, bool):
+        raise ValueError("--safe-training-staleness must be a non-negative integer")
+    if safe_training_staleness < 0:
+        raise ValueError("--safe-training-staleness must be non-negative")
+    if log_staleness_aware_loss_details and not use_staleness_aware_loss:
+        raise ValueError("--log-staleness-aware-loss-details requires --use-staleness-aware-loss")
+    if log_staleness_aware_loss_details and not getattr(args, "use_tis", False):
+        raise ValueError("--log-staleness-aware-loss-details requires --use-tis")
+    if not use_staleness_aware_loss:
+        return
+    if zero_loss:
+        raise ValueError(
+            "--use-staleness-aware-loss cannot be combined with --zero-loss-on-truncated "
+            "(overlong filtering)"
+        )
+    if not zero_reward:
+        raise ValueError("--use-staleness-aware-loss requires --zero-reward-on-truncated")
+    if not getattr(args, "fully_async", False):
+        raise ValueError("--use-staleness-aware-loss requires --fully-async")
+    if getattr(args, "loss_type", "policy_loss") != "policy_loss":
+        raise ValueError("--use-staleness-aware-loss requires the built-in policy loss")
+    if getattr(args, "custom_reward_post_process_path", None) is not None:
+        raise ValueError("--use-staleness-aware-loss requires built-in reward post-processing")
+    if getattr(args, "custom_convert_samples_to_train_data_path", None) is not None:
+        raise ValueError("--use-staleness-aware-loss requires built-in sample-to-train-data conversion")
 
 
 def miles_validate_args(args):

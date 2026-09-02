@@ -37,10 +37,22 @@
 : "${MASK_OFFPOLICY_IN_PARTIAL_ROLLOUT:=0}"
 : "${ASYNC_MAX_CONCURRENT_SAMPLES:=}"
 : "${TRAINING_BUFFER_QUEUE_SIZE:=1000}"
+: "${USE_STALENESS_AWARE_LOSS:=0}"
+: "${SAFE_TRAINING_STALENESS:=2}"
 
 if [[ "${ZERO_REWARD_ON_TRUNCATED:-0}" != "0" && "${ZERO_LOSS_ON_TRUNCATED:-0}" != "0" ]]; then
     echo "ZERO_REWARD_ON_TRUNCATED and ZERO_LOSS_ON_TRUNCATED are mutually exclusive" >&2
     exit 2
+fi
+[[ "${USE_STALENESS_AWARE_LOSS}" =~ ^[01]$ ]] ||
+    { echo "USE_STALENESS_AWARE_LOSS must be 0 or 1" >&2; exit 1; }
+[[ "${SAFE_TRAINING_STALENESS}" =~ ^[0-9]+$ ]] ||
+    { echo "SAFE_TRAINING_STALENESS must be a non-negative integer" >&2; exit 1; }
+if [[ "${USE_STALENESS_AWARE_LOSS}" == 1 ]]; then
+    [[ "${PLACEMENT}" == async ]] ||
+        { echo "USE_STALENESS_AWARE_LOSS requires PLACEMENT=async" >&2; exit 1; }
+    [[ "${ZERO_REWARD_ON_TRUNCATED:-0}" != 0 && "${ZERO_LOSS_ON_TRUNCATED:-0}" == 0 ]] ||
+        { echo "USE_STALENESS_AWARE_LOSS requires zero-reward truncation feedback without zero-loss filtering" >&2; exit 1; }
 fi
 
 [[ "${PARTIAL_ROLLOUT}" =~ ^[01]$ ]] ||
@@ -171,6 +183,9 @@ if [[ "${ZERO_REWARD_ON_TRUNCATED:-0}" != "0" ]]; then
 fi
 if [[ "${ZERO_LOSS_ON_TRUNCATED:-0}" != "0" ]]; then
     CONFIG_TAG="${CONFIG_TAG}-zero-loss-trunc"
+fi
+if [[ "${USE_STALENESS_AWARE_LOSS}" == 1 ]]; then
+    CONFIG_TAG="${CONFIG_TAG}-staleness-aware-loss-safe${SAFE_TRAINING_STALENESS}"
 fi
 # Replay-buffer formats have different resume semantics and reject one another
 # at load time. Recipes that opt into this identity axis therefore cannot

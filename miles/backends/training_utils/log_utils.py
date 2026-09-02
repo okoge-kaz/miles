@@ -7,6 +7,10 @@ import psutil
 import torch
 import torch.distributed as dist
 
+from miles.backends.training_utils.loss_hub.staleness_aware_loss import (
+    STALENESS_AWARE_LOSS_PART_PREFIX,
+    finalize_staleness_aware_loss_parts,
+)
 from miles.backends.training_utils.loss_hub.staleness_metrics import finalize_sample_staleness_metrics
 from miles.backends.training_utils.update_diagnostics import (
     UPDATE_PART_PREFIX,
@@ -438,7 +442,7 @@ def aggregate_train_losses(
     metric_sums = dict(zip(keys, values[1:], strict=True))
 
     for key, value in metric_sums.items():
-        if key.startswith(UPDATE_PART_PREFIX):
+        if key.startswith((UPDATE_PART_PREFIX, STALENESS_AWARE_LOSS_PART_PREFIX)):
             continue
         loss_reduced[key] = value * parallel_state.cp.size / num_samples_or_tokens
     if diagnostic_values is not None:
@@ -459,6 +463,7 @@ def aggregate_train_losses(
             loss_reduced[dst] = (a * a) / (b * c)
 
     loss_reduced.update(finalize_update_diagnostic_parts(metric_sums))
+    loss_reduced.update(finalize_staleness_aware_loss_parts(metric_sums))
     finalize_sample_staleness_metrics(loss_reduced)
 
     return loss_reduced

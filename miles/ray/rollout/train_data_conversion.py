@@ -87,12 +87,22 @@ def convert_samples_to_train_data(
         if (training_step := metadata.get("training_step")) is not None:
             train_data["training_steps"] = [int(training_step)] * len(samples)
 
-    if getattr(args, "log_sample_staleness_metrics", False) or getattr(args, "dump_details", None) is not None:
+    require_staleness = getattr(args, "use_staleness_aware_loss", False)
+    if (
+        getattr(args, "log_sample_staleness_metrics", False)
+        or getattr(args, "dump_details", None) is not None
+        or require_staleness
+    ):
         staleness_rows = []
         for sample in samples:
             reference = sample.metadata.get(SAMPLE_REFERENCE_VERSION_KEY)
             train_version = sample.metadata.get(TRAIN_VERSION_KEY)
             if not isinstance(reference, int) or not isinstance(train_version, int):
+                if require_staleness:
+                    raise RuntimeError(
+                        "--use-staleness-aware-loss requires complete per-sample "
+                        f"training-staleness provenance; sample {sample.index} is missing a weight version"
+                    )
                 staleness_rows = []
                 break
             if train_version < reference:
