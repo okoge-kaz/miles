@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Load an explicit allowlist from a dotenv file without evaluating shell code.
-# This is intended for Slurm job wrappers: credentials stay out of sbatch
+# This is intended for scheduler job wrappers: credentials stay out of submit
 # arguments and Ray runtime metadata while still being inherited from the job
 # process. Values are never printed.
 

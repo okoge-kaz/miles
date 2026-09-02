@@ -5,11 +5,21 @@
 : "${RAY_DONE_FLAG:?}"
 : "${GPUS_PER_NODE:?}"
 
+_MILES_COMMON_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+if ! declare -F _miles_pbs_refresh_context >/dev/null; then
+    # shellcheck source=experiments/common/pbs.sh
+    source "${_MILES_COMMON_DIR}/pbs.sh"
+fi
+unset _MILES_COMMON_DIR
+
+MILES_JOB_NUM_NODES="${MILES_JOB_NUM_NODES:?PBS node count is not initialized}"
+MILES_NODE_RANK="${MILES_NODE_RANK:?PBS node rank is not initialized}"
+
 RAY_PORT=6379
 RAY_JOIN_TIMEOUT=600
 RAY_DASHBOARD_HOST="${RAY_DASHBOARD_HOST:-0.0.0.0}"
-NNODES="${SLURM_JOB_NUM_NODES}"
-NODEID="${SLURM_NODEID:-0}"
+NNODES="${MILES_JOB_NUM_NODES}"
+NODEID="${MILES_NODE_RANK}"
 
 RAY_TEMP_ARGS=()
 if [[ -n "${RAY_TEMP_DIR:-}" ]]; then

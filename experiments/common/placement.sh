@@ -2,20 +2,29 @@
 # Needs GPUS_PER_NODE, ACTOR_NUM_NODES, ACTOR_GPUS_PER_NODE, ROLLOUT_NUM_GPUS
 # (0 when colocated), ROLLOUT_NUM_GPUS_PER_ENGINE, TENSOR_PARALLEL_SIZE,
 # CONTEXT_PARALLEL_SIZE, GLOBAL_BATCH_SIZE. Sets TRAIN_WORLD, DATA_PARALLEL_SIZE.
-# When PLACEMENT=async, ASYNC_SQSH_IMAGE_OVERRIDE optionally replaces the
-# submission-time SQSH_IMAGE after env.sh has loaded local overrides.
+# When PLACEMENT=async, ASYNC_CONTAINER_IMAGE_OVERRIDE optionally replaces the
+# submission-time CONTAINER_IMAGE after env.sh has loaded local overrides.
 #
-# Sourced by run.sbatch before srun, so a bad shape fails in seconds instead of
-# after every container has started.
+# Sourced by run.sbatch before the container step, so a bad shape fails in
+# seconds instead of after every container has started.
+
+_MILES_COMMON_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+if ! declare -F _miles_pbs_refresh_context >/dev/null; then
+    # shellcheck source=experiments/common/pbs.sh
+    source "${_MILES_COMMON_DIR}/pbs.sh"
+fi
+unset _MILES_COMMON_DIR
+
+MILES_JOB_NUM_NODES="${MILES_JOB_NUM_NODES:?PBS node count is not initialized}"
 
 TRAIN_WORLD=$(( ACTOR_NUM_NODES * ACTOR_GPUS_PER_NODE ))
-_alloc=$(( SLURM_JOB_NUM_NODES * GPUS_PER_NODE ))
+_alloc=$(( MILES_JOB_NUM_NODES * GPUS_PER_NODE ))
 _engine_pool=$(( ROLLOUT_NUM_GPUS > 0 ? ROLLOUT_NUM_GPUS : TRAIN_WORLD ))
 
 if (( TRAIN_WORLD + ROLLOUT_NUM_GPUS != _alloc )); then
     echo "placement does not use the allocation:" \
          "${ACTOR_NUM_NODES}x${ACTOR_GPUS_PER_NODE} train + ${ROLLOUT_NUM_GPUS} rollout" \
-         "!= ${SLURM_JOB_NUM_NODES}x${GPUS_PER_NODE}" >&2
+         "!= ${MILES_JOB_NUM_NODES}x${GPUS_PER_NODE}" >&2
     exit 1
 fi
 
@@ -43,18 +52,18 @@ if [[ "${PLACEMENT:-}" == async ]]; then
     : "${QUEUE_FACTOR:=1}"
     export QUEUE_TYPE QUEUE_FACTOR
 
-    if [[ -n "${ASYNC_SQSH_IMAGE_OVERRIDE:-}" ]]; then
-        [[ "${ASYNC_SQSH_IMAGE_OVERRIDE}" == /* ]] || {
-            echo "ASYNC_SQSH_IMAGE_OVERRIDE must be an absolute path: ${ASYNC_SQSH_IMAGE_OVERRIDE}" >&2
+    if [[ -n "${ASYNC_CONTAINER_IMAGE_OVERRIDE:-}" ]]; then
+        [[ "${ASYNC_CONTAINER_IMAGE_OVERRIDE}" == /* ]] || {
+            echo "ASYNC_CONTAINER_IMAGE_OVERRIDE must be an absolute path: ${ASYNC_CONTAINER_IMAGE_OVERRIDE}" >&2
             exit 1
         }
-        [[ -r "${ASYNC_SQSH_IMAGE_OVERRIDE}" ]] || {
-            echo "ASYNC_SQSH_IMAGE_OVERRIDE is not readable: ${ASYNC_SQSH_IMAGE_OVERRIDE}" >&2
+        [[ -r "${ASYNC_CONTAINER_IMAGE_OVERRIDE}" ]] || {
+            echo "ASYNC_CONTAINER_IMAGE_OVERRIDE is not readable: ${ASYNC_CONTAINER_IMAGE_OVERRIDE}" >&2
             exit 1
         }
-        SQSH_IMAGE="${ASYNC_SQSH_IMAGE_OVERRIDE}"
-        export SQSH_IMAGE
-        echo "async container override ${SQSH_IMAGE}"
+        CONTAINER_IMAGE="${ASYNC_CONTAINER_IMAGE_OVERRIDE}"
+        export CONTAINER_IMAGE
+        echo "async container override ${CONTAINER_IMAGE}"
     fi
 fi
 

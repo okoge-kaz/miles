@@ -1,47 +1,71 @@
 #!/bin/bash
 # Shared configuration for every job under experiments/.
-# Source this from an sbatch script; it defines paths only, no side effects.
+# Source this from a scheduler wrapper before resolving assets or mounts.
 
-# --- Slurm ------------------------------------------------------------------
-export SLURM_ACCOUNT_NAME="${SLURM_ACCOUNT_NAME:-coreai_horizon_dilations}"
-export GPU_PARTITION="${GPU_PARTITION:-batch}"       # batch 4h / batch_long 7d
-export GPU_QOS="${GPU_QOS:-normal}"
-export INTERACTIVE_GPU_QOS="${INTERACTIVE_GPU_QOS:-interactive}"
-export CPU_PARTITION="${CPU_PARTITION:-cpu}"         # cpu 7d
-export CPU_QOS="${CPU_QOS:-cpu-normal}"
-export INTERACTIVE_CPU_QOS="${INTERACTIVE_CPU_QOS:-cpu-interactive}"
-export GPUS_PER_NODE="${GPUS_PER_NODE:-8}"           # aws-pdx pool0: B300 x8, 192 CPUs
-export TRAINING_ATTENTION_BACKEND="${TRAINING_ATTENTION_BACKEND:-fused}"  # TE fused attention on B300
+# --- PBS --------------------------------------------------------------------
+# Keep reusable PBS headers project-neutral. Operators may pass a project to a
+# direct qsub command (for example, -P gai51740) without baking it into recipes.
+# Queue and resource defaults remain overridable without repetition.
+export PBS_GPU_QUEUE="${PBS_GPU_QUEUE:-R9920261300}"
+export PBS_GPU_RESOURCE_TYPE="${PBS_GPU_RESOURCE_TYPE:-rt_HF}"
+# CPU-only payloads also default to the project reservation. They request no
+# GPUs and select its HC resource class. Override PBS_CPU_QUEUE for an
+# intentional normal-queue submission; both defaults remain configurable.
+export PBS_CPU_QUEUE="${PBS_CPU_QUEUE:-${PBS_GPU_QUEUE}}"
+export PBS_CPU_RESOURCE_TYPE="${PBS_CPU_RESOURCE_TYPE:-rt_HC}"
+export PBS_GPU_CPUS_PER_NODE="${PBS_GPU_CPUS_PER_NODE:-192}"
+export PBS_CPU_CPUS_PER_NODE="${PBS_CPU_CPUS_PER_NODE:-32}"
+export ABCI_HPCX_MODULE="${ABCI_HPCX_MODULE:-hpcx/2.20}"
+export PBS_DEFAULT_WALLTIME="${PBS_DEFAULT_WALLTIME:-24:00:00}"
+export PBS_CONTAINER_WALLTIME="${PBS_CONTAINER_WALLTIME:-00:30:00}"
+export PBS_PREP_WALLTIME="${PBS_PREP_WALLTIME:-08:00:00}"
+export PBS_DOWNLOAD_WALLTIME="${PBS_DOWNLOAD_WALLTIME:-24:00:00}"
+export GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
+export TRAINING_ATTENTION_BACKEND="${TRAINING_ATTENTION_BACKEND:-fused}"
 
-# --- Workspace on lustre ----------------------------------------------------
-# Split by whether a job READS or WRITES the directory.
-#
-# Read-only assets are shared from one workspace so that a second person does not
-# re-download 8 GB of weights or re-run the difficulty filter to get a
-# byte-identical prompt file. They are world-readable and stay put.
-export SHARED_WS="${SHARED_WS:-/lustre/fsw/portfolios/coreai/users/kfujii}"
-export DATASET_DIR="${SHARED_WS}/datasets"           # prompt files, eval benchmarks
-export HF_CKPT_DIR="${HF_CKPT_DIR:-${SHARED_WS}/checkpoints/huggingface}"  # HuggingFace-format weights
-export MEGATRON_CKPT_DIR="${MEGATRON_CKPT_DIR:-${SHARED_WS}/checkpoints/megatron}"  # torch_dist weights
-export CONTAINER_DIR="${CONTAINER_DIR:-${SHARED_WS}/containers}"
+# --- Workspace --------------------------------------------------------------
+# Change this one value when moving the experiments to another filesystem. The
+# individual paths remain overridable for one-off reads of external checkpoints.
+export MILES_WORKSPACE_ROOT="${MILES_WORKSPACE_ROOT:-/groups/gai51740/kazuki_fujii}"
 
-# Written directories are per-user. Sharing them would be worse than a
-# permissions problem: CKPT_PATH is derived from the configuration, so two people
-# running the same config would land on the same directory, and since --load and
-# --save are the same path the second run would silently resume the first
-# (see notes/off-policy-variables.md, "Run identity").
-# Two people run arms of the same study and read each other's checkpoints for
-# offline evaluation, so a private umask makes another user's run unreadable --
-# and it fails late, inside the inference engine, as a FileNotFoundError on a
-# safetensors shard whose config.json loaded fine.
+# Compatibility names used by the older evaluation scripts. New code should use
+# MILES_WORKSPACE_ROOT and the purpose-specific paths below.
+export SHARED_WS="${SHARED_WS:-${MILES_WORKSPACE_ROOT}}"
+export WS="${WS:-${MILES_WORKSPACE_ROOT}}"
+
+export CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-${CKPT_ROOT:-${MILES_WORKSPACE_ROOT}/checkpoints}}"
+export CKPT_ROOT="${CHECKPOINT_ROOT}"
+export HF_CKPT_DIR="${HF_CKPT_DIR:-${CHECKPOINT_ROOT}/hf}"
+export MEGATRON_CKPT_DIR="${MEGATRON_CKPT_DIR:-${CHECKPOINT_ROOT}/megatron}"
+# Overridable so offline evaluation can read another user's training run.
+export TRAIN_CKPT_DIR="${TRAIN_CKPT_DIR:-${CHECKPOINT_ROOT}/training}"
+
+export DATASET_ROOT="${DATASET_ROOT:-${MILES_WORKSPACE_ROOT}/datasets}"
+export PRETRAIN_DATASET_DIR="${PRETRAIN_DATASET_DIR:-${DATASET_ROOT}/pre-train}"
+export RL_DATASET_DIR="${RL_DATASET_DIR:-${DATASET_DIR:-${DATASET_ROOT}/rl}}"
+export SFT_DATASET_DIR="${SFT_DATASET_DIR:-${DATASET_ROOT}/sft}"
+# Existing recipes use DATASET_DIR and the /data container path for RL/eval data.
+export DATASET_DIR="${RL_DATASET_DIR}"
+
+export CONTAINER_DIR="${CONTAINER_DIR:-${MILES_WORKSPACE_ROOT}/containers}"
+export CACHE_DIR="${CACHE_DIR:-${MILES_WORKSPACE_ROOT}/cache}"
+
+# Centralized defaults for the SFT policies referenced by the maintained recipes.
+# *_HF_MODEL is relative to HF_CKPT_DIR and is therefore also the path seen
+# below /ckpt/hf inside Singularity.
+export QWEN3_4B_BASE_HF_RELATIVE_DIR="${QWEN3_4B_BASE_HF_RELATIVE_DIR:-Qwen3-4B-Base/LR2.0e-5-SEQ32768-GBS128-MBS1-TP1-PP1-CP1-EP1-PACK1-standard-cp-STEPS4000}"
+export QWEN3_4B_BASE_HF_MODEL="${QWEN3_4B_BASE_HF_MODEL:-${QWEN3_4B_BASE_HF_RELATIVE_DIR}/iter_0004000}"
+export QWEN3_4B_BASE_HF_ROOT="${QWEN3_4B_BASE_HF_ROOT:-${HF_CKPT_DIR}/${QWEN3_4B_BASE_HF_RELATIVE_DIR}}"
+export QWEN3_8B_BASE_HF_RELATIVE_DIR="${QWEN3_8B_BASE_HF_RELATIVE_DIR:-Qwen3-8B-Base/LR1.5e-5-SEQ32768-GBS128-MBS1-TP2-PP1-CP1-EP1-PACK1-standard-cp-STEPS4000}"
+export QWEN3_8B_BASE_HF_MODEL="${QWEN3_8B_BASE_HF_MODEL:-${QWEN3_8B_BASE_HF_RELATIVE_DIR}/iter_0004000}"
+export QWEN3_8B_BASE_HF_ROOT="${QWEN3_8B_BASE_HF_ROOT:-${HF_CKPT_DIR}/${QWEN3_8B_BASE_HF_RELATIVE_DIR}}"
+export QWEN3_30B_A3B_BASE_HF_RELATIVE_DIR="${QWEN3_30B_A3B_BASE_HF_RELATIVE_DIR:-Qwen3-30B-A3B-Base/LR2.0e-5-SEQ32768-GBS128-MBS1-TP1-PP1-CP2-EP8-PACK1-standard-cp-STEPS4000}"
+export QWEN3_30B_A3B_BASE_HF_MODEL="${QWEN3_30B_A3B_BASE_HF_MODEL:-${QWEN3_30B_A3B_BASE_HF_RELATIVE_DIR}/iter_0004000}"
+export QWEN3_30B_A3B_BASE_HF_ROOT="${QWEN3_30B_A3B_BASE_HF_ROOT:-${HF_CKPT_DIR}/${QWEN3_30B_A3B_BASE_HF_RELATIVE_DIR}}"
+
+# Checkpoints are keyed by configuration, so group-writable defaults could let
+# two users silently resume the same optimizer state.
 umask 0022
-
-export WS="${WS:-/lustre/fsw/portfolios/coreai/users/${USER}}"
-export CKPT_ROOT="${WS}/checkpoints"
-# Overridable so offline evaluation can read another user's run: point it at
-# their checkpoints/training and the container mount follows.
-export TRAIN_CKPT_DIR="${TRAIN_CKPT_DIR:-${CKPT_ROOT}/training}"
-export CACHE_DIR="${WS}/cache"                       # compile / JIT caches
 
 # The miles checkout that gets mounted over /root/miles inside the container.
 # Derived from this file's own location, so a second checkout mounts itself
@@ -53,67 +77,95 @@ export MILES_REPO="${MILES_REPO:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." 
 # This script deliberately does not read `.env` (or any other repository file
 # containing credentials). Supply secrets through the process environment or a
 # scheduler-supported secret mechanism. Canonical submit wrappers pass only
-# explicit fixed-name allowlists; do not use `sbatch --export=ALL` for jobs that
+# explicit fixed-name allowlists; do not use `qsub -V` for jobs that
 # can reach credentials. `.env.example` documents recognized names only.
 
 # Inference Hub is OpenAI-compatible, so litellm reaches it as provider "openai"
 # with the base URL overridden rather than as a gemini/anthropic provider.
 export NVIDIA_INFERENCE_BASE_URL="${NVIDIA_INFERENCE_BASE_URL:-https://inference-api.nvidia.com/v1}"
 
-# Where sbatch logs land (stdout and stderr combined, one file per job).
-# The #SBATCH --output directives use the relative path experiments/outputs/,
-# so submit from the repo root. Git-ignored.
+# Scheduler logs and local run manifests. Git-ignored.
 export OUTPUT_DIR="${MILES_REPO}/experiments/outputs"
 
 # --- Container --------------------------------------------------------------
 export DOCKER_IMAGE="${DOCKER_IMAGE:-radixark/miles:latest}"
-# The prefill-staleness runs require SGLang's scheduler-authoritative policy
-# provenance fields, which are present in this derived image. An explicitly set
-# SQSH_IMAGE still takes precedence for historical reproduction.
-export SQSH_IMAGE="${SQSH_IMAGE:-${CONTAINER_DIR}/miles-search-r1-b300-20260815.sqsh}"
+# The upstream OCI tag can move independently of the Miles SGLang fork. The
+# Singularity build therefore reapplies and verifies the scheduler-authoritative
+# policy-provenance revision instead of trusting whichever checkout the tag has.
+export SGLANG_REPO="${SGLANG_REPO:-okoge-kaz/sglang}"
+export SGLANG_BRANCH="${SGLANG_BRANCH:-miles-staleness-weight-boundaries}"
+export SGLANG_COMMIT="${SGLANG_COMMIT:-f994b9aedfd0b1465dbb8f4e2a02eb789fc76dce}"
+export CONTAINER_IMAGE="${CONTAINER_IMAGE:-${CONTAINER_DIR}/miles.sif}"
+export ASYNC_CONTAINER_IMAGE_OVERRIDE="${ASYNC_CONTAINER_IMAGE_OVERRIDE:-${CONTAINER_IMAGE}}"
+
+# Use the cluster-provided NCCL and InfiniBand stack. TCP remains available only
+# as an explicit diagnostic control in validate_nccl_collective.sbatch.
+export MILES_NCCL_TRANSPORT="${MILES_NCCL_TRANSPORT:-system}"
+
+# Singularity's host-side image/layer cache. The build job deliberately
+# overrides both cache and temp paths to its node-local scratch directory; this
+# persistent default remains useful for non-build pulls and inspection.
+export SINGULARITY_CACHEDIR="${SINGULARITY_CACHEDIR:-${CACHE_DIR}/singularity}"
+export APPTAINER_CACHEDIR="${APPTAINER_CACHEDIR:-${SINGULARITY_CACHEDIR}}"
+export SINGULARITY_TMPDIR="${SINGULARITY_TMPDIR:-${PBS_LOCALDIR:-${TMPDIR:-/tmp}}}"
+export APPTAINER_TMPDIR="${APPTAINER_TMPDIR:-${SINGULARITY_TMPDIR}}"
 
 # In-container paths. Keep these stable: every train.sh references them.
 #   /root/miles       miles checkout (over the image's copy)
 #   /root/Megatron-LM stays as shipped by the image
-#   /data             datasets
+#   /data             RL and evaluation datasets
+#   /data/pre-train   pre-training datasets
+#   /data/sft         supervised fine-tuning datasets
 #   /ckpt/{hf,megatron,training}
+#   /cache            persistent framework and compiler caches
+export CONTAINER_CACHE_DIR="${CONTAINER_CACHE_DIR:-/cache}"
+export CONTAINER_HOME="${CONTAINER_HOME:-${CONTAINER_CACHE_DIR}/home}"
 export CONTAINER_MOUNTS="\
 ${MILES_REPO}:/root/miles,\
 ${DATASET_DIR}:/data,\
+${PRETRAIN_DATASET_DIR}:/data/pre-train,\
+${SFT_DATASET_DIR}:/data/sft,\
 ${HF_CKPT_DIR}:/ckpt/hf,\
 ${MEGATRON_CKPT_DIR}:/ckpt/megatron,\
 ${TRAIN_CKPT_DIR}:/ckpt/training,\
+${CACHE_DIR}:${CONTAINER_CACHE_DIR},\
 ${CACHE_DIR}:/root/.cache"
 
-# Only the directories this user owns. The shared ones are read-only to everyone
-# else, and creating them here would mask a missing asset as a silent empty
-# directory rather than failing where it is staged.
-mkdir -p "${TRAIN_CKPT_DIR}" "${CACHE_DIR}" "${OUTPUT_DIR}"
-for _shared in "${DATASET_DIR}" "${HF_CKPT_DIR}" "${MEGATRON_CKPT_DIR}" "${CONTAINER_DIR}"; do
-    [[ -d "${_shared}" ]] || echo "env.sh: missing shared asset ${_shared} (see experiments/setup/)" >&2
-done
-unset _shared
+# Creating the fixed layout is idempotent; completion markers still distinguish
+# staged assets from empty directories and partial downloads.
+mkdir -p \
+    "${HF_CKPT_DIR}" \
+    "${MEGATRON_CKPT_DIR}" \
+    "${TRAIN_CKPT_DIR}" \
+    "${CONTAINER_DIR}" \
+    "${PRETRAIN_DATASET_DIR}" \
+    "${RL_DATASET_DIR}" \
+    "${RL_DATASET_DIR}/pre-train" \
+    "${RL_DATASET_DIR}/sft" \
+    "${SFT_DATASET_DIR}" \
+    "${CACHE_DIR}" \
+    "${OUTPUT_DIR}"
 
 # --- Compile / JIT caches ---------------------------------------------------
-# $HOME is /root in the container and is not mounted, so anything writing to
-# ~/.cache already lands on CACHE_DIR and survives the job — that is how
-# huggingface/, tvm-ffi/ (sgl_kernel) and deep_gemm/ got there. These are the
-# ones that do NOT, because they default outside ~/.cache:
-#
-#   torch inductor  /tmp/torchinductor_$USER   <- /tmp is RAM-backed here
-#   triton          ~/.triton/cache            <- /root/.triton, not mounted
-#   CUDA PTX JIT    ~/.nv/ComputeCache         <- /root/.nv, not mounted
-#
-# Left alone, every job recompiles from scratch and the inductor cache eats
-# node RAM while doing it. Each recipe's fixed srun export list carries only the
-# cache variables it uses. A corrupt entry after a killed job shows up as a JIT/JSONDecodeError
-# (docs/faq.md:112) — delete the directory under $CACHE_DIR and rerun.
-export TRITON_CACHE_DIR=/root/.cache/triton
-export TORCHINDUCTOR_CACHE_DIR=/root/.cache/torchinductor
-export TORCH_HOME=/root/.cache/torch
-export CUDA_CACHE_PATH=/root/.cache/nv_compute
-export CUDA_CACHE_MAXSIZE=4294967296
-export VLLM_CACHE_ROOT=/root/.cache/vllm
+# Keep every large or expensive cache on shared storage. The duplicate
+# /root/.cache bind above preserves older train.sh files while these variables
+# direct current tools to the format-neutral /cache mount.
+export XDG_CACHE_HOME="${CONTAINER_CACHE_DIR}/xdg"
+export HF_HOME="${CONTAINER_CACHE_DIR}/huggingface"
+export HF_HUB_CACHE="${HF_HOME}/hub"
+export HUGGINGFACE_HUB_CACHE="${HF_HUB_CACHE}"
+export HF_DATASETS_CACHE="${HF_HOME}/datasets"
+export TRANSFORMERS_CACHE="${HF_HOME}/transformers"
+export TRITON_CACHE_DIR="${CONTAINER_CACHE_DIR}/triton"
+export TORCHINDUCTOR_CACHE_DIR="${CONTAINER_CACHE_DIR}/torchinductor"
+export TORCH_HOME="${CONTAINER_CACHE_DIR}/torch"
+export TORCH_EXTENSIONS_DIR="${CONTAINER_CACHE_DIR}/torch_extensions"
+export CUDA_CACHE_PATH="${CONTAINER_CACHE_DIR}/nv_compute"
+export CUDA_CACHE_MAXSIZE="${CUDA_CACHE_MAXSIZE:-4294967296}"
+export VLLM_CACHE_ROOT="${CONTAINER_CACHE_DIR}/vllm"
+export PIP_CACHE_DIR="${CONTAINER_CACHE_DIR}/pip"
+export UV_CACHE_DIR="${CONTAINER_CACHE_DIR}/uv"
+export NUMBA_CACHE_DIR="${CONTAINER_CACHE_DIR}/numba"
 
 # SGLang's DeepGEMM JIT cache. miles otherwise pins this to
 # /tmp/sglang_deep_gemm/<worker>_rank_<n> for per-rank isolation
@@ -121,13 +173,48 @@ export VLLM_CACHE_ROOT=/root/.cache/vllm
 # It reads the env var first, so setting it here wins; PER_PROCESS=1 is the
 # supported way to keep the per-rank isolation under a shared directory
 # (the TODO at server_group.py:105, and scripts/run_deepseek_v4.py:575).
-export SGLANG_DG_CACHE_DIR=/root/.cache/deep_gemm
-export SGLANG_DG_CACHE_DIR_PER_PROCESS=1
+export SGLANG_DG_CACHE_DIR="${CONTAINER_CACHE_DIR}/sglang/deep_gemm"
+export SGLANG_DG_CACHE_DIR_PER_PROCESS="${SGLANG_DG_CACHE_DIR_PER_PROCESS:-1}"
 
-mkdir -p "${CACHE_DIR}"/{triton,torchinductor,torch,nv_compute,vllm,deep_gemm}
+mkdir -p \
+    "${SINGULARITY_CACHEDIR}" \
+    "${CACHE_DIR}/xdg" \
+    "${CACHE_DIR}/home" \
+    "${CACHE_DIR}/huggingface/hub" \
+    "${CACHE_DIR}/huggingface/datasets" \
+    "${CACHE_DIR}/huggingface/transformers" \
+    "${CACHE_DIR}/triton" \
+    "${CACHE_DIR}/torchinductor" \
+    "${CACHE_DIR}/torch" \
+    "${CACHE_DIR}/torch_extensions" \
+    "${CACHE_DIR}/nv_compute" \
+    "${CACHE_DIR}/vllm" \
+    "${CACHE_DIR}/pip" \
+    "${CACHE_DIR}/uv" \
+    "${CACHE_DIR}/numba" \
+    "${CACHE_DIR}/sglang/deep_gemm"
+
+# These survive singularity exec --cleanenv and become the unprefixed names in
+# the container. Explicit assignments also avoid depending on host shell policy.
+for _cache_name in \
+    XDG_CACHE_HOME HF_HOME HF_HUB_CACHE HUGGINGFACE_HUB_CACHE \
+    HF_DATASETS_CACHE TRANSFORMERS_CACHE TRITON_CACHE_DIR \
+    TORCHINDUCTOR_CACHE_DIR TORCH_HOME TORCH_EXTENSIONS_DIR CUDA_CACHE_PATH \
+    CUDA_CACHE_MAXSIZE VLLM_CACHE_ROOT PIP_CACHE_DIR UV_CACHE_DIR \
+    NUMBA_CACHE_DIR SGLANG_DG_CACHE_DIR SGLANG_DG_CACHE_DIR_PER_PROCESS; do
+    printf -v "SINGULARITYENV_${_cache_name}" '%s' "${!_cache_name}"
+    export "SINGULARITYENV_${_cache_name}"
+done
+unset _cache_name
+
+# --no-home prevents accidental access to the submitter's host home. HOME is a
+# protected variable in SingularityCE 4, so configure its supported home mount
+# instead of trying to pass HOME through SINGULARITYENV_HOME.
+export SINGULARITY_HOME="${CACHE_DIR}/home:${CONTAINER_HOME}"
+export APPTAINER_HOME="${SINGULARITY_HOME}"
 
 # --- Weights & Biases -------------------------------------------------------
-# $HOME is not mounted into the container (--no-container-mount-home), so the
+# $HOME is not mounted into the container (--no-home), so the
 # key may be resolved here on the host, but only recipes that explicitly opt in
 # should include WANDB_API_KEY in their fixed export list. Set it yourself to
 # override; leave everything unset to disable wandb.
@@ -147,3 +234,11 @@ elif [[ -z "${WANDB_API_KEY:-}" && -f "${HOME}/.netrc" ]]; then
     fi
     unset _wandb_key
 fi
+
+# --- Scheduler and container helpers ---------------------------------------
+_miles_experiments_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+# shellcheck source=experiments/common/pbs.sh
+source "${_miles_experiments_dir}/common/pbs.sh"
+# shellcheck source=experiments/common/singularity.sh
+source "${_miles_experiments_dir}/common/singularity.sh"
+unset _miles_experiments_dir
