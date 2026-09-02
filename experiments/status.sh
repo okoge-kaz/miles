@@ -11,8 +11,19 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 OUT="${SCRIPT_DIR}/outputs"
+: "${QSTAT_BIN:=qstat}"
+: "${QSELECT_BIN:=qselect}"
 
-newest_log() { find "${OUT}" -name '*.log' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-; }
+find_logs() {
+    find "${OUT}" -type f \( \
+        -name '*.log' -o -name '*.o[0-9]*' -o -name '*.e[0-9]*' \
+        -o -name '*.OU' -o -name '*.ER' \
+    \) "$@" 2>/dev/null
+}
+
+newest_log() {
+    find_logs -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2-
+}
 
 case "${1:-}" in
     -f)
@@ -23,8 +34,12 @@ case "${1:-}" in
         ;;
     [0-9]*)
         jobid="$1"
-        scontrol show job "${jobid}" 2>/dev/null | head -20
-        log=$(find "${OUT}" -name "*-${jobid}.log" | head -1)
+        "${QSTAT_BIN}" -f "${jobid}" 2>/dev/null | head -30
+        sequence="${jobid%%.*}"
+        log=$(find "${OUT}" -type f \
+            \( -name "*-${sequence}.log" -o -name "*.o${sequence}" -o -name "*.e${sequence}" \
+                -o -name "${sequence}*.OU" -o -name "${sequence}*.ER" \) \
+            -print -quit 2>/dev/null)
         [[ -z "${log}" ]] && { echo "no log for job ${jobid} under ${OUT}"; exit 1; }
         echo "==> ${log}"
         exec tail -f "${log}"
@@ -32,20 +47,26 @@ case "${1:-}" in
 esac
 
 echo "=== queue (${USER}) ==="
-squeue -u "${USER}" -o "%.10i %.34j %.14P %.2t %.10M %.10L %R" | head -30
-n=$(squeue -u "${USER}" -h | wc -l)
-echo "(${n} jobs; states: $(squeue -u "${USER}" -h -o '%t' | sort | uniq -c | tr '\n' ' '))"
+queue_output="$("${QSTAT_BIN}" -u "${USER}" 2>/dev/null || true)"
+printf '%s\n' "${queue_output}" | head -30
+n=$("${QSELECT_BIN}" -u "${USER}" 2>/dev/null | wc -l)
+states=$(printf '%s\n' "${queue_output}" | awk 'NR > 2 && NF >= 5 { print $5 }' \
+    | sort | uniq -c | tr '\n' ' ')
+echo "(${n} jobs; states: ${states:-none})"
 
 echo
 echo "=== recent logs ==="
-find "${OUT}" -name '*.log' -printf '%T@ %TY-%Tm-%Td %TH:%TM  %s  %p\n' 2>/dev/null \
+find_logs -printf '%T@ %TY-%Tm-%Td %TH:%TM  %s  %p\n' \
     | sort -rn | head -10 | cut -d' ' -f2- || echo "(none yet)"
 
 echo
 echo "=== training runs ==="
 for d in "${OUT}"/training/*/; do
     [[ -d "$d" ]] || continue
-    printf "  %-40s %s log(s)\n" "$(basename "$d")" "$(ls "$d"/*.log 2>/dev/null | wc -l)"
+    count=$(find "$d" -maxdepth 1 -type f \
+        \( -name '*.log' -o -name '*.o[0-9]*' -o -name '*.e[0-9]*' \
+            -o -name '*.OU' -o -name '*.ER' \) 2>/dev/null | wc -l)
+    printf "  %-40s %s log(s)\n" "$(basename "$d")" "${count}"
 done
 
 echo

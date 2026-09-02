@@ -1,23 +1,17 @@
 #!/bin/bash
-#SBATCH --job-name=miles-search-r1-async-nq-hotpotqa-p10-90-qwen3-4b
-#SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=batch
-#SBATCH --qos=interactive
-#SBATCH --nodes=2
-#SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=128
-#SBATCH --gres=gpu:8
-#SBATCH --exclusive
-#SBATCH --mem=0
-#SBATCH --time=04:00:00
-#SBATCH --output=experiments/outputs/training/search_r1/nq-hotpotqa-p10-90/qwen3-4b/%x-%j.log
+#PBS -N miles-search-r1-async-nq-hotpotqa-p10-90-qwen3-4b
+#PBS -q R9920261300
+#PBS -l select=2:ncpus=192:ngpus=8:mpiprocs=1
+#PBS -l place=scatter:excl
+#PBS -l walltime=24:00:00
+#PBS -j oe
 
 # Fully asynchronous Search-R1 on NQ + HotpotQA. One node trains while the
 # other keeps multi-turn retrieval rollouts in flight.
 #
 #   experiments/submit_training.sh \
 #     search_r1/async/nq-hotpotqa-p10-90/qwen3-4b <run-name> \
-#     --qos=interactive
+#     --profile gpu
 #
 # Requires prepare_search_r1.sbatch followed by
 # difficulty_filter/run_measure_search_r1.sbatch. The prompt population is fixed
@@ -26,9 +20,9 @@
 
 set -euo pipefail
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../../../.." &>/dev/null && pwd)}"
+REPO_ROOT="${PBS_O_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../../../.." &>/dev/null && pwd)}"
 source "${REPO_ROOT}/experiments/env.sh"
-: "${ASYNC_SQSH_IMAGE_OVERRIDE:=${CONTAINER_DIR}/miles-search-r1-b300-faiss-1.12.0-20260826.sqsh}"
+: "${ASYNC_CONTAINER_IMAGE_OVERRIDE:=${CONTAINER_IMAGE}}"
 
 : "${MODEL_NAME:=Qwen3-4B-Base-LR2e-5-Step4000}"
 : "${HF_MODEL_NAME:=Qwen3-4B-Base/LR2.0e-5-SEQ32768-GBS128-MBS1-TP1-PP1-CP1-EP1-PACK1-standard-cp-STEPS4000/iter_0004000}"
@@ -172,7 +166,7 @@ fi
 : "${DEBUG_EXIT_AFTER_ROLLOUT:=}"
 
 export MODEL_NAME HF_MODEL_NAME MODEL_PROFILE PLACEMENT TASK_FAMILY DATASET_TAG PROMPT_DATA
-export ASYNC_SQSH_IMAGE_OVERRIDE
+export ASYNC_CONTAINER_IMAGE_OVERRIDE
 export ADVANTAGE_ESTIMATOR ENTROPY_COEF EPS_CLIP EPS_CLIP_HIGH EPS_CLIP_C RATIO_DENOMINATOR IS_CORRECTION KL_LOSS_COEF
 export TIS_CLIP TIS_CLIP_LOW MIS_PROFILE M2PO_BUDGET USE_OPSM OPSM_DELTA
 export LR TRAIN_SEED ROLLOUT_SEED MAX_RESPONSE_LEN ROLLOUT_MAX_CONTEXT_LEN NUM_STEPS_PER_ROLLOUT
@@ -196,30 +190,30 @@ export RUN_NAME CONFIG_TAG CKPT_PATH
 
 source "${REPO_ROOT}/experiments/common/placement.sh"
 
-export RAY_DONE_FLAG="/root/miles/experiments/outputs/.ray/${RUN_NAME}-${SLURM_JOB_ID}.done"
+export RAY_DONE_FLAG="/root/miles/experiments/outputs/.ray/${RUN_NAME}-${MILES_JOB_ID}.done"
 export RAY_HEAD_IP_FILE="${RAY_DONE_FLAG}.head-ip"
 mkdir -p "${OUTPUT_DIR}/.ray"
 rm -f \
-    "${OUTPUT_DIR}/.ray/${RUN_NAME}-${SLURM_JOB_ID}.done" \
-    "${OUTPUT_DIR}/.ray/${RUN_NAME}-${SLURM_JOB_ID}.done.head-ip"
+    "${OUTPUT_DIR}/.ray/${RUN_NAME}-${MILES_JOB_ID}.done" \
+    "${OUTPUT_DIR}/.ray/${RUN_NAME}-${MILES_JOB_ID}.done.head-ip"
 
 echo "run ${RUN_NAME}"
 echo "checkpoints ${CKPT_PATH}"
 
-STEP_CPUS_PER_NODE="${SLURM_CPUS_PER_TASK:-${SLURM_JOB_CPUS_PER_NODE%%\(*}}"
+STEP_CPUS_PER_NODE="${PBS_GPU_CPUS_PER_NODE}"
 [[ "${STEP_CPUS_PER_NODE}" =~ ^[1-9][0-9]*$ ]] || {
-    echo "invalid Slurm CPU allocation: ${STEP_CPUS_PER_NODE}" >&2
+    echo "invalid PBS CPU allocation: ${STEP_CPUS_PER_NODE}" >&2
     exit 1
 }
 
-srun \
-    --nodes="${SLURM_JOB_NUM_NODES}" \
+miles_srun \
+    --nodes="${MILES_JOB_NUM_NODES}" \
     --ntasks-per-node=1 \
     --cpus-per-task="${STEP_CPUS_PER_NODE}" \
     --mem=0 \
-    --container-image="${SQSH_IMAGE}" \
-    --container-mounts="${CONTAINER_MOUNTS}" \
-    --container-writable \
-    --no-container-mount-home \
+    --image="${CONTAINER_IMAGE}" \
+    --bind="${CONTAINER_MOUNTS}" \
+    --writable-tmpfs \
+    --no-home \
     --export=ALL \
     bash "${TRAIN_SCRIPT}"

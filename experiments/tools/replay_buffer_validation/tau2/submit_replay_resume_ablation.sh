@@ -11,7 +11,6 @@ source experiments/env.sh
 
 readonly RECIPE=experiments/scripts/tau_bench/async/areal-tau2/qwen3-4b-agentic-sft-953/run.sbatch
 readonly SUMMARY_RECIPE=experiments/tools/replay_buffer_validation/tau2/summarize.sbatch
-readonly ACCOUNT="${SLURM_ACCOUNT_NAME:-coreai_horizon_dilations}"
 readonly WANDB_PROJECT=async-rl-tau
 readonly FRESH_UPDATES=10
 readonly RESUME_UPDATES=6
@@ -30,7 +29,6 @@ readonly FRESH_WALL=04:00:00
 readonly RESUME_WALL=02:00:00
 readonly LOG_DIR="${OUTPUT_DIR}/training/tau_bench/areal-tau2/qwen3-4b-agentic-sft-953/replay-resume-ablation"
 readonly MANIFEST_DIR="${OUTPUT_DIR}/replay_buffer_validation/tau2"
-readonly IDLE_EXEMPTION='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"60","reason":"data_loading","description":"Tau2 multi-turn replay validation waits for external user-simulator turns"}}'
 readonly -a MODES=(no-replay rollout inflight inflight-overlap)
 
 : "${VALIDATION_NAMESPACE:=tau2-rbresume-$(date +%Y%m%d-%H%M%S)}"
@@ -64,7 +62,7 @@ while (($# > 0)); do
             ;;
         --reuse-first-fresh-job)
             (($# >= 2)) || {
-                echo "--reuse-first-fresh-job requires a Slurm job ID" >&2
+                echo "--reuse-first-fresh-job requires a PBS job ID" >&2
                 exit 2
             }
             REUSED_FIRST_FRESH_JOB="$2"
@@ -132,8 +130,8 @@ done
 
 recovery_source_manifest=
 if [[ -n "${REUSED_FIRST_FRESH_JOB}" ]]; then
-    [[ "${REUSED_FIRST_FRESH_JOB}" =~ ^[1-9][0-9]*$ ]] || {
-        echo "invalid reused Slurm job ID: ${REUSED_FIRST_FRESH_JOB}" >&2
+    [[ "${REUSED_FIRST_FRESH_JOB}" =~ ^[1-9][0-9]*(\[[^]]+\])?(\.[A-Za-z0-9._-]+)?$ ]] || {
+        echo "invalid reused PBS job ID: ${REUSED_FIRST_FRESH_JOB}" >&2
         exit 1
     }
     : "${RECOVERY_TAG:=recovery-$(date +%Y%m%d-%H%M%S)}"
@@ -194,13 +192,14 @@ if values.get(job_key) != sys.argv[10]:
 PY
     mapfile -t reused_logs < <(
         find "${LOG_DIR}" -maxdepth 1 -type f \
-            -name "*-${REUSED_FIRST_FRESH_JOB}.log" -print
+            \( -name "${REUSED_FIRST_FRESH_JOB}.OU" \
+            -o -name "*-${REUSED_FIRST_FRESH_JOB}.log" \) -print
     )
     ((${#reused_logs[@]} == 1)) || {
         echo "expected one log for reused job ${REUSED_FIRST_FRESH_JOB}, found ${#reused_logs[@]}" >&2
         exit 1
     }
-    rg -q --fixed-strings \
+    grep -qF -- \
         "debug_failure_after_rollout=${FRESH_UPDATES} reached at rollout_id=$((FRESH_UPDATES - 1))" \
         "${reused_logs[0]}" || {
         echo "reused fresh job did not reach the expected intentional failure" >&2
@@ -370,14 +369,10 @@ submit_phase() {
         expected_failure_rollout=$((FRESH_UPDATES - 1))
     fi
     validate_checkpoint_schedule "${phase}" "${save_interval}" "${save_retain_interval}"
-    sbatch --parsable \
-        --account="${ACCOUNT}" \
-        --partition=batch \
-        --qos=interactive \
+    pbs_submit --parsable --profile gpu \
         --nodes=4 \
         --time="${wall}" \
         --job-name="taurb-s${seed}-${mode}-${phase}" \
-        --comment="${IDLE_EXEMPTION}" \
         --output="${LOG_DIR}/${run_stem}-${phase}-%j.log" \
         "${dependency[@]}" \
         --export="ALL,${COMMON_EXPORTS_CSV},CONFIG_TAG=${config_tag},RUN_NAME=${run_stem}-${phase},TRAIN_SEED=${train_seed},ROLLOUT_SEED=${seed},USE_REPLAY_BUFFER=${use_replay},REPLAY_BUFFER_TYPE=${replay_type},TAU_OVERLAP_DB_RESTORE_WITH_PREFILL=${overlap},SAVE_INTERVAL=${save_interval},SAVE_RETAIN_INTERVAL=${save_retain_interval},DEBUG_EXIT_AFTER_ROLLOUT=${debug_exit},DEBUG_FAIL_AFTER_ROLLOUT=${debug_fail},DEBUG_FAILURE_MIN_OUTSTANDING_GROUPS=${min_outstanding},DEBUG_FAILURE_MIN_COMPLETED_GROUPS=${min_completed},DEBUG_FAILURE_MIN_INFLIGHT_GROUPS=${min_inflight},DEBUG_FAILURE_MIN_INFLIGHT_TOKENS=${min_inflight_tokens},DEBUG_FAILURE_MIN_REGENERATE_GROUPS=${min_regenerate},REPLAY_RESUME_EXPECT_FAILURE_ROLLOUT_ID=${expected_failure_rollout}" \
@@ -401,21 +396,18 @@ for arm_row in "${ARM_ROWS[@]}"; do
     fi
     resume_job="$(submit_phase \
         "${seed}" "${mode}" resume "${use_replay}" "${replay_type}" "${overlap}" \
-        "${run_stem}" "${config_tag}" "${RESUME_WALL}" afterany "${fresh_job%%;*}")"
-    JOB_IDS["${seed}_${mode}_fresh"]="${fresh_job%%;*}"
-    JOB_IDS["${seed}_${mode}_resume"]="${resume_job%%;*}"
-    RESUME_JOB_IDS+=("${resume_job%%;*}")
-    previous_resume_job="${resume_job%%;*}"
+        "${run_stem}" "${config_tag}" "${RESUME_WALL}" afterany "${fresh_job}")"
+    JOB_IDS["${seed}_${mode}_fresh"]="${fresh_job}"
+    JOB_IDS["${seed}_${mode}_resume"]="${resume_job}"
+    RESUME_JOB_IDS+=("${resume_job}")
+    previous_resume_job="${resume_job}"
     printf 'submitted seed=%-6s %-18s fresh=%s resume=%s\n' \
-        "${seed}" "${mode}" "${fresh_job%%;*}" "${resume_job%%;*}"
+        "${seed}" "${mode}" "${fresh_job}" "${resume_job}"
     ((arm_index += 1))
 done
 
 summary_dependency="$(IFS=:; printf '%s' "${RESUME_JOB_IDS[*]}")"
-summary_job="$(sbatch --parsable \
-    --account="${ACCOUNT}" \
-    --partition=cpu \
-    --qos=cpu-interactive \
+summary_job="$(pbs_submit --parsable --profile cpu \
     --dependency="afterany:${summary_dependency}" \
     --job-name=taurb-summary \
     --output="${MANIFEST_DIR}/summary-${VALIDATION_NAMESPACE}-%j.log" \
@@ -449,8 +441,8 @@ summary_job="$(sbatch --parsable \
                 "${seed}" "${key^^}" "${JOB_IDS["${seed}_${mode}_resume"]}"
         done
     done
-    printf 'SUMMARY_JOB=%q\n' "${summary_job%%;*}"
+    printf 'SUMMARY_JOB=%q\n' "${summary_job}"
     printf 'SUMMARY_PATH=%q\n' "${summary}"
 } >"${manifest}"
 
-printf 'summary=%s output=%s\n' "${summary_job%%;*}" "${summary}"
+printf 'summary=%s output=%s\n' "${summary_job}" "${summary}"

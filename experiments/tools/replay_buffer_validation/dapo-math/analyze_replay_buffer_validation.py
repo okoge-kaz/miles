@@ -99,7 +99,12 @@ def parse_manifest(path: Path) -> dict[str, str]:
 
 
 def find_log(log_dir: Path, job_id: str) -> Path | None:
-    matches = sorted(log_dir.glob(f"*-{job_id}.log"))
+    matches = sorted(
+        [
+            *log_dir.glob(f"{job_id}.OU"),
+            *log_dir.glob(f"*-{job_id}.log"),
+        ]
+    )
     if not matches:
         return None
     if len(matches) > 1:

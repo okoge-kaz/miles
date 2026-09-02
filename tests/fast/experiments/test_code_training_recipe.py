@@ -15,10 +15,10 @@ def _read(name: str) -> str:
     return (REPO_ROOT / RECIPE_DIR / name).read_text(encoding="utf-8")
 
 
-def _resolve_segment_identity(slurm_job_id: str) -> tuple[str, str, str]:
+def _resolve_segment_identity(job_id: str) -> tuple[str, str, str]:
     environment = {
         "PATH": os.environ["PATH"],
-        "SLURM_JOB_ID": slurm_job_id,
+        "MILES_JOB_ID": job_id,
         "MODEL_NAME": "Qwen3-4B-Base-LR2e-5-Step4000",
         "DATASET_TAG": "nemotron3-nano-competitive-code-train",
         "TASK_FAMILY": "code",
@@ -81,12 +81,13 @@ def test_code_recipe_has_production_shape_and_offline_eval():
     train_script = _read("train.sh")
 
     for directive in (
-        "#SBATCH --partition=batch",
-        "#SBATCH --qos=interactive",
-        "#SBATCH --nodes=4",
-        "#SBATCH --time=04:00:00",
+        "#PBS -q R9920261300",
+        "#PBS -l select=4:ncpus=192:ngpus=8:mpiprocs=1",
+        "#PBS -l place=scatter:excl",
+        "#PBS -l walltime=24:00:00",
     ):
         assert directive in run_script
+    assert "#PBS -P" not in run_script
     for default in (
         ': "${MAX_RESPONSE_LEN:=16384}"',
         ': "${NUM_ROLLOUT:=300}"',
@@ -115,17 +116,16 @@ def test_code_recipe_restricts_reward_and_enables_replay():
     assert '--save "${CKPT_PATH}"' in train_script
 
 
-def test_code_recipe_is_efa_fail_closed():
+def test_code_recipe_uses_system_or_tcp_nccl_transport():
     run_script = _read("run.sbatch")
 
     for contract in (
-        ': "${MILES_NCCL_TRANSPORT:=efa}"',
-        '[[ "${NCCL_IB_DISABLE:-0}" != 1 ]]',
-        '[[ "${NCCL_NET_PLUGIN:-ofi}" == ofi ]]',
-        'NCCL_NET="AWS Libfabric"',
-        "FI_PROVIDER=efa",
-        "bash /root/miles/experiments/common/check_efa.sh",
-        "bash /root/miles/experiments/common/run_with_efa_env.sh",
+        ': "${MILES_NCCL_TRANSPORT:=system}"',
+        'case "${MILES_NCCL_TRANSPORT}" in',
+        "tcp)",
+        "NCCL_NET=Socket",
+        "system)",
+        "expected tcp or system",
     ):
         assert contract in run_script
 

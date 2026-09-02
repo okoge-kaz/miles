@@ -1,17 +1,14 @@
 #!/bin/bash
-#SBATCH --job-name=miles-staleness-telemetry-gpu
-#SBATCH --partition=interactive
-#SBATCH --nodes=1
-#SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=128
-#SBATCH --gres=gpu:8
-#SBATCH --exclusive
-#SBATCH --time=02:00:00
-#SBATCH --output=experiments/outputs/%x-%j.log
+#PBS -N miles-staleness-telemetry-gpu
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=192:ngpus=8:mpiprocs=1
+#PBS -l place=scatter:excl
+#PBS -l walltime=02:00:00
+#PBS -j oe
 
 set -euo pipefail
 
-REPO_ROOT="${SLURM_SUBMIT_DIR}"
+REPO_ROOT="${PBS_O_WORKDIR:?submit this test from the repository root}"
 source "${REPO_ROOT}/experiments/env.sh"
 BASELINE_REPO="${BASELINE_REPO:-${REPO_ROOT}-baseline}"
 if [[ ! -d "${BASELINE_REPO}" ]]; then
@@ -20,16 +17,16 @@ if [[ ! -d "${BASELINE_REPO}" ]]; then
 fi
 export CONTAINER_MOUNTS="${CONTAINER_MOUNTS},${BASELINE_REPO}:/root/miles-baseline"
 
-export STALENESS_VALIDATION_ROOT="/root/miles/experiments/outputs/staleness-telemetry-gpu-${SLURM_JOB_ID}"
+export STALENESS_VALIDATION_ROOT="/root/miles/experiments/outputs/staleness-telemetry-gpu-${MILES_JOB_ID_SHORT}"
 export STALENESS_PARITY_STEPS="${STALENESS_PARITY_STEPS:-3}"
 export STALENESS_WARMUP_STEPS="${STALENESS_WARMUP_STEPS:-2}"
 export STALENESS_MEASURED_STEPS="${STALENESS_MEASURED_STEPS:-8}"
 
-srun \
-    --container-image="${SQSH_IMAGE}" \
-    --container-mounts="${CONTAINER_MOUNTS}" \
-    --container-writable \
-    --no-container-mount-home \
+miles_srun \
+    --image="${CONTAINER_IMAGE}" \
+    --bind="${CONTAINER_MOUNTS}" \
+    --writable-tmpfs \
+    --no-home \
     --export=ALL \
     bash -lc '
 set -euo pipefail

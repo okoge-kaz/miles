@@ -7,7 +7,6 @@ set -euo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../.." &>/dev/null && pwd)"
 cd "${REPO_ROOT}"
 
-export HF_CKPT_DIR="${QWEN3_4B_BASE_HF_ROOT:-/lustre/fsw/portfolios/coreai/users/kfujii/checkpoints/huggingface/Qwen3-4B-Base/LR2.0e-5-SEQ32768-GBS128-MBS1-TP1-PP1-CP1-EP1-PACK1-standard-cp-STEPS4000}"
 source experiments/env.sh
 
 MODE=dry-run
@@ -35,8 +34,7 @@ while (( $# > 0 )); do
 done
 
 RECIPE=experiments/scripts/math/async/dapo-math-p10-90/qwen3-4b/run.sbatch
-ACCOUNT="${SLURM_ACCOUNT_NAME:-coreai_horizon_dilations}"
-: "${VALIDATION_NAMESPACE:=rbtype-step4000-${SLURM_JOB_ID:-$(date +%Y%m%d-%H%M%S)}}"
+: "${VALIDATION_NAMESPACE:=rbtype-step4000-${MILES_JOB_ID_SHORT:-$(date +%Y%m%d-%H%M%S)}}"
 WANDB_PROJECT=async-rl-miles-replay-buffer
 : "${FRESH_ROLLOUTS:=4}"
 : "${RESUME_ROLLOUTS:=2}"
@@ -44,10 +42,10 @@ WANDB_PROJECT=async-rl-miles-replay-buffer
 : "${FRESH_WALL:=02:00:00}"
 : "${RESUME_WALL:=01:30:00}"
 
-# This script normally runs inside the 32-GiB CPU finalizer.  Slurm preserves
-# these exported variables across nested sbatch calls, so remove the parent
-# step limits and let the two-node recipe establish its own resources.
-unset SLURM_MEM_PER_NODE SLURM_MEM_PER_CPU SLURM_CPUS_PER_TASK
+# This script can run inside a CPU finalizer. Remove legacy inherited step
+# limits before launching the full-node GPU phases.
+# Do not leak allocation-specific resource hints into child PBS submissions.
+unset PBS_NCPUS
 
 [[ "${VALIDATION_NAMESPACE}" =~ ^[A-Za-z0-9._-]+$ ]] || {
     echo "VALIDATION_NAMESPACE contains unsupported characters: ${VALIDATION_NAMESPACE}" >&2
@@ -69,7 +67,7 @@ if [[ "${MODE}" == submit ]]; then
         echo "filtered dataset is missing or empty: ${FILTERED_DATASET}" >&2
         exit 1
     }
-    HF_CHECKPOINT="${HF_CKPT_DIR}/iter_0004000"
+    HF_CHECKPOINT="${HF_CKPT_DIR}/${QWEN3_4B_BASE_HF_MODEL}"
     MCORE_CHECKPOINT="${MEGATRON_CKPT_DIR}/Qwen3-4B-Base-LR2e-5-Step4000_torch_dist"
     [[ -s "${HF_CHECKPOINT}/config.json" && -s "${HF_CHECKPOINT}/chat_template.jinja" ]] || {
         echo "HF checkpoint or its chat template is incomplete: ${HF_CHECKPOINT}" >&2
@@ -122,9 +120,7 @@ submit_phase() {
     local run_name="rbv-step4000-${buffer_type}-${VALIDATION_NAMESPACE}"
 
     [[ -n "${dependency_job}" ]] && dependency=(--dependency="afterok:${dependency_job}")
-    sbatch --parsable \
-        -A "${ACCOUNT}" \
-        -p batch --qos=interactive \
+    pbs_submit --parsable --profile gpu \
         --nodes=2 \
         --time="${wall}" \
         --job-name="${job_name}" \
@@ -154,9 +150,7 @@ manifest_dir="${OUTPUT_DIR}/replay_buffer_validation"
 mkdir -p "${manifest_dir}"
 manifest="${manifest_dir}/${VALIDATION_NAMESPACE}.jobs"
 summary="${manifest_dir}/${VALIDATION_NAMESPACE}.md"
-summary_job="$(sbatch --parsable \
-    -A "${ACCOUNT}" \
-    -p cpu --qos=cpu-interactive \
+summary_job="$(pbs_submit --parsable --profile cpu \
     --dependency="afterany:${inflight_resume_job}" \
     --job-name=rbv-summary \
     --export="ALL,VALIDATION_MANIFEST=${manifest},VALIDATION_SUMMARY=${summary}" \

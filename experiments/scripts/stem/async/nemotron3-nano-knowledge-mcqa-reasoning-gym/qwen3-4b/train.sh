@@ -10,6 +10,7 @@ export MILES_EXPERIMENTAL_ROLLOUT_REFACTOR=1
 
 NVLINK_COUNT="$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l || true)"
 HAS_NVLINK=$([[ "${NVLINK_COUNT}" -gt 0 ]] && echo 1 || echo 0)
+export HAS_NVLINK
 
 cd /root/miles
 [[ "${MODEL_PROFILE}" =~ ^[A-Za-z0-9._-]+$ ]] || {
@@ -206,29 +207,34 @@ WANDB_ARGS=(
     --wandb-group "${RUN_NAME}"
 )
 
-RUNTIME_ENV_JSON=$(cat <<JSON
-{
-  "env_vars": {
+RUNTIME_ENV_JSON="$(python3 - <<'PY'
+import json
+import os
+
+env_vars = {
     "PYTHONPATH": "/root/Megatron-LM/:/root/miles",
     "MILES_EXPERIMENTAL_ROLLOUT_REFACTOR": "1",
     "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-    "NCCL_NVLS_ENABLE": "${HAS_NVLINK}",
-    "NCCL_IB_DISABLE": "${NCCL_IB_DISABLE:-0}",
-    "NCCL_NET": "${NCCL_NET:-}",
-    "NCCL_NET_PLUGIN": "${NCCL_NET_PLUGIN:-}",
-    "NCCL_TUNER_PLUGIN": "${NCCL_TUNER_PLUGIN:-}",
-    "FI_PROVIDER": "${FI_PROVIDER:-}",
-    "MILES_NCCL_TRANSPORT": "${MILES_NCCL_TRANSPORT:-system}",
-    "WANDB_MODE": "${WANDB_MODE:-online}",
-    "CODE_EXEC_SANDBOX": "${CODE_EXEC_SANDBOX}",
-    "CODE_EXEC_CONCURRENCY": "${CODE_EXEC_CONCURRENCY}",
-    "CODE_EXEC_MAX_TESTS": "${CODE_EXEC_MAX_TESTS}",
-    "REASONING_GYM_DEPS_PATH": "${REASONING_GYM_DEPS_PATH:-/data/reasoning-gym-deps}",
-    "no_proxy": "127.0.0.1"
-  }
+    "NCCL_NVLS_ENABLE": os.environ["HAS_NVLINK"],
+    "NCCL_IB_DISABLE": os.environ.get("NCCL_IB_DISABLE") or "0",
+    "MILES_NCCL_TRANSPORT": os.environ.get("MILES_NCCL_TRANSPORT") or "system",
+    "WANDB_MODE": os.environ.get("WANDB_MODE") or "online",
+    "CODE_EXEC_SANDBOX": os.environ["CODE_EXEC_SANDBOX"],
+    "CODE_EXEC_CONCURRENCY": os.environ["CODE_EXEC_CONCURRENCY"],
+    "CODE_EXEC_MAX_TESTS": os.environ["CODE_EXEC_MAX_TESTS"],
+    "REASONING_GYM_DEPS_PATH": (
+        os.environ.get("REASONING_GYM_DEPS_PATH") or "/data/reasoning-gym-deps"
+    ),
+    "no_proxy": "127.0.0.1",
 }
-JSON
-)
+
+for name in ("NCCL_NET", "NCCL_NET_PLUGIN", "NCCL_TUNER_PLUGIN", "FI_PROVIDER"):
+    if value := os.environ.get(name):
+        env_vars[name] = value
+
+print(json.dumps({"env_vars": env_vars}, separators=(",", ":")))
+PY
+)"
 
 printf 'MILES_RL_ENTRY_EPOCH=%s\n' "${EPOCHREALTIME}"
 ray job submit --address="http://127.0.0.1:8265" \

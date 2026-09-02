@@ -1,13 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=search-r1-passrate
-#SBATCH --partition=batch
-#SBATCH --qos=interactive
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --gres=gpu:8
-#SBATCH --exclusive
-#SBATCH --time=04:00:00
-#SBATCH --output=experiments/outputs/difficulty/%x-%j.log
+#PBS -N search-r1-passrate
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=192:ngpus=8:mpiprocs=1
+#PBS -l place=scatter:excl
+#PBS -l walltime=08:00:00
+#PBS -j oe
 
 # Measure the initial policy's Search-R1 pass rate on every training prompt,
 # including the same multi-turn E5 retrieval environment used during training.
@@ -15,12 +12,12 @@
 #
 # Smoke (measures 64 prompts and does not write the production filtered set):
 #
-#   sbatch -A coreai_horizon_dilations --export=ALL,LIMIT=64 \
+#   pbs_submit --profile gpu --export=ALL,LIMIT=64 \
 #     experiments/tools/difficulty_filter/run_measure_search_r1.sbatch
 #
 # Full measurement + fixed p10-90 dataset:
 #
-#   sbatch -A coreai_horizon_dilations \
+#   pbs_submit --profile gpu \
 #     experiments/tools/difficulty_filter/run_measure_search_r1.sbatch
 #
 # Defaults intentionally match the training recipe's step-4000 SFT policy,
@@ -30,15 +27,11 @@
 
 set -euo pipefail
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
-SEARCH_R1_IMAGE_WAS_SET="${SQSH_IMAGE+x}"
+REPO_ROOT="${PBS_O_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
 source "${REPO_ROOT}/experiments/env.sh"
-if [[ -z "${SEARCH_R1_IMAGE_WAS_SET}" ]]; then
-    SQSH_IMAGE="${CONTAINER_DIR}/miles-search-r1-b300-faiss-1.12.0-20260826.sqsh"
-    export SQSH_IMAGE
-fi
-unset SEARCH_R1_IMAGE_WAS_SET
-[[ -r "${SQSH_IMAGE}" ]] || { echo "missing Search-R1 image: ${SQSH_IMAGE}" >&2; exit 1; }
+: "${CONTAINER_IMAGE:?source experiments/env.sh first}"
+export CONTAINER_IMAGE
+[[ -r "${CONTAINER_IMAGE}" ]] || { echo "missing Search-R1 image: ${CONTAINER_IMAGE}" >&2; exit 1; }
 
 export MODEL_NAME="${MODEL_NAME:-Qwen3-4B-Base-LR2e-5-Step4000}"
 export HF_MODEL_NAME="${HF_MODEL_NAME:-Qwen3-4B-Base/LR2.0e-5-SEQ32768-GBS128-MBS1-TP1-PP1-CP1-EP1-PACK1-standard-cp-STEPS4000/iter_0004000}"
@@ -104,10 +97,10 @@ done
 
 mkdir -p "${OUTPUT_DIR}/difficulty" "${DATASET_DIR}/difficulty"
 
-srun \
-    --container-image="${SQSH_IMAGE}" \
-    --container-mounts="${CONTAINER_MOUNTS}" \
-    --container-writable \
-    --no-container-mount-home \
+miles_srun \
+    --image="${CONTAINER_IMAGE}" \
+    --bind="${CONTAINER_MOUNTS}" \
+    --writable-tmpfs \
+    --no-home \
     --export=ALL \
     bash /root/miles/experiments/search_r1/common/run_measurement.sh

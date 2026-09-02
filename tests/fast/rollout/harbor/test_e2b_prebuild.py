@@ -446,10 +446,10 @@ def test_server_lifetime_and_training_readiness_are_production_shaped() -> None:
         / "run.sbatch"
     ).read_text(encoding="utf-8")
 
-    assert "#SBATCH --partition=cpu\n" in server_job
-    assert "#SBATCH --qos=cpu-normal\n" in server_job
-    assert "#SBATCH --cpus-per-task=32\n" in server_job
-    assert "#SBATCH --time=1-00:00:00\n" in server_job
+    assert "#PBS -q R9920261300\n" in server_job
+    assert "#PBS -l select=1:ncpus=32:mpiprocs=1\n" in server_job
+    assert "#PBS -l walltime=24:00:00\n" in server_job
+    assert "#PBS -P" not in server_job
     assert (
         'prune_agent_server_environment.sh" \\\n'
         "    /bin/bash \\\n"
@@ -457,13 +457,13 @@ def test_server_lifetime_and_training_readiness_are_production_shaped() -> None:
         'launch_agent_server.sh"'
         in server_job
     )
-    assert "#SBATCH --partition=cpu\n" in gate_job
-    assert "#SBATCH --qos=cpu-normal\n" in gate_job
+    assert "#PBS -q R9920261300\n" in gate_job
+    assert "#PBS -l select=1:ncpus=32:mpiprocs=1\n" in gate_job
+    assert "#PBS -l walltime=04:00:00\n" in gate_job
+    assert "#PBS -P" not in gate_job
     readiness = "wait_for_agent_server.py"
     assert readiness in training_job
-    assert training_job.index(readiness) < training_job.index(
-        'echo "running EFA fail-closed preflight on every node"'
-    )
+    assert training_job.index(readiness) < training_job.index("miles_srun")
     readiness_start = training_job.rfind(
         "PYTHONPATH=",
         0,
@@ -500,36 +500,35 @@ def test_submit_helper_uses_cpu_gate_and_fixed_exports(
         / "scripts"
         / "swe"
         / "async"
-        / "r2e-gym-swe-rebench-v2"
-        / "qwen3-4b-instruct-2507"
+        / "swe-rebench-v2-swe-gym"
+        / "qwen3-4b"
         / "submit_when_ready.sh"
     )
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    sbatch_log = tmp_path / "sbatch.log"
-    fake_sbatch = fake_bin / "sbatch"
-    fake_sbatch.write_text(
+    qsub_log = tmp_path / "qsub.log"
+    fake_qsub = fake_bin / "qsub"
+    fake_qsub.write_text(
         "#!/bin/bash\n"
-        "printf '%s\\n' \"$*\" >> \"$SBATCH_LOG\"\n"
+        "printf '%s\\n' \"$*\" >> \"$QSUB_LOG\"\n"
         "printf '%s\\n' \"${SWE_HOST_ADMISSION_SUMMARY:-}\" > \"$SUMMARY_LOG\"\n"
-        "count=\"$(wc -l < \"$SBATCH_LOG\")\"\n"
-        "if [[ \"$count\" == 1 ]]; then printf '12345\\n'; "
-        "else printf '12346\\n'; fi\n",
+        "count=\"$(wc -l < \"$QSUB_LOG\")\"\n"
+        "if [[ \"$count\" == 1 ]]; then printf '12345.pbs1\\n'; "
+        "else printf '12346.pbs1\\n'; fi\n",
         encoding="utf-8",
     )
-    fake_sbatch.chmod(0o700)
+    fake_qsub.chmod(0o700)
     secret = "private-run-secret-" + "x" * 32
     environment = {
         **os.environ,
         "AGENT_SERVER_URL": "http://server.internal:11000",
         "HARBOR_RUN_SECRET": secret,
         "PATH": f"{fake_bin}:/usr/bin:/bin",
-        "SBATCH_LOG": str(sbatch_log),
+        "QSUB_LOG": str(qsub_log),
         "SUMMARY_LOG": str(tmp_path / "summary.log"),
-        "SHARED_WS": str(tmp_path / "shared"),
-        "WS": str(tmp_path / "workspace"),
-        "SLURM_SUBMIT_DIR": str(root),
-        "MILES_SWE_UNRELATED_ENV_SENTINEL": "must-not-cross-sbatch",
+        "MILES_WORKSPACE_ROOT": str(tmp_path / "workspace"),
+        "PBS_O_WORKDIR": str(root),
+        "MILES_SWE_UNRELATED_ENV_SENTINEL": "must-not-cross-qsub",
     }
 
     result = subprocess.run(
@@ -542,54 +541,55 @@ def test_submit_helper_uses_cpu_gate_and_fixed_exports(
 
     assert result.returncode == 0, result.stderr
     assert result.stdout == (
-        "readiness_job_id=12345\ntraining_job_id=12346\n"
+        "readiness_job_id=12345.pbs1\ntraining_job_id=12346.pbs1\n"
     )
-    rendered = sbatch_log.read_text(encoding="utf-8")
-    assert "--dependency=afterok:12345" in rendered
-    assert "--export=ALL" not in rendered
-    assert "--export=NONE" not in rendered
-    assert rendered.count("--export=") == 2
+    rendered = qsub_log.read_text(encoding="utf-8")
+    assert "depend=afterok:12345.pbs1" in rendered
+    assert " -V " not in f" {rendered} "
+    assert rendered.count("-v ") == 2
     assert "MILES_SWE_FIXED_EXPORTS" in rendered
     gate_submission, training_submission = rendered.splitlines()
     assert "SWE_HOST_ADMISSION_SUMMARY" in gate_submission
     assert "SWE_HOST_ADMISSION_SUMMARY" not in training_submission
     assert (tmp_path / "summary.log").read_text(encoding="utf-8").strip() == str(
         tmp_path
-        / "shared"
+        / "workspace"
         / "datasets"
+        / "rl"
         / "miles-swe"
         / "admitted"
-        / "swe-rebench-v2-filtered-verified-train.summary.json"
+        / "swe-rebench-v2-train.summary.json"
     )
     assert "MILES_SWE_UNRELATED_ENV_SENTINEL" not in rendered
     assert secret not in rendered + result.stdout + result.stderr
 
 
-def _fake_sbatch_environment(
+def _fake_qsub_environment(
     tmp_path: Path,
     *,
     environment: dict[str, str],
 ) -> tuple[dict[str, str], Path]:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    sbatch_log = tmp_path / "sbatch.log"
-    fake_sbatch = fake_bin / "sbatch"
-    fake_sbatch.write_text(
+    qsub_log = tmp_path / "qsub.log"
+    fake_qsub = fake_bin / "qsub"
+    fake_qsub.write_text(
         "#!/bin/bash\n"
-        "printf '%s\\n' \"$*\" >> \"$SBATCH_LOG\"\n"
-        "printf '24680\\n'\n",
+        "printf '%s\\n' \"$*\" >> \"$QSUB_LOG\"\n"
+        "printf '24680.pbs1\\n'\n",
         encoding="utf-8",
     )
-    fake_sbatch.chmod(0o700)
+    fake_qsub.chmod(0o700)
     return (
         {
             **os.environ,
+            "MILES_WORKSPACE_ROOT": str(tmp_path / "workspace"),
             **environment,
             "PATH": f"{fake_bin}:/usr/bin:/bin",
-            "SBATCH_LOG": str(sbatch_log),
-            "MILES_SWE_UNRELATED_ENV_SENTINEL": "must-not-cross-sbatch",
+            "QSUB_LOG": str(qsub_log),
+            "MILES_SWE_UNRELATED_ENV_SENTINEL": "must-not-cross-qsub",
         },
-        sbatch_log,
+        qsub_log,
     )
 
 
@@ -605,10 +605,10 @@ def test_agent_server_submitter_exports_only_fixed_names(tmp_path: Path) -> None
     provider_secret = "provider-secret-" + "e" * 32
     run_secret = "run-secret-" + "r" * 32
     admin_secret = "admin-secret-" + "a" * 32
-    environment, sbatch_log = _fake_sbatch_environment(
+    environment, qsub_log = _fake_qsub_environment(
         tmp_path,
         environment={
-            "SLURM_SUBMIT_DIR": str(root),
+            "PBS_O_WORKDIR": str(root),
             "E2B_API_KEY": provider_secret,
             "HARBOR_ROOT": "/approved/harbor",
             "HARBOR_TASKS_DIR": "/approved/tasks",
@@ -629,10 +629,10 @@ def test_agent_server_submitter_exports_only_fixed_names(tmp_path: Path) -> None
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout == "server_job_id=24680\n"
-    rendered = sbatch_log.read_text(encoding="utf-8")
-    assert "--export=ALL" not in rendered
-    assert "--export=NONE" not in rendered
+    assert result.stdout == "server_job_id=24680.pbs1\n"
+    rendered = qsub_log.read_text(encoding="utf-8")
+    assert " -V " not in f" {rendered} "
+    assert "-v " in rendered
     for required_name in (
         "E2B_API_KEY",
         "HARBOR_RUN_SECRET",
@@ -650,10 +650,10 @@ def test_live_e2b_submitter_exports_only_fixed_names(tmp_path: Path) -> None:
     submitter = root / "tests" / "slurm" / "submit_harbor_e2b_live.sh"
     provider_secret = "provider-secret-" + "e" * 32
     unrelated_secret = "must-not-cross-live-probe"
-    environment, sbatch_log = _fake_sbatch_environment(
+    environment, qsub_log = _fake_qsub_environment(
         tmp_path,
         environment={
-            "SLURM_SUBMIT_DIR": str(root),
+            "PBS_O_WORKDIR": str(root),
             "E2B_API_KEY": provider_secret,
             "E2B_LIVE_SOURCE_IMAGE": "registry.example/repo@sha256:" + "a" * 64,
             "HARBOR_ROOT": str(tmp_path / "harbor"),
@@ -670,10 +670,10 @@ def test_live_e2b_submitter_exports_only_fixed_names(tmp_path: Path) -> None:
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout == "harbor_e2b_live_job_id=24680\n"
-    rendered = sbatch_log.read_text(encoding="utf-8")
-    assert "--export=ALL" not in rendered
-    assert "--export=NONE" not in rendered
+    assert result.stdout == "harbor_e2b_live_job_id=24680.pbs1\n"
+    rendered = qsub_log.read_text(encoding="utf-8")
+    assert " -V " not in f" {rendered} "
+    assert "-v " in rendered
     assert "MILES_SWE_FIXED_EXPORTS" in rendered
     assert provider_secret not in rendered + result.stdout + result.stderr
     assert unrelated_secret not in rendered + result.stdout + result.stderr
@@ -684,9 +684,9 @@ def test_live_e2b_submitter_exports_only_fixed_names(tmp_path: Path) -> None:
     [
         (
             "submit_admit_repository_swe_e2b.sh",
-            "repository_admission_job_id=24680\n",
+            "repository_admission_job_id=24680.pbs1\n",
         ),
-        ("submit_admit_r2e_e2b.sh", "r2e_admission_job_id=24680\n"),
+        ("submit_admit_r2e_e2b.sh", "r2e_admission_job_id=24680.pbs1\n"),
     ],
 )
 def test_admission_submitters_export_only_fixed_names(
@@ -697,10 +697,10 @@ def test_admission_submitters_export_only_fixed_names(
     root = Path(__file__).resolve().parents[4]
     submitter = root / "experiments" / "setup" / "environments" / submitter_name
     provider_secret = "provider-secret-" + "e" * 32
-    environment, sbatch_log = _fake_sbatch_environment(
+    environment, qsub_log = _fake_qsub_environment(
         tmp_path,
         environment={
-            "SLURM_SUBMIT_DIR": str(root),
+            "PBS_O_WORKDIR": str(root),
             "E2B_API_KEY": provider_secret,
             "HARBOR_ROOT": "/approved/harbor",
             "SWE_TASKSET": "swe-gym",
@@ -717,9 +717,9 @@ def test_admission_submitters_export_only_fixed_names(
 
     assert result.returncode == 0, result.stderr
     assert result.stdout == expected_output
-    rendered = sbatch_log.read_text(encoding="utf-8")
-    assert "--export=ALL" not in rendered
-    assert "--export=NONE" not in rendered
+    rendered = qsub_log.read_text(encoding="utf-8")
+    assert " -V " not in f" {rendered} "
+    assert "-v " in rendered
     assert "E2B_API_KEY" in rendered
     assert "DOCKERHUB_TOKEN" in rendered
     assert "DOCKERHUB_USERNAME" in rendered
@@ -738,10 +738,10 @@ def test_swe_prepare_submitter_exports_only_selector(tmp_path: Path) -> None:
         / "datasets"
         / "submit_prepare_swe_rl.sh"
     )
-    environment, sbatch_log = _fake_sbatch_environment(
+    environment, qsub_log = _fake_qsub_environment(
         tmp_path,
         environment={
-            "SLURM_SUBMIT_DIR": str(root),
+            "PBS_O_WORKDIR": str(root),
             "SWE_SOURCE": "swe-gym",
             "E2B_API_KEY": "must-not-cross-allocation",
         },
@@ -756,11 +756,15 @@ def test_swe_prepare_submitter_exports_only_selector(tmp_path: Path) -> None:
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout == "swe_prepare_job_id=24680\n"
-    rendered = sbatch_log.read_text(encoding="utf-8")
-    assert "--export=MILES_SWE_FIXED_EXPORTS,SWE_SOURCE" in rendered
-    assert "--export=ALL" not in rendered
-    assert "--export=NONE" not in rendered
+    assert result.stdout == "swe_prepare_job_id=24680.pbs1\n"
+    rendered = qsub_log.read_text(encoding="utf-8")
+    assert "-v " in rendered
+    assert "MILES_WORKSPACE_ROOT" in rendered
+    assert "DATASET_DIR" in rendered
+    assert "CONTAINER_IMAGE" in rendered
+    assert "MILES_SWE_FIXED_EXPORTS" in rendered
+    assert "SWE_SOURCE" in rendered
+    assert " -V " not in f" {rendered} "
     assert "E2B_API_KEY" not in rendered
     assert "MILES_SWE_UNRELATED_ENV_SENTINEL" not in rendered
 
@@ -775,17 +779,17 @@ def test_swe_prepare_submitter_exports_only_selector(tmp_path: Path) -> None:
                 "SWE_LOCKED_MANIFEST": "/private/locked.jsonl",
                 "SWE_IMAGE_LOCK_MANIFEST": "/private/locks.jsonl",
             },
-            "swe_oci_lock_job_id=24680\n",
+            "swe_oci_lock_job_id=24680.pbs1\n",
         ),
         (
             "submit_materialize_harbor_swe_tasks.sh",
             {"SWE_TASKSET": "swe-gym"},
-            "swe_materialization_job_id=24680\n",
+            "swe_materialization_job_id=24680.pbs1\n",
         ),
         (
             "submit_materialize_swebench_verified_eval.sh",
             {},
-            "swebench_verified_materialization_job_id=24680\n",
+            "swebench_verified_materialization_job_id=24680.pbs1\n",
         ),
     ],
 )
@@ -800,10 +804,10 @@ def test_swe_provenance_submitters_use_fixed_names(
         root / "experiments" / "setup" / "environments" / submitter_name
     )
     unrelated_secret = "must-not-cross-allocation"
-    environment, sbatch_log = _fake_sbatch_environment(
+    environment, qsub_log = _fake_qsub_environment(
         tmp_path,
         environment={
-            "SLURM_SUBMIT_DIR": str(root),
+            "PBS_O_WORKDIR": str(root),
             "E2B_API_KEY": unrelated_secret,
             **required_environment,
         },
@@ -819,15 +823,15 @@ def test_swe_provenance_submitters_use_fixed_names(
 
     assert result.returncode == 0, result.stderr
     assert result.stdout == expected_output
-    rendered = sbatch_log.read_text(encoding="utf-8")
-    assert "--export=ALL" not in rendered
-    assert "--export=NONE" not in rendered
+    rendered = qsub_log.read_text(encoding="utf-8")
+    assert " -V " not in f" {rendered} "
+    assert "-v " in rendered
     assert "MILES_SWE_FIXED_EXPORTS" in rendered
     assert "MILES_SWE_UNRELATED_ENV_SENTINEL" not in rendered
     assert unrelated_secret not in rendered + result.stdout + result.stderr
 
 
-def test_swe_slurm_jobs_require_fixed_submission_environment() -> None:
+def test_swe_pbs_jobs_require_fixed_submission_environment() -> None:
     root = Path(__file__).resolve().parents[4]
     jobs = [
         root
@@ -846,8 +850,8 @@ def test_swe_slurm_jobs_require_fixed_submission_environment() -> None:
         / "scripts"
         / "swe"
         / "async"
-        / "r2e-gym-swe-rebench-v2"
-        / "qwen3-4b-instruct-2507"
+        / "swe-rebench-v2-swe-gym"
+        / "qwen3-4b"
         / "run.sbatch",
         root
         / "experiments"
@@ -892,15 +896,13 @@ def test_swe_slurm_jobs_require_fixed_submission_environment() -> None:
         source = job.read_text(encoding="utf-8")
         assert "MILES_SWE_FIXED_EXPORTS" in source
         assert "MILES_SWE_UNRELATED_ENV_SENTINEL" in source
-        assert "#SBATCH --export=NIL" in source
+        assert "#PBS " in source
+        assert "#PBS -P" not in source
+        assert "#PBS -V" not in source
     training = jobs[3].read_text(encoding="utf-8")
     assert "E2B provider credentials are forbidden" in training
     preparation = jobs[6].read_text(encoding="utf-8")
-    assert "--export=ALL" not in preparation
-    assert (
-        "--export=PATH,PYTHON_DOTENV_DISABLED,PYTHONDONTWRITEBYTECODE,"
-        "SWE_SOURCE,WANDB_DISABLED,WANDB_MODE"
-    ) in preparation
+    assert "#PBS -V" not in preparation
 
 
 def test_credential_capable_swe_containers_mask_repository_dotenv() -> None:

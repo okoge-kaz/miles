@@ -353,7 +353,7 @@ run_mode() {
         echo "${JOB_EXIT}" > "${DONE_FILE}"
     else
         # Worker nodes: block until head node signals completion.
-        # In container environments (pyxis/enroot), exiting kills the container
+        # In container environments, exiting kills the container
         # and the Ray worker with it, so we must stay alive.
         echo "Worker node ${NODE_RANK}: Ray joined, waiting for head to finish..."
         while [ ! -f "${DONE_FILE}" ]; do

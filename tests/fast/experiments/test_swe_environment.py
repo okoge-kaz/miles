@@ -367,7 +367,7 @@ def test_swe_evaluator_rejects_conflicting_duplicate_digest(tmp_path) -> None:
         _load_tasks(data, limit=None)
 
 
-def test_swe_slurm_exports_only_fixed_required_environment_names() -> None:
+def test_swe_pbs_exports_only_fixed_required_environment_names() -> None:
     repository = Path(__file__).parents[3]
     recipe = (
         repository
@@ -410,11 +410,12 @@ def test_swe_slurm_exports_only_fixed_required_environment_names() -> None:
         )
     )
     scheduler_or_optional = {
+        "BASH_SOURCE",
         "EPOCHREALTIME",
         "MODEL_ARGS",
         "RAY_TEMP_DIR",
-        "SLURM_JOB_NUM_NODES",
-        "SLURM_NODEID",
+        "MILES_JOB_NUM_NODES",
+        "MILES_NODE_RANK",
         "WANDB_PROJECT",
     }
     externally_required = referenced_names - locally_assigned - scheduler_or_optional

@@ -1,15 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=eval-swebench-verified-hardened
-#SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=cpu
-#SBATCH --qos=cpu-interactive
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=32
-#SBATCH --time=04:00:00
-#SBATCH --signal=B:USR1@900
-#SBATCH --export=NIL
-#SBATCH --output=experiments/outputs/evaluation/swebench-verified/%x-%j.log
+#PBS -N eval-swebench-verified-hardened
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=32:mpiprocs=1
+#PBS -l place=scatter
+#PBS -l walltime=08:00:00
+#PBS -j oe
 
 # Hardened-local SWE-bench Verified evaluation client. This job uses pinned
 # official v2.0.13 parser/grading code, but its security path policy differs
@@ -18,7 +13,7 @@
 
 set -euo pipefail
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../../.." &>/dev/null && pwd)}"
+REPO_ROOT="${PBS_O_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../../.." &>/dev/null && pwd)}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 USER="$(id -un)"
 export PATH USER
@@ -47,7 +42,7 @@ SWE_CONTAINER_MOUNTS="${CONTAINER_MOUNTS},${DOTENV_MASK}:/root/miles/.env:ro"
 : "${HARBOR_SWE_SERVER_URL:?set the Harbor /run server URL}"
 : "${POLICY_BASE_URL:?set the OpenAI-compatible policy endpoint URL}"
 : "${SERVED_MODEL:?set the served policy model name}"
-: "${HARBOR_RUN_SECRET:?export the Harbor /run bearer secret before sbatch}"
+: "${HARBOR_RUN_SECRET:?export the Harbor /run bearer secret before pbs_submit}"
 (( ${#HARBOR_RUN_SECRET} >= 32 && ${#HARBOR_RUN_SECRET} <= 4096 )) && \
     [[ "$HARBOR_RUN_SECRET" != *$'\r'* && "$HARBOR_RUN_SECRET" != *$'\n'* ]] || {
     echo "HARBOR_RUN_SECRET must be 32-4096 characters without CR/LF" >&2
@@ -56,13 +51,19 @@ SWE_CONTAINER_MOUNTS="${CONTAINER_MOUNTS},${DOTENV_MASK}:/root/miles/.env:ro"
 SWE_EVAL_OUTPUT_ROOT="${SWE_EVAL_OUTPUT_ROOT:-/data/miles-swe/eval/swebench-verified-hardened-local}"
 SWE_EVAL_LIMIT="${SWE_EVAL_LIMIT:-}"
 SWE_EVAL_CONCURRENCY="${SWE_EVAL_CONCURRENCY:-16}"
-HARBOR_CLIENT_ID="slurm-eval-${SLURM_JOB_ID:?}"
+HARBOR_CLIENT_ID="pbs-eval-${MILES_JOB_ID:?}"
 AGENT_SERVER_URL="${HARBOR_SWE_SERVER_URL}"
 export SWE_EVAL_OUTPUT_ROOT
 export AGENT_SERVER_URL HARBOR_CLIENT_ID HARBOR_RUN_SECRET
 export SWE_EVAL_TASK_ROWS SWE_EVAL_TASK_SUMMARY
 
 evaluation_step_pid=""
+pretimeout_timer_pid=""
+: "${SWE_EVAL_PRETIMEOUT_DELAY_SECONDS:=27900}"
+[[ "${SWE_EVAL_PRETIMEOUT_DELAY_SECONDS}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "SWE_EVAL_PRETIMEOUT_DELAY_SECONDS must be a positive integer" >&2
+    exit 2
+}
 drain_harbor_client() {
     PYTHONPATH="${REPO_ROOT}" PYTHONDONTWRITEBYTECODE=1 \
         python3 \
@@ -74,13 +75,16 @@ stop_evaluation_step() {
     fi
 }
 handle_pretimeout() {
-    echo "Slurm pre-timeout signal received; draining Harbor evaluation trials" >&2
+    echo "scheduler termination signal received; draining Harbor evaluation trials" >&2
     drain_harbor_client || true
     stop_evaluation_step
 }
 cleanup_evaluation() {
     local status=$?
     trap - EXIT USR1 TERM
+    if [[ -n "${pretimeout_timer_pid}" ]]; then
+        kill "${pretimeout_timer_pid}" 2>/dev/null || true
+    fi
     drain_harbor_client || true
     stop_evaluation_step
     if [[ -n "${evaluation_step_pid}" ]]; then
@@ -92,17 +96,21 @@ trap handle_pretimeout USR1
 trap 'handle_pretimeout; exit 143' TERM
 trap cleanup_evaluation EXIT
 
-srun \
-    --container-image="${SQSH_IMAGE}" \
-    --container-mounts="${SWE_CONTAINER_MOUNTS}" \
-    --container-writable \
-    --no-container-mount-home \
+# Keep the 15-minute Harbor drain window before the eight-hour PBS walltime.
+( sleep "${SWE_EVAL_PRETIMEOUT_DELAY_SECONDS}"; kill -USR1 "$$" ) &
+pretimeout_timer_pid=$!
+
+miles_srun \
+    --image="${CONTAINER_IMAGE}" \
+    --bind="${SWE_CONTAINER_MOUNTS}" \
+    --writable-tmpfs \
+    --no-home \
     --export=HARBOR_CLIENT_ID,HARBOR_RUN_SECRET,HARBOR_SWE_SERVER_URL,POLICY_BASE_URL,PYTHON_DOTENV_DISABLED,SERVED_MODEL,SWE_EVAL_CONCURRENCY,SWE_EVAL_LIMIT,SWE_EVAL_OUTPUT_ROOT,SWE_EVAL_TASK_ROWS,SWE_EVAL_TASK_SUMMARY,WANDB_DISABLED,WANDB_MODE \
     env -u BASH_ENV -u ENV bash --noprofile --norc -c '
 set -euo pipefail
 cd /root/miles
 export PYTHONPATH=/root/miles
-run_dir="${SWE_EVAL_OUTPUT_ROOT}/${SLURM_JOB_ID}"
+run_dir="${SWE_EVAL_OUTPUT_ROOT}/${MILES_JOB_ID}"
 mkdir -p "${run_dir}"
 args=(
     --input "${SWE_EVAL_TASK_ROWS}"

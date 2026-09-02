@@ -1,18 +1,15 @@
 #!/bin/bash
-#SBATCH --job-name=q3-4b-post-rl-aime-eval
-#SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=batch
-#SBATCH --qos=interactive
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --gpus-per-node=8
-#SBATCH --cpus-per-task=128
-#SBATCH --time=04:00:00
-#SBATCH --output=experiments/outputs/reasoning_eval/%x-%j.log
+#PBS -N q3-4b-post-rl-aime-eval
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=192:ngpus=8:mpiprocs=1
+#PBS -l place=scatter:excl
+#PBS -l walltime=04:00:00
+#PBS -j oe
 
 set -euo pipefail
 
-REPO_ROOT="$(realpath -- "${SLURM_SUBMIT_DIR:?submit from the Miles repository root}")"
+REPO_ROOT="$(realpath -- "${PBS_O_WORKDIR:?submit from the Miles repository root}")"
+source "${REPO_ROOT}/experiments/env.sh"
 : "${TRAINING_HF_ROOT:?set TRAINING_HF_ROOT to the training run hf directory}"
 : "${RESULT_ROOT:?set RESULT_ROOT}"
 
@@ -26,7 +23,7 @@ TRAINING_STEP=$((10#${checkpoint_index} + 1))
 export TRAINING_STEP
 mkdir -p "${RESULT_ROOT}"
 selected_checkpoint_file="${RESULT_ROOT}/selected-checkpoint.txt"
-selected_checkpoint_partial="${selected_checkpoint_file}.partial-${SLURM_JOB_ID}"
+selected_checkpoint_partial="${selected_checkpoint_file}.partial-${MILES_JOB_ID}"
 printf '%s\n' "${CHECKPOINT_PATH}" > "${selected_checkpoint_partial}"
 if [[ -f "${selected_checkpoint_file}" ]]; then
     cmp --silent "${selected_checkpoint_partial}" "${selected_checkpoint_file}" || {

@@ -67,11 +67,14 @@ def test_retrieval_batches_requests_without_mixing_response_boundaries() -> None
     ]
 
 
-def test_search_r1_evaluation_is_interactive_and_offline() -> None:
+def test_search_r1_evaluation_uses_pbs_gpu_and_is_offline() -> None:
     launcher = (REPO_ROOT / "experiments/search_r1/evaluation/run.sbatch").read_text(
         encoding="utf-8"
     )
-    assert "#SBATCH --qos=interactive" in launcher
+    assert "#PBS -q R9920261300" in launcher
+    assert "#PBS -l select=1:ncpus=192:ngpus=8:mpiprocs=1" in launcher
+    assert "#PBS -l walltime=08:00:00" in launcher
+    assert "#PBS -P" not in launcher
     assert 'WANDB_MODE="${WANDB_MODE:-offline}"' in launcher
     assert '[[ "${WANDB_MODE}" == offline ]]' in launcher
     assert "experiments/search_r1/common/run_measurement.sh" in launcher
@@ -92,21 +95,18 @@ def test_search_r1_evaluation_is_interactive_and_offline() -> None:
 
 
 def test_search_r1_faiss_is_baked_and_checksum_pinned() -> None:
-    derivation = (
+    validation = (
         REPO_ROOT / "experiments/container/derive_search_r1_image.sbatch"
     ).read_text(encoding="utf-8")
+    dockerfile = (REPO_ROOT / "docker/Dockerfile").read_text(encoding="utf-8")
 
-    assert "faiss-cpu" in derivation
-    assert "1.12.0" in derivation
-    assert "c2e4963c7188f57cfba248f09ebd8a14c76b5ffb87382603ccd4576f2da39d74" in derivation
-    assert "pip install --no-deps" in derivation
-    assert "IndexFlatIP" in derivation
-    assert '[[ ! -e "${OUTPUT_IMAGE}" ]]' in derivation
-    assert '"${OUTPUT_IMAGE}.provenance.env"' in derivation
-    assert 'install -m 0444 "${WHEEL_PATH}"' in derivation
-    assert "\n    --mount " not in derivation
-    assert "grep -E '^(faiss|fastapi|uvicorn)='" in derivation
-    assert "/tmp/faiss_cpu.whl" not in derivation
+    assert "SEARCH_R1_FAISS_CPU_VERSION=1.12.0" in dockerfile
+    assert "c2e4963c7188f57cfba248f09ebd8a14c76b5ffb87382603ccd4576f2da39d74" in dockerfile
+    assert "pip install --no-deps /tmp/faiss_cpu.whl" in dockerfile
+    assert "IndexFlatIP" in dockerfile
+    assert "singularity exec --no-eval --no-home" in validation
+    assert '[[ -r "${CONTAINER_IMAGE}" ]]' in validation
+    assert "IndexFlatIP" in validation
 
 
 def test_search_r1_filter_is_bound_to_the_sft_policy() -> None:
@@ -114,9 +114,10 @@ def test_search_r1_filter_is_bound_to_the_sft_policy() -> None:
         REPO_ROOT / "experiments/tools/difficulty_filter/run_measure_search_r1.sbatch"
     ).read_text(encoding="utf-8")
 
-    assert "#SBATCH --partition=batch" in launcher
-    assert "#SBATCH --qos=interactive" in launcher
-    assert "#SBATCH --time=04:00:00" in launcher
+    assert "#PBS -q R9920261300" in launcher
+    assert "#PBS -l select=1:ncpus=192:ngpus=8:mpiprocs=1" in launcher
+    assert "#PBS -l walltime=08:00:00" in launcher
+    assert "#PBS -P" not in launcher
     assert "Qwen3-4B-Instruct-2507" not in launcher
     assert "Qwen3-4B-Base-LR2e-5-Step4000" in launcher
     assert "iter_0004000" in launcher

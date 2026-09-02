@@ -1,14 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=test-harbor-e2b
-#SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=cpu
-#SBATCH --qos=cpu-interactive
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
-#SBATCH --time=00:20:00
-#SBATCH --output=experiments/outputs/validation/%x-%j.log
-#SBATCH --export=NIL
+#PBS -N test-harbor-e2b
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=32:mpiprocs=1
+#PBS -l place=scatter
+#PBS -l walltime=00:20:00
+#PBS -j oe
 
 # Offline-only validation of the native Harbor E2B provider and Miles overlay.
 # Submit with only HARBOR_ROOT and, when needed, HARBOR_PYTHON explicitly
@@ -32,7 +28,7 @@ export AGENT_SETUP_TIMEOUT=1800
 export HARBOR_VERIFIER_TIMEOUT_SEC=2100
 export HARBOR_ENV_BUILD_TIMEOUT_MULTIPLIER=1
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." &>/dev/null && pwd)}"
+REPO_ROOT="${PBS_O_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." &>/dev/null && pwd)}"
 : "${HARBOR_ROOT:?set HARBOR_ROOT to the official Harbor checkout}"
 
 readonly EXPECTED_HARBOR_COMMIT=2ce5ba2af33a00c9fba0463f6403313996373f85

@@ -40,12 +40,17 @@ Run these stages in order:
 
 ```bash
 bash experiments/setup/download/stage_swe_tool_rl_datasets.sh
-sbatch experiments/setup/datasets/prepare_agentic_tool_use_pivot.sbatch
-sbatch tests/slurm/test_tool_call_pivot_environment.sbatch
-sbatch experiments/setup/environments/prepare_tau_bench.sbatch
+source experiments/env.sh
+source experiments/common/pbs.sh
+pbs_submit --profile=cpu --time="${PBS_PREP_WALLTIME}" \
+  experiments/setup/datasets/prepare_agentic_tool_use_pivot.sbatch
+pbs_submit --profile=cpu --time="${PBS_PREP_WALLTIME}" \
+  tests/slurm/test_tool_call_pivot_environment.sbatch
+pbs_submit --profile=cpu --time="${PBS_PREP_WALLTIME}" \
+  experiments/setup/environments/prepare_tau_bench.sbatch
 ```
 
 `submit_effectiveness_when_idle.sh` runs Tau three pre-evaluation, Pivot
-training, and Tau three post-evaluation when this user's Slurm queue is empty.
+training, and Tau three post-evaluation when this user's PBS queue is empty.
 There is no Tau training recipe under `experiments/scripts/tau_bench/`; that
 directory is evaluation-only.

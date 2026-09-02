@@ -1,6 +1,6 @@
 #!/bin/bash
 # Submit resumable DAPO-Math pass-rate measurements for the SFT Qwen3 4B, 8B,
-# and 30B-A3B checkpoints. Each model gets one batch_long job by default. Set
+# and 30B-A3B checkpoints. Each model gets one GPU job by default. Set
 # FILTER_ROUNDS>1 to chain retries; every retry resumes the same JSONL and exits
 # immediately when the .complete marker already exists.
 #
@@ -22,9 +22,7 @@ SUBMIT=0
     exit 2
 }
 
-FILTER_PARTITION="${FILTER_PARTITION:-batch_long}"
-FILTER_QOS="${FILTER_QOS:-normal}"
-FILTER_WALL="${FILTER_WALL:-7-00:00:00}"
+FILTER_WALL="${FILTER_WALL:-${PBS_PREP_WALLTIME}}"
 FILTER_ROUNDS="${FILTER_ROUNDS:-1}"
 N_SAMPLES="${N_SAMPLES:-16}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-16384}"
@@ -44,9 +42,7 @@ if [[ ! -f "${PROMPT_HOST}" ]]; then
     if (( SUBMIT == 0 )); then
         echo "would download zhuzilin/dapo-math-17k -> ${PROMPT_HOST%/*}"
     else
-        raw_dataset_job="$(sbatch --parsable \
-            -A "${SLURM_ACCOUNT_NAME}" \
-            -p "${CPU_PARTITION}" --qos="${INTERACTIVE_CPU_QOS}" \
+        raw_dataset_job="$(pbs_submit --parsable --profile cpu \
             --job-name=ds-dapo-math-17k \
             --export=ALL,HF_REPO=zhuzilin/dapo-math-17k,LOCAL_NAME=dapo-math-17k \
             experiments/setup/download/download_dataset.sbatch)"
@@ -94,9 +90,7 @@ while IFS='|' read -r model_name hf_root hf_model_name model_type; do
         elif [[ -n "${dataset_dependency}" ]]; then
             dependency=(--dependency="${dataset_dependency}")
         fi
-        raw_job_id="$(sbatch --parsable \
-            -A "${SLURM_ACCOUNT_NAME}" \
-            -p "${FILTER_PARTITION}" --qos="${FILTER_QOS}" \
+        raw_job_id="$(pbs_submit --parsable --profile gpu \
             --time="${FILTER_WALL}" \
             --job-name="pr-${slug}-r${round}" \
             "${dependency[@]}" \

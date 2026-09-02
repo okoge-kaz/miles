@@ -1,16 +1,13 @@
 #!/bin/bash
-#SBATCH --job-name=r2e-agent-hardening
-#SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=cpu
-#SBATCH --qos=cpu-interactive
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --time=01:00:00
-#SBATCH --output=experiments/outputs/validation/%x-%j.log
+#PBS -N r2e-agent-hardening
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=32:mpiprocs=1
+#PBS -l place=scatter
+#PBS -l walltime=01:00:00
+#PBS -j oe
 
 # Exercise the exact R2E image/runtime transformation against one immutable
-# publisher image. This is not a security-hardening admission pass: Pyxis may
+# publisher image. This is not a security-hardening admission pass: Singularity may
 # expose only a single UID-0 mapping. Live admission must repeat the UID-1000,
 # no-network, no-new-privileges checks in a fresh E2B agent sandbox.
 
@@ -24,15 +21,18 @@ umask 077
 [[ "${SWE_BASE_COMMIT}" =~ ^[0-9a-f]{40}$ ]] || exit 2
 [[ "${SWE_GOLD_COMMIT}" =~ ^[0-9a-f]{40}$ ]] || exit 2
 
-repo_root="${SLURM_SUBMIT_DIR:-$(pwd -P)}"
+repo_root="${PBS_O_WORKDIR:-$(pwd -P)}"
+source "${repo_root}/experiments/env.sh"
+umask 077
 assets="${repo_root}/experiments/src/environments/swe/templates"
 [[ -d "${assets}" && ! -L "${assets}" ]] || exit 2
 
-srun \
-    --container-image="${SWE_SOURCE_IMAGE}" \
-    --container-mounts="${assets}:/mnt/miles-swe-templates:ro" \
-    --container-writable \
-    --no-container-mount-home \
+miles_srun \
+    --fakeroot \
+    --image="docker://${SWE_SOURCE_IMAGE}" \
+    --bind="${assets}:/mnt/miles-swe-templates:ro" \
+    --writable-tmpfs \
+    --no-home \
     --export=SWE_BASE_COMMIT,SWE_GOLD_COMMIT \
     env -i \
         PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
@@ -112,10 +112,11 @@ if [[ "${agent_uid}" == 1000 && "${agent_proc_uid}" == 1000:1000:1000 ]]; then
     uid_contract=e2b-validated
 elif [[ "${agent_uid}" == 0 && "${agent_proc_uid}" == 0:0:0 && \
     "${uid_map}" =~ ^[[:space:]]*0[[:space:]]+[0-9]+[[:space:]]+1[[:space:]]*$ ]]; then
-    # Pyxis maps only the submitting host UID to container UID 0, so it cannot
+    # Root-mapped fakeroot may map only the submitting host UID to container
+    # UID 0, so it cannot
     # represent UID 1000. This job still validates the immutable-image layout;
     # production E2B admission separately requires a real UID 1000 sandbox.
-    uid_contract=e2b-required-pyxis-single-map
+    uid_contract=e2b-required-fakeroot-single-map
 else
     echo "unexpected container UID mapping" >&2
     exit 8
@@ -130,10 +131,10 @@ stat -c "smoke_owner=%u:%g smoke_mode=%a" /testbed/.miles-r2e-smoke
 smoke_owner="$(stat -c %u /testbed/.miles-r2e-smoke)"
 [[ "${smoke_owner}" == 0 || "${smoke_owner}" == 1000 ]] || exit 8
 if [[ "${smoke_owner}" == 0 ]]; then
-    echo "Pyxis maps UID-1000 writes to root ownership; E2B admission still requires UID 1000"
+    echo "fakeroot maps UID-1000 writes to root ownership; E2B admission still requires UID 1000"
 fi
 rm -f -- /testbed/.miles-r2e-smoke
-if [[ "${uid_contract}" == e2b-required-pyxis-single-map ]]; then
+if [[ "${uid_contract}" == e2b-required-fakeroot-single-map ]]; then
     echo "r2e-agent-image-runtime-ok uid-contract=e2b-required"
 else
     echo "r2e-agent-image-runtime-ok uid-contract=validated"

@@ -44,7 +44,7 @@ measurement no longer describes it.
 | `filters.py` | `check_pass_rate_window`, mountable via `--dynamic-sampling-filter-path` |
 | `measure_pass_rate.py` | the expensive half: generate `k` samples per prompt, score, record |
 | `apply_filter.py` | the cheap half: turn a measurement + a window into a prompt file |
-| `run_measure.sbatch` | Slurm entry point (SGLang on 8 GPUs, then the driver) |
+| `run_measure.sbatch` | PBS entry point (SGLang on 8 GPUs, then the driver) |
 | `run_measure_search_r1.sbatch` | Search-R1 entry point: E5 retrieval plus multi-turn generation |
 | `../../search_r1/common/run_measurement.sh` | shared container-side Search-R1 server/measurement worker |
 
@@ -139,12 +139,15 @@ Measure (inference only — needs the HF weights, not the torch_dist checkpoint,
 so it can run before or alongside training):
 
 ```bash
-sbatch -A coreai_horizon_dilations \
+source experiments/env.sh
+source experiments/common/pbs.sh
+pbs_submit --profile=gpu --time="${PBS_PREP_WALLTIME}" \
   experiments/tools/difficulty_filter/run_measure.sbatch
 ```
 
 Resumable: results are appended and flushed per prompt and a rerun skips indices
-already present, so hitting the 4 h wall just means resubmitting.
+already present. If a measured run exceeds its requested walltime, resubmit the
+same job to continue from its append-only result.
 
 Then select a window (seconds, no GPU) — this is why the measurement records the
 pass rate instead of a keep/drop decision:
@@ -192,11 +195,14 @@ neither sync nor async passes an online dynamic filter.
 
 ```bash
 # First validate servers, parquet loading, retrieval, reward, and output schema.
-sbatch -A coreai_horizon_dilations --export=ALL,LIMIT=64 \
+source experiments/env.sh
+source experiments/common/pbs.sh
+pbs_submit --profile=gpu --time="${PBS_PREP_WALLTIME}" \
+  --export=ALL,LIMIT=64 \
   experiments/tools/difficulty_filter/run_measure_search_r1.sbatch
 
 # Then resume/complete the whole 169,615-row source and materialize p10-90.
-sbatch -A coreai_horizon_dilations \
+pbs_submit --profile=gpu --time="${PBS_PREP_WALLTIME}" \
   experiments/tools/difficulty_filter/run_measure_search_r1.sbatch
 ```
 

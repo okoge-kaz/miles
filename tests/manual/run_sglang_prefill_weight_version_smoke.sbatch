@@ -1,30 +1,30 @@
 #!/bin/bash
-#SBATCH --job-name=sglang-prefill-smoke
-#SBATCH --partition=interactive
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16
-#SBATCH --gres=gpu:1
-#SBATCH --time=00:30:00
-#SBATCH --output=experiments/outputs/%x-%j.log
+#PBS -N sglang-prefill-smoke
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=192:ngpus=8:mpiprocs=1
+#PBS -l place=scatter:excl
+#PBS -l walltime=00:15:00
+#PBS -j oe
 
 set -euo pipefail
 
-REPO_ROOT="${SLURM_SUBMIT_DIR}"
+REPO_ROOT="${PBS_O_WORKDIR:?submit this test from the repository root}"
 source "${REPO_ROOT}/experiments/env.sh"
-IMAGE="${SQSH_IMAGE}"
-CHECKPOINT_ROOT="/lustre/fs1/portfolios/coreai/projects/coreai_horizon_dilations/users/kfujii/checkpoints/hf"
+export SGLANG_SMOKE_MODEL_PATH="${SGLANG_SMOKE_MODEL_PATH:-/ckpt/hf/Qwen3-4B}"
 
-srun \
-    --container-image="${IMAGE}" \
-    --container-mounts="${REPO_ROOT}:/root/miles,${CHECKPOINT_ROOT}:/ckpt/hf" \
-    --container-writable \
-    --no-container-mount-home \
+miles_srun \
+    --image="${CONTAINER_IMAGE}" \
+    --bind="${CONTAINER_MOUNTS}" \
+    --writable-tmpfs \
+    --no-home \
     bash -lc '
         set -euo pipefail
+        test "$(git -c safe.directory=/sgl-workspace/sglang \
+            -C /sgl-workspace/sglang rev-parse HEAD)" = "${SGLANG_COMMIT}"
+        test -r "${SGLANG_SMOKE_MODEL_PATH}/config.json"
 
         python -m sglang.launch_server \
-            --model-path /ckpt/hf/Qwen3-1.7B \
+            --model-path "${SGLANG_SMOKE_MODEL_PATH}" \
             --host 127.0.0.1 \
             --port 30000 \
             --weight-version 10 \

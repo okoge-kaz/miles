@@ -1,28 +1,24 @@
 #!/bin/bash
-#SBATCH --job-name=test-tau3-data
-#SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=cpu
-#SBATCH --qos=cpu-interactive
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16
-#SBATCH --time=01:00:00
-#SBATCH --output=experiments/outputs/validation/%x-%j.log
+#PBS -N test-tau3-data
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=32:mpiprocs=1
+#PBS -l place=scatter
+#PBS -l walltime=01:00:00
+#PBS -j oe
 
 set -euo pipefail
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." &>/dev/null && pwd)}"
+REPO_ROOT="${PBS_O_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." &>/dev/null && pwd)}"
 source "${REPO_ROOT}/experiments/env.sh"
-TAU3_SQSH_IMAGE="${TAU3_SQSH_IMAGE:-${CONTAINER_DIR}/miles-staleness-weight-boundaries-f994b9aed-efa-1.49.0-tau3-1.0.1.sqsh}"
 DOTENV_MASK="${REPO_ROOT}/experiments/common/dotenv.disabled"
-[[ -r "${TAU3_SQSH_IMAGE}" ]]
+[[ -r "${CONTAINER_IMAGE}" ]]
 
-srun \
-    --container-image="${TAU3_SQSH_IMAGE}" \
-    --container-mounts="${CONTAINER_MOUNTS},${DOTENV_MASK}:/root/miles/.env:ro" \
-    --container-workdir=/root/miles \
-    --container-writable \
-    --no-container-mount-home \
+miles_srun \
+    --image="${CONTAINER_IMAGE}" \
+    --bind="${CONTAINER_MOUNTS},${DOTENV_MASK}:/root/miles/.env:ro" \
+    --cwd=/root/miles \
+    --writable-tmpfs \
+    --no-home \
     --export=USER \
     bash -lc '
 set -euo pipefail

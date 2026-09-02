@@ -1,28 +1,25 @@
 #!/bin/bash
-#SBATCH --job-name=miles-prefill-training-smoke
-#SBATCH --partition=interactive
-#SBATCH --nodes=1
-#SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=128
-#SBATCH --gres=gpu:8
-#SBATCH --exclusive
-#SBATCH --time=02:00:00
-#SBATCH --output=experiments/outputs/training/%x-%j.log
+#PBS -N miles-prefill-training-smoke
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=192:ngpus=8:mpiprocs=1
+#PBS -l place=scatter:excl
+#PBS -l walltime=02:00:00
+#PBS -j oe
 
 # End-to-end validation with real DAPO math data. Four H100s train Qwen3-4B
 # while four independent SGLang engines keep fully-async generation in flight.
 
 set -euo pipefail
 
-REPO_ROOT="${SLURM_SUBMIT_DIR}"
+REPO_ROOT="${PBS_O_WORKDIR:?submit this test from the repository root}"
+source "${REPO_ROOT}/experiments/env.sh"
 SGLANG_COMMIT="f994b9aedfd0b1465dbb8f4e2a02eb789fc76dce"
 
-export SQSH_IMAGE="${SQSH_IMAGE:-/lustre/fs1/portfolios/coreai/projects/coreai_horizon_dilations/users/kfujii/container/miles-staleness-weight-boundaries-${SGLANG_COMMIT:0:9}.sqsh}"
-export CONFIG_TAG="prefill-version-smoke-${SGLANG_COMMIT:0:9}-${SLURM_JOB_ID}"
-export RUN_NAME="prefill-version-smoke-${SGLANG_COMMIT:0:9}-${SLURM_JOB_ID}"
+export CONFIG_TAG="prefill-version-smoke-${SGLANG_COMMIT:0:9}-${MILES_JOB_ID_SHORT}"
+export RUN_NAME="prefill-version-smoke-${SGLANG_COMMIT:0:9}-${MILES_JOB_ID_SHORT}"
 # Ray's Unix-domain socket path is limited to 107 bytes. /root/.cache is a
 # persistent host mount, so this short path preserves logs without violating it.
-export RAY_TEMP_DIR="/root/.cache/ray/pv-${SLURM_JOB_ID}"
+export RAY_TEMP_DIR="/root/.cache/ray/pv-${MILES_JOB_ID_SHORT}"
 
 export NUM_ROLLOUT="${NUM_ROLLOUT:-3}"
 export ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-4}"
@@ -61,7 +58,7 @@ export WANDB_MODE=offline
 export WANDB_API_KEY="offline-prefill-version-smoke"
 export WANDB_PROJECT="miles-prefill-version-smoke"
 
-test -f "${SQSH_IMAGE}"
-test -f "/lustre/fs1/portfolios/coreai/projects/coreai_horizon_dilations/users/kfujii/datasets/dapo-math-p10-90/dapo-math-p10-90.jsonl"
+test -f "${CONTAINER_IMAGE}"
+test -f "${DATASET_DIR}/dapo-math-p10-90/dapo-math-p10-90.jsonl"
 
 bash "${REPO_ROOT}/experiments/scripts/math/async/dapo-math-p10-90/qwen3-4b/run.sbatch"

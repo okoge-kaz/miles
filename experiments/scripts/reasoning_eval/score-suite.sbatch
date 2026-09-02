@@ -1,13 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=q3-4b-reasoning-suite-score
-#SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=cpu
-#SBATCH --qos=cpu-interactive
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=32
-#SBATCH --time=04:00:00
-#SBATCH --output=experiments/outputs/reasoning_eval/%x-%j.log
+#PBS -N q3-4b-reasoning-suite-score
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=32:mpiprocs=1
+#PBS -l place=scatter
+#PBS -l walltime=04:00:00
+#PBS -j oe
 
 # Score generations already produced by run-evaluation.sbatch. Generated code
 # runs inside isolated user/network/PID/filesystem namespaces. The GPU-node
@@ -16,7 +13,7 @@
 
 set -euo pipefail
 
-REPO_ROOT="$(realpath -- "${SLURM_SUBMIT_DIR:?submit from the Miles repository root}")"
+REPO_ROOT="$(realpath -- "${PBS_O_WORKDIR:?submit from the Miles repository root}")"
 source "${REPO_ROOT}/experiments/env.sh"
 : "${RESULT_ROOT:?set RESULT_ROOT to a completed generation directory}"
 
@@ -92,10 +89,10 @@ for task in "${REQUESTED_TASKS[@]}"; do
     }
     limit_args=()
     [[ "${EVAL_MODE}" == full ]] || limit_args=(--limit 2)
-    srun --overlap --exact --nodes=1 --ntasks=1 --cpus-per-task="${SLURM_CPUS_PER_TASK}" \
-        --container-image="${SQSH_IMAGE}" \
-        --container-mounts="${CONTAINER_MOUNTS},${RESULT_ROOT}:/results,/usr/bin/bwrap:/usr/local/bin/bwrap" \
-        --container-writable --no-container-mount-home --export=ALL \
+    miles_srun --overlap --exact --nodes=1 --ntasks=1 --cpus-per-task="${PBS_NCPUS}" \
+        --image="${CONTAINER_IMAGE}" \
+        --bind="${CONTAINER_MOUNTS},${RESULT_ROOT}:/results,/usr/bin/bwrap:/usr/local/bin/bwrap" \
+        --writable-tmpfs --no-home --export=ALL \
         bash -lc '
 set -euo pipefail
 export PYTHONPATH=/root/miles:/data/ifbench:/data/ifbench-deps

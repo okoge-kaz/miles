@@ -1,13 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=r2e-gold-exposure
-#SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=cpu
-#SBATCH --qos=cpu-interactive
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --time=00:30:00
-#SBATCH --output=experiments/outputs/validation/%x-%j.log
+#PBS -N r2e-gold-exposure
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=32:mpiprocs=1
+#PBS -l place=scatter
+#PBS -l walltime=00:30:00
+#PBS -j oe
 
 # Inspect an R2E source image, whose checkout must be the privately bound gold
 # commit's unique parent, for exact copies of gold-touched files outside the
@@ -15,6 +12,10 @@
 # arbitrary renamed or encoded oracle artifact is absent.
 
 set -euo pipefail
+umask 077
+
+REPO_ROOT="${PBS_O_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." &>/dev/null && pwd)}"
+source "${REPO_ROOT}/experiments/env.sh"
 umask 077
 
 : "${SWE_SOURCE_IMAGE:?set an immutable R2E docker.io/...@sha256:... reference}"
@@ -28,10 +29,10 @@ if [[ ! "${SWE_EXPECTED_GOLD}" =~ ^[0-9a-f]{40}$ ]]; then
     exit 2
 fi
 
-srun \
-    --container-image="${SWE_SOURCE_IMAGE}" \
-    --container-writable \
-    --no-container-mount-home \
+miles_srun \
+    --image="docker://${SWE_SOURCE_IMAGE}" \
+    --writable-tmpfs \
+    --no-home \
     --export=SWE_EXPECTED_GOLD \
     env -i \
         PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \

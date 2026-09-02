@@ -79,7 +79,8 @@ def test_shell_entry_points_delegate_protocol_identity_to_the_helper() -> None:
         assert "aime64-v1" not in text
 
     runner = (scripts / "run-evaluation.sbatch").read_text(encoding="utf-8")
-    assert "#SBATCH --partition=batch" in runner
-    assert "#SBATCH --qos=interactive" in runner
+    assert "#PBS -q R9920261300" in runner
+    assert "#PBS -l select=1:ncpus=192:ngpus=8:mpiprocs=1" in runner
+    assert "#PBS -P" not in runner
     assert runner.index("evaluation-contract.env") < runner.index("declare -a PENDING_TASKS")
     assert "artifact-manifest.sha256" in runner

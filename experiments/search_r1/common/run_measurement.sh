@@ -19,7 +19,7 @@ export TRANSFORMERS_OFFLINE=1
 MEASUREMENT_MODE="${MEASUREMENT_MODE:-difficulty}"
 case "${MEASUREMENT_MODE}" in
     difficulty)
-        LOG_DIR="${SEARCH_R1_LOG_DIR:-/data/difficulty/search-r1-passrate-logs/${SLURM_JOB_ID}}"
+        LOG_DIR="${SEARCH_R1_LOG_DIR:-/data/difficulty/search-r1-passrate-logs/${MILES_JOB_ID}}"
         mkdir -p "${LOG_DIR}" "$(dirname -- "${OUTPUT}")" "$(dirname -- "${FILTERED_OUTPUT}")"
         ;;
     evaluation)

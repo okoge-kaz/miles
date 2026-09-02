@@ -208,8 +208,9 @@ def test_reasoning_eval_suite_routes_verified_artifacts_and_repeat_counts() -> N
         assert 'input="/data/gpqa/gpqa-${split}-miles.jsonl"' in script
 
     assert 'ENABLE_THINKING="${ENABLE_THINKING:-true}"' in runner
-    assert "#SBATCH --gres=gpu:8" in runner
-    assert "#SBATCH --gpus-per-node" not in runner
+    assert "#PBS -q R9920261300" in runner
+    assert "#PBS -l select=1:ncpus=192:ngpus=8:mpiprocs=1" in runner
+    assert "#PBS -P" not in runner
     assert "Qwen3-4B-Instruct-2507" not in runner
     assert "Qwen3-4B-Base/LR2.0e-5" in runner
     assert "iter_0004000" in runner
@@ -218,8 +219,9 @@ def test_reasoning_eval_suite_routes_verified_artifacts_and_repeat_counts() -> N
     assert "for startup_attempt in" in runner
     assert 'stop_server' in runner
     assert "aime24 aime25 aime26 math500 livecodebench" in scorer
-    assert "#SBATCH --gres=gpu:8" in post_training
-    assert "#SBATCH --gpus-per-node" not in post_training
+    assert "#PBS -q R9920261300" in post_training
+    assert "#PBS -l select=1:ncpus=192:ngpus=8:mpiprocs=1" in post_training
+    assert "#PBS -P" not in post_training
     assert "Qwen3-4B-Instruct-2507" not in aime_runner
     assert "Qwen3-4B-Base/LR2.0e-5" in aime_runner
     assert "iter_0004000" in aime_runner

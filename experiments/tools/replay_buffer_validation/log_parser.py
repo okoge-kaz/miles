@@ -1,4 +1,4 @@
-"""Parse the metric records printed to a Slurm training log."""
+"""Parse the metric records printed to a scheduler training log."""
 
 from __future__ import annotations
 
@@ -42,7 +42,7 @@ def parse_payload(payload: str) -> dict[str, Any]:
 
 
 def parse_log(path: Path) -> list[dict[str, Any]]:
-    """Return timestamped metric records from one Slurm log."""
+    """Return timestamped metric records from one scheduler log."""
     records: list[dict[str, Any]] = []
     seen: set[tuple[str, int, str]] = set()
     for line in _iter_lines(path):

@@ -26,20 +26,17 @@ AIME_REPEATS="${AIME_REPEATS:-64}"
 TRAINING_ROOT="${TRAINING_ROOT:-${TRAIN_CKPT_DIR}}"
 STUDY_RELATIVE_ROOT="math/dapo-math-p10-90-qwen3-4b-base-lr2e-5-step4000/Qwen3-4B-Base-LR2e-5-Step4000/grpo-clip0.2-0.28-tis2.0"
 STUDY_ROOT="${STUDY_ROOT:-${TRAINING_ROOT}/${STUDY_RELATIVE_ROOT}}"
-EVALUATION_ROOT="${EVALUATION_ROOT:-${WS}/evaluations/reasoning_eval}"
+EVALUATION_ROOT="${EVALUATION_ROOT:-${MILES_WORKSPACE_ROOT}/evaluations/reasoning_eval}"
 RESULT_STUDY_ROOT="${EVALUATION_ROOT}/staleness-ratio-sweep/${RUN_NAMESPACE}"
-CONTAINER_ROOT="${REASONING_EVAL_CONTAINER_ROOT:-${SHARED_WS}/containers}"
-VLLM_IMAGE="${CONTAINER_ROOT}/vllm-openai-v0.20.2-70a098d9.sqsh"
-NEMO_SKILLS_IMAGE="${CONTAINER_ROOT}/nemo-evaluator-nemo-skills-26.03-ac1b048e.sqsh"
+CONTAINER_ROOT="${REASONING_EVAL_CONTAINER_ROOT:-${CONTAINER_DIR}/reasoning-eval}"
+VLLM_IMAGE="${CONTAINER_ROOT}/vllm-openai-v0.20.2-70a098d9.sif"
+NEMO_SKILLS_IMAGE="${CONTAINER_ROOT}/nemo-evaluator-nemo-skills-26.03-ac1b048e.sif"
 VLLM_OCI_DIGEST="sha256:70a098d90dbab428a001d9e852fc0fc8d67da5beb03e7851a22247653bf35923"
 NEMO_SKILLS_OCI_DIGEST="sha256:ac1b048e13fe7f2a59751b528fc23f5f471452197ad9ae40b715a77cda0a9612"
 NEMO_SKILLS_DATA_ROOT="${REASONING_EVAL_DATA_ROOT:-${DATASET_DIR}/evaluation}/nemo-skills-26.03"
-ACCOUNT="${SLURM_ACCOUNT_NAME:-coreai_horizon_dilations}"
-PARTITION="${PARTITION:-batch}"
-QOS="${QOS:-normal}"
 WALL="${WALL:-04:00:00}"
 PRINT_LIMIT="${PRINT_LIMIT:-40}"
-SQUEUE_TIMEOUT_SECONDS="${SQUEUE_TIMEOUT_SECONDS:-10}"
+QSTAT_TIMEOUT_SECONDS="${QSTAT_TIMEOUT_SECONDS:-10}"
 SNAPSHOT_ARM_MAX_STEPS="${SNAPSHOT_ARM_MAX_STEPS:-}"
 TRUST_PINNED_SNAPSHOT="${TRUST_PINNED_SNAPSHOT:-0}"
 LOG_DIR="${OUTPUT_DIR}/reasoning_eval/staleness-ratio-sweep/${RUN_NAMESPACE}"
@@ -75,7 +72,7 @@ Options:
   --help                   Show this message.
 
 Useful environment overrides: TRAINING_ROOT or STUDY_ROOT, EVALUATION_ROOT,
-START_STEP, END_STEP, EVAL_MODE, TASKS, PARTITION, QOS, WALL, and PRINT_LIMIT.
+START_STEP, END_STEP, EVAL_MODE, TASKS, WALL, and PRINT_LIMIT.
 SNAPSHOT_ARM_MAX_STEPS can pin an arm=max_step comma-separated snapshot; when
 set, every one of the 17 arms must be present.
 HF checkpoint directory N stores the model after learning step N+1, so the
@@ -115,14 +112,14 @@ done
 
 for value in \
     "${MAX_SUBMISSIONS}" "${START_STEP}" "${END_STEP}" "${STEP_INTERVAL}" \
-    "${PRINT_LIMIT}" "${SQUEUE_TIMEOUT_SECONDS}" "${TRUST_PINNED_SNAPSHOT}"; do
+    "${PRINT_LIMIT}" "${QSTAT_TIMEOUT_SECONDS}" "${TRUST_PINNED_SNAPSHOT}"; do
     [[ "${value}" =~ ^[0-9]+$ ]] || { echo "integer controls must be nonnegative: ${value}" >&2; exit 3; }
 done
 (( START_STEP > 0 && END_STEP >= START_STEP && STEP_INTERVAL > 0 )) || {
     echo "invalid step range" >&2
     exit 4
 }
-(( SQUEUE_TIMEOUT_SECONDS > 0 )) || { echo "SQUEUE_TIMEOUT_SECONDS must be positive" >&2; exit 4; }
+(( QSTAT_TIMEOUT_SECONDS > 0 )) || { echo "QSTAT_TIMEOUT_SECONDS must be positive" >&2; exit 4; }
 (( TRUST_PINNED_SNAPSHOT <= 1 )) || { echo "TRUST_PINNED_SNAPSHOT must be 0 or 1" >&2; exit 4; }
 if (( TRUST_PINNED_SNAPSHOT == 1 )) && [[ -z "${SNAPSHOT_ARM_MAX_STEPS}" ]]; then
     echo "TRUST_PINNED_SNAPSHOT requires SNAPSHOT_ARM_MAX_STEPS" >&2
@@ -242,15 +239,19 @@ result_is_complete() {
     done
 }
 
-declare -A ACTIVE_SLURM_JOBS=()
+declare -A ACTIVE_PBS_JOBS=()
 active_job_query_ok=1
-if active_job_output="$(
-    timeout "${SQUEUE_TIMEOUT_SECONDS}" \
-        squeue --noheader --user="${SLURM_JOB_USER:-${USER:?USER is not set}}" --format='%i' 2>/dev/null
-)"; then
+set +e
+active_job_output="$(
+    timeout "${QSTAT_TIMEOUT_SECONDS}" \
+        qselect -u "${USER:?USER is not set}" 2>/dev/null
+)"
+active_job_query_status=$?
+set -e
+if (( active_job_query_status == 0 || active_job_query_status == 162 )); then
     while IFS= read -r active_job_id; do
-        [[ "${active_job_id}" =~ ^[1-9][0-9]*$ ]] || continue
-        ACTIVE_SLURM_JOBS["${active_job_id}"]=1
+        [[ "${active_job_id}" =~ ^[1-9][0-9]*(\[[^]]*\])?(\.[A-Za-z0-9._-]+)?$ ]] || continue
+        ACTIVE_PBS_JOBS["${active_job_id}"]=1
     done <<< "${active_job_output}"
 else
     active_job_query_ok=0
@@ -262,12 +263,12 @@ job_is_active() {
     for marker in "${result_root}/.submitted-job" "${result_root}/.active-job"; do
         [[ -s "${marker}" ]] || continue
         read -r job_id _ < "${marker}"
-        [[ "${job_id}" =~ ^[1-9][0-9]*$ ]] || continue
+        [[ "${job_id}" =~ ^[1-9][0-9]*(\[[^]]*\])?(\.[A-Za-z0-9._-]+)?$ ]] || continue
         if (( active_job_query_ok == 0 )); then
-            echo "could not query Slurm job ${job_id}; treating it as active" >&2
+            echo "could not query PBS job ${job_id}; treating it as active" >&2
             return 0
         fi
-        [[ -n "${ACTIVE_SLURM_JOBS[${job_id}]:-}" ]] && return 0
+        [[ -n "${ACTIVE_PBS_JOBS[${job_id}]:-}" ]] && return 0
     done
     return 1
 }
@@ -364,11 +365,9 @@ first_arm="${PENDING_ARMS[0]}"
 first_step="${PENDING_STEPS[0]}"
 first_checkpoint="${PENDING_CHECKPOINTS[0]}"
 first_result="${PENDING_RESULTS[0]}"
-sbatch \
+pbs_submit \
     --test-only \
-    -A "${ACCOUNT}" \
-    --partition="${PARTITION}" \
-    --qos="${QOS}" \
+    --profile gpu \
     --time="${WALL}" \
     --export="ALL,CHECKPOINT_PATH=${first_checkpoint},RESULT_ROOT=${first_result},ARM_NAME=${first_arm},TRAINING_STEP=${first_step},RUN_NAMESPACE=${RUN_NAMESPACE},TASKS=${TASKS},EVAL_MODE=${EVAL_MODE},PROTOCOL_NAME=${PROTOCOL_NAME},AIME_REPEATS=${AIME_REPEATS},TEMPERATURE=${TEMPERATURE},TOP_P=${TOP_P},TOP_K=${TOP_K}" \
     "${RUN_SCRIPT}"
@@ -380,14 +379,12 @@ for ((pending_index = 0; pending_index < submission_limit; pending_index++)); do
     result_root="${PENDING_RESULTS[${pending_index}]}"
     printf -v step_label '%03d' "${step}"
     mkdir -p "${result_root}"
-    raw_job_id="$(sbatch \
+    raw_job_id="$(pbs_submit \
         --parsable \
-        -A "${ACCOUNT}" \
-        --partition="${PARTITION}" \
-        --qos="${QOS}" \
+        --profile gpu \
         --time="${WALL}" \
         --job-name="q3e-${arm_name}-${step_label}" \
-        --output="${LOG_DIR}/q3e-${arm_name}-${step_label}-%j.log" \
+        --output="${LOG_DIR}/" \
         --export="ALL,CHECKPOINT_PATH=${checkpoint_path},RESULT_ROOT=${result_root},ARM_NAME=${arm_name},TRAINING_STEP=${step},RUN_NAMESPACE=${RUN_NAMESPACE},TASKS=${TASKS},EVAL_MODE=${EVAL_MODE},PROTOCOL_NAME=${PROTOCOL_NAME},AIME_REPEATS=${AIME_REPEATS},TEMPERATURE=${TEMPERATURE},TOP_P=${TOP_P},TOP_K=${TOP_K}" \
         "${RUN_SCRIPT}")"
     job_id="${raw_job_id%%;*}"

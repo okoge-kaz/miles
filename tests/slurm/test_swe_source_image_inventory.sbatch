@@ -1,19 +1,20 @@
 #!/bin/bash
-#SBATCH --job-name=swe-source-inventory
-#SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=cpu
-#SBATCH --qos=cpu-interactive
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
-#SBATCH --time=00:30:00
-#SBATCH --output=experiments/outputs/validation/%x-%j.log
+#PBS -N swe-source-inventory
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=32:mpiprocs=1
+#PBS -l place=scatter
+#PBS -l walltime=00:30:00
+#PBS -j oe
 
 # Inspect an immutable repository-SWE source image without exposing the
 # submission environment inside it. This is an admission-policy diagnostic,
 # not a substitute for the live E2B empty=0/oracle=1 checks.
 
 set -euo pipefail
+umask 077
+
+REPO_ROOT="${PBS_O_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." &>/dev/null && pwd)}"
+source "${REPO_ROOT}/experiments/env.sh"
 umask 077
 
 : "${SWE_SOURCE_IMAGE:?set an immutable docker.io/...@sha256:... reference}"
@@ -39,10 +40,10 @@ case "${SWE_SOURCE_SCHEMA}" in
         ;;
 esac
 
-srun \
-    --container-image="${SWE_SOURCE_IMAGE}" \
-    --container-writable \
-    --no-container-mount-home \
+miles_srun \
+    --image="docker://${SWE_SOURCE_IMAGE}" \
+    --writable-tmpfs \
+    --no-home \
     --export=SWE_SOURCE_SCHEMA \
     env -i \
         PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \

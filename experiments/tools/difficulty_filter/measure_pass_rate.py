@@ -13,8 +13,8 @@ grade it during training -- including the `boxed_` prefix handling and the
 different grader than the trainer uses would be worse than no filter.
 
 Resumable: results are appended and flushed per prompt, and a restart skips
-indices already present in the output. A 4 h partition limit is therefore not a
-correctness concern, only a wall-clock one.
+indices already present in the output. Reaching a requested scheduler walltime
+is therefore not a correctness concern, only a wall-clock one.
 """
 
 import argparse
@@ -269,8 +269,8 @@ def repair_trailing_record(path):
     """Make an interrupted append log safe for the next append.
 
     A normal record is written with its newline in one call and flushed, but a
-    hard Slurm time-limit can still interrupt the final filesystem write. If a
-    later process appends directly to that partial byte sequence, its first
+    hard scheduler time limit can still interrupt the final filesystem write.
+    If a later process appends directly to that partial byte sequence, its first
     complete record is concatenated to the fragment and both become unreadable.
     Preserve a valid final JSON record by adding its newline; otherwise truncate
     only the malformed tail after the last complete line.

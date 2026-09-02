@@ -5,7 +5,7 @@ set -euo pipefail
 
 umask 077
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../../../.." && pwd -P)}"
+REPO_ROOT="${PBS_O_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../../../.." && pwd -P)}"
 USER="${USER:-$(id -un)}"
 export USER
 export WANDB_MODE=offline
@@ -45,28 +45,30 @@ readonly GATE_EXPORTS="AGENT_SERVER_URL,HARBOR_READINESS_TIMEOUT_SEC,HARBOR_RUN_
 readonly TRAINING_EXPORTS="AGENT_SERVER_URL,ASYNC_MAX_CONCURRENT_SAMPLES,DEBUG_EXIT_AFTER_ROLLOUT,HARBOR_RUN_SECRET,MILES_SWE_FIXED_EXPORTS,NUM_ROLLOUT,ROLLOUT_BATCH_SIZE,SWE_AGENT_NAME,SWE_AGENT_SERVER_READY_TIMEOUT_SEC,SWE_DATASET,SWE_TRIAL_REQUEST_TIMEOUT_SEC"
 
 gate_submission="$(
-    sbatch \
+    pbs_submit \
         --parsable \
+        --profile cpu \
         --chdir="${REPO_ROOT}" \
         --export="${GATE_EXPORTS}" \
         "${GATE_JOB}"
 )"
 gate_job_id="${gate_submission%%;*}"
-[[ "${gate_job_id}" =~ ^[0-9]+$ ]] || {
-    echo "Slurm returned an invalid readiness job ID" >&2
+[[ "${gate_job_id}" =~ ^[0-9]+(\[[^]]*\])?(\.[A-Za-z0-9._-]+)?$ ]] || {
+    echo "PBS returned an invalid readiness job ID" >&2
     exit 2
 }
 training_submission="$(
-    sbatch \
+    pbs_submit \
         --parsable \
+        --profile gpu \
         --chdir="${REPO_ROOT}" \
         --dependency="afterok:${gate_job_id}" \
         --export="${TRAINING_EXPORTS}" \
         "${TRAINING_JOB}"
 )"
 training_job_id="${training_submission%%;*}"
-[[ "${training_job_id}" =~ ^[0-9]+$ ]] || {
-    echo "Slurm returned an invalid training job ID" >&2
+[[ "${training_job_id}" =~ ^[0-9]+(\[[^]]*\])?(\.[A-Za-z0-9._-]+)?$ ]] || {
+    echo "PBS returned an invalid training job ID" >&2
     exit 2
 }
 

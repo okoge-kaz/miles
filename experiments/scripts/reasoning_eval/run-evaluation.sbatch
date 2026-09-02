@@ -1,20 +1,15 @@
 #!/bin/bash
 
-#SBATCH --job-name=q3-4b-rl-eval
-#SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=batch
-#SBATCH --qos=interactive
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --gres=gpu:8
-#SBATCH --cpus-per-task=128
-#SBATCH --time=04:00:00
-#SBATCH --signal=B:TERM@120
-#SBATCH --output=experiments/outputs/reasoning_eval/%x-%j.log
+#PBS -N q3-4b-rl-eval
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=192:ngpus=8:mpiprocs=1
+#PBS -l place=scatter:excl
+#PBS -l walltime=04:00:00
+#PBS -j oe
 
 set -euo pipefail
 
-REPO_ROOT="$(realpath -- "${SLURM_SUBMIT_DIR:?submit from the Miles repository root}")"
+REPO_ROOT="$(realpath -- "${PBS_O_WORKDIR:?submit from the Miles repository root}")"
 source "${REPO_ROOT}/experiments/env.sh"
 
 TASKS_TEXT="${TASKS:-aime24 aime25 aime26}"
@@ -45,9 +40,9 @@ SERVER_READY_ATTEMPTS="${SERVER_READY_ATTEMPTS:-180}"
 SERVER_READY_INTERVAL_SECONDS="${SERVER_READY_INTERVAL_SECONDS:-5}"
 VLLM_PREFLIGHT_MAX_TOKENS="${VLLM_PREFLIGHT_MAX_TOKENS:-512}"
 VLLM_TRITON_PTXAS_PATH="${VLLM_TRITON_PTXAS_PATH:-/usr/local/cuda-13.0/bin/ptxas}"
-CONTAINER_ROOT="${REASONING_EVAL_CONTAINER_ROOT:-${SHARED_WS}/containers}"
-VLLM_IMAGE="${CONTAINER_ROOT}/vllm-openai-v0.20.2-70a098d9.sqsh"
-NEMO_SKILLS_IMAGE="${CONTAINER_ROOT}/nemo-evaluator-nemo-skills-26.03-ac1b048e.sqsh"
+CONTAINER_ROOT="${REASONING_EVAL_CONTAINER_ROOT:-${CONTAINER_DIR}/reasoning-eval}"
+VLLM_IMAGE="${CONTAINER_ROOT}/vllm-openai-v0.20.2-70a098d9.sif"
+NEMO_SKILLS_IMAGE="${CONTAINER_ROOT}/nemo-evaluator-nemo-skills-26.03-ac1b048e.sif"
 VLLM_OCI_DIGEST="sha256:70a098d90dbab428a001d9e852fc0fc8d67da5beb03e7851a22247653bf35923"
 NEMO_SKILLS_OCI_DIGEST="sha256:ac1b048e13fe7f2a59751b528fc23f5f471452197ad9ae40b715a77cda0a9612"
 NEMO_SKILLS_DATA_ROOT="${REASONING_EVAL_DATA_ROOT:-${DATASET_DIR}/evaluation}/nemo-skills-26.03"
@@ -60,7 +55,7 @@ EXPORT_TOOL_DIR="${REPO_ROOT}/experiments/tools/reasoning_eval"
 API_BASE_URL="http://127.0.0.1:${VLLM_PORT}"
 API_ENDPOINT="${API_BASE_URL}/v1/chat/completions"
 
-[[ -n "${SLURM_JOB_ID:-}" ]] || { echo "submit this script with sbatch" >&2; exit 2; }
+[[ -n "${PBS_JOBID:-}" ]] || { echo "submit this script with pbs_submit or qsub" >&2; exit 2; }
 [[ "${EVAL_MODE}" == smoke || "${EVAL_MODE}" == full ]] || {
     echo "EVAL_MODE must be smoke or full" >&2
     exit 3
@@ -207,7 +202,7 @@ checkpoint_config_sha256="$(sha256sum "${CHECKPOINT_SOURCE}/config.json")"
 checkpoint_config_sha256="${checkpoint_config_sha256%% *}"
 tokenizer_config_sha256="$(sha256sum "${CHECKPOINT_SOURCE}/tokenizer_config.json")"
 tokenizer_config_sha256="${tokenizer_config_sha256%% *}"
-JOB_TMP_ROOT="${SLURM_TMPDIR:-/tmp}"
+JOB_TMP_ROOT="${MILES_JOB_TMPDIR:-/tmp}"
 
 read -r -a REQUESTED_TASKS <<< "${TASKS_TEXT}"
 (( ${#REQUESTED_TASKS[@]} > 0 )) || { echo "TASKS is empty" >&2; exit 19; }
@@ -224,11 +219,11 @@ if ! flock --nonblock 9; then
     echo "another evaluation job is active for ${RESULT_ROOT}; nothing to do"
     exit 0
 fi
-printf '%s\n' "${SLURM_JOB_ID}" > "${RESULT_ROOT}/.active-job"
-contract_partial="${RESULT_ROOT}/.evaluation-contract.partial-${SLURM_JOB_ID}"
+printf '%s\n' "${MILES_JOB_ID}" > "${RESULT_ROOT}/.active-job"
+contract_partial="${RESULT_ROOT}/.evaluation-contract.partial-${MILES_JOB_ID}"
 trap 'rm -f -- "${RESULT_ROOT}/.active-job" "${contract_partial}"' EXIT
 
-desired_result_contract="${JOB_TMP_ROOT}/reasoning-eval-contract-${SLURM_JOB_ID}.env"
+desired_result_contract="${JOB_TMP_ROOT}/reasoning-eval-contract-${MILES_JOB_ID}.env"
 cat > "${desired_result_contract}" <<EOF
 checkpoint=${CHECKPOINT_SOURCE}
 checkpoint_manifest_sha256=${CHECKPOINT_MANIFEST_SHA256}
@@ -318,9 +313,9 @@ if (( ${#PENDING_TASKS[@]} == 0 )); then
     exit 0
 fi
 
-MODEL_RUNTIME_DIR="${JOB_TMP_ROOT}/reasoning-eval-model-${SLURM_JOB_ID}"
-TOKENIZER_RUNTIME_DIR="${JOB_TMP_ROOT}/reasoning-eval-tokenizer-${SLURM_JOB_ID}"
-desired_server_config="${JOB_TMP_ROOT}/reasoning-eval-server-${SLURM_JOB_ID}.env"
+MODEL_RUNTIME_DIR="${JOB_TMP_ROOT}/reasoning-eval-model-${MILES_JOB_ID}"
+TOKENIZER_RUNTIME_DIR="${JOB_TMP_ROOT}/reasoning-eval-tokenizer-${MILES_JOB_ID}"
+desired_server_config="${JOB_TMP_ROOT}/reasoning-eval-server-${MILES_JOB_ID}.env"
 cat > "${desired_server_config}" <<EOF
 checkpoint=${CHECKPOINT_SOURCE}
 checkpoint_manifest_sha256=${CHECKPOINT_MANIFEST_SHA256}
@@ -385,7 +380,7 @@ esac
 
 for task in "${PENDING_TASKS[@]}"; do
     partial_result="${RESULT_ROOT}/${task}.partial"
-    desired_config="${JOB_TMP_ROOT}/reasoning-eval-${SLURM_JOB_ID}-${task}.yaml"
+    desired_config="${JOB_TMP_ROOT}/reasoning-eval-${MILES_JOB_ID}-${task}.yaml"
     case "${task}" in
         aime24) eval_type=nemo_skills.ns_aime2024 ;;
         aime25) eval_type=nemo_skills.ns_aime2025 ;;
@@ -441,18 +436,18 @@ EOF
     else
         cp -- "${desired_config}" "${partial_result}/run-config.yaml"
     fi
-    srun \
+    miles_srun \
         --exact \
         --nodes=1 \
         --ntasks=1 \
         --cpus-per-task=32 \
-        --container-image="${NEMO_SKILLS_IMAGE}" \
-        --container-mounts="${partial_result}:/results,${NEMO_SKILLS_DATA_ROOT}:/evaluation-data,${EVALUATION_CACHE_ROOT}:/evaluation-cache" \
-        --container-workdir=/results \
-        --no-container-mount-home \
+        --image="${NEMO_SKILLS_IMAGE}" \
+        --bind="${partial_result}:/results,${NEMO_SKILLS_DATA_ROOT}:/evaluation-data,${EVALUATION_CACHE_ROOT}:/evaluation-cache" \
+        --cwd=/results \
+        --no-home \
         --export="ALL,HF_HOME=/evaluation-cache/huggingface,NEMO_SKILLS_DATA_DIR=/evaluation-data,NEMO_EVALUATOR_TELEMETRY_LEVEL=0,XDG_CACHE_HOME=/evaluation-cache/xdg,PYTHONUNBUFFERED=1" \
         bash -lc 'nemo-evaluator run_eval --run_config /results/run-config.yaml --dry_run' \
-        > "${partial_result}/rendered-config-${SLURM_JOB_ID}.txt"
+        > "${partial_result}/rendered-config-${MILES_JOB_ID}.txt"
 done
 
 SERVER_STEP_PID=""
@@ -479,18 +474,18 @@ SERVED_MODEL_NAME="qwen3-4b-rl-step-${TRAINING_STEP}"
 server_ready=false
 VLLM_LOG=""
 for ((startup_attempt = 1; startup_attempt <= VLLM_STARTUP_ATTEMPTS; startup_attempt++)); do
-    VLLM_LOG="${RESULT_ROOT}/vllm-${SLURM_JOB_ID}-attempt-${startup_attempt}.log"
-    srun \
+    VLLM_LOG="${RESULT_ROOT}/vllm-${MILES_JOB_ID}-attempt-${startup_attempt}.log"
+    miles_srun \
         --overlap \
         --exact \
         --nodes=1 \
         --ntasks=1 \
         --gpus-per-node=8 \
         --cpus-per-task=96 \
-        --container-image="${VLLM_IMAGE}" \
-        --container-mounts="${MODEL_MOUNTS},${TOKENIZER_RUNTIME_DIR}:/runtime-tokenizer:ro,${EVALUATION_CACHE_ROOT}:/evaluation-cache" \
-        --container-workdir=/ \
-        --no-container-mount-home \
+        --image="${VLLM_IMAGE}" \
+        --bind="${MODEL_MOUNTS},${TOKENIZER_RUNTIME_DIR}:/runtime-tokenizer:ro,${EVALUATION_CACHE_ROOT}:/evaluation-cache" \
+        --cwd=/ \
+        --no-home \
         --export="ALL,HF_HOME=/evaluation-cache/huggingface,HF_HUB_OFFLINE=1,TRANSFORMERS_OFFLINE=1,PYTHONUNBUFFERED=1,OMP_NUM_THREADS=1,NCCL_NVLS_ENABLE=0,TRITON_PTXAS_PATH=${VLLM_TRITON_PTXAS_PATH},VLLM_WORKER_MULTIPROC_METHOD=spawn" \
         bash -lc '
             exec vllm serve /checkpoint \
@@ -547,7 +542,7 @@ for ((startup_attempt = 1; startup_attempt <= VLLM_STARTUP_ATTEMPTS; startup_att
 done
 [[ "${server_ready}" == true ]] || { echo "vLLM failed to start" >&2; exit 26; }
 
-PREFLIGHT_RESPONSE="${RESULT_ROOT}/preflight-${SLURM_JOB_ID}.json"
+PREFLIGHT_RESPONSE="${RESULT_ROOT}/preflight-${MILES_JOB_ID}.json"
 curl \
     --fail \
     --silent \
@@ -585,7 +580,7 @@ for task in "${PENDING_TASKS[@]}"; do
         aime25) eval_type=nemo_skills.ns_aime2025 ;;
         aime26) eval_type=nemo_skills.ns_aime2026 ;;
     esac
-    provenance_file="${partial_result}/provenance-${SLURM_JOB_ID}.env"
+    provenance_file="${partial_result}/provenance-${MILES_JOB_ID}.env"
     cat > "${provenance_file}" <<EOF
 checkpoint=${CHECKPOINT_SOURCE}
 checkpoint_config_sha256=${checkpoint_config_sha256}
@@ -613,21 +608,21 @@ nemo_skills_image=${NEMO_SKILLS_IMAGE}
 nemo_skills_oci_digest=${NEMO_SKILLS_OCI_DIGEST}
 ${DATASET_PROVENANCE}
 evaluator_catalog_commit=eb3ddf2acc7f2e1fa03aeba168afea636562779c
-slurm_job_id=${SLURM_JOB_ID}
+pbs_job_id=${MILES_JOB_ID}
 started_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 EOF
 
     echo "Evaluating ${ARM_NAME} step=${TRAINING_STEP} task=${task}"
-    srun \
+    miles_srun \
         --overlap \
         --exact \
         --nodes=1 \
         --ntasks=1 \
         --cpus-per-task=32 \
-        --container-image="${NEMO_SKILLS_IMAGE}" \
-        --container-mounts="${partial_result}:/results,${NEMO_SKILLS_DATA_ROOT}:/evaluation-data,${EVALUATION_CACHE_ROOT}:/evaluation-cache,${EXPORT_TOOL_DIR}:/workspace/reasoning_eval:ro" \
-        --container-workdir=/results \
-        --no-container-mount-home \
+        --image="${NEMO_SKILLS_IMAGE}" \
+        --bind="${partial_result}:/results,${NEMO_SKILLS_DATA_ROOT}:/evaluation-data,${EVALUATION_CACHE_ROOT}:/evaluation-cache,${EXPORT_TOOL_DIR}:/workspace/reasoning_eval:ro" \
+        --cwd=/results \
+        --no-home \
         --export="ALL,HF_HOME=/evaluation-cache/huggingface,NEMO_SKILLS_DATA_DIR=/evaluation-data,NEMO_EVALUATOR_TELEMETRY_LEVEL=0,XDG_CACHE_HOME=/evaluation-cache/xdg,PYTHONUNBUFFERED=1" \
         bash -lc '
             set -euo pipefail

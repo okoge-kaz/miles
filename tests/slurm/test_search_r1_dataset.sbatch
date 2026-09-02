@@ -1,31 +1,22 @@
 #!/bin/bash
-#SBATCH --job-name=test-search-r1-data
-#SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=cpu
-#SBATCH --qos=cpu-interactive
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --time=00:30:00
-#SBATCH --output=experiments/outputs/validation/%x-%j.log
+#PBS -N test-search-r1-data
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=32:mpiprocs=1
+#PBS -l place=scatter
+#PBS -l walltime=00:30:00
+#PBS -j oe
 
 set -euo pipefail
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." &>/dev/null && pwd)}"
-SEARCH_R1_IMAGE_WAS_SET="${SQSH_IMAGE+x}"
+REPO_ROOT="${PBS_O_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." &>/dev/null && pwd)}"
 source "${REPO_ROOT}/experiments/env.sh"
-if [[ -z "${SEARCH_R1_IMAGE_WAS_SET}" ]]; then
-    SQSH_IMAGE="${CONTAINER_DIR}/miles-search-r1-b300-faiss-1.12.0-20260826.sqsh"
-    export SQSH_IMAGE
-fi
-unset SEARCH_R1_IMAGE_WAS_SET
-[[ -r "${SQSH_IMAGE}" ]] || { echo "missing Search-R1 image: ${SQSH_IMAGE}" >&2; exit 1; }
+[[ -r "${CONTAINER_IMAGE}" ]] || { echo "missing Search-R1 image: ${CONTAINER_IMAGE}" >&2; exit 1; }
 
-srun \
-    --container-image="${SQSH_IMAGE}" \
-    --container-mounts="${CONTAINER_MOUNTS}" \
-    --container-writable \
-    --no-container-mount-home \
+miles_srun \
+    --image="${CONTAINER_IMAGE}" \
+    --bind="${CONTAINER_MOUNTS}" \
+    --writable-tmpfs \
+    --no-home \
     --export=ALL \
     bash -lc '
 set -euo pipefail

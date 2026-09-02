@@ -1,18 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=miles-swe-e2b-qwen3-4b
-#SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=batch
-#SBATCH --qos=interactive
-#SBATCH --nodes=4
-#SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=128
-#SBATCH --gres=gpu:8
-#SBATCH --exclusive
-#SBATCH --mem=0
-#SBATCH --time=04:00:00
-#SBATCH --signal=B:USR1@900
-#SBATCH --export=NIL
-#SBATCH --output=experiments/outputs/training/swe/swe-rebench-v2-swe-gym/qwen3-4b/%x-%j.log
+#PBS -N miles-swe-e2b-qwen3-4b
+#PBS -q R9920261300
+#PBS -l select=4:ncpus=192:ngpus=8:mpiprocs=1
+#PBS -l place=scatter:excl
+#PBS -l walltime=24:00:00
+#PBS -j oe
 
 # Four-node asynchronous repository-level SWE RL.  Harbor owns task setup,
 # verification, and the E2B provider; Miles sends only task IDs and serves the
@@ -20,9 +12,7 @@
 
 set -euo pipefail
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../../../.." &>/dev/null && pwd)}"
-: "${HF_CKPT_DIR:=${QWEN3_4B_BASE_HF_ROOT:-/lustre/fsw/portfolios/coreai/users/kfujii/checkpoints/huggingface/Qwen3-4B-Base/LR2.0e-5-SEQ32768-GBS128-MBS1-TP1-PP1-CP1-EP1-PACK1-standard-cp-STEPS4000}}"
-export HF_CKPT_DIR
+REPO_ROOT="${MILES_SUBMIT_DIR:-${PBS_O_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../../../.." &>/dev/null && pwd)}}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 USER="$(id -un)"
@@ -47,12 +37,12 @@ fi
 unset E2B_API_KEY HARBOR_E2B_API_KEY E2B_API_URL HARBOR_E2B_API_URL
 source "${REPO_ROOT}/experiments/env.sh"
 
-[[ "${SLURM_JOB_NUM_NODES:?}" == 4 ]] || {
+[[ "${MILES_JOB_NUM_NODES:?}" == 4 ]] || {
     echo "SWE validation requires exactly four GPU nodes" >&2
     exit 1
 }
 : "${AGENT_SERVER_URL:?set the URL of a Harbor agent server using its E2B environment selector}"
-: "${HARBOR_RUN_SECRET:?export the Harbor /run bearer secret before sbatch}"
+: "${HARBOR_RUN_SECRET:?export the Harbor /run bearer secret before pbs_submit}"
 for secret_name in HARBOR_RUN_SECRET; do
     secret_value="${!secret_name}"
     (( ${#secret_value} >= 32 && ${#secret_value} <= 4096 )) && \
@@ -64,7 +54,7 @@ done
 unset secret_value
 SWE_TRIAL_REQUEST_TIMEOUT_SEC="${SWE_TRIAL_REQUEST_TIMEOUT_SEC:-13200}"
 [[ "${SWE_TRIAL_REQUEST_TIMEOUT_SEC}" == 13200 ]] || {
-    echo "SWE_TRIAL_REQUEST_TIMEOUT_SEC is fixed at 13200 for the four-hour pilot" >&2
+    echo "SWE_TRIAL_REQUEST_TIMEOUT_SEC is fixed at the validated 13200-second trial budget" >&2
     exit 2
 }
 SWE_AGENT_SERVER_READY_TIMEOUT_SEC="${SWE_AGENT_SERVER_READY_TIMEOUT_SEC:-60}"
@@ -73,7 +63,7 @@ SWE_AGENT_SERVER_READY_TIMEOUT_SEC="${SWE_AGENT_SERVER_READY_TIMEOUT_SEC:-60}"
     echo "SWE_AGENT_SERVER_READY_TIMEOUT_SEC must be in [1, 60]" >&2
     exit 2
 }
-HARBOR_CLIENT_ID="slurm-${SLURM_JOB_ID:?}"
+HARBOR_CLIENT_ID="pbs-${MILES_JOB_ID:?}"
 export HARBOR_CLIENT_ID
 SWE_AGENT_NAME="${SWE_AGENT_NAME:-terminus-2}"
 [[ "${SWE_AGENT_NAME}" == terminus-2 ]] || {
@@ -118,7 +108,7 @@ HOST_ADMISSION_SUMMARY="${DATASET_DIR}/miles-swe/admitted/${DATASET_TAG}-train.s
 TASK_FAMILY=swe
 TRAIN_SCRIPT=/root/miles/experiments/scripts/swe/async/swe-rebench-v2-swe-gym/qwen3-4b/train.sh
 MODEL_NAME=Qwen3-4B-Base-LR2e-5-Step4000
-HF_MODEL_NAME=iter_0004000
+HF_MODEL_NAME="${QWEN3_4B_BASE_HF_MODEL}"
 MODEL_PROFILE=qwen3-4B
 PLACEMENT=async
 
@@ -190,18 +180,22 @@ LOG_UPDATE_DIAGNOSTICS=1
 SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS=1
 DEBUG_EXIT_AFTER_ROLLOUT="${DEBUG_EXIT_AFTER_ROLLOUT:-}"
 
-MILES_NCCL_TRANSPORT=efa
-ASYNC_SQSH_IMAGE_OVERRIDE=/lustre/fsw/portfolios/coreai/users/kfujii/containers/miles-staleness-weight-boundaries-f994b9aed-efa-1.49.0.sqsh
-[[ "${NCCL_IB_DISABLE:-0}" != 1 ]] || {
-    echo "EFA mode refuses NCCL_IB_DISABLE=1" >&2
-    exit 1
-}
-NCCL_IB_DISABLE=0
-NCCL_NET_PLUGIN=ofi
-NCCL_TUNER_PLUGIN=ofi
-NCCL_NET="AWS Libfabric"
-FI_PROVIDER=efa
-LD_LIBRARY_PATH="/opt/amazon/efa/lib:/opt/amazon/ofi-nccl/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+MILES_NCCL_TRANSPORT="${MILES_NCCL_TRANSPORT:-system}"
+ASYNC_CONTAINER_IMAGE_OVERRIDE="${ASYNC_CONTAINER_IMAGE_OVERRIDE:-${CONTAINER_IMAGE}}"
+case "${MILES_NCCL_TRANSPORT}" in
+    system)
+        NCCL_IB_DISABLE=0
+        unset NCCL_NET_PLUGIN NCCL_TUNER_PLUGIN NCCL_NET FI_PROVIDER
+        ;;
+    tcp)
+        NCCL_IB_DISABLE=1
+        unset NCCL_NET_PLUGIN NCCL_TUNER_PLUGIN NCCL_NET FI_PROVIDER
+        ;;
+    *)
+        echo "unknown MILES_NCCL_TRANSPORT=${MILES_NCCL_TRANSPORT}; expected system or tcp" >&2
+        exit 2
+        ;;
+esac
 
 CONFIG_TAG="4node-e2b-16k-lr${LR}-rbs${ROLLOUT_BATCH_SIZE}-n${N_SAMPLES_PER_PROMPT}-s${MAX_WEIGHT_STALENESS}"
 
@@ -220,24 +214,24 @@ export SWE_TRIAL_REQUEST_TIMEOUT_SEC HARBOR_RUN_SECRET
 export ZERO_REWARD_ON_TRUNCATED EVAL_INTERVAL SAVE_INTERVAL SAVE_RETAIN_INTERVAL
 export SAVE_HF HF_SAVE_INTERVAL FUSE_ONE_STEP_ACTOR_LOGPROBS LOG_SAMPLE_STALENESS_METRICS
 export LOG_UPDATE_DIAGNOSTICS SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS DEBUG_EXIT_AFTER_ROLLOUT
-export MILES_NCCL_TRANSPORT ASYNC_SQSH_IMAGE_OVERRIDE NCCL_IB_DISABLE NCCL_NET_PLUGIN
-export NCCL_TUNER_PLUGIN NCCL_NET FI_PROVIDER LD_LIBRARY_PATH WANDB_MODE CONFIG_TAG
+export MILES_NCCL_TRANSPORT ASYNC_CONTAINER_IMAGE_OVERRIDE NCCL_IB_DISABLE NCCL_NET
+export LD_LIBRARY_PATH WANDB_MODE CONFIG_TAG
 export PYTHON_DOTENV_DISABLED
 
 source "${REPO_ROOT}/experiments/common/run_identity.sh"
 export RUN_NAME CONFIG_TAG CKPT_PATH
 source "${REPO_ROOT}/experiments/common/placement.sh"
 
-export RAY_DONE_FLAG="/root/miles/experiments/outputs/.ray/${RUN_NAME}-${SLURM_JOB_ID}.done"
+export RAY_DONE_FLAG="/root/miles/experiments/outputs/.ray/${RUN_NAME}-${MILES_JOB_ID}.done"
 export RAY_HEAD_IP_FILE="${RAY_DONE_FLAG}.head-ip"
 export RAY_DASHBOARD_HOST=127.0.0.1
 mkdir -p "${OUTPUT_DIR}/.ray"
 rm -f \
-    "${OUTPUT_DIR}/.ray/${RUN_NAME}-${SLURM_JOB_ID}.done" \
-    "${OUTPUT_DIR}/.ray/${RUN_NAME}-${SLURM_JOB_ID}.done.head-ip"
+    "${OUTPUT_DIR}/.ray/${RUN_NAME}-${MILES_JOB_ID}.done" \
+    "${OUTPUT_DIR}/.ray/${RUN_NAME}-${MILES_JOB_ID}.done.head-ip"
 source "${REPO_ROOT}/experiments/common/clean_checkpoint.sh"
 
-STEP_CPUS_PER_NODE="${SLURM_CPUS_PER_TASK:-${SLURM_JOB_CPUS_PER_NODE%%\(*}}"
+STEP_CPUS_PER_NODE="${PBS_GPU_CPUS_PER_NODE}"
 DOTENV_MASK="${REPO_ROOT}/experiments/common/dotenv.disabled"
 [[ -f "${DOTENV_MASK}" && ! -L "${DOTENV_MASK}" ]] || {
     echo "tracked dotenv mask is missing or unsafe" >&2
@@ -246,17 +240,12 @@ DOTENV_MASK="${REPO_ROOT}/experiments/common/dotenv.disabled"
 MOUNTS="${CONTAINER_MOUNTS},${DOTENV_MASK}:/root/miles/.env:ro"
 
 # Never forward the submission shell wholesale: it may contain unrelated cloud,
-# registry, model-provider, or tracking credentials. Slurm always supplies its
-# own SLURM_* variables in addition to these fixed names.
+# registry, model-provider, or tracking credentials. PBS context is normalized
+# to fixed MILES_* names by experiments/env.sh.
 join_export_names() {
     local IFS=,
     printf '%s' "$*"
 }
-EFA_PREFLIGHT_EXPORT_NAMES=(
-    FI_PROVIDER LD_LIBRARY_PATH MILES_NCCL_TRANSPORT NCCL_IB_DISABLE NCCL_NET
-    NCCL_NET_PLUGIN NCCL_TUNER_PLUGIN PYTHON_DOTENV_DISABLED WANDB_DISABLED
-    WANDB_MODE
-)
 TRAINING_EXPORT_NAMES=(
     ACTOR_GPUS_PER_NODE ACTOR_NUM_NODES ADVANTAGE_ESTIMATOR
     ADMISSION_SUMMARY AGENT_MODEL_NAME AGENT_SERVER_URL ASYNC_MAX_CONCURRENT_SAMPLES
@@ -264,13 +253,13 @@ TRAINING_EXPORT_NAMES=(
     CUDA_CACHE_PATH DATASET_TAG DEBUG_EXIT_AFTER_ROLLOUT DYNAMIC_FILTER_PATH
     ENTROPY_COEF EPS_CLIP EPS_CLIP_C EPS_CLIP_HIGH EVAL_INTERVAL
     EXPERT_PARALLEL_SIZE
-    FI_PROVIDER FUSE_ONE_STEP_ACTOR_LOGPROBS GLOBAL_BATCH_SIZE GPUS_PER_NODE
+    FUSE_ONE_STEP_ACTOR_LOGPROBS GLOBAL_BATCH_SIZE GPUS_PER_NODE
     HARBOR_CLIENT_ID HARBOR_RUN_SECRET HF_MODEL_NAME HF_SAVE_INTERVAL
     KL_LOSS_COEF LD_LIBRARY_PATH LOG_SAMPLE_STALENESS_METRICS
     LOG_UPDATE_DIAGNOSTICS LR M2PO_BUDGET MAX_RESPONSE_LEN MAX_SEQUENCE_LEN
     MAX_TOKENS_PER_GPU MAX_WEIGHT_STALENESS MILES_NCCL_TRANSPORT MIS_PROFILE
-    MODEL_NAME MODEL_PROFILE NCCL_IB_DISABLE NCCL_NET NCCL_NET_PLUGIN
-    NCCL_TUNER_PLUGIN NODE_RAY_TEMP_DIR NUM_ROLLOUT NUM_STEPS_PER_ROLLOUT
+    MODEL_NAME MODEL_PROFILE NCCL_IB_DISABLE NCCL_NET
+    NODE_RAY_TEMP_DIR NUM_ROLLOUT NUM_STEPS_PER_ROLLOUT
     N_SAMPLES_PER_PROMPT
     OPSM_DELTA OUTPUT_DIR PAUSE_GENERATION_MODE PLACEMENT PROMPT_DATA
     PYTHON_DOTENV_DISABLED QUEUE_FACTOR QUEUE_TYPE RATIO_DENOMINATOR
@@ -288,7 +277,6 @@ TRAINING_EXPORT_NAMES=(
     VLLM_CACHE_ROOT WANDB_DISABLED WANDB_MODE ZERO_REWARD_ON_TRUNCATED
     CUSTOM_AGENT_FUNCTION_PATH CUSTOM_GENERATE_FUNCTION_PATH CUSTOM_RM_PATH
 )
-EFA_PREFLIGHT_EXPORT_CSV="$(join_export_names "${EFA_PREFLIGHT_EXPORT_NAMES[@]}")"
 TRAINING_EXPORT_CSV="$(join_export_names "${TRAINING_EXPORT_NAMES[@]}")"
 
 PYTHONPATH="${REPO_ROOT}" PYTHONDONTWRITEBYTECODE=1 \
@@ -298,8 +286,13 @@ PYTHONPATH="${REPO_ROOT}" PYTHONDONTWRITEBYTECODE=1 \
     --admission-summary "${HOST_ADMISSION_SUMMARY}" \
     --timeout-seconds "${SWE_AGENT_SERVER_READY_TIMEOUT_SEC}"
 
-echo "running EFA fail-closed preflight on every node"
 training_step_pid=""
+pretimeout_timer_pid=""
+: "${SWE_PRETIMEOUT_DELAY_SECONDS:=85500}"
+[[ "${SWE_PRETIMEOUT_DELAY_SECONDS}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "SWE_PRETIMEOUT_DELAY_SECONDS must be a positive integer" >&2
+    exit 2
+}
 drain_harbor_client() {
     PYTHONPATH="${REPO_ROOT}" PYTHONDONTWRITEBYTECODE=1 \
         python3 \
@@ -311,13 +304,16 @@ stop_training_step() {
     fi
 }
 handle_pretimeout() {
-    echo "Slurm pre-timeout signal received; draining Harbor trials" >&2
+    echo "scheduler termination signal received; draining Harbor trials" >&2
     drain_harbor_client || true
     stop_training_step
 }
 cleanup_training() {
     local status=$?
     trap - EXIT USR1 TERM
+    if [[ -n "${pretimeout_timer_pid}" ]]; then
+        kill "${pretimeout_timer_pid}" 2>/dev/null || true
+    fi
     drain_harbor_client || true
     stop_training_step
     if [[ -n "${training_step_pid}" ]]; then
@@ -329,29 +325,22 @@ trap handle_pretimeout USR1
 trap 'handle_pretimeout; exit 143' TERM
 trap cleanup_training EXIT
 
-srun \
-    --nodes="${SLURM_JOB_NUM_NODES}" \
-    --ntasks="${SLURM_JOB_NUM_NODES}" \
-    --ntasks-per-node=1 \
-    --cpus-per-task=8 \
-    --mem=0 \
-    --container-image="${SQSH_IMAGE}" \
-    --container-mounts="${MOUNTS}" \
-    --no-container-mount-home \
-    --export="${EFA_PREFLIGHT_EXPORT_CSV}" \
-    bash /root/miles/experiments/common/check_efa.sh
+# Preserve the Harbor drain window with a local timer 15 minutes before the
+# 24-hour allocation ends.
+( sleep "${SWE_PRETIMEOUT_DELAY_SECONDS}"; kill -USR1 "$$" ) &
+pretimeout_timer_pid=$!
 
-srun \
-    --nodes="${SLURM_JOB_NUM_NODES}" \
+miles_srun \
+    --nodes="${MILES_JOB_NUM_NODES}" \
     --ntasks-per-node=1 \
     --cpus-per-task="${STEP_CPUS_PER_NODE}" \
     --mem=0 \
-    --container-image="${SQSH_IMAGE}" \
-    --container-mounts="${MOUNTS}" \
-    --container-writable \
-    --no-container-mount-home \
+    --image="${CONTAINER_IMAGE}" \
+    --bind="${MOUNTS}" \
+    --writable-tmpfs \
+    --no-home \
     --export="${TRAINING_EXPORT_CSV}" \
-    bash /root/miles/experiments/common/run_with_efa_env.sh bash "${TRAIN_SCRIPT}" &
+    bash "${TRAIN_SCRIPT}" &
 training_step_pid=$!
 set +e
 wait "${training_step_pid}"

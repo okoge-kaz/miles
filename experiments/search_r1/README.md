@@ -1,8 +1,9 @@
 # Search-R1 experiments
 
-For a destination-cluster checklist, including the B300/CUDA 13 and Enroot
-`.sqsh` qualification procedure, see
-[`CLUSTER_MIGRATION.md`](CLUSTER_MIGRATION.md).
+For the current PBS Pro + SingularityCE workflow, see
+[`../PBS_SINGULARITY.md`](../PBS_SINGULARITY.md). The older B300/CUDA 13 audit
+in [`CLUSTER_MIGRATION.md`](CLUSTER_MIGRATION.md) is a historical hardware
+qualification record, not a submission guide for this cluster.
 
 The maintained 4B recipe starts from the user's step-4000 SFT checkpoint:
 
@@ -13,8 +14,7 @@ It logs to the W&B project `async-search-r1`. Submit it with:
 
 ```bash
 experiments/submit_training.sh \
-  search_r1/async/nq-hotpotqa-p10-90/qwen3-4b search-r1-async \
-  --qos=interactive
+  search_r1/async/nq-hotpotqa-p10-90/qwen3-4b search-r1-async
 ```
 
 All Search-R1 experiment entrypoints live in this directory; no compatibility
@@ -27,7 +27,7 @@ work to one accepted rollout batch:
 ```bash
 experiments/submit_training.sh \
   search_r1/async/nq-hotpotqa-p10-90/qwen3-4b search-r1-offline-smoke \
-  --qos=interactive --time=04:00:00 \
+  --profile=gpu --time=01:00:00 \
   --export=ALL,WANDB_MODE=offline,NUM_ROLLOUT=1,ROLLOUT_BATCH_SIZE=4,N_SAMPLES_PER_PROMPT=2,GLOBAL_BATCH_SIZE=8,SAVE_INTERVAL=1
 ```
 
@@ -45,7 +45,9 @@ checkpoints outside the optimizer loop and forces W&B offline mode.
 Validate NQ and HotpotQA on two prompts each on an interactive node:
 
 ```bash
-sbatch -A coreai_horizon_dilations -p batch --qos=interactive \
+source experiments/env.sh
+source experiments/common/pbs.sh
+pbs_submit --profile=gpu --time=01:00:00 \
   --export=ALL,WANDB_MODE=offline,EVAL_MODE=smoke \
   experiments/search_r1/evaluation/run.sbatch
 ```
@@ -99,12 +101,15 @@ Prepare the assets, validate the measurement path on 64 prompts, then run the
 resumable full measurement:
 
 ```bash
-sbatch -A coreai_horizon_dilations experiments/setup/environments/prepare_search_r1.sbatch
+source experiments/env.sh
+source experiments/common/pbs.sh
+pbs_submit --profile=cpu --job-kind=prep \
+  experiments/setup/environments/prepare_search_r1.sbatch
 
-sbatch -A coreai_horizon_dilations --export=ALL,LIMIT=64 \
+pbs_submit --profile=gpu --time=01:00:00 --export=ALL,LIMIT=64 \
   experiments/tools/difficulty_filter/run_measure_search_r1.sbatch
 
-sbatch -A coreai_horizon_dilations \
+pbs_submit --profile=gpu --time="${PBS_DEFAULT_WALLTIME}" \
   experiments/tools/difficulty_filter/run_measure_search_r1.sbatch
 ```
 
@@ -237,13 +242,15 @@ fix.
 
 ## Cluster portability
 
-The recipes are ready for another Slurm cluster that provides Pyxis/Enroot,
-eight GPUs per requested node, a shared filesystem, and routable TCP between
-nodes. Override `SHARED_WS`, `WS`, `SQSH_IMAGE`, `SLURM_ACCOUNT_NAME`, and, when
-needed, `GPUS_PER_NODE` before submission. Stage assets with
-`experiments/setup/download/stage_all.sh` and
-`experiments/setup/environments/prepare_search_r1.sbatch`, then materialize the policy-specific
-fixed dataset with `experiments/tools/difficulty_filter/run_measure_search_r1.sbatch`.
+The recipes target PBS Pro, SingularityCE, eight GPUs per requested GPU node, a
+shared filesystem, and routable TCP between nodes. Set
+`MILES_WORKSPACE_ROOT` before sourcing `experiments/env.sh`; all checkpoint,
+dataset, container, and cache paths derive from it. Override the queue or node
+shape variables only when the destination differs. Stage general assets with
+`experiments/setup.sh`, prepare the retrieval assets with
+`experiments/setup/environments/prepare_search_r1.sbatch`, then materialize the
+policy-specific fixed dataset with
+`experiments/tools/difficulty_filter/run_measure_search_r1.sbatch`.
 Copying the resulting JSONL and its pass-rate/meta artifacts is sufficient when
 the other cluster uses the same policy, tokenizer, E5 index/corpus, and sampling
 settings; otherwise re-measure there.
@@ -255,10 +262,9 @@ and job processes. Bake `faiss-cpu`, `fastapi`, and `uvicorn` into the cluster
 image when compute nodes have no package-index egress; the worker installs them
 only when imports are missing.
 
-An arbitrary non-Slurm or non-Pyxis cluster is not turnkey yet. It needs a
-launcher adapter that preserves `/root/miles`, `/data`, and `/ckpt` mounts, Ray
-head/worker discovery, the retriever port, two-node async GPU placement, and
-durable shared storage for the replay buffer. Before a long run,
-perform a one-update smoke and verify the retriever's real `/retrieve` probe,
-valid tagged actions, non-empty search observations, W&B project, checkpoint,
-and replay-buffer restore.
+A different scheduler or container runtime still needs a launcher adapter that
+preserves `/root/miles`, `/data`, `/ckpt`, and `/cache`, Ray head/worker
+discovery, the retriever port, two-node async GPU placement, and durable shared
+storage for the replay buffer. Before a long run, perform a one-update smoke and
+verify the retriever's real `/retrieve` probe, valid tagged actions, non-empty
+search observations, W&B project, checkpoint, and replay-buffer restore.

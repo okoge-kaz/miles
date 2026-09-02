@@ -1,8 +1,8 @@
-# Slurm integration tests
+# PBS/Singularity integration tests
 
 These launchers are persistent cluster integration tests. They run on the
-`cpu-interactive` QoS with W&B offline by construction and write logs under
-`experiments/outputs/validation`.
+the `R9920261300` reservation with W&B offline by construction. The historical
+`tests/slurm` path is retained so existing test references remain stable.
 
 | Test | Coverage | Prerequisite |
 | --- | --- | --- |
@@ -17,7 +17,8 @@ These launchers are persistent cluster integration tests. They run on the
 Submit from the repository root, for example:
 
 ```bash
-sbatch tests/slurm/test_nemotron_components.sbatch
+source experiments/env.sh
+pbs_submit --profile=cpu tests/slurm/test_nemotron_components.sbatch
 ```
 
 Small deterministic checks remain under `tests/fast`; these jobs exist only for

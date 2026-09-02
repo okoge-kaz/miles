@@ -1,21 +1,17 @@
 #!/bin/bash
-#SBATCH --job-name=q3-4b-tool-call-pivot-eval
-#SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=batch
-#SBATCH --qos=interactive
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --gpus-per-node=8
-#SBATCH --cpus-per-task=128
-#SBATCH --time=04:00:00
-#SBATCH --output=experiments/outputs/reasoning_eval/%x-%j.log
+#PBS -N q3-4b-tool-call-pivot-eval
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=192:ngpus=8:mpiprocs=1
+#PBS -l place=scatter:excl
+#PBS -l walltime=04:00:00
+#PBS -j oe
 
 # Held-out exact next-tool-action evaluation. No external model or sandbox API
 # is used. TRAINING_HF_ROOT selects the newest complete periodic HF export.
 
 set -euo pipefail
 
-REPO_ROOT="$(realpath -- "${SLURM_SUBMIT_DIR:?submit from the Miles repository root}")"
+REPO_ROOT="$(realpath -- "${PBS_O_WORKDIR:?submit from the Miles repository root}")"
 source "${REPO_ROOT}/experiments/env.sh"
 : "${RESULT_ROOT:?set RESULT_ROOT}"
 
@@ -44,10 +40,10 @@ RESULT_ROOT="$(realpath -m -- "${RESULT_ROOT}")"
 mkdir -p "${RESULT_ROOT}" "${CACHE_DIR}/reasoning_eval/huggingface"
 printf '%s\n' "${CHECKPOINT_PATH}" > "${RESULT_ROOT}/selected-checkpoint.txt"
 
-VLLM_IMAGE="${SHARED_WS}/containers/vllm-openai-v0.20.2-70a098d9.sqsh"
+VLLM_IMAGE="${REASONING_EVAL_CONTAINER_ROOT:-${CONTAINER_DIR}/reasoning-eval}/vllm-openai-v0.20.2-70a098d9.sif"
 UNPAD_TOOL="${REPO_ROOT}/experiments/tools/reasoning_eval/unpad_vocab.py"
-MODEL_RUNTIME_DIR="${SLURM_TMPDIR:-/tmp}/tool-call-eval-model-${SLURM_JOB_ID}"
-TOKENIZER_RUNTIME_DIR="${SLURM_TMPDIR:-/tmp}/tool-call-eval-tokenizer-${SLURM_JOB_ID}"
+MODEL_RUNTIME_DIR="${MILES_JOB_TMPDIR:-/tmp}/tool-call-eval-model-${MILES_JOB_ID}"
+TOKENIZER_RUNTIME_DIR="${MILES_JOB_TMPDIR:-/tmp}/tool-call-eval-tokenizer-${MILES_JOB_ID}"
 python3 "${UNPAD_TOOL}" "${CHECKPOINT_PATH}" "${MODEL_RUNTIME_DIR}"
 if [[ -f "${MODEL_RUNTIME_DIR}/config.json" ]]; then
     MODEL_MOUNTS="${MODEL_RUNTIME_DIR}:/checkpoint,${CHECKPOINT_PATH}:${CHECKPOINT_PATH}:ro"
@@ -73,11 +69,11 @@ TOOL_CALL_EVAL_INPUT="${TOOL_CALL_EVAL_INPUT:-/data/nemotron-agentic-conv-toolus
     exit 1
 }
 SERVED_MODEL=tool-call-eval-qwen3-4b
-VLLM_LOG="${RESULT_ROOT}/vllm-${SLURM_JOB_ID}.log"
-srun --overlap --exact --nodes=1 --ntasks=1 --gpus-per-node=8 --cpus-per-task=96 \
-    --container-image="${VLLM_IMAGE}" \
-    --container-mounts="${MODEL_MOUNTS},${TOKENIZER_RUNTIME_DIR}:/runtime-tokenizer:ro,${CACHE_DIR}/reasoning_eval:/evaluation-cache" \
-    --container-workdir=/ --no-container-mount-home \
+VLLM_LOG="${RESULT_ROOT}/vllm-${MILES_JOB_ID}.log"
+miles_srun --overlap --exact --nodes=1 --ntasks=1 --gpus-per-node=8 --cpus-per-task=96 \
+    --image="${VLLM_IMAGE}" \
+    --bind="${MODEL_MOUNTS},${TOKENIZER_RUNTIME_DIR}:/runtime-tokenizer:ro,${CACHE_DIR}/reasoning_eval:/evaluation-cache" \
+    --cwd=/ --no-home \
     --export="ALL,HF_HOME=/evaluation-cache/huggingface,HF_HUB_OFFLINE=1,TRANSFORMERS_OFFLINE=1,PYTHONUNBUFFERED=1,OMP_NUM_THREADS=1,NCCL_NVLS_ENABLE=0,VLLM_WORKER_MULTIPROC_METHOD=spawn" \
     bash -lc '
 exec vllm serve /checkpoint --tokenizer /runtime-tokenizer --host 0.0.0.0 --port "$1" \
@@ -99,10 +95,10 @@ for _ in $(seq 1 180); do
 done
 curl --fail --silent "http://127.0.0.1:${VLLM_PORT}/health" >/dev/null
 
-srun --overlap --exact --nodes=1 --ntasks=1 --cpus-per-task=32 \
-    --container-image="${SQSH_IMAGE}" \
-    --container-mounts="${CONTAINER_MOUNTS},${RESULT_ROOT}:/results" \
-    --container-writable --no-container-mount-home --export=ALL \
+miles_srun --overlap --exact --nodes=1 --ntasks=1 --cpus-per-task=32 \
+    --image="${CONTAINER_IMAGE}" \
+    --bind="${CONTAINER_MOUNTS},${RESULT_ROOT}:/results" \
+    --writable-tmpfs --no-home --export=ALL \
     bash -lc '
 set -euo pipefail
 cd /root/miles

@@ -293,7 +293,7 @@ run_mode() {
             ${MISC_ARGS[@]}
     else
         # Worker nodes must stay alive so the Ray worker process keeps running.
-        # The srun will be terminated by SLURM when the head node exits.
+        # The allocation launcher terminates workers when the head node exits.
         echo "Worker node ${NODE_RANK}: waiting for head node to finish..."
         while true; do
             sleep 60

@@ -79,7 +79,7 @@ def require_gemini_api_key(environ: Mapping[str, str] | None = None) -> str:
     if not api_key:
         raise GeminiRequestError(
             "GEMINI_API_KEY is required for the Gemini Tau user backend; "
-            "provide it in the process environment (Tau Slurm wrappers load "
+            "provide it in the process environment (Tau PBS wrappers load "
             "allowlisted .env values at job startup)"
         )
     return api_key
@@ -93,7 +93,7 @@ def require_nvidia_api_key(environ: Mapping[str, str] | None = None) -> str:
     if not api_key:
         raise NvidiaRequestError(
             "NVIDIA_INFERENCE_API_KEY is required for the NVIDIA Tau user backend; "
-            "provide it in the process environment (Tau Slurm wrappers load "
+            "provide it in the process environment (Tau PBS wrappers load "
             "allowlisted .env values at job startup)"
         )
     return api_key

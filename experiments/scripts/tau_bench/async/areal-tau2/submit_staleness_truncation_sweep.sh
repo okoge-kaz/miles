@@ -28,15 +28,13 @@ readonly -a RATIOS=(1:7 2:6)
 readonly -a TRUNCATION_MODES=(zero-reward zero-loss)
 
 : "${RUN_NAMESPACE:=tau2-40k-stale-$(date +%Y%m%d-%H%M%S)}"
-: "${CHAIN_MAX_SEGMENTS:=64}"
-: "${CHAIN_PARTITION:=batch}"
-: "${CHAIN_QOS:=normal}"
+: "${CHAIN_MAX_SEGMENTS:=16}"
+: "${CHAIN_WALLTIME:=${PBS_DEFAULT_WALLTIME}}"
+: "${CHAIN_SIGNAL_LEAD_SECONDS:=900}"
 : "${WANDB_PROJECT:=async-rl-tau}"
-CHAIN_ACCOUNT="${SLURM_ACCOUNT_NAME:-coreai_horizon_dilations}"
 CHAIN_LOG_DIR="${OUTPUT_DIR}/training/tau_bench/areal-tau2/qwen3-4b-agentic-sft-953/staleness-truncation"
-readonly RUN_NAMESPACE CHAIN_MAX_SEGMENTS CHAIN_PARTITION CHAIN_QOS WANDB_PROJECT
-readonly CHAIN_ACCOUNT CHAIN_LOG_DIR
-readonly IDLE_EXEMPTION='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"60","reason":"data_loading","description":"Tau2 multi-turn RL waits for external user-simulator turns and long policy trajectories"}}'
+readonly RUN_NAMESPACE CHAIN_MAX_SEGMENTS CHAIN_WALLTIME CHAIN_SIGNAL_LEAD_SECONDS
+readonly WANDB_PROJECT CHAIN_LOG_DIR
 
 SUBMIT=0
 usage() {
@@ -51,7 +49,7 @@ Dry-run by default. --submit starts the 12-arm grid:
 
 Every arm targets 180 updates (5.721 effective epochs), uses 40,960-token
 context/response limits, TIS, LR=1e-6, inflight replay, DB/prefill overlap,
-and detailed Tau environment timing. Jobs run in dynamically extended four-hour
+and detailed Tau environment timing. Jobs run in dynamically extended 24-hour
 segments until the target tracker is present. RUN_NAMESPACE resumes the same
 identity when reused. CHAIN_MAX_SEGMENTS is a fail-safe, not a planned length.
 EOF
@@ -97,8 +95,8 @@ printf 'schedule: updates=%s, RBS=%s, n=%s, GBS=%s, prompt_groups=%s, trajectori
     "${effective_epochs}"
 printf 'sequence: max_context=%s, max_response=%s; optimizer: TIS, LR=1e-6\n' \
     "${MAX_CONTEXT_LEN}" "${MAX_RESPONSE_LEN}"
-printf 'checkpoint: Megatron every 10 (latest only), HF every 10, replay latest 1; chain: 4h, max=%s segments\n' \
-    "${CHAIN_MAX_SEGMENTS}"
+printf 'checkpoint: Megatron every 10 (latest only), HF every 10, replay latest 1; chain: %s, max=%s segments\n' \
+    "${CHAIN_WALLTIME}" "${CHAIN_MAX_SEGMENTS}"
 printf 'timing: Tau user/tool/terminal/reset/close logging=on, DB restore/prefill overlap=on\n'
 printf 'queue caveat: (capacity %s + inflight %s) / RBS %s = %s updates; M=20 is an effectively unbounded control and M=16 is near the natural ceiling.\n' \
     "${OUTPUT_QUEUE_MAX_GROUPS}" "${INFLIGHT_GROUPS}" "${ROLLOUT_BATCH_SIZE}" \
@@ -148,20 +146,26 @@ for staleness in "${STALENESS_LEVELS[@]}"; do
 done
 
 if ((SUBMIT == 0)); then
-    printf '\ndry run; add --submit to enqueue the first four-hour segment of every arm\n'
+    printf '\ndry run; add --submit to enqueue the first %s segment of every arm\n' "${CHAIN_WALLTIME}"
     exit 0
 fi
 
 mkdir -p "${CHAIN_LOG_DIR}" "${OUTPUT_DIR}/.save-trigger"
-if ! active_job_rows="$(squeue --noheader --user="${USER:?}" --format='%j|%A')"; then
+set +e
+active_job_ids="$(qselect -u "${USER:?}" 2>/dev/null)"
+active_query_status=$?
+set -e
+if (( active_query_status != 0 && active_query_status != 162 )); then
     echo "could not query active jobs; refusing a potentially duplicate submission" >&2
     exit 1
 fi
 declare -A ACTIVE_JOB_IDS=()
-while IFS='|' read -r active_name active_job_id; do
-    [[ -n "${active_name}" && -n "${active_job_id}" ]] || continue
+while IFS= read -r active_job_id; do
+    [[ -n "${active_job_id}" ]] || continue
+    active_name="$(qstat -f "${active_job_id}" | awk -F ' = ' '$1 ~ /^[[:space:]]*Job_Name$/ { print $2; exit }')"
+    [[ -n "${active_name}" ]] || continue
     ACTIVE_JOB_IDS["${active_name}"]="${ACTIVE_JOB_IDS["${active_name}"]:+${ACTIVE_JOB_IDS["${active_name}"]},}${active_job_id}"
-done <<<"${active_job_rows}"
+done <<<"${active_job_ids}"
 
 printf '\n'
 for arm_row in "${ARM_ROWS[@]}"; do
@@ -213,23 +217,18 @@ for arm_row in "${ARM_ROWS[@]}"; do
         "DEBUG_EXIT_AFTER_ROLLOUT="
         "CHAIN_INDEX=1"
         "CHAIN_MAX_SEGMENTS=${CHAIN_MAX_SEGMENTS}"
-        "CHAIN_ACCOUNT=${CHAIN_ACCOUNT}"
-        "CHAIN_PARTITION=${CHAIN_PARTITION}"
-        "CHAIN_QOS=${CHAIN_QOS}"
+        "CHAIN_WALLTIME=${CHAIN_WALLTIME}"
+        "CHAIN_SIGNAL_LEAD_SECONDS=${CHAIN_SIGNAL_LEAD_SECONDS}"
         "CHAIN_LOG_DIR=${CHAIN_LOG_DIR}"
     )
     exports_csv="$(IFS=,; printf '%s' "${exports[*]}")"
-    raw_job_id="$(sbatch --parsable \
-        --account="${CHAIN_ACCOUNT}" \
-        --partition="${CHAIN_PARTITION}" \
-        --qos="${CHAIN_QOS}" \
+    raw_job_id="$(pbs_submit --parsable --profile gpu \
         --nodes="${TOTAL_NODES}" \
-        --time=04:00:00 \
+        --time="${CHAIN_WALLTIME}" \
         --job-name="${run_name}" \
-        --comment="${IDLE_EXEMPTION}" \
         --output="${CHAIN_LOG_DIR}/${run_name}-%j.log" \
         --export="ALL,${exports_csv}" \
         "${SEGMENT_SCRIPT}")"
     printf 'submitted %-72s job=%s chain=1/%s\n' \
-        "${run_name}" "${raw_job_id%%;*}" "${CHAIN_MAX_SEGMENTS}"
+        "${run_name}" "${raw_job_id}" "${CHAIN_MAX_SEGMENTS}"
 done

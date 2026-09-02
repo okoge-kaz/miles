@@ -1,20 +1,16 @@
 #!/bin/bash
-#SBATCH --job-name=miles-swe-e2b-server
-#SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=cpu
-#SBATCH --qos=cpu-normal
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=32
-#SBATCH --time=1-00:00:00
-#SBATCH --output=experiments/outputs/validation/%x-%j.log
-#SBATCH --export=NIL
+#PBS -N miles-swe-e2b-server
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=32:mpiprocs=1
+#PBS -l place=scatter
+#PBS -l walltime=24:00:00
+#PBS -j oe
 
 # Durable one-day Harbor/E2B agent-server allocation. This leaves room for
-# full-shard admission before a four-hour training allocation starts. The
+# full-shard admission before the GPU training allocation starts. The
 # 32 CPUs provide one host core per two maximum concurrent async trajectories
 # at the recipe default of 64; live throughput remains an explicit scale gate.
-# Credentials come only from the process environment inherited by Slurm; this
+# Credentials come only from the fixed-name environment inherited through PBS;
 # script never reads a dotenv file or writes credentials to argv/log/metadata.
 
 set -euo pipefail
@@ -33,14 +29,15 @@ export PATH USER
     exit 2
 }
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd -P)}"
-: "${E2B_API_KEY:?export E2B_API_KEY before sbatch; .env is never read}"
+REPO_ROOT="${MILES_SUBMIT_DIR:-${PBS_O_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd -P)}}"
+source "${REPO_ROOT}/experiments/common/pbs.sh"
+: "${E2B_API_KEY:?export E2B_API_KEY before pbs_submit; .env is never read}"
 : "${HARBOR_ROOT:?set HARBOR_ROOT to the pinned Harbor checkout}"
 : "${HARBOR_TASKS_DIR:?set HARBOR_TASKS_DIR to production-materialized tasks}"
 : "${HARBOR_E2B_PREBUILD_TASK_IDS_FILE:?set an owner-only admitted task-id file}"
 : "${HARBOR_E2B_SEMANTIC_ADMISSION_MANIFESTS:?set colon-separated owner-only semantic admission JSONL files}"
-: "${HARBOR_RUN_SECRET:?export a dedicated /run bearer secret before sbatch}"
-: "${HARBOR_ADMIN_SECRET:?export a distinct admin bearer secret before sbatch}"
+: "${HARBOR_RUN_SECRET:?export a dedicated /run bearer secret before pbs_submit}"
+: "${HARBOR_ADMIN_SECRET:?export a distinct admin bearer secret before pbs_submit}"
 : "${MAX_CONCURRENT:?set MAX_CONCURRENT equal to the training ASYNC_MAX_CONCURRENT_SAMPLES}"
 
 [[ "$HARBOR_RUN_SECRET" != "$HARBOR_ADMIN_SECRET" ]] || {
@@ -54,8 +51,8 @@ export WANDB_DISABLED=true
 export PYTHON_DOTENV_DISABLED=1
 export PYTHONDONTWRITEBYTECODE=1
 export MILES_ROOT="${REPO_ROOT}"
-export PORT="${PORT:-$((12000 + SLURM_JOB_ID % 20000))}"
-export TRIALS_DIR="${TRIALS_DIR:-${REPO_ROOT}/outputs/validation/harbor-e2b-server-${SLURM_JOB_ID}}"
+export PORT="${PORT:-$((12000 + 10#${MILES_JOB_ID_SHORT} % 20000))}"
+export TRIALS_DIR="${TRIALS_DIR:-${REPO_ROOT}/outputs/validation/harbor-e2b-server-${MILES_JOB_ID}}"
 
 if [[ -e "${TRIALS_DIR}" ]]; then
     [[ -d "${TRIALS_DIR}" && ! -L "${TRIALS_DIR}" && \
@@ -67,15 +64,15 @@ else
     mkdir -p -m 0700 "${TRIALS_DIR}"
 fi
 chmod 0700 "${TRIALS_DIR}"
-slurm_log="${REPO_ROOT}/experiments/outputs/validation/miles-swe-e2b-server-${SLURM_JOB_ID}.log"
-if [[ -e "${slurm_log}" ]]; then
-    [[ -f "${slurm_log}" && ! -L "${slurm_log}" && \
-        "$(stat -c '%h' "${slurm_log}")" == 1 && \
-        "$(stat -c '%u' "${slurm_log}")" == "$(id -u)" ]] || {
-        echo "Slurm output path is unsafe" >&2
+scheduler_log="${REPO_ROOT}/experiments/outputs/validation/${PBS_JOBNAME:-miles-swe-e2b-server}.o${MILES_JOB_ID_SHORT}"
+if [[ -e "${scheduler_log}" ]]; then
+    [[ -f "${scheduler_log}" && ! -L "${scheduler_log}" && \
+        "$(stat -c '%h' "${scheduler_log}")" == 1 && \
+        "$(stat -c '%u' "${scheduler_log}")" == "$(id -u)" ]] || {
+        echo "PBS output path is unsafe" >&2
         exit 2
     }
-    chmod 0600 "${slurm_log}"
+    chmod 0600 "${scheduler_log}"
 fi
 server_host="$(hostname -f)"
 printf 'AGENT_SERVER_URL=http://%s:%s\n' "${server_host}" "${PORT}"

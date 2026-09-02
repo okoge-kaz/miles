@@ -1,14 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=q3-4b-reasoning-suite
-#SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=batch
-#SBATCH --qos=interactive
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --gres=gpu:8
-#SBATCH --cpus-per-task=128
-#SBATCH --time=04:00:00
-#SBATCH --output=experiments/outputs/reasoning_eval/%x-%j.log
+#PBS -N q3-4b-reasoning-suite
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=192:ngpus=8:mpiprocs=1
+#PBS -l place=scatter:excl
+#PBS -l walltime=04:00:00
+#PBS -j oe
 
 # Offline checkpoint evaluation for AIME, LiveCodeBench, GPQA, and IFBench. Generation
 # runs against an 8-way vLLM server. The server is stopped before scoring, and
@@ -17,7 +13,7 @@
 
 set -euo pipefail
 
-REPO_ROOT="$(realpath -- "${SLURM_SUBMIT_DIR:?submit from the Miles repository root}")"
+REPO_ROOT="$(realpath -- "${PBS_O_WORKDIR:?submit from the Miles repository root}")"
 source "${REPO_ROOT}/experiments/env.sh"
 EVAL_MODE="${EVAL_MODE:-full}"
 : "${CHECKPOINT_PATH:=${HF_CKPT_DIR}/Qwen3-4B-Base/LR2.0e-5-SEQ32768-GBS128-MBS1-TP1-PP1-CP1-EP1-PACK1-standard-cp-STEPS4000/iter_0004000}"
@@ -37,7 +33,7 @@ GENERATION_CONCURRENCY="${GENERATION_CONCURRENCY:-256}"
 VLLM_PORT="${VLLM_PORT:-8000}"
 VLLM_STARTUP_ATTEMPTS="${VLLM_STARTUP_ATTEMPTS:-3}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-32768}"
-VLLM_IMAGE="${SHARED_WS}/containers/vllm-openai-v0.20.2-70a098d9.sqsh"
+VLLM_IMAGE="${REASONING_EVAL_CONTAINER_ROOT:-${CONTAINER_DIR}/reasoning-eval}/vllm-openai-v0.20.2-70a098d9.sif"
 VLLM_OCI_DIGEST="sha256:70a098d90dbab428a001d9e852fc0fc8d67da5beb03e7851a22247653bf35923"
 EVALUATION_CACHE_ROOT="${CACHE_DIR}/reasoning_eval"
 UNPAD_TOOL="${REPO_ROOT}/experiments/tools/reasoning_eval/unpad_vocab.py"
@@ -73,7 +69,7 @@ CHECKPOINT_MANIFEST_SHA256="$(
 )"
 mkdir -p "${RESULT_ROOT}" "${EVALUATION_CACHE_ROOT}/huggingface"
 
-desired_contract="${SLURM_TMPDIR:-/tmp}/reasoning-eval-suite-contract-${SLURM_JOB_ID}.env"
+desired_contract="${MILES_JOB_TMPDIR:-/tmp}/reasoning-eval-suite-contract-${MILES_JOB_ID}.env"
 cat > "${desired_contract}" <<EOF
 checkpoint=${CHECKPOINT_SOURCE}
 checkpoint_manifest_sha256=${CHECKPOINT_MANIFEST_SHA256}
@@ -104,13 +100,13 @@ else
         echo "legacy RESULT_ROOT contains task artifacts without a contract" >&2
         exit 3
     fi
-    contract_partial="${RESULT_ROOT}/.evaluation-contract.partial-${SLURM_JOB_ID}"
+    contract_partial="${RESULT_ROOT}/.evaluation-contract.partial-${MILES_JOB_ID}"
     cp -- "${desired_contract}" "${contract_partial}"
     mv -- "${contract_partial}" "${RESULT_ROOT}/evaluation-contract.env"
 fi
 
-MODEL_RUNTIME_DIR="${SLURM_TMPDIR:-/tmp}/reasoning-eval-suite-model-${SLURM_JOB_ID}"
-TOKENIZER_RUNTIME_DIR="${SLURM_TMPDIR:-/tmp}/reasoning-eval-suite-tokenizer-${SLURM_JOB_ID}"
+MODEL_RUNTIME_DIR="${MILES_JOB_TMPDIR:-/tmp}/reasoning-eval-suite-model-${MILES_JOB_ID}"
+TOKENIZER_RUNTIME_DIR="${MILES_JOB_TMPDIR:-/tmp}/reasoning-eval-suite-tokenizer-${MILES_JOB_ID}"
 python3 "${UNPAD_TOOL}" "${CHECKPOINT_SOURCE}" "${MODEL_RUNTIME_DIR}"
 if [[ -f "${MODEL_RUNTIME_DIR}/config.json" ]]; then
     MODEL_MOUNTS="${MODEL_RUNTIME_DIR}:/checkpoint,${CHECKPOINT_SOURCE}:${CHECKPOINT_SOURCE}:ro"
@@ -148,11 +144,11 @@ trap stop_server EXIT INT TERM
 SERVED_MODEL=reasoning-eval-suite-qwen3-4b
 SERVER_READY=0
 for startup_attempt in $(seq 1 "${VLLM_STARTUP_ATTEMPTS}"); do
-    VLLM_LOG="${RESULT_ROOT}/vllm-${SLURM_JOB_ID}-attempt-${startup_attempt}.log"
-    srun --overlap --exact --nodes=1 --ntasks=1 --gpus-per-node=8 --cpus-per-task=96 \
-        --container-image="${VLLM_IMAGE}" \
-        --container-mounts="${MODEL_MOUNTS},${TOKENIZER_RUNTIME_DIR}:/runtime-tokenizer:ro,${EVALUATION_CACHE_ROOT}:/evaluation-cache" \
-        --container-workdir=/ --no-container-mount-home \
+    VLLM_LOG="${RESULT_ROOT}/vllm-${MILES_JOB_ID}-attempt-${startup_attempt}.log"
+    miles_srun --overlap --exact --nodes=1 --ntasks=1 --gpus-per-node=8 --cpus-per-task=96 \
+        --image="${VLLM_IMAGE}" \
+        --bind="${MODEL_MOUNTS},${TOKENIZER_RUNTIME_DIR}:/runtime-tokenizer:ro,${EVALUATION_CACHE_ROOT}:/evaluation-cache" \
+        --cwd=/ --no-home \
         --export="ALL,HF_HOME=/evaluation-cache/huggingface,HF_HUB_OFFLINE=1,TRANSFORMERS_OFFLINE=1,PYTHONUNBUFFERED=1,OMP_NUM_THREADS=1,NCCL_NVLS_ENABLE=0,VLLM_WORKER_MULTIPROC_METHOD=spawn" \
         bash -lc '
 exec vllm serve /checkpoint \
@@ -230,7 +226,7 @@ for task in "${REQUESTED_TASKS[@]}"; do
     }
     dataset_sha256="$(sha256sum "${host_input}")"
     dataset_sha256="${dataset_sha256%% *}"
-    provenance_partial="${task_root}/.provenance.partial-${SLURM_JOB_ID}"
+    provenance_partial="${task_root}/.provenance.partial-${MILES_JOB_ID}"
     cat > "${provenance_partial}" <<EOF
 task=${task}
 input=${input}
@@ -246,10 +242,10 @@ top_p=${TOP_P}
 top_k=${TOP_K}
 EOF
     mv -- "${provenance_partial}" "${task_root}/provenance.env"
-    srun --overlap --exact --nodes=1 --ntasks=1 --cpus-per-task=16 \
-        --container-image="${SQSH_IMAGE}" \
-        --container-mounts="${CONTAINER_MOUNTS},${RESULT_ROOT}:/results" \
-        --container-writable --no-container-mount-home --export=ALL \
+    miles_srun --overlap --exact --nodes=1 --ntasks=1 --cpus-per-task=16 \
+        --image="${CONTAINER_IMAGE}" \
+        --bind="${CONTAINER_MOUNTS},${RESULT_ROOT}:/results" \
+        --writable-tmpfs --no-home --export=ALL \
         bash -lc '
 set -euo pipefail
 cd /root/miles
@@ -291,10 +287,10 @@ for task in "${REQUESTED_TASKS[@]}"; do
     fi
     limit_args=()
     [[ "${EVAL_MODE}" == full ]] || limit_args=(--limit 2)
-    srun --overlap --exact --nodes=1 --ntasks=1 --cpus-per-task=128 \
-        --container-image="${SQSH_IMAGE}" \
-        --container-mounts="${CONTAINER_MOUNTS},${RESULT_ROOT}:/results,/usr/bin/bwrap:/usr/local/bin/bwrap" \
-        --container-writable --no-container-mount-home --export=ALL \
+    miles_srun --overlap --exact --nodes=1 --ntasks=1 --cpus-per-task=128 \
+        --image="${CONTAINER_IMAGE}" \
+        --bind="${CONTAINER_MOUNTS},${RESULT_ROOT}:/results,/usr/bin/bwrap:/usr/local/bin/bwrap" \
+        --writable-tmpfs --no-home --export=ALL \
         bash -lc '
 set -euo pipefail
 export PYTHONPATH=/root/miles:/data/ifbench:/data/ifbench-deps

@@ -1,14 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=test-harbor-e2b-live
-#SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=cpu
-#SBATCH --qos=cpu-interactive
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=2
-#SBATCH --time=00:20:00
-#SBATCH --output=experiments/outputs/validation/%x-%j.log
-#SBATCH --export=NIL
+#PBS -N test-harbor-e2b-live
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=32:mpiprocs=1
+#PBS -l place=scatter
+#PBS -l walltime=00:20:00
+#PBS -j oe
 
 # One explicit live lifecycle probe for Harbor's native E2B provider. This job
 # never reads .env and never places the API key in argv, output, or task data.
@@ -19,7 +15,7 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 USER="$(id -un)"
 export PATH USER
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." &>/dev/null && pwd)}"
+REPO_ROOT="${PBS_O_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." &>/dev/null && pwd)}"
 : "${MILES_SWE_FIXED_EXPORTS:?submit with submit_harbor_e2b_live.sh}"
 [[ "${MILES_SWE_FIXED_EXPORTS}" == 1 ]] || exit 2
 [[ -z "${MILES_SWE_UNRELATED_ENV_SENTINEL+x}" ]] || {

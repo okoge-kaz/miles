@@ -1,42 +1,32 @@
 #!/bin/bash
-#SBATCH --job-name=search-r1-eval
-#SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=batch
-#SBATCH --qos=interactive
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --gres=gpu:8
-#SBATCH --cpus-per-task=128
-#SBATCH --exclusive
-#SBATCH --mem=0
-#SBATCH --time=04:00:00
-#SBATCH --output=experiments/outputs/%x-%j.log
+#PBS -N search-r1-eval
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=192:ngpus=8:mpiprocs=1
+#PBS -l place=scatter:excl
+#PBS -l walltime=08:00:00
+#PBS -j oe
 
 # Held-out Search-R1 evaluation. This starts one local E5/FAISS retriever and
 # one data-parallel SGLang server, then evaluates immutable benchmark JSONL
 # files with the exact multi-turn generator and reward used for training.
 #
 # Smoke (two prompts from NQ and HotpotQA):
-#   sbatch -A coreai_horizon_dilations -p batch --qos=interactive \
+#   pbs_submit --profile gpu \
 #     --export=ALL,WANDB_MODE=offline,EVAL_MODE=smoke \
 #     experiments/search_r1/evaluation/run.sbatch
 #
 # Full held-out evaluation of an exported checkpoint:
-#   sbatch -A coreai_horizon_dilations -p batch --qos=interactive \
+#   pbs_submit --profile gpu \
 #     --export=ALL,WANDB_MODE=offline,EVAL_MODE=full,MODEL_PATH=/ckpt/training/<run>/hf/<step> \
 #     experiments/search_r1/evaluation/run.sbatch
 
 set -euo pipefail
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
-SEARCH_R1_IMAGE_WAS_SET="${SQSH_IMAGE+x}"
+REPO_ROOT="${PBS_O_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
 source "${REPO_ROOT}/experiments/env.sh"
-if [[ -z "${SEARCH_R1_IMAGE_WAS_SET}" ]]; then
-    SQSH_IMAGE="${CONTAINER_DIR}/miles-search-r1-b300-faiss-1.12.0-20260826.sqsh"
-    export SQSH_IMAGE
-fi
-unset SEARCH_R1_IMAGE_WAS_SET
-[[ -r "${SQSH_IMAGE}" ]] || { echo "missing Search-R1 image: ${SQSH_IMAGE}" >&2; exit 3; }
+: "${CONTAINER_IMAGE:?source experiments/env.sh first}"
+export CONTAINER_IMAGE
+[[ -r "${CONTAINER_IMAGE}" ]] || { echo "missing Search-R1 image: ${CONTAINER_IMAGE}" >&2; exit 3; }
 
 export WANDB_MODE="${WANDB_MODE:-offline}"
 [[ "${WANDB_MODE}" == offline ]] || {
@@ -92,7 +82,7 @@ MODEL_SOURCE="$(realpath -- "${MODEL_PATH}")"
 CHECKPOINT_MANIFEST_SHA256="$(
     python3 "${VALIDATE_TOOL}" --quiet --print-manifest "${MODEL_SOURCE}"
 )"
-MODEL_RUNTIME_DIR="${SLURM_TMPDIR:-/tmp}/search-r1-model-${SLURM_JOB_ID}"
+MODEL_RUNTIME_DIR="${MILES_JOB_TMPDIR:-/tmp}/search-r1-model-${MILES_JOB_ID}"
 python3 "${UNPAD_TOOL}" "${MODEL_SOURCE}" "${MODEL_RUNTIME_DIR}"
 if [[ -f "${MODEL_RUNTIME_DIR}/config.json" ]]; then
     MODEL_MOUNTS="${MODEL_RUNTIME_DIR}:/search-eval-model,${MODEL_SOURCE}:${MODEL_SOURCE}:ro"
@@ -132,7 +122,7 @@ for revision_marker in "${!EXPECTED_REVISIONS[@]}"; do
 done
 
 mkdir -p "${RESULT_ROOT_HOST}"
-desired_contract="${SLURM_TMPDIR:-/tmp}/search-r1-eval-contract-${SLURM_JOB_ID}.env"
+desired_contract="${MILES_JOB_TMPDIR:-/tmp}/search-r1-eval-contract-${MILES_JOB_ID}.env"
 cat > "${desired_contract}" <<EOF
 checkpoint=${MODEL_SOURCE}
 checkpoint_manifest_sha256=${CHECKPOINT_MANIFEST_SHA256}
@@ -152,7 +142,7 @@ index_revision=a4d31160a035f30764604f4827cd8f1d0315eb86
 corpus_revision=69c1c00ffe7c5554c68d8548355cb22e46aabc51
 flashrag_revision=bcafb8dd07d453be3cbeeeb3f78be1841bddf92c
 e5_revision=f52bf8ec8c7124536f0efb74aca902b2995e5bcd
-container_image=${SQSH_IMAGE}
+container_image=${CONTAINER_IMAGE}
 EOF
 for benchmark in ${BENCHMARKS}; do
     benchmark_sha256="$(sha256sum "${DATASET_DIR}/search-r1/eval/${benchmark}-miles.jsonl")"
@@ -171,7 +161,7 @@ else
         echo "legacy Search-R1 result contains artifacts without a contract" >&2
         exit 6
     fi
-    contract_partial="${RESULT_ROOT_HOST}/.evaluation-contract.partial-${SLURM_JOB_ID}"
+    contract_partial="${RESULT_ROOT_HOST}/.evaluation-contract.partial-${MILES_JOB_ID}"
     cp -- "${desired_contract}" "${contract_partial}"
     mv -- "${contract_partial}" "${RESULT_ROOT_HOST}/evaluation-contract.env"
 fi
@@ -184,10 +174,10 @@ echo "Search-R1 ${EVAL_MODE} evaluation: ${BENCHMARKS}"
 echo "checkpoint: ${MODEL_SOURCE}"
 echo "results: ${RESULT_ROOT_HOST}"
 
-srun \
-    --container-image="${SQSH_IMAGE}" \
-    --container-mounts="${CONTAINER_MOUNTS},${MODEL_MOUNTS},${RESULT_ROOT_HOST}:/results" \
-    --container-writable \
-    --no-container-mount-home \
+miles_srun \
+    --image="${CONTAINER_IMAGE}" \
+    --bind="${CONTAINER_MOUNTS},${MODEL_MOUNTS},${RESULT_ROOT_HOST}:/results" \
+    --writable-tmpfs \
+    --no-home \
     --export=ALL \
     bash /root/miles/experiments/search_r1/common/run_measurement.sh

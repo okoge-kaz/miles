@@ -1,22 +1,21 @@
 #!/bin/bash
-#SBATCH --job-name=miles-staleness-telemetry-cpu
-#SBATCH --partition=cpu_interactive
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --time=00:20:00
-#SBATCH --output=experiments/outputs/staleness-telemetry-cpu-%j.log
+#PBS -N miles-staleness-telemetry-cpu
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=32:mpiprocs=1
+#PBS -l place=scatter
+#PBS -l walltime=00:20:00
+#PBS -j oe
 
 set -euo pipefail
 
-REPO_ROOT="${SLURM_SUBMIT_DIR}"
-SQSH_IMAGE="${SQSH_IMAGE:-/lustre/fs1/portfolios/coreai/projects/coreai_horizon_dilations/users/kfujii/container/miles-staleness-weight-boundaries-f994b9aed.sqsh}"
+REPO_ROOT="${PBS_O_WORKDIR:?submit this test from the repository root}"
+source "${REPO_ROOT}/experiments/env.sh"
 
-srun \
-    --container-image="${SQSH_IMAGE}" \
-    --container-mounts="${REPO_ROOT}:/workspace/miles" \
-    --container-writable \
-    --no-container-mount-home \
+miles_srun \
+    --image="${CONTAINER_IMAGE}" \
+    --bind="${REPO_ROOT}:/workspace/miles" \
+    --writable-tmpfs \
+    --no-home \
     bash -lc '
 set -euo pipefail
 cd /workspace/miles

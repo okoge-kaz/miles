@@ -7,6 +7,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 def test_current_agentic_recipes_never_select_the_prohibited_checkpoint() -> None:
+    environment = (REPO_ROOT / "experiments/env.sh").read_text(encoding="utf-8")
     recipes = (
         REPO_ROOT
         / "experiments/scripts/tool_call_pivot/async/"
@@ -20,7 +21,10 @@ def test_current_agentic_recipes_never_select_the_prohibited_checkpoint() -> Non
         source = recipe.read_text(encoding="utf-8")
         assert "Qwen3-4B-Instruct-2507" not in source
         assert "Qwen3-4B-Base-LR2e-5-Step4000" in source
-        assert "iter_0004000" in source
+        assert "QWEN3_4B_BASE_HF_MODEL" in source
+
+    assert "QWEN3_4B_BASE_HF_RELATIVE_DIR" in environment
+    assert "${QWEN3_4B_BASE_HF_RELATIVE_DIR}/iter_0004000" in environment
 
 
 def test_submitters_reference_current_agentic_recipes() -> None:

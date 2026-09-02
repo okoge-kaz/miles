@@ -25,6 +25,6 @@ ray start --head \
     --temp-dir="${RAY_TEST_ROOT}/ray" >/dev/null
 
 # No runtime-env secret and no secret-bearing command argument is used here.
-# Ray head/driver/workers inherit the fixed-name Slurm export instead.
+# Ray head/driver/workers inherit the fixed-name PBS export instead.
 ray job submit --address=http://127.0.0.1:8265 -- \
     python3 /root/miles/tests/slurm/support/check_swe_ray_secret_inheritance.py

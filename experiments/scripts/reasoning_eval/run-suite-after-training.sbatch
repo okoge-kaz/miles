@@ -1,23 +1,19 @@
 #!/bin/bash
-#SBATCH --job-name=q3-4b-post-rl-reasoning-suite
-#SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=batch
-#SBATCH --qos=interactive
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --gres=gpu:8
-#SBATCH --cpus-per-task=128
-#SBATCH --time=04:00:00
-#SBATCH --output=experiments/outputs/reasoning_eval/%x-%j.log
+#PBS -N q3-4b-post-rl-reasoning-suite
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=192:ngpus=8:mpiprocs=1
+#PBS -l place=scatter:excl
+#PBS -l walltime=04:00:00
+#PBS -j oe
 
 # Resolve the newest complete periodic Hugging Face export after a training job,
 # then run the ordinary held-out evaluator in this allocation. Submit this job
-# with an afterany dependency: a four-hour training allocation is expected to
-# reach its wall-clock limit, while its earlier atomic exports remain valid.
+# with an afterany dependency: training may reach its wall-clock limit, while
+# its earlier atomic exports remain valid.
 
 set -euo pipefail
 
-REPO_ROOT="$(realpath -- "${SLURM_SUBMIT_DIR:?submit from the Miles repository root}")"
+REPO_ROOT="$(realpath -- "${PBS_O_WORKDIR:?submit from the Miles repository root}")"
 : "${TRAINING_HF_ROOT:?set TRAINING_HF_ROOT to the training run hf directory}"
 : "${RESULT_ROOT:?set RESULT_ROOT}"
 

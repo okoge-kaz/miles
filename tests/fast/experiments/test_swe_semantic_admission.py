@@ -645,8 +645,8 @@ def test_swe_setup_wires_admitted_names_and_candidate_locations() -> None:
     ).read_text(encoding="utf-8")
     training = (
         root
-        / "experiments/scripts/swe/async/r2e-gym-swe-rebench-v2/"
-        "qwen3-4b-instruct-2507/run.sbatch"
+        / "experiments/scripts/swe/async/swe-rebench-v2-swe-gym/"
+        "qwen3-4b/run.sbatch"
     ).read_text(encoding="utf-8")
 
     assert '${admitted_root}/${SWE_TASKSET}-train.jsonl' in materialize_setup

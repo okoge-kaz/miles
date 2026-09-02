@@ -8,6 +8,7 @@ export MILES_EXPERIMENTAL_ROLLOUT_REFACTOR=1
 
 NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
 HAS_NVLINK=$([ "$NVLINK_COUNT" -gt 0 ] && echo 1 || echo 0)
+export HAS_NVLINK
 
 cd /root/miles
 [[ "${MODEL_PROFILE}" =~ ^[A-Za-z0-9._-]+$ ]] || {
@@ -20,6 +21,16 @@ MODEL_PROFILE_PATH="/root/miles/scripts/models/${MODEL_PROFILE}.sh"
    exit 1
 }
 source "${MODEL_PROFILE_PATH}"
+
+# ABCI exposes the full-node GPU allocation as UUIDs in
+# CUDA_VISIBLE_DEVICES. Ray preserves those values in ray.get_gpu_ids(), while
+# the current rollout launcher expects numeric IDs. This recipe uses every GPU
+# on each exclusive node, so normalize the in-container view before Ray starts.
+[[ "${GPUS_PER_NODE}" =~ ^[1-9][0-9]*$ ]] || {
+   echo "GPUS_PER_NODE must be a positive integer: ${GPUS_PER_NODE}" >&2
+   exit 1
+}
+export CUDA_VISIBLE_DEVICES="$(seq -s, 0 "$(( GPUS_PER_NODE - 1 ))")"
 source /root/miles/experiments/common/ray_cluster.sh
 
 CKPT_ARGS=(
@@ -246,37 +257,46 @@ MISC_ARGS=(
    --attention-backend "${TRAINING_ATTENTION_BACKEND}"
 )
 
-# WANDB_API_KEY is inherited through --export=ALL. Never put it in this argv:
-# both shell xtrace and Ray's "Running entrypoint" line are persisted in job logs.
+# WANDB_API_KEY is resolved on the compute host and inherited by the container.
+# Never put it in this argv: both shell xtrace and Ray's "Running entrypoint"
+# line are persisted in job logs.
 WANDB_ARGS=(
    --use-wandb
-   --wandb-project "${WANDB_PROJECT:-off-policy-${DATASET_TAG}}"
+   --wandb-team "${WANDB_TEAM}"
+   --wandb-project "${WANDB_PROJECT}"
    --wandb-group "${RUN_NAME}"
 )
 
-RUNTIME_ENV_JSON=$(cat <<JSON
-{
-  "env_vars": {
+RUNTIME_ENV_JSON="$(python3 - <<'PY'
+import json
+import os
+
+env_vars = {
     "PYTHONPATH": "/root/Megatron-LM/:/root/miles",
     "MILES_EXPERIMENTAL_ROLLOUT_REFACTOR": "1",
     "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-    "NCCL_NVLS_ENABLE": "${HAS_NVLINK}",
-    "NCCL_IB_DISABLE": "${NCCL_IB_DISABLE:-0}",
-    "NCCL_NET": "${NCCL_NET:-}",
-    "NCCL_NET_PLUGIN": "${NCCL_NET_PLUGIN:-}",
-    "NCCL_TUNER_PLUGIN": "${NCCL_TUNER_PLUGIN:-}",
-    "FI_PROVIDER": "${FI_PROVIDER:-}",
-    "MILES_NCCL_TRANSPORT": "${MILES_NCCL_TRANSPORT:-system}",
-    "WANDB_MODE": "${WANDB_MODE:-online}",
-    "CODE_EXEC_SANDBOX": "${CODE_EXEC_SANDBOX:-bubblewrap}",
-    "CODE_EXEC_CONCURRENCY": "${CODE_EXEC_CONCURRENCY:-16}",
-    "CODE_EXEC_MAX_TESTS": "${CODE_EXEC_MAX_TESTS:-50}",
-    "REASONING_GYM_DEPS_PATH": "${REASONING_GYM_DEPS_PATH:-/data/reasoning-gym-deps}",
-    "no_proxy": "127.0.0.1"
-  }
+    "NCCL_NVLS_ENABLE": os.environ["HAS_NVLINK"],
+    "NCCL_IB_DISABLE": os.environ.get("NCCL_IB_DISABLE") or "0",
+    "MILES_NCCL_TRANSPORT": os.environ.get("MILES_NCCL_TRANSPORT") or "system",
+    "WANDB_MODE": os.environ.get("WANDB_MODE") or "online",
+    "CODE_EXEC_SANDBOX": os.environ.get("CODE_EXEC_SANDBOX") or "bubblewrap",
+    "CODE_EXEC_CONCURRENCY": os.environ.get("CODE_EXEC_CONCURRENCY") or "16",
+    "CODE_EXEC_MAX_TESTS": os.environ.get("CODE_EXEC_MAX_TESTS") or "50",
+    "REASONING_GYM_DEPS_PATH": (
+        os.environ.get("REASONING_GYM_DEPS_PATH") or "/data/reasoning-gym-deps"
+    ),
+    "no_proxy": "127.0.0.1",
 }
-JSON
-)
+
+# An empty NCCL selector is not equivalent to an unset selector. In system
+# mode these remain absent so NCCL can choose its internal IB implementation.
+for name in ("NCCL_NET", "NCCL_NET_PLUGIN", "NCCL_TUNER_PLUGIN", "FI_PROVIDER"):
+    if value := os.environ.get(name):
+        env_vars[name] = value
+
+print(json.dumps({"env_vars": env_vars}, separators=(",", ":")))
+PY
+)"
 
 # The replay-buffer validation analyzer uses this marker for end-to-end startup
 # from a ready Ray cluster through the first rollout and optimizer metrics.  It

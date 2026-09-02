@@ -1,24 +1,19 @@
 #!/bin/bash
-#SBATCH --job-name=passrate
-#SBATCH --partition=batch
-#SBATCH --qos=interactive
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=128
-#SBATCH --gres=gpu:8
-#SBATCH --exclusive
-#SBATCH --mem=0
-#SBATCH --time=04:00:00
-#SBATCH --output=experiments/outputs/difficulty/%x-%j.log
+#PBS -N passrate
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=192:ngpus=8:mpiprocs=1
+#PBS -l place=scatter:excl
+#PBS -l walltime=08:00:00
+#PBS -j oe
 
 # Measure a policy's per-prompt pass rate over a whole prompt file.
 #
-#   sbatch -A coreai_horizon_dilations \
+#   pbs_submit --profile gpu \
 #     experiments/tools/difficulty_filter/run_measure.sbatch
 #
 # Knobs (all --export=ALL environment variables):
 #   MODEL_NAME       policy/artifact name        (Qwen3-4B-Base-LR2e-5-Step4000)
-#   HF_MODEL_NAME    HF dir under /ckpt/hf                 (iter_0004000)
+#   HF_MODEL_NAME    HF path below /ckpt/hf
 #   PROMPT_DATA      in-container prompt jsonl
 #   OUTPUT           in-container output jsonl (resumable)
 #   N_SAMPLES        samples per prompt                    (8, matches training)
@@ -58,24 +53,18 @@
 # Inference only: this reads the HF weights that SGLang serves and never touches
 # the torch_dist checkpoint, so it can run before or in parallel with training.
 #
-# `batch` with QoS `interactive` is the GPU fast lane on aws-pdx. The partition
-# owns the B300 nodes; the QoS supplies the interactive scheduling policy.
-#
 # Resumable by design. The output jsonl is appended and flushed per prompt and a
-# rerun skips indices already present, so hitting the 4 h wall just means
-# resubmitting the same command.
+# rerun skips indices already present.
 
 set -euo pipefail
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
-: "${HF_CKPT_DIR:=${QWEN3_4B_BASE_HF_ROOT:-/lustre/fsw/portfolios/coreai/users/kfujii/checkpoints/huggingface/Qwen3-4B-Base/LR2.0e-5-SEQ32768-GBS128-MBS1-TP1-PP1-CP1-EP1-PACK1-standard-cp-STEPS4000}}"
-export HF_CKPT_DIR
+REPO_ROOT="${MILES_SUBMIT_DIR:-${PBS_O_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}}"
 source "${REPO_ROOT}/experiments/env.sh"
 
 MODEL_NAME="${MODEL_NAME:-Qwen3-4B-Base-LR2e-5-Step4000}"
 if [[ -z "${HF_MODEL_NAME:-}" ]]; then
     if [[ "${MODEL_NAME}" == Qwen3-4B-Base-LR2e-5-Step4000 ]]; then
-        HF_MODEL_NAME=iter_0004000
+        HF_MODEL_NAME="${QWEN3_4B_BASE_HF_MODEL}"
     else
         HF_MODEL_NAME="${MODEL_NAME}"
     fi
@@ -139,17 +128,16 @@ fi
 
 # This job can be submitted by a small CPU coordinator via --export=ALL. Use the
 # GPU job's requested CPUs and reset memory explicitly so a nested step cannot
-# inherit the coordinator's small cgroup. On aws-pdx an exclusive node has 192
-# CPUs while this job requests 128; asking the step for all 192 produces a Slurm
-# warning because the per-task allocation is still 128.
-STEP_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-1}"
-srun \
+# inherit the coordinator's small allocation. The PBS GPU profile supplies the
+# per-node CPU count used by the Singularity launcher.
+STEP_CPUS_PER_TASK="${PBS_GPU_CPUS_PER_NODE}"
+miles_srun \
     --cpus-per-task="${STEP_CPUS_PER_TASK}" \
     --mem=0 \
-    --container-image="${SQSH_IMAGE}" \
-    --container-mounts="${CONTAINER_MOUNTS}" \
-    --container-writable \
-    --no-container-mount-home \
+    --image="${CONTAINER_IMAGE}" \
+    --bind="${CONTAINER_MOUNTS}" \
+    --writable-tmpfs \
+    --no-home \
     --export=ALL \
     bash -lc "
 set -euo pipefail
@@ -162,7 +150,7 @@ export PYTHONUNBUFFERED=1
 # allenai/IFBench at runtime and imports its evaluation_lib, which needs nltk and
 # friends; miles points at examples/eval_multi_task/requirements_ifbench.txt for
 # these but that file is not in this checkout, so they are named here instead.
-# '+'-separated, not comma or space: sbatch --export treats commas as the
+# '+'-separated, not comma or space: pbs_submit --export treats commas as the
 # separator between VAR=VALUE pairs (a comma list silently delivers only the
 # first package) and a space ends the argument entirely.
 if [[ -n "\${EXTRA_PIP:-}" ]]; then
@@ -172,13 +160,13 @@ if [[ -n "\${EXTRA_PIP:-}" ]]; then
 fi
 
 if [[ ${SKIP_MEASUREMENT} == 0 ]]; then
-    # On B300, all three target checkpoints fit in one GPU, so the default is
+    # On the target full-GPU nodes, all three checkpoints fit in one GPU, so the default is
     # eight independent replicas behind one endpoint. SERVER_TP_SIZE remains an
     # escape hatch for a larger checkpoint without changing this worker.
     #
     # MAX_RUNNING_REQUESTS is deliberately explicit because oversubscribing does
     # not fail loudly: SGLang retracts and re-prefills requests, which burns
-    # compute silently. Re-tune it only after checking KV usage in the B300 log.
+    # compute silently. Re-tune it only after checking KV usage in the runtime log.
     python3 -m sglang.launch_server \
         --model-path /ckpt/hf/${HF_MODEL_NAME} \
         --host 127.0.0.1 --port ${SERVER_PORT} \
@@ -200,7 +188,7 @@ if [[ ${SKIP_MEASUREMENT} == 0 ]]; then
 
         # The DP controller can remain alive indefinitely after one scheduler is
         # SIGKILLed.  Detect a GPU process disappearing after all replicas have
-        # attached, so the dependency chain retries instead of wasting four hours.
+        # attached, so the dependency chain retries instead of wasting the allocation.
         gpu_processes=\$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | sed '/^[[:space:]]*\$/d' | wc -l)
         (( gpu_processes > max_gpu_processes )) && max_gpu_processes=\${gpu_processes}
         if (( max_gpu_processes >= ${GPUS_PER_NODE} && gpu_processes < ${GPUS_PER_NODE} )); then

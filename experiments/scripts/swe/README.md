@@ -11,11 +11,12 @@ The recipe exists, but it is not yet a claim that SWE RL is training-ready.
 - Offline contracts, production-container CPU tests, GPU metadata/reward
   plumbing, and one-task dry materialization for ReBench and SWE-Gym have
   passed.
-- The pinned Harbor overlay preflight completed in Slurm job `306362`
-  (74 Miles/Harbor contract tests and 175 patched-Harbor tests). Production
-  SQSH jobs `306374`, `306375`, and `306376` respectively passed the CPU
-  rollout contract, Slurm-to-Ray secret/client identity inheritance, and the
-  GPU agent-metadata-to-reward path.
+- Historical former-cluster evidence: the pinned Harbor overlay preflight job
+  `306362` passed 74 Miles/Harbor contract tests and 175 patched-Harbor tests.
+  Legacy image jobs `306374`, `306375`, and `306376` respectively passed the
+  CPU rollout contract, scheduler-to-Ray secret/client identity inheritance,
+  and the GPU agent-metadata-to-reward path. These job IDs do not validate the
+  current PBS/Singularity deployment.
 - Real source-image probes passed for SWE-Gym (`306206`), R2E-Gym (`306215`),
   and SWE-ReBench-V2 (`306242`). These prove the selected image/runtime paths,
   not live hosted-E2B admission of every source row.
@@ -47,7 +48,7 @@ not forwarded to training or rollout workers; only the scoped Harbor `/run`
 bearer token is present there. No `.env` file is loaded.
 
 Submit production training with the adjacent `submit_when_ready.sh`. It puts a
-CPU-only authenticated readiness gate ahead of the GPU job using a Slurm
+CPU-only authenticated readiness gate ahead of the GPU job using a PBS
 `afterok` dependency. The GPU allocation itself permits only a final 60-second
 health check; full task prebuild belongs to the separate one-day Harbor server
 allocation.

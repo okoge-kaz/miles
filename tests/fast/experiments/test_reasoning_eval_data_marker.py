@@ -46,7 +46,7 @@ def _write_marker(path: Path, *, image: Path, benchmarks: str, extra: str = "") 
 
 def test_superset_marker_is_accepted_after_required_data_validation(tmp_path: Path) -> None:
     data_root = tmp_path / "data"
-    image = tmp_path / "nemo-skills.sqsh"
+    image = tmp_path / "nemo-skills.sif"
     marker = data_root / "_PREPARED"
     _write_all_datasets(data_root)
     _write_marker(
@@ -69,7 +69,7 @@ def test_superset_marker_is_accepted_after_required_data_validation(tmp_path: Pa
 
 def test_marker_must_contain_every_required_benchmark(tmp_path: Path) -> None:
     data_root = tmp_path / "data"
-    image = tmp_path / "nemo-skills.sqsh"
+    image = tmp_path / "nemo-skills.sif"
     marker = data_root / "_PREPARED"
     _write_all_datasets(data_root)
     _write_marker(marker, image=image, benchmarks="aime24 aime25")
@@ -85,7 +85,7 @@ def test_marker_must_contain_every_required_benchmark(tmp_path: Path) -> None:
 
 def test_recorded_dataset_checksum_detects_mutation(tmp_path: Path) -> None:
     data_root = tmp_path / "data"
-    image = tmp_path / "nemo-skills.sqsh"
+    image = tmp_path / "nemo-skills.sif"
     marker = data_root / "_PREPARED"
     _write_all_datasets(data_root)
     datasets = validate_prepared_data(
@@ -120,23 +120,22 @@ def test_marker_rejects_different_evaluator_image(tmp_path: Path) -> None:
     _write_all_datasets(data_root)
     _write_marker(
         marker,
-        image=tmp_path / "old-image.sqsh",
+        image=tmp_path / "old-image.sif",
         benchmarks=" ".join(BENCHMARKS),
     )
 
     with pytest.raises(ValueError, match="different NeMo Skills image"):
         validate_prepared_data(
             data_root=data_root,
-            image=tmp_path / "new-image.sqsh",
+            image=tmp_path / "new-image.sif",
             benchmarks=BENCHMARKS,
             marker=marker,
         )
 
 
-def test_aime_setup_jobs_use_aws_pdx_cpu_partition_and_qos() -> None:
+def test_aime_setup_jobs_use_pbs_cpu_queue_without_project() -> None:
     scripts = REPO_ROOT / "experiments/scripts/reasoning_eval"
     for name in ("import-evaluator-images.sbatch", "prepare-aime-data.sbatch"):
         text = (scripts / name).read_text(encoding="utf-8")
-        assert "#SBATCH --partition=cpu" in text
-        assert "#SBATCH --qos=cpu-interactive" in text
-        assert "cpu_interactive" not in text
+        assert "#PBS -q R9920261300" in text
+        assert "#PBS -P" not in text

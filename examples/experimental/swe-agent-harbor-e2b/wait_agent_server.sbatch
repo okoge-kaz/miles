@@ -1,14 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=wait-miles-swe-server
-#SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=cpu
-#SBATCH --qos=cpu-normal
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=1
-#SBATCH --time=04:00:00
-#SBATCH --export=NIL
-#SBATCH --output=experiments/outputs/validation/%x-%j.log
+#PBS -N wait-miles-swe-server
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=32:mpiprocs=1
+#PBS -l place=scatter
+#PBS -l walltime=04:00:00
+#PBS -j oe
 
 # CPU-only dependency gate for the production GPU recipe. It never reads a
 # dotenv file and receives only the agent-server URL and run-secret names.
@@ -19,7 +15,7 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 USER="$(id -un)"
 export PATH USER
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd -P)}"
+REPO_ROOT="${MILES_SUBMIT_DIR:-${PBS_O_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd -P)}}"
 : "${MILES_SWE_FIXED_EXPORTS:?submit with submit_when_ready.sh}"
 [[ "${MILES_SWE_FIXED_EXPORTS}" == 1 ]] || {
     echo "MILES_SWE_FIXED_EXPORTS must be 1" >&2

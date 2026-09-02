@@ -24,11 +24,11 @@ TRIAL_PHASE_BUDGET_SEC = (
 # The gaps cover artifact transfer and both E2B sandbox teardown paths.
 TRIAL_WALL_TIMEOUT_SEC = 12_600
 TRIAL_REQUEST_TIMEOUT_SEC = 13_200
-FOUR_HOUR_JOB_TIMEOUT_SEC = 14_400
+TRIAL_TIMEOUT_CEILING_SEC = 14_400
 
 
 def validate_timeout_contract() -> None:
-    """Fail when a future phase change no longer fits the four-hour pilot."""
+    """Fail when a future phase change no longer fits the trial ceiling."""
 
     if HARBOR_TIMEOUT_MULTIPLIER != 1:
         raise RuntimeError("SWE Harbor timeout multiplier must remain one")
@@ -36,7 +36,7 @@ def validate_timeout_contract() -> None:
         TRIAL_PHASE_BUDGET_SEC
         < TRIAL_WALL_TIMEOUT_SEC
         < TRIAL_REQUEST_TIMEOUT_SEC
-        < FOUR_HOUR_JOB_TIMEOUT_SEC
+        < TRIAL_TIMEOUT_CEILING_SEC
     ):
         raise RuntimeError("SWE timeout budgets are inconsistent")
 

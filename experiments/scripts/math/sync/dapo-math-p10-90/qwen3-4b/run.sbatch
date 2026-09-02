@@ -1,18 +1,14 @@
 #!/bin/bash
-#SBATCH --job-name=miles-dapo-math-p10-90-qwen3-4b
-#SBATCH --partition=batch
-#SBATCH --qos=normal
-#SBATCH --nodes=2
-#SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:8
-#SBATCH --exclusive
-#SBATCH --time=04:00:00
-#SBATCH --output=experiments/outputs/training/math/dapo-math-p10-90/qwen3-4b/%x-%j.log
+#PBS -N miles-dapo-math-p10-90-qwen3-4b
+#PBS -q R9920261300
+#PBS -l select=2:ncpus=192:ngpus=8:mpiprocs=1
+#PBS -l place=scatter:excl
+#PBS -l walltime=24:00:00
+#PBS -j oe
 
 set -euo pipefail
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../../../.." &>/dev/null && pwd)}"
-export HF_CKPT_DIR="${QWEN3_4B_BASE_HF_ROOT:-/lustre/fsw/portfolios/coreai/users/kfujii/checkpoints/huggingface/Qwen3-4B-Base/LR2.0e-5-SEQ32768-GBS128-MBS1-TP1-PP1-CP1-EP1-PACK1-standard-cp-STEPS4000}"
+REPO_ROOT="${MILES_SUBMIT_DIR:-${PBS_O_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../../../.." &>/dev/null && pwd)}}"
 source "${REPO_ROOT}/experiments/env.sh"
 
 if [[ "${WANDB_MODE:-online}" != offline && "${WANDB_MODE:-online}" != disabled ]]; then
@@ -21,7 +17,7 @@ fi
 
 # run identity
 : "${MODEL_NAME:=Qwen3-4B-Base-LR2e-5-Step4000}"
-: "${HF_MODEL_NAME:=iter_0004000}"
+: "${HF_MODEL_NAME:=${QWEN3_4B_BASE_HF_MODEL}}"
 PLACEMENT=colocated
 : "${DATASET_TAG:=dapo-math-p10-90-qwen3-4b-base-lr2e-5-step4000}"
 : "${PROMPT_DATA:=/data/dapo-math-p10-90-qwen3-4b-base-lr2e-5-step4000/dapo-math-p10-90-qwen3-4b-base-lr2e-5-step4000.jsonl}"
@@ -120,21 +116,21 @@ if [[ -z "${RAY_HEAD_IP}" || "${RAY_HEAD_IP}" == 169.254.* ]]; then
     exit 1
 fi
 export RAY_HEAD_IP
-export RAY_DONE_FLAG="/root/miles/experiments/outputs/.ray/${RUN_NAME}-${SLURM_JOB_ID}.done"
+export RAY_DONE_FLAG="/root/miles/experiments/outputs/.ray/${RUN_NAME}-${MILES_JOB_ID}.done"
 mkdir -p "${OUTPUT_DIR}/.ray"
-rm -f "${OUTPUT_DIR}/.ray/${RUN_NAME}-${SLURM_JOB_ID}.done"
+rm -f "${OUTPUT_DIR}/.ray/${RUN_NAME}-${MILES_JOB_ID}.done"
 
 source "${REPO_ROOT}/experiments/common/clean_checkpoint.sh"
 
 echo "run ${RUN_NAME}"
 echo "checkpoints ${CKPT_PATH}"
 
-srun \
-    --nodes="${SLURM_JOB_NUM_NODES}" \
+miles_srun \
+    --nodes="${MILES_JOB_NUM_NODES}" \
     --ntasks-per-node=1 \
-    --container-image="${SQSH_IMAGE}" \
-    --container-mounts="${CONTAINER_MOUNTS}" \
-    --container-writable \
-    --no-container-mount-home \
+    --image="${CONTAINER_IMAGE}" \
+    --bind="${CONTAINER_MOUNTS}" \
+    --writable-tmpfs \
+    --no-home \
     --export=ALL \
     bash /root/miles/experiments/scripts/math/sync/dapo-math-p10-90/qwen3-4b/train.sh

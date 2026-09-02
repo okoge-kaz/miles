@@ -250,15 +250,15 @@ import os
 keys = (
     "PATH",
     "NCCL_IB_DISABLE",
-    "NCCL_NET",
-    "NCCL_NET_PLUGIN",
-    "NCCL_TUNER_PLUGIN",
-    "FI_PROVIDER",
     "MILES_NCCL_TRANSPORT",
     "NVIDIA_INFERENCE_BASE_URL",
     "WANDB_MODE",
 )
 env = {key: os.environ.get(key, "") for key in keys}
+for key in ("NCCL_NET", "NCCL_NET_PLUGIN", "NCCL_TUNER_PLUGIN", "FI_PROVIDER"):
+    if value := os.environ.get(key):
+        env[key] = value
+
 env.update(
     {
         "PYTHONPATH": (

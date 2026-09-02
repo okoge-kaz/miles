@@ -99,7 +99,7 @@ def _required_secret(name: str) -> str:
     value = os.environ.get(name, "").strip()
     if not value:
         raise RuntimeError(
-            f"{name} is required in the process environment; Tau Slurm wrappers "
+            f"{name} is required in the process environment; Tau PBS wrappers "
             "load only allowlisted .env values at job startup"
         )
     return value

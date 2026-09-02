@@ -52,7 +52,7 @@ export PYTHONPATH="/root/miles/examples/experimental/search-r1:${PYTHONPATH:-}"
 # is what a Ray actor can reach; loopback is not, even co-located.
 RETRIEVER_HOST="${RAY_HEAD_IP:-127.0.0.1}"
 
-if [[ "${SLURM_NODEID:-0}" == "0" ]]; then
+if [[ "${MILES_NODE_RANK:-0}" == "0" ]]; then
     # faiss-cpu is intentional: the index stays on CPU so the GPUs remain with
     # the policy. The immutable Search-R1 image must already contain the exact
     # dependency set; never mutate a distributed training runtime with pip.

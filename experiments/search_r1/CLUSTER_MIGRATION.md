@@ -1,5 +1,10 @@
 # Search-R1 cluster migration and B300 qualification
 
+> Historical record: this document describes the former Slurm + Enroot B300
+> audit. It is retained for its CUDA and hardware qualification notes. Do not
+> use its submission commands on the current cluster; use
+> [`../PBS_SINGULARITY.md`](../PBS_SINGULARITY.md) for PBS Pro + SingularityCE.
+
 This is the hand-off checklist for moving the fixed-difficulty Search-R1 async
 experiment to another Slurm cluster. It records the repository and
 container audit performed on 2026-08-14. The application recipes are ready to

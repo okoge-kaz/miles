@@ -1,27 +1,22 @@
 #!/bin/bash
-#SBATCH --job-name=continue-pr-qwen3-4b-step4000
-#SBATCH --partition=cpu
-#SBATCH --qos=cpu-interactive
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=1
-#SBATCH --mem=2G
-#SBATCH --time=00:10:00
-#SBATCH --output=experiments/outputs/difficulty/%x-%j.log
+#PBS -N continue-pr-qwen3-4b-step4000
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=32:mpiprocs=1
+#PBS -l place=scatter
+#PBS -l walltime=00:10:00
+#PBS -j oe
 
 set -euo pipefail
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../.." &>/dev/null && pwd)}"
-export HF_CKPT_DIR="${QWEN3_4B_BASE_HF_ROOT:-/lustre/fsw/portfolios/coreai/users/kfujii/checkpoints/huggingface/Qwen3-4B-Base/LR2.0e-5-SEQ32768-GBS128-MBS1-TP1-PP1-CP1-EP1-PACK1-standard-cp-STEPS4000}"
+REPO_ROOT="${MILES_SUBMIT_DIR:-${PBS_O_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../.." &>/dev/null && pwd)}}"
 source "${REPO_ROOT}/experiments/env.sh"
 cd "${REPO_ROOT}"
 
 MODEL_NAME=Qwen3-4B-Base-LR2e-5-Step4000
-HF_MODEL_NAME=iter_0004000
+HF_MODEL_NAME="${QWEN3_4B_BASE_HF_MODEL}"
 PROMPT_DATA=/data/dapo-math-17k/dapo-math-17k.jsonl
 PASS_RATES="/data/difficulty/dapo-math-17k.${MODEL_NAME}.n16-len16384-zero-trunc.passrate.jsonl"
 AUDIT_OUTPUT="/data/difficulty/dapo-math-17k.${MODEL_NAME}.n16-len16384-zero-trunc.audit.jsonl"
-ACCOUNT="${SLURM_ACCOUNT_NAME:-coreai_horizon_dilations}"
 TOTAL_PROMPTS=17398
 HALF_PROMPTS=$(( TOTAL_PROMPTS / 2 ))
 FILTER_ROUND="${FILTER_ROUND:-1}"
@@ -30,7 +25,8 @@ TAIL_START_INDEX="${TAIL_START_INDEX:-}"
 TAIL_OUTPUT="${PASS_RATES%.jsonl}.shard-0-tail-${TAIL_START_INDEX}-of-${HALF_PROMPTS}.jsonl"
 
 # Do not export this 2-GiB coordinator's step limits into GPU child jobs.
-unset SLURM_MEM_PER_NODE SLURM_MEM_PER_CPU SLURM_CPUS_PER_TASK
+# Do not leak allocation-specific resource hints into child PBS submissions.
+unset PBS_NCPUS
 
 filter_exports() {
     local output="$1"
@@ -70,8 +66,7 @@ submit_shard() {
     local output="${PASS_RATES%.jsonl}.shard-${shard}-of-2.jsonl"
     local audit="${AUDIT_OUTPUT%.jsonl}.shard-${shard}-of-2.jsonl"
 
-    sbatch --parsable \
-        -A "${ACCOUNT}" -p batch --qos=interactive --time=04:00:00 \
+    pbs_submit --parsable --profile gpu --time="${PBS_PREP_WALLTIME}" \
         --job-name="pr${shard}-qwen3-4b-step4000" \
         --export="$(filter_exports "${output}" "START_INDEX=${start_index},END_INDEX=${end_index},DUMP_RESPONSES=${audit},DUMP_LIMIT=8")" \
         experiments/tools/difficulty_filter/run_measure.sbatch
@@ -80,8 +75,7 @@ submit_shard() {
 submit_tail() {
     local audit="${AUDIT_OUTPUT%.jsonl}.shard-0-tail-${TAIL_START_INDEX}-of-${HALF_PROMPTS}.jsonl"
 
-    sbatch --parsable \
-        -A "${ACCOUNT}" -p batch --qos=interactive --time=04:00:00 \
+    pbs_submit --parsable --profile gpu --time="${PBS_PREP_WALLTIME}" \
         --job-name="pr0tail-qwen3-4b-step4000" \
         --export="$(filter_exports "${TAIL_OUTPUT}" "START_INDEX=${TAIL_START_INDEX},END_INDEX=${HALF_PROMPTS},DUMP_RESPONSES=${audit},DUMP_LIMIT=8")" \
         experiments/tools/difficulty_filter/run_measure.sbatch
@@ -90,7 +84,7 @@ submit_tail() {
 reconcile_tail
 
 if shard_complete 0 && shard_complete 1; then
-    finalize_job="$(sbatch --parsable -A "${ACCOUNT}" \
+    finalize_job="$(pbs_submit --parsable --profile cpu \
         experiments/tools/difficulty_filter/dapo-math/finalize_filter.sbatch)"
     echo "both shards complete after round ${FILTER_ROUND}; finalize=${finalize_job}"
     exit 0
@@ -114,7 +108,7 @@ if [[ -n "${TAIL_START_INDEX}" ]] && ! tail_complete; then
 fi
 
 dependency="$(IFS=:; echo "${jobs[*]}")"
-continuation_job="$(sbatch --parsable -A "${ACCOUNT}" \
+continuation_job="$(pbs_submit --parsable --profile cpu \
     --dependency="afterany:${dependency}" \
     --export="ALL,FILTER_ROUND=${next_round},FILTER_MAX_ROUNDS=${FILTER_MAX_ROUNDS},TAIL_START_INDEX=${TAIL_START_INDEX},HF_CKPT_DIR=${HF_CKPT_DIR}" \
     experiments/tools/difficulty_filter/dapo-math/continue_filter.sbatch)"

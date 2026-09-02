@@ -1,40 +1,37 @@
 #!/bin/bash
-#SBATCH --job-name=miles-aws-pdx-preflight
-#SBATCH --partition=batch
-#SBATCH --qos=interactive
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --gres=gpu:8
-#SBATCH --exclusive
-#SBATCH --time=01:00:00
-#SBATCH --output=experiments/outputs/validation/%x-%j.log
+#PBS -N miles-cluster-preflight
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=192:ngpus=8:mpiprocs=1
+#PBS -l place=scatter:excl
+#PBS -l walltime=01:00:00
+#PBS -j oe
 
-# Host, Pyxis, CUDA, B300, and native-extension preflight. This is intentionally
+# Host, Singularity, CUDA, GPU, and native-extension preflight. This is intentionally
 # read-only; SGLang generation and a Miles optimizer update are separate gates.
 
 set -euo pipefail
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." &>/dev/null && pwd)}"
+REPO_ROOT="${PBS_O_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." &>/dev/null && pwd)}"
 source "${REPO_ROOT}/experiments/env.sh"
 export WANDB_MODE=offline
 
 mkdir -p "${OUTPUT_DIR}/validation"
-[[ -r "${SQSH_IMAGE}" ]] || {
-    echo "missing SQSH_IMAGE=${SQSH_IMAGE}" >&2
+[[ -r "${CONTAINER_IMAGE}" ]] || {
+    echo "missing CONTAINER_IMAGE=${CONTAINER_IMAGE}" >&2
     exit 1
 }
 
 echo "host=$(hostname) arch=$(uname -m)"
-echo "image=${SQSH_IMAGE}"
+echo "image=${CONTAINER_IMAGE}"
 echo "wandb_mode=${WANDB_MODE}"
 nvidia-smi --query-gpu=index,name,driver_version,memory.total --format=csv,noheader
 nvidia-smi topo -m
 
-srun \
-    --container-image="${SQSH_IMAGE}" \
-    --container-mounts="${CONTAINER_MOUNTS}" \
-    --container-writable \
-    --no-container-mount-home \
+miles_srun \
+    --image="${CONTAINER_IMAGE}" \
+    --bind="${CONTAINER_MOUNTS}" \
+    --writable-tmpfs \
+    --no-home \
     --export=ALL \
     bash -lc '
 set -euo pipefail

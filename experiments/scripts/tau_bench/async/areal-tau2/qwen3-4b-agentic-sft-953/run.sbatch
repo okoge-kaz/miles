@@ -1,16 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=miles-areal-tau2-qwen3-4b-agentic-sft953
-#SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=batch
-#SBATCH --qos=interactive
-#SBATCH --nodes=8
-#SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=128
-#SBATCH --gres=gpu:8
-#SBATCH --exclusive
-#SBATCH --mem=0
-#SBATCH --time=04:00:00
-#SBATCH --output=experiments/outputs/training/tau_bench/areal-tau2/qwen3-4b-agentic-sft-953/%x-%j.log
+#PBS -N miles-areal-tau2-qwen3-4b-agentic-sft953
+#PBS -q R9920261300
+#PBS -l select=8:ncpus=192:ngpus=8:mpiprocs=1
+#PBS -l place=scatter:excl
+#PBS -l walltime=24:00:00
+#PBS -j oe
 
 # Eight-node asynchronous GRPO on only the 1,982 AReaL Tau2 RL tasks. The
 # trainer:rollout split is selectable from 1:7, 2:6, 3:5, and 4:4. Every
@@ -19,7 +13,7 @@
 
 set -euo pipefail
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../../../.." &>/dev/null && pwd)}"
+REPO_ROOT="${PBS_O_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../../../.." &>/dev/null && pwd)}"
 export WANDB_MODE="${WANDB_MODE:-offline}"
 source "${REPO_ROOT}/experiments/env.sh"
 source "${REPO_ROOT}/experiments/common/load_job_env.sh"
@@ -40,8 +34,8 @@ readonly TOTAL_NODES
     echo "AReaL Tau2 supports TOTAL_NODES=4 for validation or TOTAL_NODES=8 for training studies" >&2
     exit 1
 }
-[[ "${SLURM_JOB_NUM_NODES:?}" == "${TOTAL_NODES}" ]] || {
-    echo "AReaL Tau2 requested TOTAL_NODES=${TOTAL_NODES}, got ${SLURM_JOB_NUM_NODES}" >&2
+[[ "${MILES_JOB_NUM_NODES:?}" == "${TOTAL_NODES}" ]] || {
+    echo "AReaL Tau2 requested TOTAL_NODES=${TOTAL_NODES}, got ${MILES_JOB_NUM_NODES}" >&2
     exit 1
 }
 
@@ -372,22 +366,13 @@ unset replay_failure_threshold
     exit 1
 }
 
-: "${MILES_NCCL_TRANSPORT:=efa}"
-: "${ASYNC_SQSH_IMAGE_OVERRIDE:=${CONTAINER_DIR}/miles-staleness-weight-boundaries-f994b9aed-efa-1.49.0-tau3-1.0.1.sqsh}"
-[[ -r "${ASYNC_SQSH_IMAGE_OVERRIDE}" ]] || {
-    echo "Tau runtime image is missing: ${ASYNC_SQSH_IMAGE_OVERRIDE}" >&2
+: "${MILES_NCCL_TRANSPORT:=system}"
+: "${ASYNC_CONTAINER_IMAGE_OVERRIDE:=${CONTAINER_IMAGE}}"
+[[ -r "${ASYNC_CONTAINER_IMAGE_OVERRIDE}" ]] || {
+    echo "Tau runtime image is missing: ${ASYNC_CONTAINER_IMAGE_OVERRIDE}" >&2
     exit 1
 }
 case "${MILES_NCCL_TRANSPORT}" in
-    efa)
-        [[ "${NCCL_IB_DISABLE:-0}" != 1 ]]
-        NCCL_IB_DISABLE=0
-        NCCL_NET_PLUGIN=ofi
-        NCCL_TUNER_PLUGIN=ofi
-        NCCL_NET="AWS Libfabric"
-        FI_PROVIDER=efa
-        LD_LIBRARY_PATH="/opt/amazon/efa/lib:/opt/amazon/ofi-nccl/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-        ;;
     tcp)
         NCCL_IB_DISABLE=1
         NCCL_NET=Socket
@@ -398,7 +383,7 @@ case "${MILES_NCCL_TRANSPORT}" in
         unset NCCL_NET NCCL_NET_PLUGIN NCCL_TUNER_PLUGIN FI_PROVIDER
         ;;
     *)
-        echo "unknown MILES_NCCL_TRANSPORT=${MILES_NCCL_TRANSPORT}" >&2
+        echo "unknown MILES_NCCL_TRANSPORT=${MILES_NCCL_TRANSPORT}; expected system or tcp" >&2
         exit 1
         ;;
 esac
@@ -438,8 +423,8 @@ export DEBUG_FAILURE_MARKER DEBUG_FAILURE_MIN_OUTSTANDING_GROUPS DEBUG_FAILURE_M
 export DEBUG_FAILURE_MIN_INFLIGHT_GROUPS DEBUG_FAILURE_MIN_INFLIGHT_TOKENS
 export DEBUG_FAILURE_MIN_REGENERATE_GROUPS
 export REPLAY_RESUME_EXPECT_FAILURE_ROLLOUT_ID
-export TOTAL_NODES MILES_NCCL_TRANSPORT ASYNC_SQSH_IMAGE_OVERRIDE NCCL_IB_DISABLE LD_LIBRARY_PATH
-export NCCL_NET NCCL_NET_PLUGIN NCCL_TUNER_PLUGIN FI_PROVIDER WANDB_MODE
+export TOTAL_NODES MILES_NCCL_TRANSPORT ASYNC_CONTAINER_IMAGE_OVERRIDE NCCL_IB_DISABLE LD_LIBRARY_PATH
+export NCCL_NET WANDB_MODE
 export WANDB_PROJECT
 
 source "${REPO_ROOT}/experiments/common/run_identity.sh"
@@ -451,12 +436,12 @@ export DEBUG_FAILURE_MARKER
 export RUN_NAME CONFIG_TAG CKPT_PATH
 source "${REPO_ROOT}/experiments/common/placement.sh"
 
-export RAY_DONE_FLAG="/root/miles/experiments/outputs/.ray/${RUN_NAME}-${SLURM_JOB_ID}.done"
+export RAY_DONE_FLAG="/root/miles/experiments/outputs/.ray/${RUN_NAME}-${MILES_JOB_ID}.done"
 export RAY_HEAD_IP_FILE="${RAY_DONE_FLAG}.head-ip"
 mkdir -p "${OUTPUT_DIR}/.ray"
 rm -f \
-    "${OUTPUT_DIR}/.ray/${RUN_NAME}-${SLURM_JOB_ID}.done" \
-    "${OUTPUT_DIR}/.ray/${RUN_NAME}-${SLURM_JOB_ID}.done.head-ip"
+    "${OUTPUT_DIR}/.ray/${RUN_NAME}-${MILES_JOB_ID}.done" \
+    "${OUTPUT_DIR}/.ray/${RUN_NAME}-${MILES_JOB_ID}.done.head-ip"
 source "${REPO_ROOT}/experiments/common/clean_checkpoint.sh"
 
 replay_resume_failure_preflight() {
@@ -624,38 +609,21 @@ printf 'AReaL Tau2 plan: schedule=%s effective_epochs=%s updates=%s prompt_group
     "${SCHEDULE_MODE}" "${EFFECTIVE_EPOCHS}" "${NUM_ROLLOUT}" "${PLANNED_PROMPT_GROUPS}" \
     "${PLANNED_TRAJECTORIES}" "${FINAL_BATCH_OVERSHOOT}"
 
-STEP_CPUS_PER_NODE="${SLURM_CPUS_PER_TASK:-${SLURM_JOB_CPUS_PER_NODE%%\(*}}"
+STEP_CPUS_PER_NODE="${PBS_GPU_CPUS_PER_NODE}"
 [[ "${STEP_CPUS_PER_NODE}" =~ ^[1-9][0-9]*$ ]]
 DOTENV_MASK="${REPO_ROOT}/experiments/common/dotenv.disabled"
 MOUNTS="${CONTAINER_MOUNTS},${DOTENV_MASK}:/root/miles/.env:ro"
 
-if [[ "${MILES_NCCL_TRANSPORT}" == efa ]]; then
-    srun \
-        --nodes="${SLURM_JOB_NUM_NODES}" \
-        --ntasks="${SLURM_JOB_NUM_NODES}" \
-        --ntasks-per-node=1 \
-        --cpus-per-task=8 \
-        --mem=0 \
-        --container-image="${SQSH_IMAGE}" \
-        --container-mounts="${MOUNTS}" \
-        --no-container-mount-home \
-        --export=ALL \
-        bash /root/miles/experiments/common/check_efa.sh
-fi
-
 container_command=(bash "${TRAIN_SCRIPT}")
-if [[ "${MILES_NCCL_TRANSPORT}" == efa ]]; then
-    container_command=(bash /root/miles/experiments/common/run_with_efa_env.sh "${container_command[@]}")
-fi
-srun \
-    --nodes="${SLURM_JOB_NUM_NODES}" \
+miles_srun \
+    --nodes="${MILES_JOB_NUM_NODES}" \
     --ntasks-per-node=1 \
     --cpus-per-task="${STEP_CPUS_PER_NODE}" \
     --mem=0 \
-    --container-image="${SQSH_IMAGE}" \
-    --container-mounts="${MOUNTS}" \
-    --container-writable \
-    --no-container-mount-home \
+    --image="${CONTAINER_IMAGE}" \
+    --bind="${MOUNTS}" \
+    --writable-tmpfs \
+    --no-home \
     --export=ALL \
     "${container_command[@]}"
 

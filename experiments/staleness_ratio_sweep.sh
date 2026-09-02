@@ -15,16 +15,12 @@ source "${REPO_ROOT}/experiments/env.sh"
 : "${TOTAL_NODES:=8}"
 : "${STALENESS_LEVELS:=1 2 4 8}"
 : "${RATIOS:=1:7 2:6 3:5 4:4}"
-: "${PARTITION:=batch}"
-: "${QOS:=normal}"
-: "${WALL:=04:00:00}"
-: "${CHAIN_JOBS:=10}"
+: "${WALL:=${PBS_DEFAULT_WALLTIME}}"
+: "${CHAIN_JOBS:=2}"
 WANDB_PROJECT=async-rl-dapo-math
 : "${RUN_NAMESPACE:=sr-$(date +%Y%m%d-%H%M%S)}"
 
-ACCOUNT="${SLURM_ACCOUNT_NAME:-coreai_horizon_dilations}"
 LOG_DIR="${OUTPUT_DIR}/training/math/dapo-math-p10-90/qwen3-4b"
-IDLE_EXEMPTION='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"60","reason":"data_loading","description":"Async RL waits for long math generations between optimizer steps"}}'
 
 SUBMIT=0
 INCLUDE_COLOCATED=0
@@ -49,7 +45,7 @@ grid therefore contains 16 async arms plus one colocated arm. With
 exact derived checkpoint directory before starting.
 
 Useful environment overrides: TOTAL_NODES, STALENESS_LEVELS, RATIOS,
-CHAIN_JOBS, PARTITION, QOS, WALL, and RUN_NAMESPACE.
+CHAIN_JOBS, WALL, and RUN_NAMESPACE.
 EOF
 }
 
@@ -248,8 +244,8 @@ printf 'fixed safety: response=%s, zero-trunc=%s, replay=%s/%s, fused-logprobs=%
     "${FUSE_ONE_STEP_ACTOR_LOGPROBS_VALUE}" "${SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS_VALUE}"
 printf 'fixed checkpoints: save-hf=%s, hf interval=%s; settings=%s; clean=%s\n' \
     "${SAVE_HF_VALUE}" "${HF_SAVE_INTERVAL_VALUE}" "${SETTING_COUNT}" "${CLEAN_CHECKPOINT}"
-printf 'submission: %s nodes, %s, %s, %s chained job(s), wandb=%s\n' \
-    "${TOTAL_NODES}" "${PARTITION}" "${WALL}" "${CHAIN_JOBS}" "${WANDB_PROJECT}"
+printf 'submission: %s nodes, %s, %s chained job(s), wandb=%s\n' \
+    "${TOTAL_NODES}" "${WALL}" "${CHAIN_JOBS}" "${WANDB_PROJECT}"
 printf 'namespace: %s\n\n' "${RUN_NAMESPACE}"
 printf '  %-4s %-3s %-3s %-4s %-8s %s\n' max T R dp gbs/dp run
 for point in "${POINTS[@]}"; do
@@ -305,19 +301,15 @@ submit_chain() {
         clean_value=0
         (( CLEAN_CHECKPOINT == 1 && chain_index == 1 )) && clean_value=1
         exports_csv="${base_exports_csv},CLEAN_CHECKPOINT=${clean_value}"
-        raw_job_id="$(sbatch --parsable \
+        raw_job_id="$(pbs_submit --parsable --profile gpu \
             "${dependency[@]}" \
-            -A "${ACCOUNT}" \
-            --partition="${PARTITION}" \
-            --qos="${QOS}" \
             --nodes="${TOTAL_NODES}" \
             --time="${WALL}" \
             --job-name="${run_name}" \
-            --comment="${IDLE_EXEMPTION}" \
             --output="${LOG_DIR}/${run_name}-%j.log" \
             --export="ALL,${exports_csv}" \
             "${RECIPE_PATH}")"
-        job_id="${raw_job_id%%;*}"
+        job_id="${raw_job_id}"
         printf 'submitted %-40s chain %d/%d job=%s dependency=%s\n' \
             "${run_name}" "${chain_index}" "${CHAIN_JOBS}" "${job_id}" \
             "${dependency[*]:-none}"
@@ -359,19 +351,15 @@ submit_colocated_chain() {
         clean_value=0
         (( CLEAN_CHECKPOINT == 1 && chain_index == 1 )) && clean_value=1
         exports_csv="${base_exports_csv},CLEAN_CHECKPOINT=${clean_value}"
-        raw_job_id="$(sbatch --parsable \
+        raw_job_id="$(pbs_submit --parsable --profile gpu \
             "${dependency[@]}" \
-            -A "${ACCOUNT}" \
-            --partition="${PARTITION}" \
-            --qos="${QOS}" \
             --nodes="${TOTAL_NODES}" \
             --time="${WALL}" \
             --job-name="${run_name}" \
-            --comment="${IDLE_EXEMPTION}" \
             --output="${LOG_DIR}/${run_name}-%j.log" \
             --export="ALL,${exports_csv}" \
             "${COLOCATED_RECIPE_PATH}")"
-        job_id="${raw_job_id%%;*}"
+        job_id="${raw_job_id}"
         printf 'submitted %-40s chain %d/%d job=%s dependency=%s\n' \
             "${run_name}" "${chain_index}" "${CHAIN_JOBS}" "${job_id}" \
             "${dependency[*]:-none}"

@@ -1,27 +1,24 @@
 #!/bin/bash
 
-#SBATCH --job-name=reason-eval-data
-#SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=cpu
-#SBATCH --qos=cpu-interactive
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=32
-#SBATCH --time=04:00:00
-#SBATCH --output=experiments/outputs/reasoning_eval/setup/%x-%j.log
+#PBS -N reason-eval-data
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=32:mpiprocs=1
+#PBS -l place=scatter
+#PBS -l walltime=04:00:00
+#PBS -j oe
 
 set -euo pipefail
 
 SCRIPT_PATH="$(realpath -- "${BASH_SOURCE[0]}")"
-if [[ -n "${SLURM_JOB_ID:-}" ]]; then
-    REPO_ROOT="$(realpath -- "${SLURM_SUBMIT_DIR:?submit from the Miles repository root}")"
+if [[ -n "${MILES_JOB_ID:-}" ]]; then
+    REPO_ROOT="$(realpath -- "${PBS_O_WORKDIR:?submit from the Miles repository root}")"
 else
     REPO_ROOT="$(cd -- "$(dirname -- "${SCRIPT_PATH}")/../../.." && pwd)"
 fi
 source "${REPO_ROOT}/experiments/env.sh"
 
-CONTAINER_ROOT="${REASONING_EVAL_CONTAINER_ROOT:-${SHARED_WS}/containers}"
-NEMO_SKILLS_IMAGE="${CONTAINER_ROOT}/nemo-evaluator-nemo-skills-26.03-ac1b048e.sqsh"
+CONTAINER_ROOT="${REASONING_EVAL_CONTAINER_ROOT:-${CONTAINER_DIR}/reasoning-eval}"
+NEMO_SKILLS_IMAGE="${CONTAINER_ROOT}/nemo-evaluator-nemo-skills-26.03-ac1b048e.sif"
 NEMO_SKILLS_DATA_ROOT="${REASONING_EVAL_DATA_ROOT:-${DATASET_DIR}/evaluation}/nemo-skills-26.03"
 EVALUATION_CACHE_ROOT="${REASONING_EVAL_CACHE_ROOT:-${CACHE_DIR}/reasoning_eval}"
 PREPARED_MARKER="${NEMO_SKILLS_DATA_ROOT}/_PREPARED"
@@ -44,11 +41,11 @@ export_miles_aime_data() {
         --output-root "${MILES_AIME_DATA_ROOT}"
 }
 
-if [[ -z "${SLURM_JOB_ID:-}" ]]; then
+if [[ -z "${MILES_JOB_ID:-}" ]]; then
     cd "${REPO_ROOT}"
     mkdir -p experiments/outputs/reasoning_eval/setup
-    sbatch --test-only --export=ALL "${SCRIPT_PATH}"
-    exec sbatch --export=ALL "${SCRIPT_PATH}" "$@"
+    pbs_submit --test-only --profile cpu --export=ALL "${SCRIPT_PATH}"
+    exec pbs_submit --profile cpu --export=ALL "${SCRIPT_PATH}" "$@"
 fi
 
 [[ -f "${NEMO_SKILLS_IMAGE}" ]] || {
@@ -79,14 +76,14 @@ if [[ -f "${PREPARED_MARKER}" ]]; then
     exit 4
 fi
 
-srun \
+miles_srun \
     --nodes=1 \
     --ntasks=1 \
     --cpus-per-task=32 \
-    --container-image="${NEMO_SKILLS_IMAGE}" \
-    --container-mounts="${NEMO_SKILLS_DATA_ROOT}:/evaluation-data,${EVALUATION_CACHE_ROOT}:/evaluation-cache${AUTH_CONTAINER_MOUNT}" \
-    --container-workdir=/nemo_run/code \
-    --no-container-mount-home \
+    --image="${NEMO_SKILLS_IMAGE}" \
+    --bind="${NEMO_SKILLS_DATA_ROOT}:/evaluation-data,${EVALUATION_CACHE_ROOT}:/evaluation-cache${AUTH_CONTAINER_MOUNT}" \
+    --cwd=/nemo_run/code \
+    --no-home \
     --export="ALL,HF_HOME=/evaluation-cache/huggingface,NEMO_SKILLS_DATA_DIR=/evaluation-data,XDG_CACHE_HOME=/evaluation-cache/xdg,PYTHONUNBUFFERED=1${AUTH_CONTAINER_EXPORT}" \
     bash -lc '
         set -euo pipefail
@@ -98,12 +95,12 @@ srun \
 DATASET_PROVENANCE="$(
     python3 "${PREPARED_DATA_TOOL}" "${PREPARED_DATA_ARGS[@]}" --print-env
 )"
-MARKER_PARTIAL="${PREPARED_MARKER}.partial-${SLURM_JOB_ID}"
+MARKER_PARTIAL="${PREPARED_MARKER}.partial-${MILES_JOB_ID}"
 {
     printf 'nemo_skills_image=%s\n' "${NEMO_SKILLS_IMAGE}"
     printf 'benchmarks=%s\n' "${BENCHMARKS[*]}"
     printf '%s\n' "${DATASET_PROVENANCE}"
-    printf 'slurm_job_id=%s\n' "${SLURM_JOB_ID}"
+    printf 'pbs_job_id=%s\n' "${MILES_JOB_ID}"
     printf 'prepared_at_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } > "${MARKER_PARTIAL}"
 mv -- "${MARKER_PARTIAL}" "${PREPARED_MARKER}"

@@ -64,7 +64,12 @@ def _parse_manifest(path: Path) -> dict[str, str]:
 
 
 def _find_log(log_dir: Path, job_id: str) -> Path | None:
-    matches = sorted(log_dir.glob(f"*-{job_id}.log"))
+    matches = sorted(
+        [
+            *log_dir.glob(f"{job_id}.OU"),
+            *log_dir.glob(f"*-{job_id}.log"),
+        ]
+    )
     if len(matches) > 1:
         raise RuntimeError(f"multiple logs found for job {job_id}: {matches}")
     return matches[0] if matches else None

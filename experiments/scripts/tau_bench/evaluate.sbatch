@@ -1,14 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=q3-4b-tau3-eval
-#SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=batch
-#SBATCH --qos=interactive
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --gpus-per-node=8
-#SBATCH --cpus-per-task=128
-#SBATCH --time=04:00:00
-#SBATCH --output=experiments/outputs/reasoning_eval/%x-%j.log
+#PBS -N q3-4b-tau3-eval
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=192:ngpus=8:mpiprocs=1
+#PBS -l place=scatter:excl
+#PBS -l walltime=04:00:00
+#PBS -j oe
 
 # Held-out Tau v3 v1.0.1 evaluation for checkpoints trained on the external
 # AReaL Tau2 RL split. Official Tau v3 train/base tasks are not accepted by
@@ -16,7 +12,7 @@
 
 set -euo pipefail
 
-REPO_ROOT="$(realpath -- "${SLURM_SUBMIT_DIR:?submit from the Miles repository root}")"
+REPO_ROOT="$(realpath -- "${PBS_O_WORKDIR:?submit from the Miles repository root}")"
 export WANDB_MODE="${WANDB_MODE:-offline}"
 source "${REPO_ROOT}/experiments/env.sh"
 source "${REPO_ROOT}/experiments/common/load_job_env.sh"
@@ -67,8 +63,8 @@ esac
     exit 1
 }
 
-TAU3_SQSH_IMAGE="${TAU3_SQSH_IMAGE:-${CONTAINER_DIR}/miles-staleness-weight-boundaries-f994b9aed-efa-1.49.0-tau3-1.0.1.sqsh}"
-[[ -r "${TAU3_SQSH_IMAGE}" ]] || { echo "Tau three image not found: ${TAU3_SQSH_IMAGE}" >&2; exit 1; }
+TAU3_CONTAINER_IMAGE="${TAU3_CONTAINER_IMAGE:-${CONTAINER_IMAGE}}"
+[[ -r "${TAU3_CONTAINER_IMAGE}" ]] || { echo "Tau three image not found: ${TAU3_CONTAINER_IMAGE}" >&2; exit 1; }
 
 VALIDATE_TOOL="${REPO_ROOT}/experiments/tools/reasoning_eval/validate_checkpoint.py"
 if [[ -z "${CHECKPOINT_PATH:-}" ]]; then
@@ -95,10 +91,10 @@ RESULT_ROOT="$(realpath -m -- "${RESULT_ROOT}")"
 mkdir -p "${RESULT_ROOT}" "${CACHE_DIR}/reasoning_eval/huggingface"
 printf '%s\n' "${CHECKPOINT_PATH}" > "${RESULT_ROOT}/selected-checkpoint.txt"
 
-VLLM_IMAGE="${SHARED_WS}/containers/vllm-openai-v0.20.2-70a098d9.sqsh"
+VLLM_IMAGE="${REASONING_EVAL_CONTAINER_ROOT:-${CONTAINER_DIR}/reasoning-eval}/vllm-openai-v0.20.2-70a098d9.sif"
 UNPAD_TOOL="${REPO_ROOT}/experiments/tools/reasoning_eval/unpad_vocab.py"
-MODEL_RUNTIME_DIR="${SLURM_TMPDIR:-/tmp}/tau3-eval-model-${SLURM_JOB_ID}"
-TOKENIZER_RUNTIME_DIR="${SLURM_TMPDIR:-/tmp}/tau3-eval-tokenizer-${SLURM_JOB_ID}"
+MODEL_RUNTIME_DIR="${MILES_JOB_TMPDIR:-/tmp}/tau3-eval-model-${MILES_JOB_ID}"
+TOKENIZER_RUNTIME_DIR="${MILES_JOB_TMPDIR:-/tmp}/tau3-eval-tokenizer-${MILES_JOB_ID}"
 python3 "${UNPAD_TOOL}" "${CHECKPOINT_PATH}" "${MODEL_RUNTIME_DIR}"
 if [[ -f "${MODEL_RUNTIME_DIR}/config.json" ]]; then
     MODEL_MOUNTS="${MODEL_RUNTIME_DIR}:/checkpoint,${CHECKPOINT_PATH}:${CHECKPOINT_PATH}:ro"
@@ -118,11 +114,11 @@ fi
 
 VLLM_PORT="${VLLM_PORT:-8000}"
 SERVED_MODEL=tau3-eval-qwen3-4b
-VLLM_LOG="${RESULT_ROOT}/vllm-${SLURM_JOB_ID}.log"
-srun --overlap --exact --nodes=1 --ntasks=1 --gpus-per-node=8 --cpus-per-task=96 \
-    --container-image="${VLLM_IMAGE}" \
-    --container-mounts="${MODEL_MOUNTS},${TOKENIZER_RUNTIME_DIR}:/runtime-tokenizer:ro,${CACHE_DIR}/reasoning_eval:/evaluation-cache" \
-    --container-workdir=/ --no-container-mount-home \
+VLLM_LOG="${RESULT_ROOT}/vllm-${MILES_JOB_ID}.log"
+miles_srun --overlap --exact --nodes=1 --ntasks=1 --gpus-per-node=8 --cpus-per-task=96 \
+    --image="${VLLM_IMAGE}" \
+    --bind="${MODEL_MOUNTS},${TOKENIZER_RUNTIME_DIR}:/runtime-tokenizer:ro,${CACHE_DIR}/reasoning_eval:/evaluation-cache" \
+    --cwd=/ --no-home \
     --export="USER,HF_HOME=/evaluation-cache/huggingface,HF_HUB_OFFLINE=1,TRANSFORMERS_OFFLINE=1,PYTHONUNBUFFERED=1,OMP_NUM_THREADS=1,NCCL_NVLS_ENABLE=0,VLLM_WORKER_MULTIPROC_METHOD=spawn" \
     bash -lc '
 exec vllm serve /checkpoint --tokenizer /runtime-tokenizer --host 0.0.0.0 --port "$1" \
@@ -165,10 +161,10 @@ for task_split in ${TASK_SPLITS}; do
     export TAU_USER_PROVIDER TAU_USER_MODEL TAU_USER_REQUEST_TIMEOUT TAU_USER_MAX_RETRIES
     export NVIDIA_INFERENCE_BASE_URL
     TAU_EVAL_EXPORTS="USER,TAU_USER_PROVIDER,TAU_USER_MODEL,TAU_USER_REQUEST_TIMEOUT,TAU_USER_MAX_RETRIES,NVIDIA_INFERENCE_BASE_URL,${TAU_SECRET_NAME}"
-    srun --overlap --exact --nodes=1 --ntasks=1 --cpus-per-task=32 \
-        --container-image="${TAU3_SQSH_IMAGE}" \
-        --container-mounts="${CONTAINER_MOUNTS},${DOTENV_MASK}:/root/miles/.env:ro,${RESULT_ROOT}:/results" \
-        --container-workdir=/root/miles --container-writable --no-container-mount-home \
+    miles_srun --overlap --exact --nodes=1 --ntasks=1 --cpus-per-task=32 \
+        --image="${TAU3_CONTAINER_IMAGE}" \
+        --bind="${CONTAINER_MOUNTS},${DOTENV_MASK}:/root/miles/.env:ro,${RESULT_ROOT}:/results" \
+        --cwd=/root/miles --writable-tmpfs --no-home \
         --export="${TAU_EVAL_EXPORTS}" \
         /opt/tau3/.venv/bin/python -m experiments.src.evaluators.tau_bench \
             --input "${input}" \

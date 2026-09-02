@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cancel the active Harbor trials owned by one Slurm/Ray client.
+"""Cancel the active Harbor trials owned by one PBS/Ray client.
 
 All configuration, including the HMAC master, comes from the process
 environment. The secret is never accepted on argv or printed.

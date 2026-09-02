@@ -57,7 +57,7 @@ def test_recovery_submission_reuses_fresh_job_and_exports_valid_save_intervals(
     tmp_path: Path,
 ) -> None:
     namespace = "pytest-rbresume"
-    reused_job = "812345"
+    reused_job = "812345.pbs1"
     fake_repo = tmp_path / "miles"
     output_root = fake_repo / "experiments/outputs"
     manifest_dir = output_root / "replay_buffer_validation/tau2"
@@ -85,32 +85,32 @@ def test_recovery_submission_reuses_fresh_job_and_exports_valid_save_intervals(
         + "\n",
         encoding="utf-8",
     )
-    (log_dir / f"taurb-fresh-{reused_job}.log").write_text(
+    (log_dir / f"{reused_job}.OU").write_text(
         "debug_failure_after_rollout=10 reached at rollout_id=9\n",
         encoding="utf-8",
     )
 
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    mock_sbatch = fake_bin / "sbatch"
-    mock_sbatch.write_text(
+    mock_qsub = fake_bin / "qsub"
+    mock_qsub.write_text(
         """#!/bin/bash
 set -euo pipefail
 job_id=900000
-if [[ -s "${MOCK_SBATCH_STATE}" ]]; then
-    job_id="$(< "${MOCK_SBATCH_STATE}")"
+if [[ -s "${MOCK_QSUB_STATE}" ]]; then
+    job_id="$(< "${MOCK_QSUB_STATE}")"
 fi
 job_id=$((job_id + 1))
-printf '%s\n' "${job_id}" >"${MOCK_SBATCH_STATE}"
-printf '%q ' "$@" >>"${MOCK_SBATCH_LOG}"
-printf '\n' >>"${MOCK_SBATCH_LOG}"
-printf '%s\n' "${job_id}"
+printf '%s\n' "${job_id}" >"${MOCK_QSUB_STATE}"
+printf '%q ' "$@" >>"${MOCK_QSUB_LOG}"
+printf '\n' >>"${MOCK_QSUB_LOG}"
+printf '%s.pbs1\n' "${job_id}"
 """,
         encoding="utf-8",
     )
-    mock_sbatch.chmod(0o755)
-    sbatch_log = tmp_path / "sbatch.log"
-    sbatch_state = tmp_path / "sbatch.state"
+    mock_qsub.chmod(0o755)
+    qsub_log = tmp_path / "qsub.log"
+    qsub_state = tmp_path / "qsub.state"
     launcher = (
         REPO_ROOT
         / "experiments/tools/replay_buffer_validation/tau2/"
@@ -118,16 +118,15 @@ printf '%s\n' "${job_id}"
     )
     environment = {
         **os.environ,
-        "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "MILES_REPO": str(fake_repo),
-        "WS": str(tmp_path / "workspace"),
-        "SHARED_WS": str(tmp_path / "shared"),
+        "MILES_WORKSPACE_ROOT": str(tmp_path / "workspace"),
         "VALIDATION_NAMESPACE": namespace,
         "RECOVERY_TAG": "save-retain-fix",
         "WANDB_MODE": "online",
         "WANDB_API_KEY": "test-key",
-        "MOCK_SBATCH_LOG": str(sbatch_log),
-        "MOCK_SBATCH_STATE": str(sbatch_state),
+        "PBS_QSUB_BIN": str(mock_qsub),
+        "MOCK_QSUB_LOG": str(qsub_log),
+        "MOCK_QSUB_STATE": str(qsub_state),
     }
 
     result = subprocess.run(
@@ -138,18 +137,19 @@ printf '%s\n' "${job_id}"
             "--reuse-first-fresh-job",
             reused_job,
         ],
-        check=True,
+        check=False,
         capture_output=True,
         env=environment,
         text=True,
     )
+    assert result.returncode == 0, result.stderr
 
-    calls = [shlex.split(line) for line in sbatch_log.read_text().splitlines()]
+    calls = [shlex.split(line) for line in qsub_log.read_text().splitlines()]
     assert len(calls) == 8
-    assert "--dependency=afterany:812345" in calls[0]
-    assert "--dependency=afterok:900001" in calls[1]
+    assert "depend=afterany:812345.pbs1" in calls[0]
+    assert "depend=afterok:900001.pbs1" in calls[1]
     for index, call in enumerate(calls[:7]):
-        exported = next(argument for argument in call if argument.startswith("--export="))
+        exported = next(argument for argument in call if "SAVE_INTERVAL=" in argument)
         if index % 2 == 0:
             assert "SAVE_INTERVAL=1000,SAVE_RETAIN_INTERVAL=1000" in exported
             assert "DEBUG_EXIT_AFTER_ROLLOUT=6" in exported
@@ -159,12 +159,12 @@ printf '%s\n' "${job_id}"
 
     recovery_manifest = manifest_dir / f"{namespace}.save-retain-fix.jobs"
     manifest_text = recovery_manifest.read_text(encoding="utf-8")
-    assert "SEED_42_NO_REPLAY_FRESH_JOB=812345" in manifest_text
-    assert "SEED_42_NO_REPLAY_RESUME_JOB=900001" in manifest_text
-    assert "SEED_42_INFLIGHT_OVERLAP_RESUME_JOB=900007" in manifest_text
-    assert "SUMMARY_JOB=900008" in manifest_text
+    assert "SEED_42_NO_REPLAY_FRESH_JOB=812345.pbs1" in manifest_text
+    assert "SEED_42_NO_REPLAY_RESUME_JOB=900001.pbs1" in manifest_text
+    assert "SEED_42_INFLIGHT_OVERLAP_RESUME_JOB=900007.pbs1" in manifest_text
+    assert "SUMMARY_JOB=900008.pbs1" in manifest_text
     assert "reused    seed=42" in result.stdout
-    assert "summary=900008" in result.stdout
+    assert "summary=900008.pbs1" in result.stdout
 
 
 def test_tau_recipe_rejects_incompatible_save_intervals_before_launch() -> None:

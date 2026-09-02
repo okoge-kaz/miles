@@ -1,19 +1,20 @@
 #!/bin/bash
-#SBATCH --job-name=swe-agent-image-hardening
-#SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=cpu
-#SBATCH --qos=cpu-interactive
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
-#SBATCH --time=00:30:00
-#SBATCH --output=experiments/outputs/validation/%x-%j.log
+#PBS -N swe-agent-image-hardening
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=32:mpiprocs=1
+#PBS -l place=scatter
+#PBS -l walltime=00:30:00
+#PBS -j oe
 
 # Execute the exact materialized agent-image hardening scripts against an
-# immutable source image through Pyxis. This exercises the Dockerfile RUN path
+# immutable source image through Singularity. This exercises the Dockerfile RUN path
 # without using an external E2B credential.
 
 set -euo pipefail
+umask 077
+
+REPO_ROOT="${PBS_O_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." &>/dev/null && pwd)}"
+source "${REPO_ROOT}/experiments/env.sh"
 umask 077
 
 : "${SWE_SOURCE_IMAGE:?set an immutable docker.io/...@sha256:... reference}"
@@ -25,8 +26,9 @@ umask 077
 [[ "${SWE_BASE_COMMIT}" =~ ^[0-9a-f]{40}$ ]] || exit 2
 [[ -d "${SWE_TASK_ENV}" && ! -L "${SWE_TASK_ENV}" ]] || exit 2
 task_env="$(realpath "${SWE_TASK_ENV}")"
+sealed_task_root="${DATASET_DIR}/miles-swe/private/harbor-tasks-dry-run"
 case "${task_env}" in
-    /scratch/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/kfujii/datasets/miles-swe/private/harbor-tasks-dry-run/*/environment) ;;
+    "${sealed_task_root}"/*/environment) ;;
     *)
         echo "SWE_TASK_ENV is outside the sealed dry-run task root" >&2
         exit 2
@@ -56,11 +58,12 @@ case "${SWE_SOURCE_SCHEMA}" in
     *) exit 2 ;;
 esac
 
-srun \
-    --container-image="${SWE_SOURCE_IMAGE}" \
-    --container-mounts="${task_root}:/mnt/miles-swe-task:ro" \
-    --container-writable \
-    --no-container-mount-home \
+miles_srun \
+    --fakeroot \
+    --image="docker://${SWE_SOURCE_IMAGE}" \
+    --bind="${task_root}:/mnt/miles-swe-task:ro" \
+    --writable-tmpfs \
+    --no-home \
     --export=SWE_BASE_COMMIT,SWE_RUNTIME_POLICY,SWE_SOURCE_SCHEMA \
     env -i \
         PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \

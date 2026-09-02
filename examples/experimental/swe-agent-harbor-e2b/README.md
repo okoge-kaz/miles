@@ -49,12 +49,12 @@ or mismatched binding is an ungraded `TaskDigestMismatch`, never reward zero.
 
 ## Start the E2B agent server
 
-The launcher never reads `.env`. Credential-capable Slurm container steps also
+The launcher never reads `.env`. Credential-capable PBS Singularity steps also
 mount the tracked comment-only `experiments/common/dotenv.disabled` over
 `/root/miles/.env` read-only, so an unrelated host checkout file cannot be
 discovered inside the container. The repository itself is never mounted into a
 model-controlled E2B sandbox. Put `E2B_API_KEY` in the process environment
-through a shell export, Slurm secret injection, or your secret manager. It
+through a shell export, PBS secret injection, or your secret manager. It
 checks only that the value is present and never prints it. It also exports
 `PYTHON_DOTENV_DISABLED=1`, so Harbor's optional registry client cannot
 implicitly discover a dotenv file later in the process.
@@ -63,12 +63,15 @@ implicitly discover a dotenv file later in the process.
 export E2B_API_KEY=<injected-secret>
 export HARBOR_ROOT=/path/to/harbor
 export HARBOR_TASKS_DIR=/path/to/materialized/harbor_tasks
+export HARBOR_E2B_PREBUILD_TASK_IDS_FILE=/path/to/admitted-instance-ids.txt
+export HARBOR_E2B_SEMANTIC_ADMISSION_MANIFESTS=/path/to/admission-a.jsonl:/path/to/admission-b.jsonl
 export TRIALS_DIR=/path/to/trials
+export MAX_CONCURRENT=64
 # Inject a unique master per training/evaluation job and a server-only admin key.
 export HARBOR_RUN_SECRET=<job-scoped-secret-at-least-32-characters>
 export HARBOR_ADMIN_SECRET=<distinct-server-admin-secret-at-least-32-characters>
 
-bash examples/experimental/swe-agent-harbor-e2b/launch_agent_server.sh
+bash examples/experimental/swe-agent-harbor-e2b/submit_agent_server.sh
 ```
 
 The launcher calls `apply_harbor_e2b_overlays.sh`, which pins the Harbor commit,
@@ -96,7 +99,7 @@ session-server instance, and the exact task ID; a captured token cannot start a
 sibling trajectory or another admitted task. `/cancel` uses a distinct context
 with the same exact binding, including a bounded cancellation tombstone that
 closes cancel-before-registration races. `/drain` is client-scoped and cancels
-only that Slurm job's remaining inventory. Only these derived bearers cross the
+only that PBS job's remaining inventory. Only these derived bearers cross the
 HTTP boundary.
 `/flush` uses a distinct session-only HMAC context, and a token for one session
 cannot flush another. Do not share one server/master between mutually untrusted
@@ -112,7 +115,7 @@ environment. This boundary assumes the exact pinned Harbor/controller code is
 trusted. Dashboard routes and the standalone dashboard port are disabled
 because they expose private trial metadata; the owner-only JSONL
 remains available for host-side auditing. The HTTP server binds `0.0.0.0` for
-Slurm workers and therefore must remain behind a private-fabric ACL. TLS/mTLS
+PBS workers and therefore must remain behind a private-fabric ACL. TLS/mTLS
 and bearer replay defense on a hostile network are outside this deployment
 boundary.
 
@@ -218,14 +221,14 @@ task); a 32,000-task stress model was 23,584,059 bytes. The former 2 MiB cap was
 therefore insufficient for the full Ultra shard. Two additional aggregate
 SHA-256 bindings add only fixed-size overhead.
 
-For private Slurm deployments, use `terminus-2` as the default agent: it remains
+For private PBS deployments, use `terminus-2` as the default agent: it remains
 in the Harbor host process and does not require exposing the Miles session
 endpoint to a sandbox. `run_agent_server.sbatch` provides a one-day
-`cpu/cpu-normal` allocation with 32 host CPUs, W&B offline mode, owner-only
+reservation allocation with 32 host CPUs and no requested GPUs, W&B offline mode, owner-only
 trial storage, and a logged non-secret connection URL. This prevents full-shard
-prebuild time from consuming the four-hour training lifetime. The training
+prebuild time from consuming the GPU training allocation. The training
 launcher polls the bearer-authenticated `/health` endpoint and does not start
-Ray/EFA work until the server has completed prebuild and is accepting traffic.
+Ray/NCCL work until the server has completed prebuild and is accepting traffic.
 Set `MAX_CONCURRENT` explicitly to the same bounded value as the training
 recipe's `ASYNC_MAX_CONCURRENT_SAMPLES` (currently 64); the launcher rejects a
 mismatch and caps either value at 256 rather than silently imposing a server
@@ -240,16 +243,16 @@ helper:
 ```bash
 export AGENT_SERVER_URL=http://private-server-host:port
 export HARBOR_RUN_SECRET=<same-job-scoped-master>
-bash experiments/scripts/swe/async/r2e-gym-swe-rebench-v2/\
-qwen3-4b-instruct-2507/submit_when_ready.sh
+bash experiments/scripts/swe/async/swe-rebench-v2-swe-gym/\
+qwen3-4b/submit_when_ready.sh
 ```
 
-It submits a one-CPU `cpu-normal` readiness job, then submits the GPU job with
+It submits a CPU-only reservation readiness job, then submits the GPU job with
 `afterok:<readiness-job>`. Both submissions use fixed-name environment exports;
-every underlying job defaults to `#SBATCH --export=NIL`, and the secret value is
-absent from argv and logs. The GPU job performs only a
+every underlying job is submitted without `-V` and receives only a fixed `-v`
+allowlist, so the secret value is absent from argv and logs. The GPU job performs only a
 final authenticated health check capped at 60 seconds, so a stale or restarted
-server fails before Ray/EFA initialization rather than consuming an hour of GPU
+server fails before Ray/NCCL initialization rather than consuming an hour of GPU
 time.
 
 ## Network topology

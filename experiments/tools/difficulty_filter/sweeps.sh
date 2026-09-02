@@ -21,10 +21,8 @@ set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)"
 cd "${REPO_ROOT}"
+source experiments/env.sh
 
-ACCOUNT="${SLURM_ACCOUNT_NAME:-coreai_horizon_dilations}"
-PARTITION="${GPU_PARTITION:-batch}"
-QOS="${INTERACTIVE_GPU_QOS:-interactive}"
 MODEL="${MODEL_NAME:-Qwen3-4B-Base-LR2e-5-Step4000}"
 ENV="experiments.src.environments"
 REWARDS="experiments.src.reward_sets.all_domains"
@@ -113,7 +111,7 @@ while IFS='|' read -r name data verifier extra; do
     [[ -n "${extra}" ]] && exports="${exports},${extra}"
     [[ -n "${limits}" ]] && exports="${exports},${limits}"
 
-    id=$(sbatch --parsable -A "${ACCOUNT}" -p "${PARTITION}" --qos="${QOS}" \
+    id=$(pbs_submit --parsable --profile gpu \
         --job-name="${job}" \
         --export="${exports}" \
         experiments/tools/difficulty_filter/run_measure.sbatch)

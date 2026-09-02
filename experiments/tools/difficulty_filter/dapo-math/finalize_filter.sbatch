@@ -1,17 +1,14 @@
 #!/bin/bash
-#SBATCH --job-name=merge-pr-qwen3-4b-step4000
-#SBATCH --partition=cpu
-#SBATCH --qos=cpu-interactive
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=32G
-#SBATCH --time=01:00:00
-#SBATCH --output=experiments/outputs/difficulty/%x-%j.log
+#PBS -N merge-pr-qwen3-4b-step4000
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=32:mpiprocs=1
+#PBS -l place=scatter
+#PBS -l walltime=01:00:00
+#PBS -j oe
 
 set -euo pipefail
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../.." &>/dev/null && pwd)}"
+REPO_ROOT="${PBS_O_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../.." &>/dev/null && pwd)}"
 source "${REPO_ROOT}/experiments/env.sh"
 
 MODEL_NAME=Qwen3-4B-Base-LR2e-5-Step4000
@@ -32,13 +29,13 @@ for shard in "${SHARD_0}" "${SHARD_1}"; do
 done
 unset shard host_path
 
-srun \
-    --cpus-per-task="${SLURM_JOB_CPUS_PER_NODE:-8}" \
+miles_srun \
+    --cpus-per-task="${PBS_NCPUS:-8}" \
     --mem=0 \
-    --container-image="${SQSH_IMAGE}" \
-    --container-mounts="${CONTAINER_MOUNTS}" \
-    --container-writable \
-    --no-container-mount-home \
+    --image="${CONTAINER_IMAGE}" \
+    --bind="${CONTAINER_MOUNTS}" \
+    --writable-tmpfs \
+    --no-home \
     --export=ALL \
     bash -lc "
 set -euo pipefail
@@ -61,11 +58,11 @@ touch ${MERGED_OUTPUT}.measured ${MERGED_OUTPUT}.complete
 "
 
 if [[ "${SUBMIT_REPLAY_BUFFER_VALIDATION:-1}" != "0" ]]; then
-    [[ -n "${SLURM_JOB_ID:-}" ]] || {
-        echo "SUBMIT_REPLAY_BUFFER_VALIDATION requires a Slurm job" >&2
+    [[ -n "${MILES_JOB_ID:-}" ]] || {
+        echo "SUBMIT_REPLAY_BUFFER_VALIDATION requires a PBS job" >&2
         exit 1
     }
     "${REPO_ROOT}/experiments/tools/replay_buffer_validation/dapo-math/submit_replay_buffer_validation.sh" \
         --submit \
-        --afterok "${SLURM_JOB_ID}"
+        --afterok "${MILES_JOB_ID}"
 fi

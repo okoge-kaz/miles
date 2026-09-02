@@ -1,20 +1,17 @@
 #!/bin/bash
-#SBATCH --job-name=test-tau-nvidia-api
-#SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=cpu
-#SBATCH --qos=cpu-interactive
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=2
-#SBATCH --time=00:10:00
-#SBATCH --output=experiments/outputs/validation/%x-%j.log
+#PBS -N test-tau-nvidia-api
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=32:mpiprocs=1
+#PBS -l place=scatter
+#PBS -l walltime=00:10:00
+#PBS -j oe
 
 # One real, credential-bearing provider probe. The job reads only the named
 # values from .env and never writes the key or response text to stdout.
 
 set -euo pipefail
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." &>/dev/null && pwd)}"
+REPO_ROOT="${PBS_O_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." &>/dev/null && pwd)}"
 export WANDB_MODE=offline
 source "${REPO_ROOT}/experiments/env.sh"
 source "${REPO_ROOT}/experiments/common/load_job_env.sh"
@@ -27,11 +24,11 @@ DOTENV_MASK="${REPO_ROOT}/experiments/common/dotenv.disabled"
     exit 1
 }
 
-srun \
-    --container-image="${SQSH_IMAGE}" \
-    --container-mounts="${CONTAINER_MOUNTS},${DOTENV_MASK}:/root/miles/.env:ro" \
-    --container-writable \
-    --no-container-mount-home \
+miles_srun \
+    --image="${CONTAINER_IMAGE}" \
+    --bind="${CONTAINER_MOUNTS},${DOTENV_MASK}:/root/miles/.env:ro" \
+    --writable-tmpfs \
+    --no-home \
     --export=USER,WANDB_MODE,NVIDIA_INFERENCE_API_KEY,TAU_USER_MODEL \
     bash -lc '
 set -euo pipefail

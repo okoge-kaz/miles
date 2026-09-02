@@ -167,7 +167,7 @@ def test_agent_runtime_policy_is_narrow_and_explicit() -> None:
     assert "JSON.parse(fs.readFileSync" in admission
 
 
-def test_materialized_timeout_budget_fits_the_four_hour_pilot() -> None:
+def test_materialized_timeout_budget_fits_the_trial_ceiling() -> None:
     manifest = _rebench_task().to_task_manifest()
     manifest["source_image"] = manifest["sandbox"]["source_image"]
     task_toml = tomllib.loads(
@@ -194,14 +194,14 @@ def test_materialized_timeout_budget_fits_the_four_hour_pilot() -> None:
         timeouts.TRIAL_PHASE_BUDGET_SEC
         < timeouts.TRIAL_WALL_TIMEOUT_SEC
         < timeouts.TRIAL_REQUEST_TIMEOUT_SEC
-        < timeouts.FOUR_HOUR_JOB_TIMEOUT_SEC
+        < timeouts.TRIAL_TIMEOUT_CEILING_SEC
     )
 
     repository = Path(__file__).parents[3]
     training = (
         repository
-        / "experiments/scripts/swe/async/r2e-gym-swe-rebench-v2/"
-        "qwen3-4b-instruct-2507/run.sbatch"
+        / "experiments/scripts/swe/async/swe-rebench-v2-swe-gym/"
+        "qwen3-4b/run.sbatch"
     ).read_text(encoding="utf-8")
     evaluation = (
         repository / "experiments/scripts/swe/eval/swebench-verified/run.sbatch"

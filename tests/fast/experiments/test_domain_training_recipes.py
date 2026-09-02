@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -17,6 +19,12 @@ RECIPES = (
     "experiments/scripts/tool_call_pivot/async/nemotron-agentic-conv-tooluse-pivot/qwen3-4b",
 )
 RECIPE_IDS = ("code", "instruction-following", "math-code-stem", "stem", "tool_call_pivot")
+RUNTIME_ENV_RECIPES = (
+    *RECIPES,
+    "experiments/scripts/swe/async/swe-rebench-v2-swe-gym/qwen3-4b",
+    "experiments/scripts/tau_bench/async/areal-tau2/qwen3-4b-agentic-sft-953",
+)
+RUNTIME_ENV_RECIPE_IDS = (*RECIPE_IDS, "swe", "tau")
 CUSTOM_RM_PATHS = {
     RECIPES[0]: "experiments.src.reward_sets.code.reward",
     RECIPES[1]: "experiments.src.reward_sets.instruction_following.reward",
@@ -30,9 +38,38 @@ def _read(relative_path: str) -> str:
     return (REPO_ROOT / relative_path).read_text(encoding="utf-8")
 
 
+def _render_runtime_env(recipe_dir: str, **overrides: str) -> dict[str, dict[str, str]]:
+    train_script = _read(f"{recipe_dir}/train.sh")
+    marker = "RUNTIME_ENV_JSON=\"$(python3 - <<'PY'\n"
+    python_source = train_script.split(marker, maxsplit=1)[1].split(
+        "\nPY\n)\"", maxsplit=1
+    )[0]
+    environment = {
+        "PATH": os.environ["PATH"],
+        "HAS_NVLINK": "1",
+        "MILES_NCCL_TRANSPORT": "system",
+        "NCCL_IB_DISABLE": "0",
+        "CODE_EXEC_SANDBOX": "bubblewrap",
+        "CODE_EXEC_CONCURRENCY": "16",
+        "CODE_EXEC_MAX_TESTS": "50",
+        "OPEN_INSTRUCT_PATH": "/data/open-instruct",
+        "OPEN_INSTRUCT_DEPS_PATH": "/data/open-instruct-deps",
+        "TAU_LOG_LEVEL": "ERROR",
+    }
+    environment.update(overrides)
+    result = subprocess.run(
+        [sys.executable, "-c", python_source],
+        check=True,
+        capture_output=True,
+        env=environment,
+        text=True,
+    )
+    return json.loads(result.stdout)
+
+
 def _resolve_segment_identity(
     run_script: str,
-    slurm_job_id: str,
+    job_id: str,
     num_rollout: str = "300",
 ) -> tuple[str, str, str]:
     task_family = next(
@@ -43,7 +80,7 @@ def _resolve_segment_identity(
     )
     environment = {
         "PATH": os.environ["PATH"],
-        "SLURM_JOB_ID": slurm_job_id,
+        "MILES_JOB_ID": job_id,
         "MODEL_NAME": "Qwen3-4B-Base-LR2e-5-Step4000",
         "DATASET_TAG": dataset_tag,
         "TASK_FAMILY": task_family,
@@ -98,18 +135,49 @@ def _resolve_segment_identity(
     return run_name, checkpoint_path, config_tag
 
 
+@pytest.mark.parametrize(
+    "recipe_dir",
+    RUNTIME_ENV_RECIPES,
+    ids=RUNTIME_ENV_RECIPE_IDS,
+)
+def test_async_runtime_env_omits_empty_nccl_selectors(recipe_dir: str) -> None:
+    system_vars = _render_runtime_env(recipe_dir)["env_vars"]
+
+    assert system_vars["MILES_NCCL_TRANSPORT"] == "system"
+    assert system_vars["NCCL_IB_DISABLE"] == "0"
+    for name in ("NCCL_NET", "NCCL_NET_PLUGIN", "NCCL_TUNER_PLUGIN", "FI_PROVIDER"):
+        assert name not in system_vars
+
+    tcp_vars = _render_runtime_env(
+        recipe_dir,
+        MILES_NCCL_TRANSPORT="tcp",
+        NCCL_IB_DISABLE="1",
+        NCCL_NET="Socket",
+        NCCL_NET_PLUGIN="",
+        NCCL_TUNER_PLUGIN="example-tuner",
+        FI_PROVIDER="verbs",
+    )["env_vars"]
+    assert tcp_vars["MILES_NCCL_TRANSPORT"] == "tcp"
+    assert tcp_vars["NCCL_IB_DISABLE"] == "1"
+    assert tcp_vars["NCCL_NET"] == "Socket"
+    assert "NCCL_NET_PLUGIN" not in tcp_vars
+    assert tcp_vars["NCCL_TUNER_PLUGIN"] == "example-tuner"
+    assert tcp_vars["FI_PROVIDER"] == "verbs"
+
+
 @pytest.mark.parametrize("recipe_dir", RECIPES, ids=RECIPE_IDS)
-def test_domain_recipe_keeps_four_hour_segment_scheduler_and_production_shape(recipe_dir: str):
+def test_domain_recipe_uses_pbs_scheduler_and_production_shape(recipe_dir: str):
     run_script = _read(f"{recipe_dir}/run.sbatch")
     train_script = _read(f"{recipe_dir}/train.sh")
 
     for directive in (
-        "#SBATCH --partition=batch",
-        "#SBATCH --qos=interactive",
-        "#SBATCH --nodes=4",
-        "#SBATCH --time=04:00:00",
+        "#PBS -q R9920261300",
+        "#PBS -l select=4:ncpus=192:ngpus=8:mpiprocs=1",
+        "#PBS -l place=scatter:excl",
+        "#PBS -l walltime=24:00:00",
     ):
         assert directive in run_script
+    assert "#PBS -P" not in run_script
 
     for default in (
         ': "${MAX_RESPONSE_LEN:=16384}"',
@@ -127,8 +195,6 @@ def test_domain_recipe_keeps_four_hour_segment_scheduler_and_production_shape(re
     ):
         assert default in run_script
 
-    assert "#SBATCH --partition=batch_long" not in run_script
-    assert "#SBATCH --qos=normal" not in run_script
     for argument in (
         '--num-rollout "${NUM_ROLLOUT}"',
         '--rollout-batch-size "${ROLLOUT_BATCH_SIZE}"',
@@ -163,7 +229,7 @@ def test_domain_recipe_segments_resume_the_same_checkpoint_identity(recipe_dir: 
     assert identity_source in run_script
     assert "export RUN_NAME CONFIG_TAG CKPT_PATH" in run_script
     assert 'source "${REPO_ROOT}/experiments/common/clean_checkpoint.sh"' in run_script
-    assert "SLURM_JOB_ID" not in run_script[: run_script.index(identity_source)]
+    assert "MILES_JOB_ID" not in run_script[: run_script.index(identity_source)]
 
     config_tag = next(line for line in run_script.splitlines() if line.startswith(': "${CONFIG_TAG:='))
     for stable_axis in (
@@ -177,11 +243,11 @@ def test_domain_recipe_segments_resume_the_same_checkpoint_identity(recipe_dir: 
         "ROLLOUT_SEED",
     ):
         assert stable_axis in config_tag
-    assert "SLURM_JOB_ID" not in config_tag
+    assert "MILES_JOB_ID" not in config_tag
 
     assert 'RUN_NAME="${RUN_NAME:-' in identity_script
     assert 'CKPT_PATH="/ckpt/training/${TASK_FAMILY}/${DATASET_TAG}/' in identity_script
-    assert "SLURM_JOB_ID" not in identity_script
+    assert "MILES_JOB_ID" not in identity_script
     assert ': "${CLEAN_CHECKPOINT:=0}"' in clean_script
     assert "CLEAN_CHECKPOINT=1" not in run_script
 
@@ -198,10 +264,10 @@ def test_domain_recipe_segments_resume_the_same_checkpoint_identity(recipe_dir: 
     assert '--save-retain-interval "${SAVE_RETAIN_INTERVAL}"' in train_script
     assert '--hf-save-interval "${HF_SAVE_INTERVAL}"' in train_script
 
-    first_identity = _resolve_segment_identity(run_script, slurm_job_id="100001")
-    resumed_identity = _resolve_segment_identity(run_script, slurm_job_id="100002")
+    first_identity = _resolve_segment_identity(run_script, job_id="100001.pbs1")
+    resumed_identity = _resolve_segment_identity(run_script, job_id="100002.pbs1")
     assert first_identity == resumed_identity
-    assert _resolve_segment_identity(run_script, slurm_job_id="100003", num_rollout="301") != first_identity
+    assert _resolve_segment_identity(run_script, job_id="100003.pbs1", num_rollout="301") != first_identity
     run_name, checkpoint_path, config_tag = first_identity
     assert run_name
     assert len(run_name) + 9 <= 128
@@ -227,19 +293,18 @@ def test_domain_recipe_keeps_runtime_safety_contracts(recipe_dir: str):
     assert ': "${SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS:=1}"' in run_script
     assert "--sglang-enable-response-weight-version-segments" in train_script
 
-    for efa_contract in (
-        ': "${MILES_NCCL_TRANSPORT:=efa}"',
-        '[[ "${NCCL_IB_DISABLE:-0}" != 1 ]]',
-        '[[ "${NCCL_NET_PLUGIN:-ofi}" == ofi ]]',
-        'NCCL_NET="AWS Libfabric"',
-        "FI_PROVIDER=efa",
-        'echo "running EFA fail-closed preflight on every node"',
-        '--nodes="${SLURM_JOB_NUM_NODES}"',
-        '--ntasks="${SLURM_JOB_NUM_NODES}"',
-        "bash /root/miles/experiments/common/check_efa.sh",
-        "bash /root/miles/experiments/common/run_with_efa_env.sh",
+    for transport_contract in (
+        ': "${MILES_NCCL_TRANSPORT:=system}"',
+        'case "${MILES_NCCL_TRANSPORT}" in',
+        "tcp)",
+        "NCCL_IB_DISABLE=1",
+        "NCCL_NET=Socket",
+        "system)",
+        "NCCL_IB_DISABLE=0",
+        "expected tcp or system",
     ):
-        assert efa_contract in run_script
+        assert transport_contract in run_script
+    assert "#PBS -P" not in run_script
 
 
 def test_tool_call_pivot_recipe_uses_current_sft_and_pinned_dataset() -> None:
@@ -253,7 +318,7 @@ def test_tool_call_pivot_recipe_uses_current_sft_and_pinned_dataset() -> None:
     assert "--custom-generate-function-path" not in train_script
     assert "Qwen3-4B-Instruct-2507" not in run_script
     assert 'MODEL_NAME:=Qwen3-4B-Base-LR2e-5-Step4000' in run_script
-    assert 'HF_MODEL_NAME:=iter_0004000' in run_script
+    assert 'HF_MODEL_NAME:=${QWEN3_4B_BASE_HF_MODEL}' in run_script
     assert (
         "PROMPT_DATA=/data/nemotron-agentic-conv-tooluse-pivot/"
         "nemotron-agentic-conv-tooluse-pivot-train.jsonl"

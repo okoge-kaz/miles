@@ -1,17 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=test-swe-agent-meta
-#SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=batch
-#SBATCH --qos=interactive
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16
-#SBATCH --gres=gpu:1
-#SBATCH --time=00:30:00
-#SBATCH --output=experiments/outputs/validation/%x-%j.log
-#SBATCH --export=NIL
+#PBS -N test-swe-agent-meta
+#PBS -q R9920261300
+#PBS -l select=1:ncpus=192:ngpus=8:mpiprocs=1
+#PBS -l place=scatter:excl
+#PBS -l walltime=00:30:00
+#PBS -j oe
 
-# The production SQSH imports Transformer Engine for this integration test, so
+# The production SIF imports Transformer Engine for this integration test, so
 # a CUDA-capable node is required even though the SGLang server is mocked.
 # This job is offline-only and never reads a dotenv file.
 
@@ -21,7 +16,7 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 USER="$(id -un)"
 export PATH USER
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." &>/dev/null && pwd)}"
+REPO_ROOT="${PBS_O_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." &>/dev/null && pwd)}"
 export WANDB_MODE=offline
 export WANDB_DISABLED=true
 export PYTHON_DOTENV_DISABLED=1
@@ -36,16 +31,16 @@ DOTENV_MASK="${REPO_ROOT}/experiments/common/dotenv.disabled"
 }
 SWE_CONTAINER_MOUNTS="${CONTAINER_MOUNTS},${DOTENV_MASK}:/root/miles/.env:ro"
 
-[[ -r "${SQSH_IMAGE}" ]] || {
-    echo "missing production Miles SQSH_IMAGE" >&2
+[[ -r "${CONTAINER_IMAGE}" ]] || {
+    echo "missing production Miles CONTAINER_IMAGE" >&2
     exit 1
 }
 
-srun \
-    --container-image="${SQSH_IMAGE}" \
-    --container-mounts="${SWE_CONTAINER_MOUNTS}" \
-    --container-writable \
-    --no-container-mount-home \
+miles_srun \
+    --image="${CONTAINER_IMAGE}" \
+    --bind="${SWE_CONTAINER_MOUNTS}" \
+    --writable-tmpfs \
+    --no-home \
     --export=PYTHON_DOTENV_DISABLED,PYTHONDONTWRITEBYTECODE,WANDB_DISABLED,WANDB_MODE \
     bash --noprofile --norc -c '
 set -euo pipefail
@@ -69,4 +64,4 @@ python3 -m pytest -q \
     tests/fast/rollout/inference_rollout/integration/test_agent_metadata.py
 '
 
-echo "GPU-dependent SWE agent metadata integration passed in production SQSH."
+echo "GPU-dependent SWE agent metadata integration passed in production SIF."

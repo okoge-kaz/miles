@@ -271,18 +271,18 @@ import os
 names = (
     "AGENT_MODEL_NAME",
     "AGENT_SERVER_URL",
-    "FI_PROVIDER",
     "HARBOR_CLIENT_ID",
     "LD_LIBRARY_PATH",
     "MILES_NCCL_TRANSPORT",
     "NCCL_IB_DISABLE",
-    "NCCL_NET",
-    "NCCL_NET_PLUGIN",
-    "NCCL_TUNER_PLUGIN",
     "PYTHON_DOTENV_DISABLED",
     "WANDB_MODE",
 )
 env_vars = {name: os.environ.get(name, "") for name in names}
+for name in ("NCCL_NET", "NCCL_NET_PLUGIN", "NCCL_TUNER_PLUGIN", "FI_PROVIDER"):
+    if value := os.environ.get(name):
+        env_vars[name] = value
+
 env_vars.update(
     {
         "PYTHONPATH": "/root/Megatron-LM/:/root/miles/examples/swe-agent:/root/miles",

@@ -1,32 +1,24 @@
 #!/bin/bash
-#SBATCH --job-name=miles-stem-async-qwen3-4b
-#SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=batch
-#SBATCH --qos=interactive
-#SBATCH --nodes=4
-#SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=128
-#SBATCH --gres=gpu:8
-#SBATCH --exclusive
-#SBATCH --mem=0
-#SBATCH --time=04:00:00
-#SBATCH --output=experiments/outputs/training/stem/nemotron3-nano-knowledge-mcqa-reasoning-gym/qwen3-4b/%x-%j.log
+#PBS -N miles-stem-async-qwen3-4b
+#PBS -q R9920261300
+#PBS -l select=4:ncpus=192:ngpus=8:mpiprocs=1
+#PBS -l place=scatter:excl
+#PBS -l walltime=24:00:00
+#PBS -j oe
 
 # Four-node asynchronous RL on the Nemotron 3 Nano Knowledge-MCQA +
 # ReasoningGym blend. GPQA remains a held-out evaluation dataset.
-# This file owns the complete STEM recipe; submit it directly with sbatch.
+# This file owns the complete STEM recipe; submit it with pbs_submit.
 
 set -euo pipefail
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../../../.." &>/dev/null && pwd)}"
-: "${HF_CKPT_DIR:=${QWEN3_4B_BASE_HF_ROOT:-/lustre/fsw/portfolios/coreai/users/kfujii/checkpoints/huggingface/Qwen3-4B-Base/LR2.0e-5-SEQ32768-GBS128-MBS1-TP1-PP1-CP1-EP1-PACK1-standard-cp-STEPS4000}}"
-export HF_CKPT_DIR
+REPO_ROOT="${MILES_SUBMIT_DIR:-${PBS_O_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../../../.." &>/dev/null && pwd)}}"
 source "${REPO_ROOT}/experiments/env.sh"
 
 if [[ "${WANDB_MODE:-online}" != offline && "${WANDB_MODE:-online}" != disabled ]]; then
     : "${WANDB_API_KEY:?set WANDB_API_KEY, use WANDB_MODE=offline, or disable wandb}"
 fi
-[[ "${SLURM_JOB_NUM_NODES:?}" == 4 ]] || {
+[[ "${MILES_JOB_NUM_NODES:?}" == 4 ]] || {
     echo "STEM validation requires exactly four GPU nodes" >&2
     exit 1
 }
@@ -37,7 +29,7 @@ PROMPT_DATA=/data/nemotron-performance-transfer/nemotron3-nano-knowledge-mcqa-re
 TRAIN_SCRIPT=/root/miles/experiments/scripts/stem/async/nemotron3-nano-knowledge-mcqa-reasoning-gym/qwen3-4b/train.sh
 
 : "${MODEL_NAME:=Qwen3-4B-Base-LR2e-5-Step4000}"
-: "${HF_MODEL_NAME:=iter_0004000}"
+: "${HF_MODEL_NAME:=${QWEN3_4B_BASE_HF_MODEL}}"
 : "${MODEL_PROFILE:=qwen3-4B}"
 PLACEMENT=async
 
@@ -121,25 +113,9 @@ readonly VERIFIED_CUSTOM_RM_PATH=experiments.src.reward_sets.stem.reward
 : "${SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS:=1}"
 : "${DEBUG_EXIT_AFTER_ROLLOUT:=}"
 
-: "${MILES_NCCL_TRANSPORT:=efa}"
-: "${ASYNC_SQSH_IMAGE_OVERRIDE:=/lustre/fsw/portfolios/coreai/users/kfujii/containers/miles-staleness-weight-boundaries-f994b9aed-efa-1.49.0.sqsh}"
+: "${MILES_NCCL_TRANSPORT:=system}"
+: "${ASYNC_CONTAINER_IMAGE_OVERRIDE:=${CONTAINER_IMAGE}}"
 case "${MILES_NCCL_TRANSPORT}" in
-    efa)
-        [[ "${NCCL_IB_DISABLE:-0}" != 1 ]] || {
-            echo "EFA mode refuses NCCL_IB_DISABLE=1" >&2
-            exit 1
-        }
-        [[ "${NCCL_NET_PLUGIN:-ofi}" == ofi ]] || {
-            echo "EFA mode requires NCCL_NET_PLUGIN=ofi" >&2
-            exit 1
-        }
-        NCCL_IB_DISABLE=0
-        NCCL_NET_PLUGIN=ofi
-        NCCL_TUNER_PLUGIN=ofi
-        NCCL_NET="AWS Libfabric"
-        FI_PROVIDER=efa
-        LD_LIBRARY_PATH="/opt/amazon/efa/lib:/opt/amazon/ofi-nccl/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-        ;;
     tcp)
         NCCL_IB_DISABLE=1
         NCCL_NET=Socket
@@ -150,7 +126,7 @@ case "${MILES_NCCL_TRANSPORT}" in
         unset NCCL_NET NCCL_NET_PLUGIN NCCL_TUNER_PLUGIN FI_PROVIDER
         ;;
     *)
-        echo "unknown MILES_NCCL_TRANSPORT=${MILES_NCCL_TRANSPORT}; expected efa, tcp, or system" >&2
+        echo "unknown MILES_NCCL_TRANSPORT=${MILES_NCCL_TRANSPORT}; expected tcp or system" >&2
         exit 1
         ;;
 esac
@@ -174,59 +150,41 @@ export SAVE_INTERVAL SAVE_RETAIN_INTERVAL SAVE_HF HF_SAVE_INTERVAL
 export DUMP_TRAIN_DATA DUMP_POLICY_LOSS_DEBUG FUSE_ONE_STEP_ACTOR_LOGPROBS VERIFY_FUSED_ONE_STEP_ACTOR_LOGPROBS
 export LOG_SAMPLE_STALENESS_METRICS LOG_SAMPLE_STALENESS_RATIO_HISTOGRAM LOG_UPDATE_DIAGNOSTICS
 export SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS DEBUG_EXIT_AFTER_ROLLOUT
-export MILES_NCCL_TRANSPORT ASYNC_SQSH_IMAGE_OVERRIDE NCCL_IB_DISABLE LD_LIBRARY_PATH
-export NCCL_NET NCCL_NET_PLUGIN NCCL_TUNER_PLUGIN FI_PROVIDER
+export MILES_NCCL_TRANSPORT ASYNC_CONTAINER_IMAGE_OVERRIDE NCCL_IB_DISABLE LD_LIBRARY_PATH
+export NCCL_NET
 
 source "${REPO_ROOT}/experiments/common/run_identity.sh"
 export RUN_NAME CONFIG_TAG CKPT_PATH
 source "${REPO_ROOT}/experiments/common/placement.sh"
 
-export RAY_DONE_FLAG="/root/miles/experiments/outputs/.ray/${RUN_NAME}-${SLURM_JOB_ID}.done"
+export RAY_DONE_FLAG="/root/miles/experiments/outputs/.ray/${RUN_NAME}-${MILES_JOB_ID}.done"
 export RAY_HEAD_IP_FILE="${RAY_DONE_FLAG}.head-ip"
 mkdir -p "${OUTPUT_DIR}/.ray"
 rm -f \
-    "${OUTPUT_DIR}/.ray/${RUN_NAME}-${SLURM_JOB_ID}.done" \
-    "${OUTPUT_DIR}/.ray/${RUN_NAME}-${SLURM_JOB_ID}.done.head-ip"
+    "${OUTPUT_DIR}/.ray/${RUN_NAME}-${MILES_JOB_ID}.done" \
+    "${OUTPUT_DIR}/.ray/${RUN_NAME}-${MILES_JOB_ID}.done.head-ip"
 
 source "${REPO_ROOT}/experiments/common/clean_checkpoint.sh"
 echo "run ${RUN_NAME}"
 echo "checkpoints ${CKPT_PATH}"
 
-STEP_CPUS_PER_NODE="${SLURM_CPUS_PER_TASK:-${SLURM_JOB_CPUS_PER_NODE%%\(*}}"
+STEP_CPUS_PER_NODE="${PBS_GPU_CPUS_PER_NODE}"
 [[ "${STEP_CPUS_PER_NODE}" =~ ^[1-9][0-9]*$ ]] || {
-    echo "invalid SLURM_JOB_CPUS_PER_NODE=${SLURM_JOB_CPUS_PER_NODE:-unset}" >&2
+    echo "invalid PBS_NCPUS=${PBS_NCPUS:-unset}" >&2
     exit 1
 }
 MOUNTS="${CONTAINER_MOUNTS},/usr/bin/bwrap:/usr/local/bin/bwrap"
 
-if [[ "${MILES_NCCL_TRANSPORT}" == efa ]]; then
-    echo "running EFA fail-closed preflight on every node"
-    srun \
-        --nodes="${SLURM_JOB_NUM_NODES}" \
-        --ntasks="${SLURM_JOB_NUM_NODES}" \
-        --ntasks-per-node=1 \
-        --cpus-per-task=8 \
-        --mem=0 \
-        --container-image="${SQSH_IMAGE}" \
-        --container-mounts="${MOUNTS}" \
-        --no-container-mount-home \
-        --export=ALL \
-        bash /root/miles/experiments/common/check_efa.sh
-fi
-
 container_command=(bash "${TRAIN_SCRIPT}")
-if [[ "${MILES_NCCL_TRANSPORT}" == efa ]]; then
-    container_command=(bash /root/miles/experiments/common/run_with_efa_env.sh "${container_command[@]}")
-fi
 
-srun \
-    --nodes="${SLURM_JOB_NUM_NODES}" \
+miles_srun \
+    --nodes="${MILES_JOB_NUM_NODES}" \
     --ntasks-per-node=1 \
     --cpus-per-task="${STEP_CPUS_PER_NODE}" \
     --mem=0 \
-    --container-image="${SQSH_IMAGE}" \
-    --container-mounts="${MOUNTS}" \
-    --container-writable \
-    --no-container-mount-home \
+    --image="${CONTAINER_IMAGE}" \
+    --bind="${MOUNTS}" \
+    --writable-tmpfs \
+    --no-home \
     --export=ALL \
     "${container_command[@]}"

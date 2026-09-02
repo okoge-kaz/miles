@@ -3,7 +3,7 @@
 
     experiments/sweep.py --sweep experiments/sweeps/<name>.txt \\
         --recipe math/async/dapo-math-p10-90/qwen3-4b [--recipe ...] \\
-        [-- <extra sbatch args>]
+        [-- <extra pbs_submit args>]
 
 Prints the grid and exits. Add --submit to actually submit.
 
@@ -50,6 +50,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EXPERIMENTS = REPO_ROOT / "experiments"
 EXPERIMENT_SCRIPTS = EXPERIMENTS / "scripts"
+PBS_SUBMIT = EXPERIMENTS / "common" / "pbs.sh"
 
 # Short forms used in CONFIG_TAG, so a tag stays readable as a directory name.
 TAG_ABBREV = {
@@ -191,8 +192,7 @@ def main() -> int:
     )
     ap.add_argument("--submit", action="store_true", help="actually submit; otherwise print the grid and exit")
     ap.add_argument("--max-jobs", type=int, default=32, help="refuse to submit more points than this (default 32)")
-    ap.add_argument("--account", default="coreai_horizon_dilations")
-    ap.add_argument("sbatch_args", nargs="*", help="extra sbatch args, after --")
+    ap.add_argument("pbs_args", nargs="*", help="extra pbs_submit args, after --")
     args = ap.parse_args()
 
     varying, fixed = parse_sweep(args.sweep)
@@ -211,9 +211,9 @@ def main() -> int:
 
     print(f"sweep      {sweep_name}  ({args.sweep})")
     print(f"recipes    {len(recipes)}: " + ", ".join(r for r, _ in recipes))
-    print(f"varying    " + ", ".join(f"{n}={'/'.join(v)}" for n, v in varying.items()))
+    print("varying    " + ", ".join(f"{n}={'/'.join(v)}" for n, v in varying.items()))
     if fixed:
-        print(f"fixed      " + ", ".join(f"{k}={v}" for k, v in fixed.items()))
+        print("fixed      " + ", ".join(f"{k}={v}" for k, v in fixed.items()))
     print(f"points     {len(grid)} per recipe, {total} jobs total")
     print()
 
@@ -237,14 +237,15 @@ def main() -> int:
                 continue
 
             export = "ALL," + ",".join(f"{k}={v}" for k, v in env.items())
+            recipe_script = path / "run.sbatch"
             cmd = [
-                "sbatch",
+                str(PBS_SUBMIT),
                 "--parsable",
-                "-A",
-                args.account,
+                "--profile",
+                "gpu",
                 f"--export={export}",
-                *args.sbatch_args,
-                f"experiments/scripts/{rel}/run.sbatch",
+                *args.pbs_args,
+                str(recipe_script.relative_to(REPO_ROOT)),
             ]
 
             if not args.submit:

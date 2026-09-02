@@ -102,7 +102,11 @@ dedicated launcher is described below. A direct recipe launch uses the default
 1:7 split:
 
 ```bash
-sbatch experiments/scripts/tau_bench/async/areal-tau2/qwen3-4b-agentic-sft-953/run.sbatch
+source experiments/env.sh
+source experiments/common/pbs.sh
+pbs_submit --profile=gpu --nodes=8 --time="${PBS_DEFAULT_WALLTIME}" \
+  --export=MILES_WORKSPACE_ROOT \
+  experiments/scripts/tau_bench/async/areal-tau2/qwen3-4b-agentic-sft-953/run.sbatch
 ```
 
 Set `TRAIN_EPOCHS=5` to use the shorter schedule. Detailed tool/user-simulator
@@ -137,13 +141,13 @@ identities and are never enabled together.
 Both Megatron and HF artifacts are written every ten updates. HF snapshots are
 all retained. `SAVE_RETAIN_INTERVAL=181` is beyond the run horizon, so Megatron
 retention keeps only the latest resumable checkpoint; replay retention is also
-one committed buffer. Fifteen minutes before each four-hour wall limit the
+one committed buffer. Fifteen minutes before each 24-hour wall limit the
 segment creates an external-save sentinel and submits exactly one `afterany`
 successor. Reusing the same `RUN_NAMESPACE` resumes that identity. Once update
 180 is committed, training exits normally and no new successor is submitted.
 `CHAIN_MAX_SEGMENTS` defaults to 64 only as a runaway-chain guard.
 
-Submission is idempotent with respect to active Slurm jobs. Re-running the
+Submission is idempotent with respect to active PBS jobs. Re-running the
 launcher with the same `RUN_NAMESPACE` skips matching pending or running arms
 and submits only missing arms, which also makes recovery from a partial
 controller outage safe.
@@ -167,7 +171,9 @@ forces in-run evaluation off and never materializes official Tau v3 train/base
 rows:
 
 ```bash
-RESULT_ROOT=/path/to/results \
-TRAINING_HF_ROOT=/path/to/training/hf \
-sbatch experiments/scripts/tau_bench/evaluate.sbatch
+export RESULT_ROOT=/path/to/results
+export TRAINING_HF_ROOT=/path/to/training/hf
+pbs_submit --profile=gpu \
+  --export=MILES_WORKSPACE_ROOT,RESULT_ROOT,TRAINING_HF_ROOT \
+  experiments/scripts/tau_bench/evaluate.sbatch
 ```

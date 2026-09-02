@@ -140,7 +140,9 @@ def test_training_recipe_caps_epochs_and_uses_inflight_replay() -> None:
 
     assert ': "${TRAIN_EPOCHS:=6}"' in run_script
     assert '[[ "${TRAIN_EPOCHS}" =~ ^[1-6]$ ]]' in run_script
-    assert '#SBATCH --nodes=8' in run_script
+    assert '#PBS -l select=8:ncpus=192:ngpus=8:mpiprocs=1' in run_script
+    assert '#PBS -l walltime=24:00:00' in run_script
+    assert '#PBS -P' not in run_script
     assert ': "${TOTAL_NODES:=8}"' in run_script
     assert ': "${ROLLOUT_BATCH_SIZE:=63}"' in run_script
     assert ': "${N_SAMPLES_PER_PROMPT:=16}"' in run_script
@@ -170,7 +172,9 @@ def test_training_recipe_caps_epochs_and_uses_inflight_replay() -> None:
     assert '[[ -z "${REF_LOAD}" ]] || CKPT_ARGS+=' in train_script
 
 
-def test_40k_staleness_study_is_a_twelve_arm_self_extending_chain() -> None:
+def test_40k_staleness_study_is_a_twelve_arm_self_extending_chain(
+    tmp_path: Path,
+) -> None:
     recipe_root = REPO_ROOT / "experiments/scripts/tau_bench/async/areal-tau2"
     launcher_path = recipe_root / "submit_staleness_truncation_sweep.sh"
     segment_path = recipe_root / "internal/run_staleness_truncation_segment.sbatch"
@@ -199,9 +203,9 @@ def test_40k_staleness_study_is_a_twelve_arm_self_extending_chain() -> None:
     ):
         assert fixed_setting in launcher
 
-    assert "#SBATCH --time=04:00:00" in segment
-    assert "#SBATCH --signal=B:USR1@900" in segment
-    assert '--dependency="afterany:${SLURM_JOB_ID}"' in segment
+    assert "#PBS -l walltime=24:00:00" in segment
+    assert 'CHAIN_SIGNAL_LEAD_SECONDS:=900' in segment
+    assert '--dependency="afterany:${MILES_JOB_ID}"' in segment
     assert "trap request_checkpoint_and_successor USR1" in segment
     assert "refusing a potentially duplicate submission" in launcher
     assert 'ACTIVE_JOB_IDS["${run_name}"]' in launcher
@@ -210,6 +214,7 @@ def test_40k_staleness_study_is_a_twelve_arm_self_extending_chain() -> None:
 
     environment = {
         **os.environ,
+        "MILES_WORKSPACE_ROOT": str(tmp_path / "workspace"),
         "RUN_NAMESPACE": "pytest-study",
         "WANDB_MODE": "offline",
     }

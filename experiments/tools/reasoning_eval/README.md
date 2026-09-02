@@ -20,9 +20,9 @@ scorers are interchangeable.
 
 The reportable AIME evaluator follows the pinned NeMo 26.03 reference protocol:
 
-- vLLM 0.20.2 is imported as SquashFS and serves one Qwen3-4B RL Hugging Face
-  checkpoint with tensor parallelism 1 and data parallelism 8.
-- NeMo Evaluator/NeMo Skills 26.03 is imported as a second SquashFS image and
+- vLLM 0.20.2 is imported as a Singularity SIF and serves one Qwen3-4B RL
+  Hugging Face checkpoint with tensor parallelism 1 and data parallelism 8.
+- NeMo Evaluator/NeMo Skills 26.03 is imported as a second SIF and
   prepares and grades AIME24, AIME25, and AIME26.
 - The checked-in default targets `Qwen3-4B-Base-LR2e-5-Step4000` and uses
   `ENABLE_THINKING=true`. vLLM uses `--reasoning-parser qwen3`, and the preflight
@@ -37,12 +37,19 @@ The reportable AIME evaluator follows the pinned NeMo 26.03 reference protocol:
 From the Miles repository root, submit and wait for these jobs in order:
 
 ```bash
-experiments/scripts/reasoning_eval/import-evaluator-images.sbatch
-experiments/scripts/reasoning_eval/prepare-aime-data.sbatch
+source experiments/env.sh
+source experiments/common/pbs.sh
+
+images_job="$(pbs_submit --parsable --profile=cpu \
+  --time="${PBS_CONTAINER_WALLTIME}" \
+  experiments/scripts/reasoning_eval/import-evaluator-images.sbatch)"
+pbs_submit --profile=cpu --time="${PBS_PREP_WALLTIME}" \
+  --dependency="afterok:${images_job}" \
+  experiments/scripts/reasoning_eval/prepare-aime-data.sbatch
 ```
 
-Both setup jobs use partition `cpu` with QoS `cpu-interactive`; no GPU
-allocation is held while images or benchmark data are downloaded and prepared.
+Both setup jobs use the CPU-only reservation profile: they request CPUs but no
+GPUs while images or benchmark data are downloaded and prepared.
 An existing preparation marker may contain additional benchmarks, but all three
 AIME datasets, their 30 unique records, evaluator image, and any recorded
 checksums must validate before it is reused.
@@ -58,10 +65,10 @@ The current sweep namespace defaults to `sr-20260819-212906`. Point
 user's readable output:
 
 ```bash
-TRAINING_ROOT=/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/hiso/async-rl/checkpoints/training \
+TRAINING_ROOT="${TRAIN_CKPT_DIR}" \
 experiments/scripts/reasoning_eval/submit-staleness-sweep.sh
 
-TRAINING_ROOT=/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/hiso/async-rl/checkpoints/training \
+TRAINING_ROOT="${TRAIN_CKPT_DIR}" \
 experiments/scripts/reasoning_eval/submit-staleness-sweep.sh --submit
 ```
 
@@ -70,13 +77,13 @@ trainer:rollout nodes `1:7,2:6,3:5,4:4`) plus the colocated arm, at learning
 steps 10 through 300. Miles' HF directory number is zero-based at save time, so
 learning steps `10,20,...,300` resolve to directories `9,19,...,299`.
 
-One Slurm job loads each checkpoint once and evaluates all three AIME tasks.
+One PBS job loads each checkpoint once and evaluates all three AIME tasks.
 Each task has its own response cache and is finalized atomically with `_SUCCESS`.
 Re-running the launcher skips completed task suites and queued/running jobs; a
 job interrupted between tasks resumes only unfinished task caches. Use
 `--max-submissions N` to change the default eight-job submission wave. Re-run
-the same command as jobs finish; use `--max-submissions 0` only when the Slurm
-association is allowed to queue every pending checkpoint at once.
+the same command as jobs finish; use `--max-submissions 0` only when PBS queue
+policy allows every pending checkpoint to be queued at once.
 
 The protocol name is derived from the effective repeat count. For example,
 `AIME_REPEATS=8` produces an `aime8` protocol rather than reusing the default
@@ -90,10 +97,9 @@ For a post-training evaluation, submit `run-after-training.sbatch` with
 complete numeric Hugging Face export and records that choice atomically before
 running the ordinary evaluator.
 
-`refill-snapshot.sbatch` uses the aws-pdx `batch` partition for all lanes and
-distinguishes them by QoS: `short`, `normal`, and `interactive`. Set
+Submit `refill-snapshot.sbatch` through `pbs_submit --profile=cpu`. Set
 `REFILL_ONCE=1` to execute one controller iteration, which is useful for a
-controlled validation of lane routing.
+controlled validation of queue routing.
 
 ## Results and figures
 
