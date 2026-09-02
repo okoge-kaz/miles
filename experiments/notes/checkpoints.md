@@ -2,11 +2,12 @@
 
 ## Layout
 
-Host root: `/lustre/fsw/portfolios/coreai/users/kfujii/checkpoints`
+Host root: `$CHECKPOINT_ROOT` (by default
+`$MILES_WORKSPACE_ROOT/checkpoints`).
 
 | Directory | In container | Format | Who reads it |
 |---|---|---|---|
-| `huggingface/` | `/ckpt/hf` | HuggingFace (safetensors + config + tokenizer) | SGLang engines (`--hf-checkpoint`), tokenizer loading, the converter |
+| `hf/` | `/ckpt/hf` | Hugging Face (safetensors + config + tokenizer) | SGLang engines (`--hf-checkpoint`), tokenizer loading, the converter |
 | `megatron/` | `/ckpt/megatron` | Megatron `torch_dist` | trainer (`--ref-load`, and `--load` on a cold start) |
 | `training/` | `/ckpt/training` | Megatron `torch_dist` + optimizer state | written by `--save`, read back by `--load` |
 
@@ -24,7 +25,7 @@ Megatron cannot consume a raw HuggingFace directory, and SGLang cannot consume a
 `torch_dist` one, so both exist at once:
 
 ```
-huggingface/Qwen3-4B  ──convert_hf_to_torch_dist.py──►  megatron/Qwen3-4B_torch_dist
+hf/Qwen3-4B  ──convert_hf_to_torch_dist.py──►  megatron/Qwen3-4B_torch_dist
      │                                                  │
      └──► SGLang engines (rollout)                       └──► Megatron actor + reference
 ```
@@ -32,10 +33,12 @@ huggingface/Qwen3-4B  ──convert_hf_to_torch_dist.py──►  megatron/Qwen3
 Keep the HF directory after conversion — the launch scripts still point the
 engines at it.
 
-## SFT baselines staged on aws-pdx
+## Historical SFT staging record
 
 The three SFT baselines used for DAPO-Math difficulty measurement were converted
-successfully on 2026-08-21. Each directory has a
+successfully on the former cluster on 2026-08-21. This is provenance, not a
+statement that the assets exist below the current `$CHECKPOINT_ROOT`. Each
+directory had a
 `latest_checkpointed_iteration.txt` containing `release`.
 
 | Model | Megatron directory | Size |
@@ -79,7 +82,7 @@ Consequences worth remembering:
 - Changing hyperparameters and relaunching with the same `RUN_NAME` **continues**
   the old run only when they still derive the same `CKPT_PATH`. The maintained
   recipes derive a deterministic `RUN_NAME` and checkpoint path from the
-  training identity; the Slurm job id is deliberately not part of either one.
+  training identity; the scheduler job ID is deliberately not part of either one.
   Re-submit the same recipe with the same overrides and leave
   `CLEAN_CHECKPOINT=0` to resume. Changing an identity-bearing setting, including
   the maintained recipes' `NUM_ROLLOUT`, selects a new checkpoint directory.
@@ -96,7 +99,7 @@ save, and the whole path sat behind a single `should_run_periodic_action` on
 
 | Artifact | Consumer | Size, measured | Pruned by `--save-retain-interval` |
 |---|---|---|---|
-| torch_dist (`--save`) | resume after a 4h preemption | 54 GB | yes |
+| torch_dist (`--save`) | resume after interruption | 54 GB | yes |
 | HF (`--save-hf`) | offline eval, i.e. the `Q(t)` series | 7.6 GB | **no** -- it lands outside `--save` |
 
 `checkpoint_artifacts_due` (`miles/utils/misc.py`) returns `(write_dist,
@@ -128,8 +131,10 @@ per-export cost is a larger fraction of a fast arm's step time than a slow one's
 so it biases `S` in the direction of the effect being measured -- roughly 1% on a
 32k-response arm against 3% on a 4k arm at `h=10`, and double that at `h=5`.
 
-`--save-interval` stays at 20. It is sized by preemption, not by analysis: 4h of
-wall-clock is about 98 rollouts, so 20 caps redone work at ~50 min.
+`--save-interval` stays at 20. The original sizing used the former cluster's
+four-hour preemption window: about 98 rollouts, with 20 capping redone work at
+roughly 50 minutes. The current cluster has no four-hour limit; retain or change
+the interval based on measured checkpoint cost and acceptable recovery loss.
 
 The current `math/async/.../run.sbatch` defaults to `SAVE_INTERVAL=10`,
 `SAVE_RETAIN_INTERVAL=100`, and `HF_SAVE_INTERVAL=10`, matching the sizing
@@ -160,12 +165,12 @@ multi-node variant for large models.
 
 There is no maintained `experiments/verify_resume.sh`; older notes that named it
 described a deleted one-off launcher. A current recipe is considered validated
-for chained four-hour jobs only after this two-job check succeeds:
+for restart across successive PBS jobs only after this two-job check succeeds:
 
-1. A fresh `batch`/`interactive`-QoS job runs at least one real
+1. A fresh GPU job runs at least one real
    forward/backward optimizer update and writes a distributed checkpoint. It
    need not consume the production
-   `NUM_ROLLOUT` schedule or run for four hours.
+   `NUM_ROLLOUT` schedule or consume the full requested walltime.
 2. A second job uses the same identity and `CLEAN_CHECKPOINT=0`, loads the saved
    training checkpoint, restores optimizer and RNG state, and advances the
    iteration again. Loading iteration 0 is valid when the first job performed
@@ -176,14 +181,20 @@ for chained four-hour jobs only after this two-job check succeeds:
 
 The checked-in recipe contract is covered by
 `tests/fast/experiments/test_domain_training_recipes.py`: load and save share one
-path, the identity is stable across Slurm job ids, and a changed rollout schedule
+path, the identity is stable across scheduler job IDs, and a changed rollout schedule
 gets a different identity. That static test prevents path regressions but does
 not replace the two GPU jobs above. Historical fresh/resume jobs may still be
 useful evidence for Miles' checkpoint machinery; if their custom reward or
 generator import path has since been removed, they are not evidence that the
 current environment recipe resumes.
 
-The current IFEvalG recipe has passed this gate. Job 306686 performed optimizer
+### Historical former-cluster resume evidence
+
+The following job IDs and transport details are retained only as benchmark
+evidence from the former cluster. They do not describe current PBS or
+Singularity configuration.
+
+The IFEvalG recipe passed this gate there. Job 306686 performed optimizer
 step 0 and published the iteration-0 checkpoint plus `replay_buffer_0`; job
 306687 reused the same identity, restored iteration 0, performed optimizer step
 1, and published iteration 1 plus `replay_buffer_1`. Both four-node jobs used
@@ -192,7 +203,7 @@ step 0 and published the iteration-0 checkpoint plus `replay_buffer_0`; job
 job's checkpoint had been published; they are shutdown noise, not a failed
 resume.
 
-The current Code recipe has also passed the same gate at revision `a6dcaaf1`.
+The Code recipe at revision `a6dcaaf1` also passed the same gate.
 Job 306787 performed optimizer step 0 and published iteration 0 plus
 `replay_buffer_0`. Job 306788 reused the identity, loaded model iteration 0, and
 restored that replay artifact in 0.459 seconds (six pending groups, four
@@ -201,17 +212,17 @@ performed optimizer step 1 and published iteration 1 plus `replay_buffer_1`.
 Both jobs completed with exit code 0. Teardown `BrokenPipeError` messages came
 after durable publication and do not invalidate the resume result.
 
-The current STEM recipe at revision `82bfd482` has passed the gate as well. Job
+The STEM recipe at revision `82bfd482` passed the gate as well. Job
 306790 exited 0 after optimizer step 0 and publication of iteration 0 plus
 `replay_buffer_0`. Same-identity job 306792 loaded model iteration 0, restored
 that replay state, performed optimizer step 1, and published iteration 1 plus
 `replay_buffer_1` before exiting 0.
 
-The current Math recipe passed a reduced-batch resume smoke in jobs
+The Math recipe represented by these former-cluster jobs passed a reduced-batch resume smoke in jobs
 307062/307063. The first trained steps 0 and 1; the second loaded iteration 1,
 restored 8 pending and 4 inflight groups plus one prepared batch in 0.098
 seconds, and advanced through iteration 3. It exercised the 16K response cap and
-current checkpoint identity but reduced `n` and the rollout/global batch sizes;
+that recipe's checkpoint identity but reduced `n` and the rollout/global batch sizes;
 the checked-in production defaults remain n=16.
 
 The current Math+Code+STEM recipe passed the production-shaped n=16 replay gate

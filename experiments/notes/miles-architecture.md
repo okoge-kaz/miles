@@ -82,16 +82,20 @@ Our two recipes sit at different depths:
 ## Launch path
 
 ```
-run.sbatch  → one srun task per Slurm node (pyxis) → train.sh
-                                                      ├─ source scripts/models/<type>.sh
-                                                      ├─ source experiments/common/ray_cluster.sh
-                                                      │    ├─ node 0: start Ray head
-                                                      │    └─ other nodes: join and wait
-                                                      └─ node 0: ray job submit -- python3 train[_async].py
-                                                               ├─ create_placement_groups()
-                                                               ├─ create_rollout_manager() → router + SGLang engines
-                                                               ├─ create_training_models() → actor + reference
-                                                               └─ rollout → reward → train → weight sync
+run.sbatch
+  └─ miles_srun
+       └─ mpirun -map-by ppr:1:node -bind-to none
+            └─ one Singularity task per PBS node
+                 └─ train.sh
+                      ├─ source scripts/models/<type>.sh
+                      ├─ source experiments/common/ray_cluster.sh
+                      │    ├─ node 0: start Ray head
+                      │    └─ other nodes: join and wait
+                      └─ node 0: ray job submit -- python3 train[_async].py
+                               ├─ create_placement_groups()
+                               ├─ create_rollout_manager() → router + SGLang engines
+                               ├─ create_training_models() → actor + reference
+                               └─ rollout → reward → train → weight sync
 ```
 
 This is the maintained `experiments/scripts/**/run.sbatch` path. It starts and

@@ -80,8 +80,17 @@ The intended pinned protocol uses:
 The setup entry points are:
 
 ```bash
-sbatch experiments/scripts/reasoning_eval/import-evaluator-images.sbatch
-sbatch experiments/scripts/reasoning_eval/prepare-aime-data.sbatch
+source experiments/env.sh
+source experiments/common/pbs.sh
+
+images_job="$(pbs_submit --parsable --profile=cpu \
+  --time="${PBS_CONTAINER_WALLTIME}" \
+  --export=MILES_WORKSPACE_ROOT \
+  experiments/scripts/reasoning_eval/import-evaluator-images.sbatch)"
+pbs_submit --profile=cpu --time="${PBS_PREP_WALLTIME}" \
+  --dependency="afterok:${images_job}" \
+  --export=MILES_WORKSPACE_ROOT \
+  experiments/scripts/reasoning_eval/prepare-aime-data.sbatch
 ```
 
 Image validation job 306707 confirmed the two pinned SquashFS artifacts. The
@@ -180,7 +189,7 @@ Tau and exact tool action diagnostics have dedicated entry points:
 Tau three is the primary downstream benchmark for the conversational tool-use
 Pivot training recipe. It accepts only the held-out v1.0.1 test split and uses
 either the verified NVIDIA-hosted Gemini user simulator or direct Gemini.
-Credentials are allowlisted at the Slurm job boundary; the Python evaluator does
+Credentials are allowlisted at the PBS submission boundary; the Python evaluator does
 not parse dotenv files. The exact tool-action evaluator remains a training-domain
 diagnostic and is not the reported downstream benchmark. Both evaluation paths
 still require successful current-checkpoint GPU execution evidence.
@@ -188,7 +197,7 @@ still require successful current-checkpoint GPU execution evidence.
 ## Validation checklist
 
 For a quick evaluation validation, a small smoke is sufficient; it need not
-consume the four-hour allocation. Check all of the following:
+consume the requested allocation. Check all of the following:
 
 1. the exact checkpoint and tokenizer pass structural validation;
 2. the job opens the real held-out data path;
@@ -199,6 +208,6 @@ consume the four-hour allocation. Check all of the following:
 7. the full evaluation uses a new, protocol-locked result root rather than
    silently mixing sampling settings.
 
-Slurm `COMPLETED` by itself is not sufficient: inspect result counts and success
+PBS completion by itself is not sufficient: inspect result counts and success
 markers. Conversely, a smoke score of exactly zero on two prompts can still
 validate plumbing; it is not enough to judge model quality.

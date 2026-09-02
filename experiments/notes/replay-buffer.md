@@ -141,7 +141,14 @@ Resume metrics are emitted on the first restored rollout:
 For the math-async recipe:
 
 ```bash
-CONFIG_TAG=my-run-replay USE_REPLAY_BUFFER=1 REPLAY_BUFFER_TYPE=rollout sbatch \
+source experiments/env.sh
+source experiments/common/pbs.sh
+export WANDB_MODE=offline
+export CONFIG_TAG=my-run-replay
+export USE_REPLAY_BUFFER=1
+export REPLAY_BUFFER_TYPE=rollout
+pbs_submit --profile=gpu --nodes=2 --time="${PBS_DEFAULT_WALLTIME}" \
+  --export=MILES_WORKSPACE_ROOT,WANDB_MODE,CONFIG_TAG,USE_REPLAY_BUFFER,REPLAY_BUFFER_TYPE \
   experiments/scripts/math/async/dapo-math-p10-90/qwen3-4b/run.sbatch
 ```
 

@@ -1,5 +1,11 @@
 # Replay-buffer validation
 
+> Historical benchmark record: absolute paths, image names, scheduler job IDs,
+> and network transport details below describe the former cluster. They are not
+> current PBS/Singularity setup instructions. Use `experiments/env.sh` and
+> [`../PBS_SINGULARITY.md`](../PBS_SINGULARITY.md) for current paths and launch
+> commands.
+
 This note records the correctness, resume-latency, batching-efficiency, and
 short-horizon convergence checks for the opt-in replay buffer. The earlier runs
 cover what is now `--replay-buffer-type rollout`. The 2026-08-19 production-shape
@@ -19,7 +25,7 @@ separately below.
 - Trainer batching metrics: `5a0d2775`
 - Historical container: `miles-prefill-weight-version-23aaf6597.sqsh`. The
   recorded absolute path no longer exists, so these old jobs are not directly
-  reproducible from that image. The maintained 4B recipes currently pin
+  reproducible from that image. The former 4B recipes also pinned
   `/lustre/fsw/portfolios/coreai/users/kfujii/containers/miles-staleness-weight-boundaries-f994b9aed-efa-1.49.0.sqsh`.
 - Dataset: real `dapo-math-p10-90` prompts
 - Model: `Qwen3-4B-Instruct-2507`
@@ -390,7 +396,7 @@ exists.
 Do not copy the historical `WANDB_API_KEY=offline` or `--export=ALL` command.
 Offline mode is selected with `WANDB_MODE=offline` and needs no fake credential.
 Python training/evaluation code must not discover or parse repository dotenv
-files; credentials, when needed, belong at an allowlisted Slurm job boundary.
+files; credentials, when needed, belong at an allowlisted PBS job boundary.
 The current comparison launcher still unconditionally
 requires `WANDB_API_KEY` at submission and exports the caller environment, so it
 must be hardened before it is the canonical offline reproduction path. Until
@@ -414,7 +420,7 @@ changes only `USE_REPLAY_BUFFER=0` and uses a distinct identity. Changing
   proof. The paired AIME24 interval includes both a small regression and a
   modest improvement; longer runs and more evaluation samples are needed to
   resolve either.
-- Slurm queue delay is excluded from trainer wallclock comparisons; job
+- Scheduler queue delay is excluded from trainer wallclock comparisons; job
   `Elapsed`, per-step timing, and resume-side `perf/rollout_time` are reported
   separately.
 - The 2048-token historical validation cap was intentionally cheaper than the

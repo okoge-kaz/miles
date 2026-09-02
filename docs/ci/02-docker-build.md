@@ -34,6 +34,8 @@ The Dockerfile is the build recipe: it provides the cu13 defaults and emits one 
 
 **Output** — one `radixark/miles` image for the platform buildx targets: the sglang base, then the Python dependencies declared in `requirements.txt`, Megatron-LM (`radixark/Megatron-LM@miles-main`), miles, and the prebuilt wheels (`sgl-router` among them). A multi-arch build is one `buildx` run executed once per platform — `TARGETARCH` differs each time, so each arch installs its own wheels — and buildx pushes the two as a single manifest.
 
+The CUDA image also keeps `/root` traversable and its baked Miles, Megatron-LM, and SGLang source trees readable by a non-root UID so it can be used as a Singularity base image. Writable runtime state belongs in mounted dataset, checkpoint, and cache directories rather than in those image paths.
+
 `docker/Dockerfile.rocm` is the ROCm counterpart (build-args `GPU_ARCH` + a ROCm `SGLANG_IMAGE_TAG`; the 7.2 variants also set `APPLY_ROCR_VMMFIX=1`, which downloads the ROCr VMM-pause fix `.so` from the `WHEELS_TAG_ROCM` release and installs it — ROCm 7.0 has no such regression and leaves it off).
 
 ## Build script

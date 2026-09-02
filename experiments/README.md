@@ -1,8 +1,11 @@
 # experiments/
 
-Slurm (pyxis + enroot) recipes for running miles on **aws-pdx**. Non-agentic RL
-first: these establish that the container, the checkpoints, the rollout loop and
-the reward path all work, before anything needs a sandbox provider.
+PBS Pro + SingularityCE recipes for running miles on the current cluster.
+Non-agentic RL comes first: these establish that the container, checkpoints,
+rollout loop, and reward path work before anything needs a sandbox provider.
+
+See [`PBS_SINGULARITY.md`](PBS_SINGULARITY.md) for the canonical workspace,
+asset-preparation, submission, walltime, and job-management workflow.
 
 Everything here is deliberately explicit — paths, argument groups, and mounts
 are spelled out rather than inherited from `scripts/`, so a diff between two
@@ -12,9 +15,11 @@ experiments shows exactly what changed.
 
 ```
 experiments/
-  env.sh                        shared paths / account / container mounts
+  env.sh                        shared workspace paths, queues, caches, mounts
+  setup.sh                      unified dry-run / PBS asset setup entrypoint
   status.sh                     queue + logs at a glance
-  container/import_image.sbatch docker image -> dated .sqsh
+  container/import_image.sbatch OCI image -> dated SIF + stable miles.sif
+  container/miles.def           non-root permissions + static bind targets
   setup/download/               reusable transfer + staging jobs
   setup/models/                 HF -> torch_dist conversion jobs
   setup/manifests/              model and dataset inventories
@@ -24,7 +29,9 @@ experiments/
   configs/eval_aime.yaml        AIME benchmark eval (--eval-config)
   configs/eval_math500.yaml     MATH-500 benchmark eval
   common/run_identity.sh        run name, config tag, checkpoint path
-  common/placement.sh           derive + validate the GPU split, before srun
+  common/pbs.sh                 PBS submission + allocation context
+  common/singularity.sh         SIF execution across PBS nodes
+  common/placement.sh           derive + validate the GPU split before launch
   common/ray_cluster.sh         multi-node ray bring-up
   scripts/math/sync/<dataset>/          colocated single-turn math recipes
   scripts/math/async/<dataset>/         fully-async single-turn math recipes
@@ -85,11 +92,19 @@ worked examples. The two differ only where the task differs: the async one
 searches staleness and the actor/rollout split, the colocated one does not have
 those knobs at all.
 
-Each recipe is a pair: `run.sbatch` allocates the node and starts the
-container, `train.sh` runs inside it and holds the actual argument groups.
+Each recipe is a pair: `run.sbatch` describes the allocation and starts the
+Singularity container, while `train.sh` runs inside it and holds the actual
+argument groups. The `.sbatch` suffix is retained for compatibility; submit
+these files only through `pbs_submit`.
 `train.sh` is a full copy per model rather than a shared file with overrides —
 one file is the whole configuration, and a diff between two models shows every
 difference at once.
+
+The SIF must be built through `container/miles.def`, not by pulling the OCI
+image directly. The wrapper makes the baked `/root` code paths readable by the
+submitting UID, creates all static bind destinations, and is verified by an
+unprivileged post-build smoke test. See
+[`PBS_SINGULARITY.md`](PBS_SINGULARITY.md#build-the-image-for-non-root-execution).
 
 ### Models
 
@@ -160,15 +175,17 @@ Node counts and parallelism are set at the top of `run.sbatch`, in one block of
 any of it on the command line — the `:=` form means an exported value wins:
 
 ```bash
-sbatch -A $ACC -N 4 \
+source experiments/env.sh
+source experiments/common/pbs.sh
+pbs_submit --profile=gpu --nodes=4 --time="${PBS_DEFAULT_WALLTIME}" \
   --export=ALL,ACTOR_NUM_NODES=2,ACTOR_GPUS_PER_NODE=8,ROLLOUT_NUM_GPUS=16 \
   experiments/scripts/math/async/dapo-math-p10-90/qwen3-4b/run.sbatch
 ```
 
-Nothing is inferred from the allocation. `-N 4` allocates four nodes;
+Nothing is inferred from the allocation. `--nodes=4` allocates four nodes;
 `ACTOR_NUM_NODES` and `ROLLOUT_NUM_GPUS` say what they are used for, and
-`common/placement.sh` rejects the job **before `srun`** — in seconds, without
-starting a single container — if:
+`common/placement.sh` rejects the job **before the Singularity launch** — in
+seconds, without starting a container — if:
 
 * the split does not add up to the allocation,
 * `tp × cp` does not divide the training GPUs,
@@ -312,7 +329,7 @@ where you think — and leave it off for the long ones.
 ```bash
 experiments/sweep.py --sweep experiments/sweeps/offpolicy.txt \
   --recipe math/async/dapo-math-p10-90/qwen3-4b \
-  -- -N 2 -p batch_short --time=02:00:00
+  -- --profile=gpu --nodes=2 --time=02:00:00
 ```
 
 It prints the grid and stops. `--submit` launches it; `--max-jobs` (32) is a
@@ -344,53 +361,66 @@ Submitted points are recorded in `outputs/sweeps/<name>-<timestamp>.jsonl` with
 their job ids and full environment, so results can be joined back to their
 configuration.
 
-Sweep on `batch_short`, not `batch` — a grid is measurement, and the ranges
-worth covering are in each dataset's README.
+Use an explicit short walltime for a measurement grid; the ranges worth
+covering are in each dataset's README.
 
 ### Running one
 
-`.claude/skills/miles-run-ladder` is the intended progression: `interactive` for
-bring-up on 2 nodes, `batch_short` for parallelism and rollout tuning, `batch`
-for the real 4 h job.
+Use `pbs_submit` for both short validation runs and production runs. The shared
+default for training is 24 hours; request a shorter walltime for a smoke run
+instead of changing the global default. `pbs_submit` intentionally remains
+project-neutral; pass a project only on a manual direct `qsub` command. See
+[`PBS_SINGULARITY.md`](PBS_SINGULARITY.md) for the complete command pattern.
 
 ## Logs
 
-Every job writes one combined stdout+stderr file to
-`experiments/outputs/<job-name>-<jobid>.log`. The `#SBATCH --output` path is
-relative, so **submit from the repo root**.
+PBS combines stdout and stderr for these jobs. Logs are written below
+`experiments/outputs/`; wrappers may select a recipe-specific subdirectory.
+Directory output targets use PBS's `<full-job-id>.OU` filename. Submit from the
+repository root so relative output paths resolve consistently.
 
 ```bash
 experiments/status.sh            # queue + the 10 newest logs
 experiments/status.sh -f         # follow the newest log
-experiments/status.sh 15004856   # job detail + follow that job's log
+experiments/status.sh <job-id>   # job detail + follow that job's log
 ```
 
 `experiments/outputs/` is git-ignored (`outputs/.gitignore`), so logs never end
 up in a commit.
 
-## Paths on lustre
+Use native PBS commands when operating on a job directly:
+
+```bash
+qstat -u "${USER}"
+qstat -f <job-id>
+qdel <job-id>
+```
+
+Keep the complete ID returned by PBS, including its server suffix when present.
+
+## Persistent paths
 
 | Purpose | Host path | In container |
 |---|---|---|
-| Datasets | `/lustre/fsw/portfolios/coreai/users/kfujii/datasets` | `/data` |
-| HF weights | `…/checkpoints/huggingface` | `/ckpt/hf` |
-| Megatron (`torch_dist`) weights | `…/checkpoints/megatron` | `/ckpt/megatron` |
-| Training checkpoints | `…/checkpoints/training` | `/ckpt/training` |
-| Container images | `…/containers` | — |
-| Caches (HF, enroot, JIT) | `…/cache` | `/root/.cache` |
-| miles checkout | `…/src/miles` | `/root/miles` |
+| Datasets | `$MILES_WORKSPACE_ROOT/datasets/rl` | `/data` |
+| HF weights | `$MILES_WORKSPACE_ROOT/checkpoints/hf` | `/ckpt/hf` |
+| Megatron (`torch_dist`) weights | `$MILES_WORKSPACE_ROOT/checkpoints/megatron` | `/ckpt/megatron` |
+| Training checkpoints | `$MILES_WORKSPACE_ROOT/checkpoints/training` | `/ckpt/training` |
+| Container images | `$MILES_WORKSPACE_ROOT/containers` | — |
+| Caches (HF, SGLang, JIT) | `$MILES_WORKSPACE_ROOT/cache` | `/cache` |
+| miles checkout | `$MILES_REPO` | `/root/miles` |
 
-The image ships miles at `/root/miles`; the mount shadows it with this checkout,
-so edits here take effect without rebuilding.
+`MILES_WORKSPACE_ROOT` defaults to `/groups/gai51740/kazuki_fujii`. Change that
+one variable to relocate the complete persistent layout. The image ships miles
+at `/root/miles`; the source mount shadows it with this checkout, so source
+edits take effect without rebuilding.
 
-`$HOME` is not mounted, so everything that writes to `~/.cache` already lands on
-that mount and survives the job — that is how `huggingface/`, `tvm-ffi/`
-(sgl_kernel) and `deep_gemm/` got there. `env.sh` additionally redirects the
-caches that default *outside* `~/.cache` and would otherwise be recompiled every
-job: torch inductor (`/tmp/torchinductor_$USER`, and `/tmp` is RAM-backed here),
-triton (`~/.triton/cache`), the CUDA PTX JIT cache (`~/.nv/ComputeCache`), and
-SGLang's DeepGEMM cache, which miles otherwise pins under `/tmp`
-(`ray/rollout/server_group.py:107`).
+`$HOME` is not mounted into the SIF. `env.sh` redirects Hugging Face, SGLang,
+Torch, Triton, vLLM, CUDA, pip, and uv caches to the shared `/cache` mount so
+downloads and compiled kernels survive between jobs. Singularity's own host
+cache defaults to `$CACHE_DIR/singularity`, while temporary files use
+`PBS_LOCALDIR` or `TMPDIR`. The container build deliberately puts its disposable
+Singularity layer cache in the same node-local build directory.
 
 CUDA graphs are not part of this: they are captured in-process at engine start
 and never written to disk. What a warm cache saves is the torch.compile and
@@ -402,19 +432,15 @@ A corrupt entry after a killed job surfaces as a JIT or JSON decode error
 ## Order of operations
 
 ```bash
-export ACC=coreai_horizon_dilations
+export MILES_WORKSPACE_ROOT=/groups/gai51740/kazuki_fujii
+source experiments/env.sh
 
-# 1. An aws-pdx B300 image is already staged and selected by env.sh. Import a
-#    replacement only when the pinned image is absent or intentionally updated.
+# Create the directory tree and inspect the complete asset plan.
+experiments/setup.sh init
+experiments/setup.sh all
 
-# 2. Download DAPO-Math if missing, then convert the three existing SFT models.
-sbatch -A $ACC -p cpu --qos=cpu-interactive \
-  --export=ALL,HF_REPO=zhuzilin/dapo-math-17k,LOCAL_NAME=dapo-math-17k \
-  experiments/setup/download/download_dataset.sbatch
-experiments/setup/models/stage_sft_checkpoints.sh --submit
-
-# 3. Measure policy-specific DAPO-Math difficulty windows.
-experiments/tools/difficulty_filter/dapo-math/submit_sft_models.sh --submit
+# Submit the reviewed container, model, dataset, and SFT dependency graph.
+experiments/setup.sh all --submit
 ```
 
 Adding one more model later does not need the whole list re-staged.
@@ -422,24 +448,31 @@ Adding one more model later does not need the whole list re-staged.
 it; both halves are skipped if already done.
 
 ```bash
-experiments/setup/download/stage_model.sh Qwen3-4B-Instruct-2507
+experiments/setup/download/stage_model.sh Qwen3-4B
 ```
+
+That command materializes `checkpoints/hf/Qwen3-4B`, then submits the
+`afterok` conversion that writes `checkpoints/megatron/Qwen3-4B_torch_dist`.
 
 Then the training recipes:
 
 ```bash
-# 4a. Math RL, colocated.
-sbatch -A $ACC experiments/scripts/math/sync/dapo-math-p10-90/qwen3-4b/run.sbatch
+source experiments/common/pbs.sh
 
-# 4b. The same task on the fully-async rollout.
-sbatch -A $ACC experiments/scripts/math/async/dapo-math-p10-90/qwen3-4b/run.sbatch
+# Math RL, colocated.
+pbs_submit --profile=gpu --nodes=2 \
+  experiments/scripts/math/sync/dapo-math-p10-90/qwen3-4b/run.sbatch
+
+# The same task on the fully-async rollout.
+pbs_submit --profile=gpu --nodes=2 \
+  experiments/scripts/math/async/dapo-math-p10-90/qwen3-4b/run.sbatch
 ```
 
 A fast smoke variant (a few rollouts, short responses), for checking a change
 before spending a slot on a full run:
 
 ```bash
-sbatch -A $ACC -p batch --qos=interactive --nodes=1 --time=01:00:00 \
+pbs_submit --profile=gpu --nodes=1 --time=01:00:00 \
   --export=ALL,WANDB_MODE=offline,ACTOR_NUM_NODES=1,NUM_ROLLOUT=1,ROLLOUT_BATCH_SIZE=4,N_SAMPLES_PER_PROMPT=2,GLOBAL_BATCH_SIZE=8,MAX_RESPONSE_LEN=512 \
   experiments/scripts/math/sync/dapo-math-p10-90/qwen3-4b/run.sbatch
 ```
@@ -457,26 +490,29 @@ deliberately off-policy, and the assert is what stops it happening by accident.
 
 ## Cluster facts these scripts assume
 
-Measured on aws-pdx, 2026-08-21:
+- PBS Pro provides `$PBS_NODEFILE`; multi-node launch uses the host HPC-X
+  `mpirun` with one unbound process per node.
+- The default reservation queue is `R9920261300`. GPU jobs use `RTYPE=rt_HF`
+  and request eight GPUs plus 192 CPUs per node. CPU-only jobs use
+  `RTYPE=rt_HC` on the same reservation, request 32 CPUs, and request no GPUs.
+- Maintained scripts and `pbs_submit` do not submit a PBS project option;
+  operators may supply one in a manual direct `qsub` command.
+- There is no four-hour cluster limit. Defaults are 30 minutes for container
+  preparation, eight hours for deterministic preparation, and 24 hours for
+  downloads and training. Override them only when the workload needs it.
+- The container runtime is SingularityCE and the stable image is
+  `$CONTAINER_DIR/miles.sif`.
 
-- GPU partitions are `batch` (4 h) and `batch_long` (7 d); nodes advertise
-  eight GPUs and 192 CPUs.
-- CPU work uses partition `cpu` (7 d).
-- Scheduling class is a separate QoS. Use `batch` + `interactive` for GPU
-  bring-up, `batch`/`batch_long` + `normal` for production, and `cpu` +
-  `cpu-interactive` for setup. All combinations were checked with
-  `sbatch --test-only`.
-- The runtime is Enroot/Pyxis (`srun --container-image`).
-
-See `notes/cluster.md` for the live audit commands and complete allowed-QoS list.
+See `notes/cluster.md` for live queue, filesystem, runtime, and network checks.
 
 ## Optional
 
 - **wandb**: set `WANDB_API_KEY` for online logging. For validation, set
   `WANDB_MODE=offline`; no API key is required.
-- **Docker Hub rate limits**: if `enroot import` returns HTTP 429, put
-  credentials in `$ENROOT_CONFIG_PATH/.credentials`
-  (`machine auth.docker.io login <user> password <token>`).
+- **OCI registry access**: `experiments/setup.sh container --submit` uses
+  `singularity build` with `container/miles.def`. Configure registry
+  credentials in Singularity when the selected image is private or
+  rate-limited.
 
 ## Next step (agentic RL)
 

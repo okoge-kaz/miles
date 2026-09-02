@@ -95,7 +95,7 @@ identity, restores prior simulator history, and prefills the policy prefix.
 Tau v3 remains the held-out downstream evaluation. Its evaluator accepts only
 official `test` rows. Both paths use either the verified NVIDIA-hosted Gemini
 endpoint or direct Gemini, selected by `TAU_USER_PROVIDER`; credentials are
-allowlisted at the Slurm job boundary. Official Tau v3 train/base tasks are not
+allowlisted at the PBS job boundary. Official Tau v3 train/base tasks are not
 materialized or accepted by the evaluator.
 
 The static NVIDIA conversational tool-use Pivot recipe remains a separate
@@ -155,7 +155,6 @@ For a domain to be called end-to-end validated on the current revision, require:
 5. a held-out offline-evaluation smoke, followed by the intended full benchmark
    for any effectiveness claim.
 
-The four-hour `batch`/`interactive` allocation is a maximum and can be chained.
-Validation does not require consuming all four hours; a few real optimizer steps
-plus a real resume are sufficient. Do not promote a pending, failed, or old-path
-job to “verified.”
+The maintained PBS training default is 24 hours. Validation does not require
+consuming that allocation; a few real optimizer steps plus a real resume are
+sufficient. Do not promote a pending, failed, or old-path job to “verified.”

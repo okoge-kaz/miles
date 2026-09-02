@@ -6,8 +6,9 @@ This document covers the math sets in use plus the mechanics of reading a JSONL.
 
 ## Location
 
-Host: `/lustre/fsw/portfolios/coreai/users/kfujii/datasets` → mounted at `/data`
-inside the container.
+Host paths derive from `MILES_WORKSPACE_ROOT`: `${RL_DATASET_DIR}` is mounted at
+`/data`, `${PRETRAIN_DATASET_DIR}` at `/data/pre-train`, and `${SFT_DATASET_DIR}`
+at `/data/sft` inside the container.
 
 | Dataset | Path | Used by |
 |---|---|---|
@@ -53,7 +54,8 @@ checkpoint and resume.
 `jq` is available on the login node, so no container is needed for a quick look.
 
 ```bash
-D=/lustre/fsw/portfolios/coreai/users/kfujii/datasets/dapo-math-17k/dapo-math-17k.jsonl
+source experiments/env.sh
+D="${RL_DATASET_DIR}/dapo-math-17k/dapo-math-17k.jsonl"
 
 wc -l "$D"                       # number of prompts
 ls -lh "$D"
@@ -79,9 +81,13 @@ For a real token count (this is what `--rollout-max-prompt-len` is compared
 against), use the tokenizer from the HF checkpoint inside the container:
 
 ```bash
-srun -A coreai_horizon_dilations -p cpu --qos=cpu-interactive -n1 --time=20 \
-  --container-image=/lustre/fsw/portfolios/coreai/users/kfujii/containers/miles-search-r1-b300-20260815.sqsh \
-  --container-mounts=/lustre/fsw/portfolios/coreai/users/kfujii/datasets:/data,/lustre/fsw/portfolios/coreai/users/kfujii/checkpoints/huggingface/Qwen3-4B-Base/LR2.0e-5-SEQ32768-GBS128-MBS1-TP1-PP1-CP1-EP1-PACK1-standard-cp-STEPS4000:/ckpt/hf \
+source experiments/env.sh
+source experiments/common/singularity.sh
+miles_container_exec \
+  --image "${CONTAINER_IMAGE}" \
+  --bind "${CONTAINER_MOUNTS}" \
+  --no-nv \
+  -- \
   python3 - <<'PY'
 import json
 from transformers import AutoTokenizer

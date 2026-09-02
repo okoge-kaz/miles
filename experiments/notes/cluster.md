@@ -1,105 +1,118 @@
-# aws-pdx cluster notes
+# PBS/Singularity cluster notes
 
-Measured on 2026-08-21 from `aws-pdx-slurm-1-vscode-02`. Re-run the commands
-below after a cluster maintenance window instead of carrying assumptions from
-cw-dfw.
+Measured on 2026-08-31 on the current ABCI login environment. Re-run these
+checks after cluster maintenance instead of carrying assumptions from the old
+Slurm/Enroot deployment.
 
-## Account, partitions, and QoS
+## Scheduler and queues
 
-Slurm account: `coreai_horizon_dilations`.
+The scheduler is PBS Pro 2022.1.6. Maintained jobs use:
 
-The important migration detail is that scheduling class is split across two
-fields on aws-pdx. `interactive` and `cpu-interactive` are **QoS names**, not
-partitions.
+| Workload | Queue | Resource type | Per-node request | Default walltime |
+| --- | --- | --- | --- | ---: |
+| GPU training/evaluation | `R9920261300` | `RTYPE=rt_HF` | 192 CPUs, 8 GPUs | `24:00:00` for training |
+| CPU build/download/preparation | `R9920261300` | `RTYPE=rt_HC` | 32 CPUs, 0 GPUs | task-specific |
 
-| workload | partition | QoS | tested wall time |
-|---|---|---|---|
-| GPU smoke / conversion | `batch` | `interactive` | 1--4 h |
-| GPU production | `batch` | `normal` | up to 4 h |
-| GPU long pass-rate sweep | `batch_long` | `normal` | up to 7 d |
-| CPU setup fast lane | `cpu` | `cpu-interactive` | setup-job scale |
-| CPU regular | `cpu` | `cpu-normal` | up to 7 d |
-| CPU long QoS | `cpu` | `cpu-long` | use only when needed |
+The reservation has no old four-hour Slurm limit. Request the measured workload
+duration: the Miles SIF build normally uses 30 minutes, short validation jobs use minutes,
+checkpoint/data preparation is normally one to eight hours, and network
+downloads default to 24 hours. A direct normal-queue submission remains an
+explicit override; the maintained CPU profile uses the reservation queue with
+the `rt_HC` resource class.
 
-All six combinations used by the recipes were accepted by `sbatch
---test-only` on 2026-08-21. In particular, do not write `-p interactive` or
-`-p cpu_interactive`; Slurm rejects those because no such partitions exist.
+Do not add `#PBS -P` to reusable job files. The shared `pbs_submit` helper is
+deliberately project-neutral. For a manual direct allocation, pass the project
+at invocation time when needed, for example `qsub -P gai51740 ...`; the
+`miles-run-ladder` skill contains complete interactive and batch examples.
 
-Current partitions from `sinfo` / `scontrol show partition`:
-
-| partition | max time | nodes | advertised GRES |
-|---|---:|---:|---|
-| `batch` | 4 h | 207 | `gpu:8` |
-| `batch_long` | 7 d | 207 | `gpu:8` |
-| `cpu` | 7 d | 350 | none |
-| `cpu_datamover` | unlimited | 350 | none |
-
-The account association currently allows these QoS values:
-
-```
-cpu-datamover,cpu-free,cpu-interactive,cpu-long,cpu-normal,cpu-short,
-free,free-admin,hero-res,interactive,normal,preemptable-res,short
-```
-
-Check the live state with:
+Inspect live state with:
 
 ```bash
-sinfo -h -o '%P|%a|%l|%D|%G'
-sacctmgr -n -P show assoc user="$USER" \
-  format=Cluster,Account,User,Partition,QOS,DefaultQOS
-sbatch --test-only -A coreai_horizon_dilations -p batch \
-  --qos=interactive --time=01:00:00 --nodes=1 --gres=gpu:8 <script>
+qstat -q
+qstat -Qf R9920261300
+qstat -Qf rt_HC
+pbsnodes -aS
+qfree
 ```
 
-The GPU nodes advertise 192 CPUs and eight GPUs through the partition defaults.
-The interactive preflight measured eight `NVIDIA B300 SXM6 AC` devices with
-275040 MiB each, driver 580.126.09, and CUDA compute capability 10.3. Inside the
-selected image, PyTorch 2.11.0+cu130 reported CUDA 13.0; a BF16 CUDA matmul and
-the FlashAttention, Transformer Engine, SGLang, and Ray imports all passed.
-Re-run the preflight after changing the image or after a cluster maintenance
-window rather than treating the filename as qualification evidence.
+PBS provides `PBS_O_WORKDIR` and `PBS_NODEFILE`. `pbs_submit` starts the payload
+in the requested submit directory; `miles_container_exec_all` creates a unique
+hostfile and launches one Singularity process per node with HPC-X Open MPI:
 
-For Megatron training, the aws-pdx recipes default to Transformer Engine's
-`fused` attention backend through `TRAINING_ATTENTION_BACKEND=fused`. In the
-end-to-end B300 gate, `flash` entered the FlashAttention/CuTe SM100 backward
-kernel but made no optimizer progress, while `fused` completed the same actor
-update in 13 seconds. An import check therefore does not qualify the `flash`
-training backend on this image.
+```text
+-map-by ppr:1:node -bind-to none
+```
 
-## Filesystem and assets
+The explicit unbound policy prevents Ray and torch workers from inheriting a
+single-core MPI mask. The launcher logs `Cpus_allowed_list` on every node and
+checks it against `--cpus-per-task` when that value is supplied.
 
-`/lustre/fsw/portfolios/coreai/users/kfujii` is a symlink to this project's
-per-user directory under `/scratch/fsw/portfolios/coreai/projects/`. The recipes
-use the stable `/lustre/fsw/...` spelling.
+## Filesystems and scratch
 
-| asset | host path |
-|---|---|
-| datasets | `/lustre/fsw/portfolios/coreai/users/kfujii/datasets` |
-| Hugging Face checkpoints | `.../checkpoints/huggingface` |
-| Megatron checkpoints | `.../checkpoints/megatron` |
-| training outputs | `.../checkpoints/training` |
-| containers | `.../containers` |
-| persistent caches | `.../cache` |
+`/groups` is Lustre. Persistent experiment state is rooted at:
 
-The current Miles image is
-`containers/miles-search-r1-b300-20260815.sqsh`. `experiments/env.sh` mounts
-the active checkout over `/root/miles`, so repository edits are visible without
-rebuilding the image.
+```text
+/groups/gai51740/kazuki_fujii/
+  checkpoints/{hf,megatron,training}/
+  containers/
+  datasets/{pre-train,rl,sft}/
+  cache/
+  src/
+```
 
-## Interactive validation convention
+Set `MILES_WORKSPACE_ROOT` to move this complete layout. All purpose-specific
+paths in `experiments/env.sh` derive from it and remain individually
+overridable for exceptional reads.
 
-An interactive validation allocation means partition `batch` plus QoS
-`interactive`. During bring-up, export `WANDB_MODE=offline`; the math recipes
-allow this without requiring an API key and pass the mode into Ray workers.
+Both `/tmp` and `/local` are node-local XFS on the measured host, while `/local`
+itself is not generally user-writable. Container builds therefore use
+`PBS_LOCALDIR`, then a writable scheduler-created `/local/<job-id>`, then
+`TMPDIR`/`/tmp`, and create a private job directory with `mktemp`. They never
+try to create a missing job directory directly under the protected `/local`.
+
+The build job changes into that private directory and points all four build-time
+variables there:
+
+```text
+SINGULARITY_TMPDIR
+APPTAINER_TMPDIR
+SINGULARITY_CACHEDIR
+APPTAINER_CACHEDIR
+```
+
+Only the verified SIF, checksum, and provenance are moved back to
+`$MILES_WORKSPACE_ROOT/containers`.
+
+## Container runtime
+
+The measured runtime is SingularityCE 4.4.1. Normal Miles jobs run with the
+submitting UID, `--no-home`, and `--writable-tmpfs`; they do not use fakeroot.
+The one exception in the standard workflow is the unprivileged image build,
+which uses `singularity build --fakeroot --fix-perms`.
+
+The definition file makes `/root` traversable, makes image-resident Miles,
+Megatron, SGLang, and Tau code readable, and pre-creates every maintained bind
+destination. Before publication, the build job runs the candidate as the
+ordinary UID with the real repository, dataset, checkpoint, cache, nested
+`.env`, and Bubblewrap binds.
+
+AWS EFA is not installed or configured by this repository. Multi-node jobs use
+the cluster-provided NCCL and InfiniBand stack. TCP is retained only as an
+explicit comparison mode in `validate_nccl_collective.sbatch`.
+
+## Bring-up sequence
 
 ```bash
-salloc -A coreai_horizon_dilations -p batch --qos=interactive \
-  --nodes=1 --gres=gpu:8 --time=01:00:00
+export MILES_WORKSPACE_ROOT=/groups/gai51740/kazuki_fujii
+source experiments/env.sh
+
+experiments/setup.sh init
+experiments/setup.sh status
+experiments/setup.sh container
+experiments/setup.sh container --submit
 ```
 
-Inside the allocation, validate in order: `nvidia-smi`, container GPU visibility
-and CUDA imports, a short SGLang generation, checkpoint conversion/load, then a
-single Miles optimizer update. A successful import alone is not an end-to-end
-Miles validation. The 2026-08-21 qualification used `batch` + `interactive`
-with `WANDB_MODE=offline` and completed rollout, one optimizer update,
-torch_dist save, and post-update SGLang weight sync with the `fused` backend.
+After the image build completes, run the short cluster and container validation
+jobs before a full training allocation. A successful import alone is not an
+end-to-end qualification; check GPU visibility, a short generation, checkpoint
+load/conversion, and at least one optimizer update.

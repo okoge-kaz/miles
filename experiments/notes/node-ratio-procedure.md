@@ -42,7 +42,7 @@ decomposition is emitted whether or not a bound is configured.
 The historical `experiments/realized_staleness_sweep.sh` launcher ran this pass,
 but neither it nor the earlier `node_ratio_sweep.sh` exists in the current tree.
 The two historical modes below remain the study design; a maintained launcher
-and a fresh dry-run/Slurm smoke are required before using these as commands:
+and a fresh dry-run/PBS smoke are required before using these as commands:
 
 | mode | shape | answers |
 |---|---|---|
@@ -267,10 +267,11 @@ run, which split does that bound want?
   under test, not noise to be excluded: a tight bound slows production, which
   drains the queue, which lowers the lag — the feedback loop described above. The
   readout is therefore the pair (realized lag, throughput), never lag alone.
-- 8 nodes, `batch`, 4 h. **`NUM_ROLLOUT` is not overridden**: the recipe's 300
-  stands. The launcher defaults to an `afterany` chain of ten allocations so a
-  point can reach that production horizon despite the partition wall limit;
-  `CHAIN_JOBS` changes only the allocation count, not the learning schedule.
+- Historical execution used 8 nodes and ten chained four-hour allocations on
+  the former cluster. **`NUM_ROLLOUT` is not overridden**: the recipe's 300
+  stands. The current PBS launcher instead derives `WALL` from
+  `PBS_DEFAULT_WALLTIME` and defaults `CHAIN_JOBS` to two; either value can be
+  overridden without changing the learning schedule.
 - **Checkpoints are written on the recipe's cadence**, the same one the
   convergence sweep runs at: `--save-interval 10`, `--save-retain-interval 100`,
   HF export every 10. A point that turns out to be the right balance is then a

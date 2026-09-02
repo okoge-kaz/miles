@@ -141,7 +141,7 @@ sandbox is unavailable. On this cluster the base image uses the read-only host
 binary mount:
 
 ```bash
---container-mounts="${CONTAINER_MOUNTS},/usr/bin/bwrap:/usr/local/bin/bwrap"
+--bind="${CONTAINER_MOUNTS},/usr/bin/bwrap:/usr/local/bin/bwrap"
 ```
 
 `CODE_EXEC_SANDBOX=process` is only an explicit escape hatch for an already
@@ -246,21 +246,19 @@ publication and job completion; they are teardown noise, not a training failure.
 The same interpretation applies to Code 306787/306788: both jobs exited 0 after
 their durable artifacts were published.
 
-## Reproduction and QoS
+## Reproduction and queues
 
-| Work | Partition | QoS |
-|---|---|---|
-| Hugging Face / Git transfer and verifier dependency staging | `cpu_datamover` | `cpu-datamover` |
-| Full conversion | `cpu` | `cpu-normal` |
-| CPU schema/unit/integration validation | `cpu` | `cpu-interactive` |
-| GPU bring-up validation | `batch` | `interactive` |
-| Maintained GPU training and chained resume jobs | `batch` | `interactive` |
+| Work | PBS queue | Typical walltime |
+|---|---|---:|
+| Hugging Face / Git transfer | `R9920261300` (CPU-only) | `24:00:00` |
+| Full checkpoint/data conversion | `R9920261300` | `08:00:00` |
+| CPU schema/unit/integration validation | `R9920261300` (CPU-only) | minutes to one hour |
+| GPU bring-up validation | `R9920261300` | task-specific short run |
+| Maintained GPU training and resume jobs | `R9920261300` | `24:00:00` |
 
-The maintained recipes request four hours and are intended to be chained with a
-stable run identity. A forward/backward validation may exit after a few real
-optimizer steps; it does not need to consume the allocation. Use `batch_long`
-only for a separately reviewed run rather than treating it as the current
-recipe default.
+The maintained recipes request 24 hours and preserve a stable run identity
+across an intentional resume. A forward/backward validation may exit after a few
+real optimizer steps; it does not need to consume the allocation.
 
 Entry points:
 

@@ -1,7 +1,9 @@
 # notes/
 
-Reference notes for running miles on aws-pdx. Historical measurements in
-`notes/agents/` may still name their original cluster. Two kinds of documents:
+Reference notes for running Miles with PBS Pro and SingularityCE. Historical
+measurements in `notes/agents/` retain their original scheduler, image format,
+paths, and job IDs; they are evidence, not current operating instructions. Two
+kinds of documents:
 
 | Directory | Contents | Update policy |
 |---|---|---|
@@ -10,8 +12,8 @@ Reference notes for running miles on aws-pdx. Historical measurements in
 
 Index:
 
-- [cluster.md](cluster.md) — aws-pdx partitions, QoS mapping, and asset paths
-- [containers.md](containers.md) — docker image → `.sqsh`, pyxis flags, mount layout
+- [cluster.md](cluster.md) — cluster resources and asset paths
+- [containers.md](containers.md) — OCI image to SIF, non-root permissions, and mount layout
 - [dataset-inventory.md](dataset-inventory.md) — what is staged, by genre: path, row count, verifier, whether it is verified
 - [nemotron-rl-training-data.md](nemotron-rl-training-data.md) — the original 21 requested Nemotron/LCB/GPQA repositories, later SWE manifest delta, conversion outputs, and verifier/environment readiness
 - [nemotron3-nano-super-task-coverage.md](nemotron3-nano-super-task-coverage.md) — Nano/Super task coverage, IFBench/Tau scope, replay admission, and E2B SWE work

@@ -99,10 +99,10 @@ zero-overlap 2,000-row held-out file at
 Message-action rows are intentionally excluded because the exact-action
 verifier cannot establish their semantics.
 
-The maintained production-shaped recipes use four `batch` nodes with
-`qos=interactive`, a four-hour wall clock, 16,384 maximum response tokens, 192
-prompts per rollout, 16 samples per prompt, and no in-run evaluation. Chained
-jobs resume the same deterministic checkpoint identity; see
+The maintained production-shaped recipes use four `R9920261300` PBS nodes with
+a 24-hour wall clock, 16,384 maximum response tokens, 192 prompts per rollout,
+16 samples per prompt, and no in-run evaluation. Resume jobs use the same
+deterministic checkpoint identity; see
 [checkpoints.md](checkpoints.md). A recipe default or static test is not marked
 as resume-verified until a second GPU job actually restores and advances it.
 
