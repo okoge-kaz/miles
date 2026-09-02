@@ -177,6 +177,53 @@ two dependency-free SVG figures below the study's `analysis/` directory.
 `metrics.json[task]["pass@1"]["symbolic_correct"]`; an AIME mean is emitted only
 after AIME24/25/26 have all completed for a checkpoint.
 
+## Read the training rollouts
+
+The per-iteration responses used by training are stored under the resolved
+checkpoint root at `dump/rollout_data/<rollout_id>.pt`. These are different
+from `rollout/replay_buffer_*.pt`, which are checkpoint-time snapshots of queue
+state rather than a complete iteration history. Run the decoder in a Python
+environment containing the training version of PyTorch:
+
+```bash
+python experiments/tools/reasoning_eval/decode_rollout_dump.py \
+  /path/to/checkpoint/dump/rollout_data/19.pt \
+  /path/to/checkpoint/dump/rollout_data/20.pt \
+  --tag s20 \
+  --output-dir /path/to/readable-rollouts/s20
+```
+
+Each input produces a full sample JSONL, a compact summary JSON, and a Markdown
+report containing prompts, generated token IDs, and readable responses. The
+report separates positive reward, zero reward with truncation, and zero reward
+without truncation. Pass `--tokenizer /path/to/hf-tokenizer` to decode directly
+from the saved generated token IDs and record whether that text matches the
+saved response. `rollout_id` is the zero-based filename ID; `training_step` in
+the output is its one-based counterpart.
+
+To locate the onset and amplification of short guesses, time-pressure phrases,
+and long token loops across a contiguous range, run:
+
+```bash
+python experiments/tools/reasoning_eval/trace_rollout_text.py \
+  /path/to/checkpoint/dump/rollout_data \
+  --start 0 \
+  --end 100 \
+  --output /path/to/readable-rollouts/s20/qualitative-trace.csv
+```
+
+The CSV includes per-iteration candidate counts, positive-reward candidate
+counts, reward-group context, and first-prefill weight-version ranges. The
+adjacent `qualitative-trace.examples.jsonl` contains the full prompt and
+response for manual review. Regex labels are candidates, not semantic ground
+truth: `explicit_guess` covers strict first-person guess phrases, while
+`self_guess_mention` also includes phrases such as `we can guess` that may be a
+legitimate reasoning statement. Review `guess_audit_candidate` for false
+positives and `short_nonmatch_review` for false negatives before drawing a
+conclusion. Use `--examples-per-category 0` to write every candidate and every
+short non-match instead of the default three examples per category per
+iteration.
+
 For the joined staleness, throughput, and wall-clock analysis, use a Python
 environment containing `wandb` and run:
 

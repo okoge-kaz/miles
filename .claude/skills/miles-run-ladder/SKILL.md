@@ -215,6 +215,44 @@ While running, the questions worth asking are about learning, not speed:
 fully-async — see `notes/telemetry.md`); a gap opening between AIME-2024 and
 AIME-2025 means memorisation rather than learning.
 
+## Find generated outputs for post-hoc analysis
+
+Start from the resolved host-side checkpoint path printed by `run.sbatch`, then
+inspect `<checkpoint>/dump/`. Do not start from `rollout/replay_buffer_*.pt`
+when the question is what the trainer received at each iteration: replay-buffer
+files are checkpoint-time snapshots of pending, ready, prepared, and inflight
+state, not the complete per-iteration history.
+
+Use these files:
+
+- `dump/rollout_data/<rollout_id>.pt` is the authoritative per-iteration
+  pre-training rollout dump. It contains `Sample` dictionaries with prompt,
+  prompt-plus-response token IDs, `response_length`, decoded `response`, label,
+  reward, status, rollout log probabilities, and weight-version provenance.
+  Slice generated token IDs as `tokens[-response_length:]`; handle zero length
+  explicitly because `tokens[-0:]` returns the whole list.
+- `dump/dashboard_columns/rollout_<rollout_id>.parquet` is the point-readable
+  token-column mirror: sample index, response/total lengths, token IDs, loss
+  mask, and rollout log probabilities. Prefer it for cheap length/token scans;
+  use the `.pt` file for response text, reward, status, prompt, and provenance.
+- `dump/train_data/<rollout_id>_<rank>.pt` exists only with
+  `DUMP_TRAIN_DATA=1`. It is not needed to inspect generated responses and is
+  normally absent from production runs.
+- `dump/trajectory/<rollout_id>.jsonl` exists only for rollout paths that attach
+  raw conversation messages.
+
+`DUMP_TRAIN_DATA=0` passes `--no-dump-train-data`; it does **not** disable
+`rollout_data` or `dashboard_columns`. Confirm the effective mapping in
+`miles/utils/arguments.py` and the write path in
+`miles/ray/rollout/debug_data.py` before concluding that outputs are absent.
+The `.pt` files require PyTorch and Miles' `Sample` definitions, so decode them
+inside the same training image when the login-node Python lacks `torch`.
+
+Align file IDs with tracking metrics explicitly. The dump payload stores its
+own `rollout_id`; tracking tables may present a one-based training step while
+filenames are zero-based. Verify one response-length mean against the tracking
+history instead of assuming an offset.
+
 ## Handing the command to someone else
 
 Before another person runs a submission command, run that command yourself once,
