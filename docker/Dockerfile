@@ -24,12 +24,6 @@ ARG MEGATRON_BRANCH=miles-main
 
 ARG ENABLE_CUDA_13=1
 
-# EFA installer 1.49.0 carries libfabric 2.4.0amzn5.0 and AWS OFI NCCL 1.20.0.
-# The checksum is for the versioned AWS release tarball, whose signature was
-# verified against the Amazon EC2 EFA release key (4E90...3CCC).
-ARG EFA_INSTALLER_VERSION=1.49.0
-ARG EFA_INSTALLER_SHA256=cf2e9281a2328a243c76f911a490faed43ca0fecfe4733c25e34b2e92a32c309
-
 ARG WHEELS_REPO=yueming-yuan/miles-wheels
 # Two complete wheels release tags (the wheels repo's own names). The build picks
 # one by TARGETARCH and installs it verbatim — no on-the-fly tag assembly here.
@@ -41,20 +35,15 @@ ARG WHEELS_TAG_ARM64=cu130-aarch64
 
 WORKDIR /root/
 
+# Singularity runs the image as the submitting uid, not as Docker's root user.
+# Keep the existing image layout while allowing access to /root/Megatron-LM.
+RUN chmod 0755 /root
+
 # ======================================== Apt dependencies =============================================
 
 RUN apt update
 # ethtool for network diagnostics
 RUN apt install -y nvtop rsync dnsutils ethtool
-
-# Include EFA userspace in every image, but do not auto-enable it. The installer
-# uses the named libnccl-net-ofi.so NGC layout, so non-AWS jobs keep the base
-# image's NCCL transport unless they explicitly select the named plugin and
-# NCCL_NET="AWS Libfabric".
-RUN --mount=type=bind,source=docker/install_aws_efa.sh,target=/tmp/install_aws_efa.sh \
-    EFA_INSTALLER_VERSION="${EFA_INSTALLER_VERSION}" \
-    EFA_INSTALLER_SHA256="${EFA_INSTALLER_SHA256}" \
-    bash /tmp/install_aws_efa.sh
 
 # nccl-tests for diagnostics
 RUN git clone https://github.com/NVIDIA/nccl-tests.git /tmp/nccl-tests && \
@@ -320,6 +309,14 @@ assert 'map_dataclass_to_tuple' in p, \
   'apache-tvm-ffi resolves to a build too old for nvidia-cutlass-dsl 4.6.0: %s' % list(p)"
 
 RUN rm -rf /tmp/wheels
+
+# Singularity preserves OCI ownership and mode bits while executing as the
+# submitting uid. Every image-resident path used below /root must therefore be
+# traversable and readable without Docker root privileges. Writable state is
+# supplied by the explicit /root/miles and /root/.cache bind mounts at runtime.
+RUN mkdir -p /root/.cache && \
+    chmod 0755 /root /root/.cache && \
+    chmod -R a+rX /root/Megatron-LM /root/miles /sgl-workspace/sglang
 
 # The cu130 sglang base ships its baked Rust toolchain outside the default PATH.
 ENV PATH="/root/.cargo/bin:${PATH}"

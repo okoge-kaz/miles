@@ -1,0 +1,214 @@
+Bootstrap: docker
+From: {{ DOCKER_IMAGE }}
+
+%labels
+    org.opencontainers.image.title Miles PBS/Singularity runtime
+    org.opencontainers.image.description Non-root HPC wrapper for the Miles OCI image
+    ai.miles.sglang.commit {{ SGLANG_COMMIT }}
+
+%post
+    set -eu
+
+    # This cluster uses its native InfiniBand/NCCL stack. Strip AWS EFA
+    # userspace even if a caller selects an OCI base that contains it.
+    efa_packages=""
+    if command -v dpkg-query >/dev/null 2>&1; then
+        for package in libfabric1-aws libnccl-ofi-ngc-v3; do
+            if dpkg-query -W "${package}" >/dev/null 2>&1; then
+                efa_packages="${efa_packages} ${package}"
+            fi
+        done
+    fi
+    if [ -n "${efa_packages}" ]; then
+        DEBIAN_FRONTEND=noninteractive apt-get purge -y ${efa_packages}
+    fi
+    rm -rf /opt/amazon
+    # Ubuntu's shared ibverbs-providers package includes both the ABCI mlx5
+    # provider and Amazon's EFA provider. Keep the package (and mlx5), but
+    # remove only the EFA userspace driver and its development surface.
+    rm -f \
+        /etc/libibverbs.d/efa.driver \
+        /usr/include/infiniband/efadv.h \
+        /usr/include/rdma/efa-abi.h
+    find /usr/lib /usr/local/lib \
+        \( -type f -o -type l \) \
+        \( -name 'libefa.a' -o -name 'libefa.so*' \
+           -o -name 'libefa-rdmav*.so' -o -name 'libefa.pc' \) \
+        -delete 2>/dev/null || true
+    find /usr/lib /usr/local/lib \( -type f -o -type l \) \
+        \( -name 'libnccl-net-ofi.so*' -o -name 'libnccl-tuner-ofi.so*' \) \
+        -delete 2>/dev/null || true
+
+    # The mutable Miles OCI tag may contain upstream SGLang. Fully asynchronous
+    # training requires the Miles fork's scheduler-authoritative policy version
+    # fields, so make the checkout deterministic in the final SIF.
+    sglang_repository=https://github.com/{{ SGLANG_REPO }}.git
+    sglang_branch={{ SGLANG_BRANCH }}
+    sglang_commit={{ SGLANG_COMMIT }}
+    git -c safe.directory=/sgl-workspace/sglang \
+        -C /sgl-workspace/sglang fetch "${sglang_repository}" "${sglang_branch}"
+    git -c safe.directory=/sgl-workspace/sglang \
+        -C /sgl-workspace/sglang checkout --force "${sglang_commit}"
+    test "$(git -c safe.directory=/sgl-workspace/sglang \
+        -C /sgl-workspace/sglang rev-parse HEAD)" = "${sglang_commit}"
+    cd /sgl-workspace/sglang
+    python3 -m pip install -e "python[all]" --no-deps
+
+    # Tau was a separate Enroot-derived layer in the old cluster. Build it into
+    # the final SIF here so the Singularity workflow does not depend on whether
+    # the selected Miles OCI tag happened to include that derived layer.
+    tau_repository=https://github.com/sierra-research/tau2-bench.git
+    tau_release=v1.0.1
+    tau_commit=fc0055dc4e0a316c3f83133267fbd6faaa770992
+    rm -rf /opt/tau3
+    git clone --filter=blob:none --no-checkout "${tau_repository}" /opt/tau3
+    git -C /opt/tau3 checkout --detach "${tau_commit}"
+    test "$(git -C /opt/tau3 describe --tags --exact-match)" = "${tau_release}"
+    test -f /opt/tau3/data/tau2/domains/retail/tasks.json
+    test -f /opt/tau3/data/tau2/domains/airline/tasks.json
+    test -f /opt/tau3/data/tau2/domains/telecom/tasks.json
+    cd /opt/tau3
+    uv export --frozen --extra gym --no-dev --no-emit-project \
+        --output-file /tmp/tau3-requirements.txt
+    uv venv --system-site-packages --python python3 /opt/tau3/.venv
+    uv pip sync --python /opt/tau3/.venv/bin/python /tmp/tau3-requirements.txt
+    uv pip install --python /opt/tau3/.venv/bin/python --no-deps /opt/tau3
+    rm -f /tmp/tau3-requirements.txt
+
+    # Bind destinations used by experiments/env.sh and the evaluation recipes.
+    # They must exist before a read-only SIF is mounted, even though their
+    # contents are supplied from the host at runtime.
+    mkdir -p \
+        /root/.cache \
+        /root/miles-baseline \
+        /data/pre-train \
+        /data/sft \
+        /ckpt/hf \
+        /ckpt/megatron \
+        /ckpt/training \
+        /cache \
+        /cache/home \
+        /checkpoint \
+        /search-eval-model \
+        /results \
+        /dump \
+        /runtime-tokenizer \
+        /evaluation-data \
+        /evaluation-cache \
+        /evaluation-auth \
+        /workspace/miles \
+        /workspace/reasoning_eval
+
+    # Some SWE/evaluation jobs bind a host executable or token onto a file.
+    # Placeholders avoid relying on overlay-created file targets.
+    if [ ! -e /usr/local/bin/bwrap ]; then
+        touch /usr/local/bin/bwrap
+        chmod 0755 /usr/local/bin/bwrap
+    fi
+    touch /evaluation-auth/token
+    chmod 0644 /evaluation-auth/token
+
+    # OCI images normally protect /root with mode 0700. Singularity keeps the
+    # submitting uid, while the current Miles/Megatron paths are under /root.
+    # Keep the layout compatible, but make every code path read/traverse-only
+    # for non-root users. Host bind mounts provide all writable state.
+    chmod 0755 /root /root/.cache
+    for path in \
+        /root/Megatron-LM \
+        /root/miles \
+        /opt/tau3 \
+        /sgl-workspace/sglang; do
+        if [ -e "${path}" ]; then
+            chmod -R a+rX "${path}"
+        fi
+    done
+    chmod 0755 \
+        /data /data/pre-train /data/sft \
+        /ckpt /ckpt/hf /ckpt/megatron /ckpt/training \
+        /cache /cache/home /checkpoint /search-eval-model /results /dump \
+        /runtime-tokenizer /evaluation-data /evaluation-cache \
+        /evaluation-auth /workspace /workspace/miles /workspace/reasoning_eval \
+        /root/miles-baseline
+    if [ -d /sgl-workspace ]; then
+        chmod 0755 /sgl-workspace
+    fi
+    for path in /tmp /var/tmp; do
+        if ! chmod 1777 "${path}" 2>/dev/null; then
+            mode="$(stat -c %a "${path}")"
+            [ "${mode}" = 1777 ] || {
+                echo "${path} is not mode 1777 and cannot be corrected: ${mode}" >&2
+                exit 1
+            }
+        fi
+    done
+
+%environment
+    export TAU2_DATA_DIR=/opt/tau3/data
+
+%test
+    set -eu
+    export TAU2_DATA_DIR=/opt/tau3/data
+    test ! -e /opt/amazon
+    for package in libfabric1-aws libnccl-ofi-ngc-v3; do
+        ! dpkg-query -W "${package}" >/dev/null 2>&1
+    done
+    test ! -e /etc/libibverbs.d/efa.driver
+    test ! -e /usr/include/infiniband/efadv.h
+    test ! -e /usr/include/rdma/efa-abi.h
+    ! find /usr/lib /usr/local/lib \
+        \( -type f -o -type l \) \
+        \( -name 'libefa.a' -o -name 'libefa.so*' \
+           -o -name 'libefa-rdmav*.so' -o -name 'libefa.pc' \) \
+        -print -quit 2>/dev/null | grep -q .
+    test -r /etc/libibverbs.d/mlx5.driver
+    test -r /usr/lib/x86_64-linux-gnu/libibverbs.so.1
+    find /usr/lib/x86_64-linux-gnu/libibverbs \( -type f -o -type l \) \
+        -name 'libmlx5-rdmav*.so' -print -quit | grep -q .
+    ! find /usr/lib /usr/local/lib \( -type f -o -type l \) \
+        \( -name 'libnccl-net-ofi.so*' -o -name 'libnccl-tuner-ofi.so*' \) \
+        -print -quit 2>/dev/null | grep -q .
+    test_cache=/tmp/miles-sglang-build-test
+    mkdir -p \
+        "${test_cache}/cuda" \
+        "${test_cache}/deep-gemm" \
+        "${test_cache}/flashinfer" \
+        "${test_cache}/hf" \
+        "${test_cache}/numba" \
+        "${test_cache}/pycache" \
+        "${test_cache}/torch" \
+        "${test_cache}/torch-extensions" \
+        "${test_cache}/torchinductor" \
+        "${test_cache}/triton" \
+        "${test_cache}/xdg"
+    export CUDA_CACHE_PATH="${test_cache}/cuda"
+    export FLASHINFER_WORKSPACE_BASE="${test_cache}/flashinfer"
+    export HF_HOME="${test_cache}/hf"
+    export NUMBA_CACHE_DIR="${test_cache}/numba"
+    export PYTHONPYCACHEPREFIX="${test_cache}/pycache"
+    export SGLANG_DG_CACHE_DIR="${test_cache}/deep-gemm"
+    export TORCH_HOME="${test_cache}/torch"
+    export TORCH_EXTENSIONS_DIR="${test_cache}/torch-extensions"
+    export TORCHINDUCTOR_CACHE_DIR="${test_cache}/torchinductor"
+    export TRITON_CACHE_DIR="${test_cache}/triton"
+    export XDG_CACHE_HOME="${test_cache}/xdg"
+    test "$(git -c safe.directory=/sgl-workspace/sglang \
+        -C /sgl-workspace/sglang rev-parse HEAD)" = "{{ SGLANG_COMMIT }}"
+    python3 -m pytest -q -p no:cacheprovider \
+        /sgl-workspace/sglang/test/registered/unit/managers/test_policy_weight_version.py
+    test -d "${TAU2_DATA_DIR}"
+    test -x /root
+    for path in \
+        /root/Megatron-LM \
+        /root/miles \
+        /opt/tau3 \
+        /sgl-workspace/sglang \
+        /data \
+        /ckpt/hf \
+        /cache; do
+        test -r "${path}"
+        test -x "${path}"
+    done
+    test -w /tmp
+    test -w /var/tmp
+    /opt/tau3/.venv/bin/python -c \
+        'import importlib.metadata; from tau2.runner.helpers import load_tasks; assert importlib.metadata.version("tau2") == "1.0.1"; assert len(load_tasks("retail", "train")) == 74; assert len(load_tasks("airline", "train")) == 30; assert len(load_tasks("telecom", "train")) == 74'
