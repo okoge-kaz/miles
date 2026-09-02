@@ -5,6 +5,44 @@ import pytest
 import requests
 
 
+@pytest.mark.parametrize(
+    ("host", "expected_host"),
+    [
+        ("10.0.80.17", "10.0.80.17"),
+        ("[2001:db8::17]", "2001:db8::17"),
+    ],
+)
+def test_init_normal_resolves_unbracketed_host_before_launch(
+    monkeypatch, host, expected_host
+):
+    pytest.importorskip("sglang")
+    import miles.backends.sglang_utils.sglang_engine as sglang_engine
+
+    resolved_args = MagicMock()
+    server_args = MagicMock(return_value=resolved_args)
+    launch_server_process = MagicMock()
+    monkeypatch.setattr(sglang_engine, "ServerArgs", server_args)
+    monkeypatch.setattr(sglang_engine, "launch_server_process", launch_server_process)
+
+    engine = sglang_engine.SGLangEngine.__new__(sglang_engine.SGLangEngine)
+    engine.server_host = host
+    engine.server_port = 22000
+    engine.node_rank = 0
+    engine.router_ip = None
+    engine.router_port = None
+    original_args = {"host": host, "port": engine.server_port, "node_rank": engine.node_rank}
+
+    engine._init_normal(original_args)
+
+    server_args.assert_called_once_with(
+        host=expected_host,
+        port=engine.server_port,
+        node_rank=engine.node_rank,
+    )
+    launch_server_process.assert_called_once_with(resolved_args)
+    assert original_args["host"] == host
+
+
 def test_wait_server_healthy_rejects_listener_owned_by_another_process(monkeypatch):
     pytest.importorskip("sglang")
     from miles.backends.sglang_utils.sglang_engine import _wait_server_healthy

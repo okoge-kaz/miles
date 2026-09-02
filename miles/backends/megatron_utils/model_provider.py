@@ -24,6 +24,12 @@ from miles.utils.replay_base import routing_replay_manager
 logger = logging.getLogger(__name__)
 
 
+def _legacy_grouped_gemm_kwargs(layer_spec, args: argparse.Namespace) -> dict[str, bool]:
+    if "moe_use_legacy_grouped_gemm" not in inspect.signature(layer_spec).parameters:
+        return {}
+    return {"moe_use_legacy_grouped_gemm": getattr(args, "moe_use_legacy_grouped_gemm", False)}
+
+
 def _apply_bridge_runtime_config(provider, args: argparse.Namespace) -> None:
     """Copy the runtime config from args onto a bridge-built provider.
 
@@ -242,7 +248,7 @@ def get_model_provider_func(
                         moe_grouped_gemm=args.moe_grouped_gemm,
                         qk_layernorm=args.qk_layernorm,
                         multi_latent_attention=args.multi_latent_attention,
-                        moe_use_legacy_grouped_gemm=args.moe_use_legacy_grouped_gemm,
+                        **_legacy_grouped_gemm_kwargs(get_gpt_layer_with_transformer_engine_spec, args),
                     )
                 else:
                     transformer_layer_spec = get_gpt_layer_local_spec(
@@ -250,12 +256,12 @@ def get_model_provider_func(
                         moe_grouped_gemm=args.moe_grouped_gemm,
                         qk_layernorm=args.qk_layernorm,
                         multi_latent_attention=args.multi_latent_attention,
-                        moe_use_legacy_grouped_gemm=args.moe_use_legacy_grouped_gemm,
                         normalization=args.normalization,
                         use_kitchen=config.use_kitchen,
                         use_true_on_policy_backend=config.true_on_policy_contract is not None,
                         use_kitchen_attention=config.use_kitchen_attention,
                         kitchen_attention_backend=config.kitchen_attention_backend,
+                        **_legacy_grouped_gemm_kwargs(get_gpt_layer_local_spec, args),
                     )
 
         build_model_context = nullcontext

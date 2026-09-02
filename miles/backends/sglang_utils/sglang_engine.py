@@ -69,7 +69,6 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     from sglang.srt.entrypoints.http_server import launch_server
 
     multiprocessing.set_start_method("spawn", force=True)
-    server_args.host = server_args.host.strip("[]")
     p = multiprocessing.Process(target=launch_server, args=(server_args,))
     p.start()
     process_pid = p.pid
@@ -274,7 +273,11 @@ class SGLangEngine(RayActor):
 
     def _init_normal(self, server_args_dict):
         logger.info(f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}")
-        self.process = launch_server_process(ServerArgs(**server_args_dict))
+        # ServerArgs is read-only after its declarations materialize. Keep the
+        # bracketed IPv6 form in server_args_dict for URLs, but bind the server
+        # with the unbracketed host expected by SGLang.
+        launch_args = {**server_args_dict, "host": server_args_dict["host"].strip("[]")}
+        self.process = launch_server_process(ServerArgs(**launch_args))
 
         if self.node_rank == 0 and self.router_ip and self.router_port:
             if parse(sglang_router.__version__) <= parse("0.2.1") or self.args.use_miles_router:

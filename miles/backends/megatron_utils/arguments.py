@@ -1,8 +1,12 @@
 import logging
 import os
 
+try:
+    from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding as _vocab_size_with_padding
+except ImportError:
+    from megatron.training.tokenizer.tokenizer import _vocab_size_with_padding
+
 from megatron.training.arguments import parse_args, validate_args
-from megatron.training.tokenizer.tokenizer import _vocab_size_with_padding
 
 __all__ = ["validate_args", "parse_args", "set_default_megatron_args"]
 
@@ -41,5 +45,8 @@ def set_default_megatron_args(args):
 
     if not hasattr(args, "miles_dsa_topk_backend"):
         args.miles_dsa_topk_backend = "torch"
+
+    if not hasattr(args, "enable_gloo_process_groups"):
+        args.enable_gloo_process_groups = getattr(args, "use_gloo_process_groups", False)
 
     return args
