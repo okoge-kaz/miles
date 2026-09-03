@@ -327,6 +327,7 @@ def test_pipeline_snapshot_yields_same_window_for_all_throughputs() -> None:
         pipeline_snapshot={
             "window_seconds": 2.0,
             "generated_tokens": 10.0,
+            "generated_groups": 4.0,
             "completed_training_batches": 1.0,
             "accepted_tokens": 3.0,
             "accepted_tokens_available": 1.0,
@@ -342,6 +343,9 @@ def test_pipeline_snapshot_yields_same_window_for_all_throughputs() -> None:
     )
 
     assert metrics["throughput/generated_tokens_per_second"] == 5
+    assert metrics["throughput/generated_groups_per_second"] == 2
+    assert metrics["throughput/generated_groups"] == 4
+    assert metrics["throughput/window_seconds"] == 2
     assert metrics["throughput/accepted_tokens_per_second"] == 1.5
     assert metrics["throughput/useful_tokens_per_second"] == 1.5
     assert metrics["throughput/window_useful_efficiency"] == 0.3

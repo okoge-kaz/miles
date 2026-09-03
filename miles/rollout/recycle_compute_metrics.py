@@ -1208,6 +1208,7 @@ def pipeline_throughput_metrics(
     """Render one completion-to-completion producer/trainer wall window."""
     window_seconds = float(pipeline_snapshot.get("window_seconds", 0.0))
     generated_tokens = float(pipeline_snapshot.get("generated_tokens", 0.0))
+    generated_groups = float(pipeline_snapshot.get("generated_groups", 0.0))
     completed_updates_available = "optimizer_updates" in pipeline_snapshot
     completed_updates = float(pipeline_snapshot.get("optimizer_updates", 0.0))
     window_accepted_available = bool(pipeline_snapshot.get("accepted_tokens_available", False))
@@ -1216,6 +1217,8 @@ def pipeline_throughput_metrics(
         "throughput/window_seconds": window_seconds,
         "throughput/generated_tokens": generated_tokens,
         "throughput/generated_tokens_per_second": (generated_tokens / window_seconds if window_seconds > 0.0 else 0.0),
+        "throughput/generated_groups": generated_groups,
+        "throughput/generated_groups_per_second": (generated_groups / window_seconds if window_seconds > 0.0 else 0.0),
         "throughput/completed_training_batches": float(pipeline_snapshot.get("completed_training_batches", 0.0)),
         "throughput/optimizer_updates_available": float(completed_updates_available),
         "throughput/window_accepted_loss_tokens_available": float(window_accepted_available),

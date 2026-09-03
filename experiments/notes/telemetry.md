@@ -1315,6 +1315,8 @@ the first and final batches are not shifted into adjacent windows.
 
 It reports:
 
+- `throughput/generated_groups_per_second`, the direct completed prompt-group
+  service rate used by the producer/consumer balance model;
 - `throughput/{generated,accepted,useful}_tokens_per_second`;
 - `throughput/cumulative_accepted_loss_tokens`, with its availability flag;
 - `throughput/optimizer_updates_per_second`;
