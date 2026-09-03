@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import html
 import json
 import math
 import re
@@ -71,6 +72,18 @@ class Fit:
     slope: float
     intercept: float
     r_squared: float
+
+
+@dataclass(frozen=True)
+class _PlotSeries:
+    """One dependency-free SVG line or scatter series."""
+
+    label: str
+    color: str
+    points: tuple[tuple[float, float], ...]
+    connected: bool = True
+    dashed: bool = False
+    marker: str = "circle"
 
 
 @dataclass(frozen=True)
@@ -569,6 +582,9 @@ def ratio_candidates(
                 "rho": prediction.rho,
                 "predicted_optimizer_updates_per_hour": prediction.actual_updates_per_second * 3600,
                 "predicted_training_staleness_or_cap": prediction.steady_staleness_or_cap,
+                "predicted_natural_staleness": prediction.natural_staleness,
+                "predicted_linear_growth_per_training_step": prediction.linear_growth_per_training_step,
+                "predicted_effective_staleness_cap": prediction.effective_staleness_cap,
                 "staleness_regime": prediction.regime,
             }
         )
@@ -577,6 +593,286 @@ def ratio_candidates(
         for candidate in candidates:
             candidate["recommended_for_throughput"] = int(candidate is best)
     return candidates
+
+
+def _svg_header(*, title: str, subtitle: str) -> list[str]:
+    return [
+        '<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="620" viewBox="0 0 1280 620">',
+        "<style>text{font-family:Arial,sans-serif;fill:#222}.title{font-size:24px;font-weight:700}"
+        ".subtitle{font-size:14px;fill:#555}.axis-label{font-size:15px;font-weight:600}"
+        ".tick{font-size:12px;fill:#555}.legend{font-size:13px}.grid{stroke:#ddd;stroke-width:1}"
+        ".axis{stroke:#555;stroke-width:1.3}.series{fill:none;stroke-width:2.8}"
+        "</style>",
+        '<rect width="100%" height="100%" fill="white"/>',
+        f'<text class="title" x="640" y="35" text-anchor="middle">{html.escape(title)}</text>',
+        f'<text class="subtitle" x="640" y="61" text-anchor="middle">{html.escape(subtitle)}</text>',
+    ]
+
+
+def _plot_bounds(series: tuple[_PlotSeries, ...]) -> tuple[float, float, float]:
+    points = [point for item in series for point in item.points]
+    if not points:
+        raise ValueError("cannot render a chart without points")
+    x_min = min(point[0] for point in points)
+    x_max = max(point[0] for point in points)
+    if x_min == x_max:
+        x_min -= 0.5
+        x_max += 0.5
+    y_max = max(point[1] for point in points)
+    return x_min, x_max, max(y_max * 1.12, 1.0)
+
+
+def _series_elements(
+    series: _PlotSeries,
+    *,
+    x_map: Any,
+    y_map: Any,
+) -> list[str]:
+    points = " ".join(f"{x_map(x):.2f},{y_map(y):.2f}" for x, y in series.points)
+    dash = ' stroke-dasharray="8 6"' if series.dashed else ""
+    elements = []
+    if series.connected and len(series.points) > 1:
+        elements.append(f'<polyline class="series" stroke="{series.color}"{dash} points="{points}"/>')
+    for x, y in series.points:
+        center_x, center_y = x_map(x), y_map(y)
+        if series.marker == "none":
+            continue
+        if series.marker == "square":
+            elements.append(
+                f'<rect x="{center_x - 4:.2f}" y="{center_y - 4:.2f}" width="8" height="8" '
+                f'fill="white" stroke="{series.color}" stroke-width="2"/>'
+            )
+        else:
+            elements.append(
+                f'<circle cx="{center_x:.2f}" cy="{center_y:.2f}" r="4" '
+                f'fill="white" stroke="{series.color}" stroke-width="2"/>'
+            )
+    return elements
+
+
+def _render_xy_chart(
+    *,
+    title: str,
+    subtitle: str,
+    x_label: str,
+    y_label: str,
+    series: tuple[_PlotSeries, ...],
+    x_ticks: tuple[tuple[float, str], ...],
+) -> str:
+    plot_x, plot_y, plot_width, plot_height = 105.0, 95.0, 850.0, 425.0
+    x_min, x_max, y_max = _plot_bounds(series)
+    x_padding = 0.04 * (x_max - x_min)
+    x_min, x_max = x_min - x_padding, x_max + x_padding
+    x_map = lambda value: plot_x + plot_width * (value - x_min) / (x_max - x_min)
+    y_map = lambda value: plot_y + plot_height * (y_max - value) / y_max
+    elements = _svg_header(title=title, subtitle=subtitle)
+    for index in range(6):
+        value = y_max * index / 5
+        y = y_map(value)
+        elements.extend(
+            [
+                f'<line class="grid" x1="{plot_x:.2f}" y1="{y:.2f}" x2="{plot_x + plot_width:.2f}" y2="{y:.2f}"/>',
+                f'<text class="tick" x="{plot_x - 10:.2f}" y="{y + 4:.2f}" text-anchor="end">{value:.2f}</text>',
+            ]
+        )
+    for value, label in x_ticks:
+        x = x_map(value)
+        elements.extend(
+            [
+                f'<line class="grid" x1="{x:.2f}" y1="{plot_y:.2f}" x2="{x:.2f}" y2="{plot_y + plot_height:.2f}"/>',
+                f'<text class="tick" x="{x:.2f}" y="{plot_y + plot_height + 21:.2f}" text-anchor="middle">{html.escape(label)}</text>',
+            ]
+        )
+    elements.extend(
+        [
+            f'<line class="axis" x1="{plot_x:.2f}" y1="{plot_y:.2f}" x2="{plot_x:.2f}" y2="{plot_y + plot_height:.2f}"/>',
+            f'<line class="axis" x1="{plot_x:.2f}" y1="{plot_y + plot_height:.2f}" x2="{plot_x + plot_width:.2f}" y2="{plot_y + plot_height:.2f}"/>',
+            f'<text class="axis-label" x="{plot_x + plot_width / 2:.2f}" y="578" text-anchor="middle">{html.escape(x_label)}</text>',
+            f'<text class="axis-label" x="23" y="{plot_y + plot_height / 2:.2f}" text-anchor="middle" transform="rotate(-90 23 {plot_y + plot_height / 2:.2f})">{html.escape(y_label)}</text>',
+        ]
+    )
+    for item in series:
+        elements.extend(_series_elements(item, x_map=x_map, y_map=y_map))
+    for index, item in enumerate(series):
+        y = 120 + index * 30
+        dash = ' stroke-dasharray="8 6"' if item.dashed else ""
+        elements.extend(
+            [
+                f'<line x1="1000" y1="{y}" x2="1033" y2="{y}" stroke="{item.color}" stroke-width="2.8"{dash}/>',
+                f'<text class="legend" x="1042" y="{y + 4}">{html.escape(item.label)}</text>',
+            ]
+        )
+    elements.append("</svg>")
+    return "\n".join(elements) + "\n"
+
+
+def _fit_curve(fit: Fit, nodes: list[int], function: Any) -> tuple[tuple[float, float], ...]:
+    minimum, maximum = min(nodes), max(nodes)
+    return tuple(
+        (minimum + (maximum - minimum) * index / 60, function(fit, minimum + (maximum - minimum) * index / 60))
+        for index in range(61)
+    )
+
+
+def _training_scaling_figure(selected: list[dict[str, Any]], fit: Fit, nodes: list[int]) -> str:
+    observed = tuple((point["trainer_nodes"], point["train_compute_seconds"]) for point in selected)
+    fitted = _fit_curve(fit, nodes, _fit_train_seconds)
+    return _render_xy_chart(
+        title="Trainer strong scaling",
+        subtitle=f"tau_T(T) = {fit.slope:.2f}/T + {fit.intercept:.2f} seconds; R²={fit.r_squared:.4f}",
+        x_label="trainer nodes T",
+        y_label="training compute seconds / update",
+        series=(
+            _PlotSeries("late-window median", "#0072B2", observed, connected=False),
+            _PlotSeries("inverse-node fit", "#D55E00", fitted, marker="none"),
+        ),
+        x_ticks=tuple((node, str(node)) for node in nodes),
+    )
+
+
+def _rollout_scaling_figure(selected: list[dict[str, Any]], fit: Fit, nodes: list[int]) -> str:
+    uncensored = tuple(
+        (point["rollout_nodes"], point["rollout_groups_per_second"])
+        for point in selected
+        if not point["rollout_rate_capacity_censored"]
+    )
+    censored = tuple(
+        (point["rollout_nodes"], point["rollout_groups_per_second"])
+        for point in selected
+        if point["rollout_rate_capacity_censored"]
+    )
+    series = [
+        _PlotSeries("uncensored median", "#0072B2", uncensored, connected=False),
+        _PlotSeries("reciprocal-rate fit", "#D55E00", _fit_curve(fit, nodes, _fit_rollout_rate), marker="none"),
+    ]
+    if censored:
+        series.append(_PlotSeries("backpressure-censored", "#777777", censored, connected=False, marker="square"))
+    if fit.intercept > 0:
+        asymptote = 1 / fit.intercept
+        series.append(
+            _PlotSeries(
+                f"asymptote {asymptote:.3f} groups/s",
+                "#009E73",
+                ((min(nodes), asymptote), (max(nodes), asymptote)),
+                dashed=True,
+                marker="none",
+            )
+        )
+    return _render_xy_chart(
+        title="Rollout engine scaling and saturation",
+        subtitle=(
+            f"1/lambda_R(R) = {fit.slope:.3f}/R + {fit.intercept:.3f}; "
+            f"R²={fit.r_squared:.4f}; {selected[0]['rollout_group_rate_source']}"
+        ),
+        x_label="rollout nodes / engines R",
+        y_label="completed prompt groups / second",
+        series=tuple(series),
+        x_ticks=tuple((node, str(node)) for node in nodes),
+    )
+
+
+def _ratio_throughput_figure(
+    selected: list[dict[str, Any]],
+    candidates: list[dict[str, Any]],
+    ratio_ticks: tuple[tuple[float, str], ...],
+) -> str:
+    measured = tuple(
+        (point["trainer_nodes"], 3600 * point["predicted_actual_updates_per_second"])
+        for point in selected
+    )
+    fitted = tuple(
+        (candidate["trainer_nodes"], candidate["predicted_optimizer_updates_per_hour"])
+        for candidate in candidates
+    )
+    return _render_xy_chart(
+        title="Fixed-budget node-ratio throughput",
+        subtitle="Effective optimizer rate is min(trainer capacity, rollout capacity / batch groups)",
+        x_label="train:rollout node ratio",
+        y_label="optimizer updates / hour",
+        series=(
+            _PlotSeries("measured-rate estimate", "#0072B2", measured, connected=False),
+            _PlotSeries("node-scaling model", "#D55E00", fitted),
+        ),
+        x_ticks=ratio_ticks,
+    )
+
+
+def _staleness_validation_figure(
+    selected: list[dict[str, Any]],
+    candidates: list[dict[str, Any]],
+    ratio_ticks: tuple[tuple[float, str], ...],
+) -> str:
+    observed = tuple(
+        (point["trainer_nodes"], point["observed_training_staleness"])
+        for point in selected
+        if point["observed_training_staleness"] is not None
+    )
+    predicted = tuple(
+        (candidate["trainer_nodes"], candidate["predicted_training_staleness_or_cap"])
+        for candidate in candidates
+        if candidate["predicted_training_staleness_or_cap"] is not None
+    )
+    return _render_xy_chart(
+        title="Predicted versus observed training staleness",
+        subtitle="t1r7 is a queue-cap envelope; t2r6 and trainer-heavier splits are stationary predictions",
+        x_label="train:rollout node ratio",
+        y_label="training staleness (optimizer versions)",
+        series=(
+            _PlotSeries("observed late-window median", "#0072B2", observed, connected=False),
+            _PlotSeries("model steady value or cap", "#D55E00", predicted),
+        ),
+        x_ticks=ratio_ticks,
+    )
+
+
+def _staleness_trajectory_figure(candidates: list[dict[str, Any]], steps: int) -> str:
+    colors = ("#D55E00", "#0072B2", "#009E73", "#CC79A7", "#E69F00")
+    series = []
+    for index, candidate in enumerate(candidates):
+        initial = candidate["predicted_natural_staleness"] or 0.0
+        growth = candidate["predicted_linear_growth_per_training_step"]
+        cap = candidate["predicted_effective_staleness_cap"]
+        points = []
+        for step in range(steps + 1):
+            value = initial + growth * step
+            points.append((step, min(value, cap) if cap is not None else value))
+        series.append(_PlotSeries(candidate["ratio"], colors[index % len(colors)], tuple(points), marker="none"))
+    tick_step = max(1, steps // 4)
+    ticks = sorted({0, steps, *range(tick_step, steps, tick_step)})
+    return _render_xy_chart(
+        title="Predicted staleness regime trajectories",
+        subtitle="Deterministic central path; stochastic completion-time outliers are intentionally excluded",
+        x_label="training updates since an empty-queue warm start",
+        y_label="predicted training staleness",
+        series=tuple(series),
+        x_ticks=tuple((step, str(step)) for step in ticks),
+    )
+
+
+def _write_history_figures(
+    output_dir: Path,
+    *,
+    points: list[dict[str, Any]],
+    fits: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    trajectory_steps: int,
+) -> None:
+    selected = [point for point in points if point["max_weight_staleness"] == fits["fit_staleness"]]
+    train_fit, rollout_fit = Fit(**fits["training_fit"]), Fit(**fits["rollout_fit"])
+    trainer_nodes = sorted({point["trainer_nodes"] for point in selected})
+    rollout_nodes = sorted({point["rollout_nodes"] for point in selected})
+    ratio_ticks = tuple((row["trainer_nodes"], row["ratio"]) for row in candidates)
+    figures = {
+        "training-node-scaling.svg": _training_scaling_figure(selected, train_fit, trainer_nodes),
+        "rollout-node-scaling.svg": _rollout_scaling_figure(selected, rollout_fit, rollout_nodes),
+        "node-ratio-throughput.svg": _ratio_throughput_figure(selected, candidates, ratio_ticks),
+        "staleness-prediction-vs-observed.svg": _staleness_validation_figure(selected, candidates, ratio_ticks),
+        "predicted-staleness-trajectories.svg": _staleness_trajectory_figure(candidates, trajectory_steps),
+    }
+    figures_dir = output_dir / "figures"
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    for filename, content in figures.items():
+        (figures_dir / filename).write_text(content, encoding="utf-8")
 
 
 def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -633,6 +929,8 @@ def _run_point(args: argparse.Namespace) -> None:
 
 
 def _run_history(args: argparse.Namespace) -> None:
+    if args.trajectory_steps < 1:
+        raise ValueError("trajectory_steps must be positive")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     points = summarize_history(
         args.history_csv,
@@ -658,12 +956,20 @@ def _run_history(args: argparse.Namespace) -> None:
     )
     _write_csv(args.output_dir / "point-predictions.csv", points)
     _write_csv(args.output_dir / "ratio-candidates.csv", candidates)
+    _write_history_figures(
+        args.output_dir,
+        points=points,
+        fits=fits,
+        candidates=candidates,
+        trajectory_steps=args.trajectory_steps,
+    )
     summary = {
         "history_csv": str(args.history_csv),
         "window": args.window,
         "exclude_after_resume": args.exclude_after_resume,
         "fits": fits,
         "ratio_candidates": candidates,
+        "figures_directory": str(args.output_dir / "figures"),
         "rate_warning": (
             "Rows without throughput/generated_groups_per_second use a token-rate proxy. "
             "That proxy is selection-sensitive when generated sample length is unavailable."
@@ -698,6 +1004,7 @@ def parse_args() -> argparse.Namespace:
     history.add_argument("--fit-staleness", type=int, required=True)
     history.add_argument("--total-nodes", type=int, required=True)
     history.add_argument("--allowed-trainer-nodes", type=_parse_int_list, required=True)
+    history.add_argument("--trajectory-steps", type=int, default=100)
     history.set_defaults(run=_run_history)
     return parser.parse_args()
 

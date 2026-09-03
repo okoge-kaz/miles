@@ -226,6 +226,17 @@ python experiments/tools/pipeline_balance_model.py history \
   --allowed-trainer-nodes 1,2,3,4
 ```
 
+The `history` command also writes five dependency-free SVG figures under
+`OUTPUT_DIR/figures/`:
+
+- `training-node-scaling.svg`: observed trainer time and the inverse-DP fit;
+- `rollout-node-scaling.svg`: uncensored rollout rate, fit, censored points,
+  and the fitted saturation asymptote;
+- `node-ratio-throughput.svg`: measured-rate and fitted updates/hour;
+- `staleness-prediction-vs-observed.svg`: the late-window validation;
+- `predicted-staleness-trajectories.svg`: stationary lines or linear growth to
+  the active queue/weight cap.
+
 New runs log `throughput/generated_groups_per_second` directly. Historical
 runs fall back to generated token rate divided by samples per group and mean
 response length; the output records which source was used and flags

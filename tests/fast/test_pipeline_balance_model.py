@@ -1,5 +1,6 @@
 import importlib.util
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pytest
@@ -102,3 +103,58 @@ def test_inverse_node_fit_recovers_parallel_work_and_fixed_floor():
     assert fit.slope == pytest.approx(220.0)
     assert fit.intercept == pytest.approx(10.0)
     assert fit.r_squared == 1.0
+
+
+def test_history_figures_are_dependency_free_valid_svg(tmp_path):
+    fits = {
+        "fit_staleness": 8,
+        "training_fit": {"observations": 2, "slope": 100.0, "intercept": 10.0, "r_squared": 1.0},
+        "rollout_fit": {"observations": 2, "slope": 1.0, "intercept": 1.0, "r_squared": 1.0},
+    }
+    points = [
+        {
+            "max_weight_staleness": 8,
+            "trainer_nodes": 1,
+            "rollout_nodes": 2,
+            "train_compute_seconds": 110.0,
+            "rollout_groups_per_second": 2 / 3,
+            "rollout_group_rate_source": "direct generated-group counter",
+            "rollout_rate_capacity_censored": 0,
+            "predicted_actual_updates_per_second": 1 / 110,
+            "observed_training_staleness": 2.1,
+        },
+        {
+            "max_weight_staleness": 8,
+            "trainer_nodes": 2,
+            "rollout_nodes": 1,
+            "train_compute_seconds": 60.0,
+            "rollout_groups_per_second": 0.5,
+            "rollout_group_rate_source": "direct generated-group counter",
+            "rollout_rate_capacity_censored": 0,
+            "predicted_actual_updates_per_second": 1 / 120,
+            "observed_training_staleness": 2.0,
+        },
+    ]
+    candidates = MODEL.ratio_candidates(
+        fits,
+        total_nodes=3,
+        trainer_nodes=[1, 2],
+        batch_groups=60,
+        concurrency_groups=60,
+        queue_policy="queue-recycle",
+        queue_capacity_groups=300,
+        max_weight_staleness=8,
+    )
+
+    MODEL._write_history_figures(
+        tmp_path,
+        points=points,
+        fits=fits,
+        candidates=candidates,
+        trajectory_steps=10,
+    )
+
+    figures = sorted((tmp_path / "figures").glob("*.svg"))
+    assert len(figures) == 5
+    for figure in figures:
+        ET.parse(figure)
