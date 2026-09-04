@@ -43,6 +43,13 @@ SQUEUE_TIMEOUT_SECONDS="${SQUEUE_TIMEOUT_SECONDS:-10}"
 SNAPSHOT_ARM_MAX_STEPS="${SNAPSHOT_ARM_MAX_STEPS:-}"
 TRUST_PINNED_SNAPSHOT="${TRUST_PINNED_SNAPSHOT:-0}"
 LOG_DIR="${OUTPUT_DIR}/reasoning_eval/staleness-ratio-sweep/${RUN_NAMESPACE}"
+STALENESS_LEVELS="${STALENESS_LEVELS:-1 2 4 8}"
+RATIOS="${RATIOS:-1:7 2:6 3:5 4:4}"
+INCLUDE_COLOCATED="${INCLUDE_COLOCATED:-1}"
+TRAINING_BUFFER_QUEUE_SIZE="${TRAINING_BUFFER_QUEUE_SIZE:-1000}"
+ASYNC_MAX_CONCURRENT_SAMPLES="${ASYNC_MAX_CONCURRENT_SAMPLES:-}"
+ASYNC_RUN_SUFFIX="${ASYNC_RUN_SUFFIX:-}"
+COLOCATED_RUN_SUFFIX="${COLOCATED_RUN_SUFFIX:-}"
 
 if [[ "${EVAL_MODE}" == smoke ]]; then
     EFFECTIVE_REPEATS=1
@@ -64,8 +71,8 @@ usage() {
     cat <<'EOF'
 usage: experiments/scripts/reasoning_eval/submit-staleness-sweep.sh [options]
 
-Scan every 10-step Hugging Face checkpoint from the 16 async staleness/ratio
-arms and the colocated arm. Completed AIME24/25/26 results and active jobs are
+Scan every 10-step Hugging Face checkpoint from the configured
+staleness/node-ratio arms. Completed AIME24/25/26 results and active jobs are
 skipped. Without --submit this only reports what would be submitted.
 
 Options:
@@ -75,9 +82,13 @@ Options:
   --help                   Show this message.
 
 Useful environment overrides: TRAINING_ROOT or STUDY_ROOT, EVALUATION_ROOT,
+STALENESS_LEVELS, RATIOS, INCLUDE_COLOCATED, TRAINING_BUFFER_QUEUE_SIZE,
+ASYNC_MAX_CONCURRENT_SAMPLES, ASYNC_RUN_SUFFIX, COLOCATED_RUN_SUFFIX,
 START_STEP, END_STEP, EVAL_MODE, TASKS, PARTITION, QOS, WALL, and PRINT_LIMIT.
+The run suffix overrides select training variants whose checkpoint identities
+differ from the default zero-reward-on-truncation configuration.
 SNAPSHOT_ARM_MAX_STEPS can pin an arm=max_step comma-separated snapshot; when
-set, every one of the 17 arms must be present.
+set, every configured arm must be present.
 HF checkpoint directory N stores the model after learning step N+1, so the
 default step 10,20,...,300 scan resolves directories 9,19,...,299.
 EOF
@@ -113,6 +124,13 @@ while (( $# > 0 )); do
     esac
 done
 
+GRID_CONFIG_PATH="${RESULT_STUDY_ROOT}/grid.env"
+if [[ -f "${GRID_CONFIG_PATH}" ]]; then
+    # The first submitted evaluation freezes the training cohort contract so
+    # refill and analysis commands only need its namespace thereafter.
+    source "${GRID_CONFIG_PATH}"
+fi
+
 for value in \
     "${MAX_SUBMISSIONS}" "${START_STEP}" "${END_STEP}" "${STEP_INTERVAL}" \
     "${PRINT_LIMIT}" "${SQUEUE_TIMEOUT_SECONDS}" "${TRUST_PINNED_SNAPSHOT}"; do
@@ -145,6 +163,53 @@ for task in ${TASKS}; do
 done
 (( ${#SEEN_TASKS[@]} > 0 )) || { echo "TASKS is empty" >&2; exit 7; }
 
+[[ "${INCLUDE_COLOCATED}" =~ ^[01]$ ]] || {
+    echo "INCLUDE_COLOCATED must be 0 or 1" >&2
+    exit 7
+}
+[[ "${TRAINING_BUFFER_QUEUE_SIZE}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "TRAINING_BUFFER_QUEUE_SIZE must be a positive integer" >&2
+    exit 7
+}
+if [[ -n "${ASYNC_MAX_CONCURRENT_SAMPLES}" ]]; then
+    [[ "${ASYNC_MAX_CONCURRENT_SAMPLES}" =~ ^[1-9][0-9]*$ ]] || {
+        echo "ASYNC_MAX_CONCURRENT_SAMPLES must be empty or a positive integer" >&2
+        exit 7
+    }
+fi
+for run_suffix in "${ASYNC_RUN_SUFFIX}" "${COLOCATED_RUN_SUFFIX}"; do
+    if [[ -n "${run_suffix}" && ! "${run_suffix}" =~ ^-[A-Za-z0-9._-]+$ ]]; then
+        echo "run suffixes must be empty or begin with '-' and contain only safe filename characters" >&2
+        exit 7
+    fi
+done
+declare -A SEEN_STALENESS=()
+for staleness in ${STALENESS_LEVELS}; do
+    [[ "${staleness}" =~ ^[1-9][0-9]*$ ]] || {
+        echo "STALENESS_LEVELS must contain positive integers" >&2
+        exit 7
+    }
+    [[ -z "${SEEN_STALENESS[${staleness}]:-}" ]] || {
+        echo "duplicate staleness level: ${staleness}" >&2
+        exit 7
+    }
+    SEEN_STALENESS["${staleness}"]=1
+done
+(( ${#SEEN_STALENESS[@]} > 0 )) || { echo "STALENESS_LEVELS is empty" >&2; exit 7; }
+declare -A SEEN_RATIOS=()
+for ratio in ${RATIOS}; do
+    [[ "${ratio}" =~ ^([1-9][0-9]*):([1-9][0-9]*)$ ]] || {
+        echo "RATIOS must contain positive T:R pairs" >&2
+        exit 7
+    }
+    [[ -z "${SEEN_RATIOS[${ratio}]:-}" ]] || {
+        echo "duplicate node ratio: ${ratio}" >&2
+        exit 7
+    }
+    SEEN_RATIOS["${ratio}"]=1
+done
+(( ${#SEEN_RATIOS[@]} > 0 )) || { echo "RATIOS is empty" >&2; exit 7; }
+
 if (( SUBMIT == 1 )); then
     for required_asset in "${VLLM_IMAGE}" "${NEMO_SKILLS_IMAGE}" "${NEMO_SKILLS_DATA_ROOT}/_PREPARED"; do
         [[ -f "${required_asset}" ]] || {
@@ -170,24 +235,47 @@ if (( SUBMIT == 1 )); then
     mkdir -p "${RESULT_STUDY_ROOT}"
     exec 8> "${RESULT_STUDY_ROOT}/.submission.lock"
     flock --nonblock 8 || { echo "another sweep submission process is active" >&2; exit 9; }
+    grid_config_temporary="${GRID_CONFIG_PATH}.tmp.$$"
+    {
+        printf "STALENESS_LEVELS='%s'\n" "${STALENESS_LEVELS}"
+        printf "RATIOS='%s'\n" "${RATIOS}"
+        printf 'INCLUDE_COLOCATED=%s\n' "${INCLUDE_COLOCATED}"
+        printf 'TRAINING_BUFFER_QUEUE_SIZE=%s\n' "${TRAINING_BUFFER_QUEUE_SIZE}"
+        printf "ASYNC_MAX_CONCURRENT_SAMPLES='%s'\n" "${ASYNC_MAX_CONCURRENT_SAMPLES}"
+        printf "ASYNC_RUN_SUFFIX='%s'\n" "${ASYNC_RUN_SUFFIX}"
+        printf "COLOCATED_RUN_SUFFIX='%s'\n" "${COLOCATED_RUN_SUFFIX}"
+    } > "${grid_config_temporary}"
+    mv "${grid_config_temporary}" "${GRID_CONFIG_PATH}"
 fi
 
 declare -a ARM_NAMES=()
 declare -a HF_ROOTS=()
-for staleness in 1 2 4 8; do
-    for train_nodes in 1 2 3 4; do
-        rollout_nodes=$((8 - train_nodes))
+training_identity_suffix=""
+if [[ -n "${ASYNC_MAX_CONCURRENT_SAMPLES}" ]]; then
+    training_identity_suffix="-concurrency-${ASYNC_MAX_CONCURRENT_SAMPLES}"
+fi
+if (( TRAINING_BUFFER_QUEUE_SIZE != 1000 )); then
+    training_identity_suffix+="-tbq${TRAINING_BUFFER_QUEUE_SIZE}"
+fi
+async_run_suffix="${ASYNC_RUN_SUFFIX:--zero-trunc-rb-inflight${training_identity_suffix}}"
+colocated_run_suffix="${COLOCATED_RUN_SUFFIX:--zero-trunc}"
+for staleness in ${STALENESS_LEVELS}; do
+    for ratio in ${RATIOS}; do
+        train_nodes="${ratio%%:*}"
+        rollout_nodes="${ratio#*:}"
         arm_name="s${staleness}-t${train_nodes}r${rollout_nodes}"
         ARM_NAMES+=("${arm_name}")
         HF_ROOTS+=(
-            "${STUDY_ROOT}/async/off-policy/max-weight-staleness-${staleness}-from-prefill/${arm_name}-${RUN_NAMESPACE}-zero-trunc-rb-inflight/hf"
+            "${STUDY_ROOT}/async/off-policy/max-weight-staleness-${staleness}-from-prefill/${arm_name}-${RUN_NAMESPACE}${async_run_suffix}/hf"
         )
     done
 done
-ARM_NAMES+=(s0-colocated)
-HF_ROOTS+=(
-    "${STUDY_ROOT}/colocated/on-policy/max-weight-staleness-0/s0-colocated-${RUN_NAMESPACE}-zero-trunc/hf"
-)
+if (( INCLUDE_COLOCATED == 1 )); then
+    ARM_NAMES+=(s0-colocated)
+    HF_ROOTS+=(
+        "${STUDY_ROOT}/colocated/on-policy/max-weight-staleness-0/s0-colocated-${RUN_NAMESPACE}${colocated_run_suffix}/hf"
+    )
+fi
 
 declare -A KNOWN_ARMS=()
 declare -A SNAPSHOT_MAX_STEP_BY_ARM=()
@@ -243,10 +331,34 @@ result_is_complete() {
 }
 
 declare -A ACTIVE_SLURM_JOBS=()
+declare -A TRACKED_SLURM_JOBS=()
+for ((step = START_STEP; step <= END_STEP; step += STEP_INTERVAL)); do
+    printf -v step_name 'step_%04d' "${step}"
+    for arm_name in "${ARM_NAMES[@]}"; do
+        if [[ -n "${SNAPSHOT_ARM_MAX_STEPS}" ]] \
+            && (( step > SNAPSHOT_MAX_STEP_BY_ARM[${arm_name}] )); then
+            continue
+        fi
+        result_root="${RESULT_STUDY_ROOT}/${arm_name}/${step_name}/${PROTOCOL_NAME}/${EVAL_MODE}"
+        for marker in "${result_root}/.submitted-job" "${result_root}/.active-job"; do
+            [[ -s "${marker}" ]] || continue
+            read -r tracked_job_id _ < "${marker}"
+            [[ "${tracked_job_id}" =~ ^[1-9][0-9]*$ ]] || continue
+            TRACKED_SLURM_JOBS["${tracked_job_id}"]=1
+        done
+    done
+done
+tracked_job_ids=""
+for tracked_job_id in "${!TRACKED_SLURM_JOBS[@]}"; do
+    [[ -z "${tracked_job_ids}" ]] || tracked_job_ids+=","
+    tracked_job_ids+="${tracked_job_id}"
+done
 active_job_query_ok=1
-if active_job_output="$(
+if [[ -z "${tracked_job_ids}" ]]; then
+    active_job_output=""
+elif active_job_output="$(
     timeout "${SQUEUE_TIMEOUT_SECONDS}" \
-        squeue --noheader --user="${SLURM_JOB_USER:-${USER:?USER is not set}}" --format='%i' 2>/dev/null
+        squeue --noheader --jobs="${tracked_job_ids}" --format='%i' 2>/dev/null
 )"; then
     while IFS= read -r active_job_id; do
         [[ "${active_job_id}" =~ ^[1-9][0-9]*$ ]] || continue
@@ -281,6 +393,7 @@ complete_count=0
 active_count=0
 missing_count=0
 incomplete_count=0
+unreadable_count=0
 
 for ((step = START_STEP; step <= END_STEP; step += STEP_INTERVAL)); do
     checkpoint_directory=$((step - 1))
@@ -298,8 +411,14 @@ for ((step = START_STEP; step <= END_STEP; step += STEP_INTERVAL)); do
                 ((missing_count += 1))
                 continue
             fi
-            if ! checkpoint_is_complete "${checkpoint_path}"; then
-                ((incomplete_count += 1))
+            checkpoint_validation_status=0
+            checkpoint_is_complete "${checkpoint_path}" || checkpoint_validation_status=$?
+            if (( checkpoint_validation_status != 0 )); then
+                if (( checkpoint_validation_status == 2 )); then
+                    ((unreadable_count += 1))
+                else
+                    ((incomplete_count += 1))
+                fi
                 continue
             fi
         fi
@@ -324,16 +443,31 @@ printf 'checkpoint study: %s\n' "${STUDY_ROOT}"
 printf 'result study: %s\n' "${RESULT_STUDY_ROOT}"
 printf 'protocol/mode: %s / %s\n' "${PROTOCOL_NAME}" "${EVAL_MODE}"
 printf 'tasks: %s\n' "${TASKS}"
-printf 'grid: 17 arms x %d requested steps\n' "$(((END_STEP - START_STEP) / STEP_INTERVAL + 1))"
+printf 'grid: %d arms x %d requested steps (staleness=%s; ratios=%s; colocated=%s; queue=%s; concurrency=%s)\n' \
+    "${#ARM_NAMES[@]}" "$(((END_STEP - START_STEP) / STEP_INTERVAL + 1))" \
+    "${STALENESS_LEVELS}" "${RATIOS}" "${INCLUDE_COLOCATED}" \
+    "${TRAINING_BUFFER_QUEUE_SIZE}" "${ASYNC_MAX_CONCURRENT_SAMPLES:-recipe-default}"
+printf 'training variant suffixes: async=%s; colocated=%s\n' \
+    "${async_run_suffix}" "${colocated_run_suffix}"
 if [[ -n "${SNAPSHOT_ARM_MAX_STEPS}" ]]; then
     printf 'snapshot arm max steps: %s\n' "${SNAPSHOT_ARM_MAX_STEPS}"
 fi
 if (( TRUST_PINNED_SNAPSHOT == 1 )); then
     echo "checkpoint validation: trusting the previously validated pinned snapshot"
 fi
-printf 'status: available=%d complete=%d active=%d pending=%d missing=%d incomplete=%d\n' \
+printf 'status: available=%d complete=%d active=%d pending=%d missing=%d incomplete=%d unreadable=%d\n' \
     "${available_count}" "${complete_count}" "${active_count}" "${#PENDING_ARMS[@]}" \
-    "${missing_count}" "${incomplete_count}"
+    "${missing_count}" "${incomplete_count}" "${unreadable_count}"
+if (( active_job_query_ok == 1 )); then
+    active_job_ids=""
+    for active_job_id in "${!ACTIVE_SLURM_JOBS[@]}"; do
+        [[ -z "${active_job_ids}" ]] || active_job_ids+=","
+        active_job_ids+="${active_job_id}"
+    done
+    printf 'active job ids: %s\n' "${active_job_ids}"
+else
+    echo "active job ids: unavailable"
+fi
 
 for pending_index in "${!PENDING_ARMS[@]}"; do
     (( pending_index < PRINT_LIMIT )) || break

@@ -8,25 +8,21 @@ import csv
 import html
 import math
 import os
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable
+
+from experiments.tools.reasoning_eval.grid import reasoning_eval_grid_from_environment
 
 
-STALENESS_LEVELS = (1, 2, 4, 8)
-ASYNC_ARMS = tuple(
-    f"s{staleness}-t{train_nodes}r{8 - train_nodes}"
-    for staleness in STALENESS_LEVELS
-    for train_nodes in (1, 2, 3, 4)
-)
-ALL_ARMS = (*ASYNC_ARMS, "s0-colocated")
+EVALUATION_GRID = reasoning_eval_grid_from_environment()
+STALENESS_LEVELS = EVALUATION_GRID.staleness_levels
+NODE_RATIOS = EVALUATION_GRID.node_ratios
+ALL_ARMS = EVALUATION_GRID.all_arms
+SERIES_PALETTE = ("#0072B2", "#D55E00", "#009E73", "#CC79A7")
 COLORS = {
-    1: "#0072B2",
-    2: "#D55E00",
-    3: "#009E73",
-    4: "#CC79A7",
-    0: "#222222",
-}
+    trainer_nodes: SERIES_PALETTE[index % len(SERIES_PALETTE)] for index, (trainer_nodes, _) in enumerate(NODE_RATIOS)
+} | {0: "#222222"}
 TASK_COLORS = {"aime24": "#4C78A8", "aime25": "#F58518", "aime26": "#54A24B"}
 
 
@@ -121,13 +117,21 @@ def _panel_axes(
     for index in range(5):
         score = y_min + (y_max - y_min) * index / 4.0
         axis_y = y_position(score)
-        elements.append(f'<line class="grid" x1="{plot_x}" y1="{axis_y:.2f}" x2="{plot_x + plot_width}" y2="{axis_y:.2f}"/>')
-        elements.append(f'<text class="tick" x="{plot_x - 8}" y="{axis_y + 4:.2f}" text-anchor="end">{score:.0f}</text>')
+        elements.append(
+            f'<line class="grid" x1="{plot_x}" y1="{axis_y:.2f}" x2="{plot_x + plot_width}" y2="{axis_y:.2f}"/>'
+        )
+        elements.append(
+            f'<text class="tick" x="{plot_x - 8}" y="{axis_y + 4:.2f}" text-anchor="end">{score:.0f}</text>'
+        )
     step_ticks = sorted({min_step, max_step, *range(((min_step + 49) // 50) * 50, max_step + 1, 50)})
     for step in step_ticks:
         axis_x = x_position(step)
-        elements.append(f'<line class="grid" x1="{axis_x:.2f}" y1="{plot_y}" x2="{axis_x:.2f}" y2="{plot_y + plot_height}"/>')
-        elements.append(f'<text class="tick" x="{axis_x:.2f}" y="{plot_y + plot_height + 18}" text-anchor="middle">{step}</text>')
+        elements.append(
+            f'<line class="grid" x1="{axis_x:.2f}" y1="{plot_y}" x2="{axis_x:.2f}" y2="{plot_y + plot_height}"/>'
+        )
+        elements.append(
+            f'<text class="tick" x="{axis_x:.2f}" y="{plot_y + plot_height + 18}" text-anchor="middle">{step}</text>'
+        )
     elements.extend(
         [
             f'<line class="axis" x1="{plot_x}" y1="{plot_y}" x2="{plot_x}" y2="{plot_y + plot_height}"/>',
@@ -150,9 +154,7 @@ def _line_elements(
     valid = sorted((row for row in points if row.macro_mean is not None), key=lambda row: row.training_step)
     if not valid:
         return []
-    coordinates = " ".join(
-        f"{x_position(row.training_step):.2f},{y_position(row.macro_mean):.2f}" for row in valid
-    )
+    coordinates = " ".join(f"{x_position(row.training_step):.2f},{y_position(row.macro_mean):.2f}" for row in valid)
     dash = ' stroke-dasharray="7 5"' if dashed else ""
     elements = [f'<polyline class="series" stroke="{color}"{dash} points="{coordinates}"/>']
     elements.extend(
@@ -168,19 +170,28 @@ def _render_learning_curves(rows: list[ResultRow]) -> str:
     min_step = min((row.training_step for row in rows), default=10)
     max_step = max((row.training_step for row in rows), default=300)
     y_bounds = _score_bounds(row.macro_mean for row in rows if row.macro_mean is not None)
-    elements = _svg_header(width, height, "AIME24/25/26 macro mean by staleness and node ratio")
+    elements = _svg_header(width, height, "AIME mean by staleness and node ratio")
     legend_y = 60
-    for index, train_nodes in enumerate((1, 2, 3, 4)):
+    for index, (train_nodes, rollout_nodes) in enumerate(NODE_RATIOS):
         legend_x = 210 + index * 180
-        elements.append(f'<line x1="{legend_x}" y1="{legend_y}" x2="{legend_x + 28}" y2="{legend_y}" stroke="{COLORS[train_nodes]}" stroke-width="3"/>')
-        elements.append(f'<text class="label" x="{legend_x + 36}" y="{legend_y + 5}">T:R={train_nodes}:{8 - train_nodes}</text>')
-    elements.append('<line x1="930" y1="60" x2="958" y2="60" stroke="#222" stroke-width="3" stroke-dasharray="7 5"/>')
-    elements.append('<text class="label" x="966" y="65">colocated</text>')
+        elements.append(
+            f'<line x1="{legend_x}" y1="{legend_y}" x2="{legend_x + 28}" y2="{legend_y}" stroke="{COLORS[train_nodes]}" stroke-width="3"/>'
+        )
+        elements.append(
+            f'<text class="label" x="{legend_x + 36}" y="{legend_y + 5}">T:R={train_nodes}:{rollout_nodes}</text>'
+        )
+    if EVALUATION_GRID.include_colocated:
+        elements.append(
+            '<line x1="930" y1="60" x2="958" y2="60" stroke="#222" stroke-width="3" stroke-dasharray="7 5"/>'
+        )
+        elements.append('<text class="label" x="966" y="65">colocated</text>')
     colocated = [row for row in rows if row.arm == "s0-colocated"]
     for panel_index, staleness in enumerate(STALENESS_LEVELS):
         panel_x = 35 + (panel_index % 2) * 600
         panel_y = 85 + (panel_index // 2) * 355
-        elements.append(f'<text class="panel-title" x="{panel_x + panel_width / 2}" y="{panel_y + 18}" text-anchor="middle">max weight staleness = {staleness}</text>')
+        elements.append(
+            f'<text class="panel-title" x="{panel_x + panel_width / 2}" y="{panel_y + 18}" text-anchor="middle">max weight staleness = {staleness}</text>'
+        )
         axes, x_position, y_position = _panel_axes(
             x=panel_x,
             y=panel_y,
@@ -191,8 +202,8 @@ def _render_learning_curves(rows: list[ResultRow]) -> str:
             y_bounds=y_bounds,
         )
         elements.extend(axes)
-        for train_nodes in (1, 2, 3, 4):
-            arm = f"s{staleness}-t{train_nodes}r{8 - train_nodes}"
+        for train_nodes, rollout_nodes in NODE_RATIOS:
+            arm = f"s{staleness}-t{train_nodes}r{rollout_nodes}"
             arm_rows = [row for row in rows if row.arm == arm]
             elements.extend(
                 _line_elements(
@@ -239,7 +250,9 @@ def _render_latest_scores(rows: list[ResultRow]) -> str:
         elements.append(f'<line class="grid" x1="{plot_x}" y1="{axis_y}" x2="{plot_x + plot_width}" y2="{axis_y}"/>')
         elements.append(f'<text class="tick" x="{plot_x - 10}" y="{axis_y + 4}" text-anchor="end">{score}</text>')
     if not latest:
-        elements.append(f'<text class="panel-title" x="{width / 2}" y="{height / 2}" text-anchor="middle">No complete three-task checkpoint results yet</text>')
+        elements.append(
+            f'<text class="panel-title" x="{width / 2}" y="{height / 2}" text-anchor="middle">No complete three-task checkpoint results yet</text>'
+        )
         elements.append("</svg>")
         return "\n".join(elements) + "\n"
     group_width = plot_width / len(latest)
@@ -251,9 +264,13 @@ def _render_latest_scores(rows: list[ResultRow]) -> str:
         ):
             bar_x = center + (task_index - 1) * bar_width - bar_width / 2
             bar_height = plot_height * score / 100.0
-            elements.append(f'<rect x="{bar_x:.2f}" y="{plot_y + plot_height - bar_height:.2f}" width="{bar_width - 1:.2f}" height="{bar_height:.2f}" fill="{TASK_COLORS[task]}"/>')
+            elements.append(
+                f'<rect x="{bar_x:.2f}" y="{plot_y + plot_height - bar_height:.2f}" width="{bar_width - 1:.2f}" height="{bar_height:.2f}" fill="{TASK_COLORS[task]}"/>'
+            )
         label_y = plot_y + plot_height + 18
-        elements.append(f'<text class="tick" x="{center:.2f}" y="{label_y}" text-anchor="end" transform="rotate(-48 {center:.2f} {label_y})">{html.escape(row.arm)} @ {row.training_step}</text>')
+        elements.append(
+            f'<text class="tick" x="{center:.2f}" y="{label_y}" text-anchor="end" transform="rotate(-48 {center:.2f} {label_y})">{html.escape(row.arm)} @ {row.training_step}</text>'
+        )
     for index, task in enumerate(("aime24", "aime25", "aime26")):
         legend_x = 570 + index * 150
         elements.append(f'<rect x="{legend_x}" y="52" width="16" height="12" fill="{TASK_COLORS[task]}"/>')
@@ -274,8 +291,11 @@ def main() -> None:
     aggregate_csv = args.aggregate_csv.resolve()
     output_dir = args.output_dir or aggregate_csv.parent / "figures"
     rows = _read_rows(aggregate_csv)
-    _atomic_write(output_dir / "aime-macro-mean-vs-step.svg", _render_learning_curves(rows))
+    _atomic_write(output_dir / "aime-mean-vs-step.svg", _render_learning_curves(rows))
     _atomic_write(output_dir / "latest-aime-by-arm.svg", _render_latest_scores(rows))
+    obsolete_path = output_dir / "aime-macro-mean-vs-step.svg"
+    if obsolete_path.exists():
+        obsolete_path.unlink()
     print(output_dir)
 
 

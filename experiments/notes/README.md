@@ -23,6 +23,7 @@ Index:
 - [miles-architecture.md](miles-architecture.md) — the four objects, the directory map, the plug points
 - [parallelism.md](parallelism.md) — why every recipe is CP=1, the measured cost of context parallelism, per-model memory headroom
 - [node-ratio-procedure.md](node-ratio-procedure.md) — how the train:rollout split is chosen, and why the staleness measurement has to come first
+- [pipeline-balance-model.md](pipeline-balance-model.md) — producer/consumer equations, queue-policy staleness predictions, and node-scaling fits
 - [algorithm-ablation.md](algorithm-ablation.md) — the frame the algorithm arms run in, and what miles can express today
 - [rollout-scaling.md](rollout-scaling.md) — the two floors under rollout time, and when adding rollout GPUs stops helping
 - [offline-eval.md](offline-eval.md) — the separately validated domain, pinned reasoning, Miles-native config, Tau, and tool-call evaluation paths

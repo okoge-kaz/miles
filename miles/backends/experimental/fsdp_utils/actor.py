@@ -10,6 +10,7 @@ import torch
 import torch.distributed as dist
 from tqdm import tqdm
 
+from miles.ray.train.types import TrainResultWithTiming
 from miles.ray.train_actor import TrainRayActor
 from miles.utils import train_dump_utils, train_metric_utils
 from miles.utils.context_utils import with_defer
@@ -292,13 +293,15 @@ class FSDPTrainRayActor(TrainRayActor):
         if not self.args.offload_train:
             return
 
-        print_memory("before offload model")
+        if getattr(self.args, "log_memory_usage", False):
+            print_memory("before offload model")
 
         self.model.cpu()
         move_torch_optimizer(self.optimizer, "cpu")
         clear_memory()
         dist.barrier(group=get_gloo_group())
-        print_memory("after offload model")
+        if getattr(self.args, "log_memory_usage", False):
+            print_memory("after offload model")
 
     @timer
     def wake_up(self) -> None:
@@ -309,7 +312,8 @@ class FSDPTrainRayActor(TrainRayActor):
         self.model.cuda()
         move_torch_optimizer(self.optimizer, "cuda")
         dist.barrier(group=get_gloo_group())
-        print_memory("after wake_up model")
+        if getattr(self.args, "log_memory_usage", False):
+            print_memory("after wake_up model")
 
     def save_model(
         self, rollout_id: int, force_sync: bool = False, *, write_dist: bool = True, write_hf: bool = True
@@ -418,21 +422,30 @@ class FSDPTrainRayActor(TrainRayActor):
         rollout_data_ref: Box,
         witness_info: "WitnessInfo | None" = None,
         attempt: int = 0,
-    ) -> None:
+        collect_wake_up_time: bool = False,
+    ) -> None | TrainResultWithTiming:
         """Run one training update over a rollout batch (``rollout_data_ref`` is a Box handle to the
         Ray object ref with the rollout tensors; fetched and partitioned by data-parallel rank)."""
         assert witness_info is None
         assert attempt == 0
 
         self._heartbeat.bump()
+        local_wake_up_time = 0.0
         if self.args.offload_train:
+            previous_wake_up_time = Timer().log_dict().get("wake_up", 0.0) if collect_wake_up_time else 0.0
             self.wake_up()
+            if collect_wake_up_time:
+                local_wake_up_time = Timer().log_dict().get("wake_up", 0.0) - previous_wake_up_time
 
         with inverse_timer("train_wait"), timer("train"), ExitStack() as stack:
             rollout_data, store_get_result = get_rollout_data(self.args, rollout_data_ref, witness_info=None)
             stack.enter_context(store_get_result)
             if self.args.debug_rollout_only:
-                return
+                return (
+                    TrainResultWithTiming(result=None, local_wake_up_time=local_wake_up_time)
+                    if collect_wake_up_time
+                    else None
+                )
             optimizer_updates = self._train_core(rollout_id=rollout_id, rollout_data=rollout_data)
 
         train_metric_utils.log_perf_data_raw(
@@ -444,6 +457,8 @@ class FSDPTrainRayActor(TrainRayActor):
         )
 
         self._heartbeat.bump()
+        if collect_wake_up_time:
+            return TrainResultWithTiming(result=None, local_wake_up_time=local_wake_up_time)
 
     def _train_core(self, rollout_id: int, rollout_data) -> int:
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
@@ -490,6 +505,7 @@ class FSDPTrainRayActor(TrainRayActor):
                             "ref_log_probs",
                             "rollout_log_probs",
                             "sample_staleness",
+                            "truncated",
                             "sample_indices",
                             "sample_group_indices",
                             "generation_attempt_numbers",

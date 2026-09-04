@@ -20,6 +20,7 @@ from miles.backends.training_utils.loss_hub.math_utils import (
     compute_policy_loss,
     compute_sequence_level_ess_parts,
 )
+from miles.backends.training_utils.loss_hub.staleness_aware_loss import apply_staleness_aware_loss
 from miles.backends.training_utils.loss_hub.staleness_metrics import compute_sample_staleness_parts
 from miles.backends.training_utils.parallel import get_parallel_state
 from miles.backends.training_utils.update_diagnostics import compute_update_diagnostic_parts
@@ -399,6 +400,15 @@ def policy_loss_function(
     else:
         pg_loss_reducer = sum_of_sample_mean
 
+    # Apply after OPSM/TIS so the decay follows the final policy-gradient mask.
+    # Entropy and explicit KL losses below remain untouched.
+    pg_loss, staleness_aware_loss_parts = apply_staleness_aware_loss(
+        args=args,
+        batch=batch,
+        pg_loss_tokens=pg_loss,
+        final_masks=modified_response_masks,
+    )
+
     policy_log_ratio = None
     if batch.get("rollout_log_probs") is not None and (
         getattr(args, "log_sample_staleness_metrics", False) or debug_base_pg_loss is not None
@@ -615,6 +625,7 @@ def policy_loss_function(
     }
     reported_loss |= {name: value.clone().detach() for name, value in fused_metrics.items()}
     reported_loss |= sample_staleness_parts
+    reported_loss |= staleness_aware_loss_parts
     reported_loss |= compute_update_diagnostic_parts(
         args,
         batch,

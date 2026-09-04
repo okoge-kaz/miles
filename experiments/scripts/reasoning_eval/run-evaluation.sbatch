@@ -41,7 +41,9 @@ VLLM_PORT="${VLLM_PORT:-8000}"
 VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.90}"
 VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-64}"
 VLLM_STARTUP_ATTEMPTS="${VLLM_STARTUP_ATTEMPTS:-3}"
-SERVER_READY_ATTEMPTS="${SERVER_READY_ATTEMPTS:-180}"
+EVALUATOR_ATTEMPTS="${EVALUATOR_ATTEMPTS:-3}"
+VLLM_ENGINE_READY_TIMEOUT_SECONDS="${VLLM_ENGINE_READY_TIMEOUT_SECONDS:-2400}"
+SERVER_READY_ATTEMPTS="${SERVER_READY_ATTEMPTS:-540}"
 SERVER_READY_INTERVAL_SECONDS="${SERVER_READY_INTERVAL_SECONDS:-5}"
 VLLM_PREFLIGHT_MAX_TOKENS="${VLLM_PREFLIGHT_MAX_TOKENS:-512}"
 VLLM_TRITON_PTXAS_PATH="${VLLM_TRITON_PTXAS_PATH:-/usr/local/cuda-13.0/bin/ptxas}"
@@ -57,6 +59,7 @@ VALIDATE_TOOL="${REPO_ROOT}/experiments/tools/reasoning_eval/validate_checkpoint
 PREPARED_DATA_TOOL="${REPO_ROOT}/experiments/tools/reasoning_eval/prepared_data.py"
 PROTOCOL_TOOL="${REPO_ROOT}/experiments/tools/reasoning_eval/protocol.py"
 EXPORT_TOOL_DIR="${REPO_ROOT}/experiments/tools/reasoning_eval"
+VLLM_RUNTIME_HOOKS="${EXPORT_TOOL_DIR}/vllm_runtime_hooks"
 API_BASE_URL="http://127.0.0.1:${VLLM_PORT}"
 API_ENDPOINT="${API_BASE_URL}/v1/chat/completions"
 
@@ -82,7 +85,8 @@ for integer_value in \
     "${CONTEXT_LENGTH}" "${PROMPT_TOKEN_RESERVE}" "${TOP_K}" "${AIME_REPEATS}" \
     "${AIME_PARALLELISM}" "${SMOKE_LIMIT_SAMPLES}" "${MAX_RETRIES}" \
     "${REQUEST_TIMEOUT_SECONDS}" "${VLLM_SEED}" "${VLLM_PORT}" \
-    "${VLLM_MAX_NUM_SEQS}" "${VLLM_STARTUP_ATTEMPTS}" "${SERVER_READY_ATTEMPTS}" \
+    "${VLLM_MAX_NUM_SEQS}" "${VLLM_STARTUP_ATTEMPTS}" "${EVALUATOR_ATTEMPTS}" \
+    "${VLLM_ENGINE_READY_TIMEOUT_SECONDS}" "${SERVER_READY_ATTEMPTS}" \
     "${SERVER_READY_INTERVAL_SECONDS}" "${VLLM_PREFLIGHT_MAX_TOKENS}"; do
     [[ "${integer_value}" =~ ^[1-9][0-9]*$ ]] || {
         echo "integer evaluation controls must be positive: ${integer_value}" >&2
@@ -169,6 +173,14 @@ DATASET_PROVENANCE="$(
         --benchmark aime24 --benchmark aime25 --benchmark aime26 \
         --print-env
 )"
+[[ -r "${VLLM_RUNTIME_HOOKS}/sitecustomize.py" ]] || {
+    echo "vLLM runtime hook is missing: ${VLLM_RUNTIME_HOOKS}/sitecustomize.py" >&2
+    exit 13
+}
+grep -Fx "nemo_skills_image=${NEMO_SKILLS_IMAGE}" "${NEMO_SKILLS_DATA_ROOT}/_PREPARED" >/dev/null || {
+    echo "AIME data was prepared with a different NeMo Skills image" >&2
+    exit 13
+}
 for checkpoint_file in \
     config.json tokenizer.json tokenizer_config.json generation_config.json \
     chat_template.jinja model.safetensors.index.json; do
@@ -320,6 +332,43 @@ fi
 
 MODEL_RUNTIME_DIR="${JOB_TMP_ROOT}/reasoning-eval-model-${SLURM_JOB_ID}"
 TOKENIZER_RUNTIME_DIR="${JOB_TMP_ROOT}/reasoning-eval-tokenizer-${SLURM_JOB_ID}"
+VLLM_IMAGE_CACHE_DIR="${JOB_TMP_ROOT}/reasoning-eval-images"
+VLLM_RUNTIME_IMAGE="${VLLM_IMAGE_CACHE_DIR}/$(basename -- "${VLLM_IMAGE}")"
+stage_node_local_image() {
+    local source="$1"
+    local destination="$2"
+    local source_size temporary
+
+    mkdir -p "$(dirname -- "${destination}")"
+    source_size="$(stat -c '%s' "${source}")"
+    (
+        flock --exclusive 8
+        if [[ -s "${destination}" \
+            && "$(stat -c '%s' "${destination}")" == "${source_size}" ]]; then
+            exit 0
+        fi
+        temporary="${destination}.partial-${SLURM_JOB_ID}"
+        rm -f -- "${temporary}"
+        cp --reflink=auto -- "${source}" "${temporary}"
+        [[ "$(stat -c '%s' "${temporary}")" == "${source_size}" ]] || {
+            echo "staged image size mismatch: ${source}" >&2
+            exit 1
+        }
+        mv -- "${temporary}" "${destination}"
+    ) 8> "${destination}.lock"
+}
+cleanup_runtime_dirs() {
+    rm -rf -- "${MODEL_RUNTIME_DIR}" "${TOKENIZER_RUNTIME_DIR}"
+}
+cleanup_before_server() {
+    status=$?
+    trap - EXIT
+    cleanup_runtime_dirs
+    rm -f -- "${RESULT_ROOT}/.active-job"
+    exit "${status}"
+}
+trap cleanup_before_server EXIT
+stage_node_local_image "${VLLM_IMAGE}" "${VLLM_RUNTIME_IMAGE}"
 desired_server_config="${JOB_TMP_ROOT}/reasoning-eval-server-${SLURM_JOB_ID}.env"
 cat > "${desired_server_config}" <<EOF
 checkpoint=${CHECKPOINT_SOURCE}
@@ -350,7 +399,7 @@ else
 fi
 python3 "${UNPAD_TOOL}" "${CHECKPOINT_SOURCE}" "${MODEL_RUNTIME_DIR}"
 if [[ -f "${MODEL_RUNTIME_DIR}/config.json" ]]; then
-    MODEL_MOUNTS="${MODEL_RUNTIME_DIR}:/checkpoint,${CHECKPOINT_SOURCE}:${CHECKPOINT_SOURCE}:ro"
+    MODEL_MOUNTS="${MODEL_RUNTIME_DIR}:/checkpoint:ro"
     VOCAB_COMPAT_ACTION="removed-megatron-vocab-padding"
 else
     MODEL_MOUNTS="${CHECKPOINT_SOURCE}:/checkpoint:ro"
@@ -446,6 +495,7 @@ EOF
         --nodes=1 \
         --ntasks=1 \
         --cpus-per-task=32 \
+        --mem=128G \
         --container-image="${NEMO_SKILLS_IMAGE}" \
         --container-mounts="${partial_result}:/results,${NEMO_SKILLS_DATA_ROOT}:/evaluation-data,${EVALUATION_CACHE_ROOT}:/evaluation-cache" \
         --container-workdir=/results \
@@ -469,6 +519,7 @@ cleanup() {
     status=$?
     trap - EXIT INT TERM
     stop_server
+    cleanup_runtime_dirs
     rm -f -- "${RESULT_ROOT}/.active-job"
     exit "${status}"
 }
@@ -480,6 +531,9 @@ server_ready=false
 VLLM_LOG=""
 for ((startup_attempt = 1; startup_attempt <= VLLM_STARTUP_ATTEMPTS; startup_attempt++)); do
     VLLM_LOG="${RESULT_ROOT}/vllm-${SLURM_JOB_ID}-attempt-${startup_attempt}.log"
+    # An overlapping step otherwise receives the cluster's 2 GiB step default,
+    # even though the eight-GPU job owns the node's full memory allocation.  It
+    # must retain the warmed container pages and all eight worker processes.
     srun \
         --overlap \
         --exact \
@@ -487,12 +541,31 @@ for ((startup_attempt = 1; startup_attempt <= VLLM_STARTUP_ATTEMPTS; startup_att
         --ntasks=1 \
         --gpus-per-node=8 \
         --cpus-per-task=96 \
-        --container-image="${VLLM_IMAGE}" \
-        --container-mounts="${MODEL_MOUNTS},${TOKENIZER_RUNTIME_DIR}:/runtime-tokenizer:ro,${EVALUATION_CACHE_ROOT}:/evaluation-cache" \
+        --mem=512G \
+        --container-image="${VLLM_RUNTIME_IMAGE}" \
+        --container-mounts="${MODEL_MOUNTS},${TOKENIZER_RUNTIME_DIR}:/runtime-tokenizer:ro,${EVALUATION_CACHE_ROOT}:/evaluation-cache,${VLLM_RUNTIME_HOOKS}:/vllm-runtime-hooks:ro" \
         --container-workdir=/ \
         --no-container-mount-home \
-        --export="ALL,HF_HOME=/evaluation-cache/huggingface,HF_HUB_OFFLINE=1,TRANSFORMERS_OFFLINE=1,PYTHONUNBUFFERED=1,OMP_NUM_THREADS=1,NCCL_NVLS_ENABLE=0,TRITON_PTXAS_PATH=${VLLM_TRITON_PTXAS_PATH},VLLM_WORKER_MULTIPROC_METHOD=spawn" \
+        --export="ALL,HF_HOME=/evaluation-cache/huggingface,HF_HUB_OFFLINE=1,TRANSFORMERS_OFFLINE=1,PYTHONPATH=/vllm-runtime-hooks,PYTHONUNBUFFERED=1,OMP_NUM_THREADS=1,NCCL_NVLS_ENABLE=0,TRITON_PTXAS_PATH=${VLLM_TRITON_PTXAS_PATH},VLLM_ENGINE_READY_TIMEOUT_S=${VLLM_ENGINE_READY_TIMEOUT_SECONDS},VLLM_WORKER_MULTIPROC_METHOD=spawn" \
         bash -lc '
+            set -euo pipefail
+
+            # A cold Enroot filesystem is overwhelmed when eight spawned vLLM
+            # workers fault the same large Python/CUDA extensions concurrently.
+            # Read site-packages once before spawning them.  The workers import
+            # more than torch/vLLM (for example cpuinfo) after loading the model,
+            # so warming only those trees or only large files still leaves the
+            # Enroot root device saturated by concurrent small random reads.  The
+            # node has ample page cache, and this sequential pass replaces
+            # hundreds of GiB of duplicated worker reads.
+            package_root=/usr/local/lib/python3.12/site-packages
+            prewarm_started=${SECONDS}
+            find "${package_root}" \
+                -xdev -type f -readable -exec cat -- {} + > /dev/null
+            find /usr/lib/x86_64-linux-gnu \
+                -xdev -type f -readable -size +1M -exec cat -- {} + > /dev/null
+            echo "vLLM container page-cache prewarm completed in $((SECONDS - prewarm_started))s"
+
             exec vllm serve /checkpoint \
                 --tokenizer /runtime-tokenizer \
                 --host 0.0.0.0 \
@@ -602,6 +675,7 @@ top_p=${TOP_P}
 top_k=${TOP_K}
 num_repeats=${NUM_REPEATS}
 expected_output_records=${EXPECTED_OUTPUT_RECORDS}
+evaluator_attempts=${EVALUATOR_ATTEMPTS}
 max_new_tokens=${MAX_NEW_TOKENS}
 vocab_compat_action=${VOCAB_COMPAT_ACTION}
 tokenizer_compat_action=${TOKENIZER_COMPAT_ACTION}
@@ -617,25 +691,53 @@ slurm_job_id=${SLURM_JOB_ID}
 started_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 EOF
 
-    echo "Evaluating ${ARM_NAME} step=${TRAINING_STEP} task=${task}"
-    srun \
-        --overlap \
-        --exact \
-        --nodes=1 \
-        --ntasks=1 \
-        --cpus-per-task=32 \
-        --container-image="${NEMO_SKILLS_IMAGE}" \
-        --container-mounts="${partial_result}:/results,${NEMO_SKILLS_DATA_ROOT}:/evaluation-data,${EVALUATION_CACHE_ROOT}:/evaluation-cache,${EXPORT_TOOL_DIR}:/workspace/reasoning_eval:ro" \
-        --container-workdir=/results \
-        --no-container-mount-home \
-        --export="ALL,HF_HOME=/evaluation-cache/huggingface,NEMO_SKILLS_DATA_DIR=/evaluation-data,NEMO_EVALUATOR_TELEMETRY_LEVEL=0,XDG_CACHE_HOME=/evaluation-cache/xdg,PYTHONUNBUFFERED=1" \
-        bash -lc '
-            set -euo pipefail
-            nemo-evaluator run_eval --run_config /results/run-config.yaml
-            python3 /workspace/reasoning_eval/export_adapter_cache.py \
-                --cache-dir /results/adapter-cache \
-                --output /results/model-outputs.jsonl
-        '
+    evaluator_succeeded=false
+    for ((evaluator_attempt = 1; evaluator_attempt <= EVALUATOR_ATTEMPTS; evaluator_attempt++)); do
+        echo "Evaluating ${ARM_NAME} step=${TRAINING_STEP} task=${task} attempt=${evaluator_attempt}/${EVALUATOR_ATTEMPTS}"
+        if srun \
+            --overlap \
+            --exact \
+            --nodes=1 \
+            --ntasks=1 \
+            --cpus-per-task=32 \
+            --mem=512G \
+            --container-image="${NEMO_SKILLS_IMAGE}" \
+            --container-mounts="${partial_result}:/results,${NEMO_SKILLS_DATA_ROOT}:/evaluation-data,${EVALUATION_CACHE_ROOT}:/evaluation-cache,${EXPORT_TOOL_DIR}:/workspace/reasoning_eval:ro" \
+            --container-workdir=/results \
+            --no-container-mount-home \
+            --export="ALL,HF_HOME=/evaluation-cache/huggingface,NEMO_SKILLS_DATA_DIR=/evaluation-data,NEMO_EVALUATOR_TELEMETRY_LEVEL=0,XDG_CACHE_HOME=/evaluation-cache/xdg,PYTHONUNBUFFERED=1" \
+            bash -lc '
+                set -euo pipefail
+                nemo-evaluator run_eval --run_config /results/run-config.yaml
+                python3 /workspace/reasoning_eval/export_adapter_cache.py \
+                    --cache-dir /results/adapter-cache \
+                    --output /results/model-outputs.jsonl
+            '; then
+            if [[ -s "${partial_result}/model-outputs.jsonl" \
+                && -s "${partial_result}/evaluator/eval-results/${task}/metrics.json" ]]; then
+                attempt_output_records="$(wc -l < "${partial_result}/model-outputs.jsonl")"
+                if (( attempt_output_records == EXPECTED_OUTPUT_RECORDS )) \
+                    && jq --exit-status --arg task "${task}" '
+                        .[$task]["pass@1"].symbolic_correct
+                        | (type == "number") and (. >= 0) and (. <= 100)
+                    ' "${partial_result}/evaluator/eval-results/${task}/metrics.json" >/dev/null; then
+                    evaluator_succeeded=true
+                    break
+                fi
+                echo "Evaluator attempt produced incomplete outputs for ${task}: " \
+                    "records=${attempt_output_records} expected=${EXPECTED_OUTPUT_RECORDS}" >&2
+            else
+                echo "Evaluator attempt did not produce model outputs and metrics for ${task}" >&2
+            fi
+        fi
+        if (( evaluator_attempt < EVALUATOR_ATTEMPTS )); then
+            echo "Evaluator attempt failed for ${task}; retrying from cached partial outputs" >&2
+        fi
+    done
+    [[ "${evaluator_succeeded}" == true ]] || {
+        echo "Evaluator failed after ${EVALUATOR_ATTEMPTS} attempts for ${task}" >&2
+        exit 32
+    }
     [[ -s "${partial_result}/model-outputs.jsonl" ]] || {
         echo "model output export is missing for ${task}" >&2
         exit 28

@@ -185,8 +185,9 @@ groups from the worker's output queue". A deep queue drains instantly, so
 inverse, not generation getting faster. It is an observable for queue depth.
 
 So the ordering is: production rate > consumption rate -> queue fills -> samples
-wait -> lag. The ceiling is `OUTPUT_QUEUE_MAX_GROUPS / rollout_batch_size` =
-1000/192 ~ 5, which is where R=5's 2.98 sits.
+wait -> lag. At the default, the ceiling is
+`training_buffer_queue_size / rollout_batch_size` = 1000/192 ~ 5, which is where
+R=5's 2.98 sits.
 
 **The bound closes a negative feedback loop around this.** A recycled group is
 regenerated from scratch (`_recycle` -> `reset_for_retry` -> back to the buffer),
@@ -236,10 +237,11 @@ nothing truncates:
 | 10 | 922 | 4.62 | **6** |
 | 11 | 980 | 5.05 | **6** |
 
-`OUTPUT_QUEUE_MAX_GROUPS` (1000, `fully_async_rollout.py:34`) plus the 192
-in-flight groups, over 192 consumed per step, is 6.2 — and `max_staleness` stops
-at 6 while `queue_size` sits against the cap. R=5 reaches 660-830 and max 5-6;
-R=1..3 never leave `queue_size` 0-1 and are ordered by node ratio instead.
+The configured `training_buffer_queue_size` (1000 for this historical run) plus
+the 192 in-flight groups, over 192 consumed per step, is 6.2 — and
+`max_staleness` stops at 6 while `queue_size` sits against the cap. R=5 reaches
+660-830 and max 5-6; R=1..3 never leave `queue_size` 0-1 and are ordered by node
+ratio instead.
 
 Two consequences:
 
@@ -247,12 +249,14 @@ Two consequences:
   `--max-weight-staleness`. The s=64 arms are s~6 arms; their
   `stale_groups_recycled` is 0 because the bound never gets the chance to bite.
   The ceiling scales with `--num-steps-per-rollout` (~6.2k), not with the bound.
-  Reaching further up the staleness axis means editing the constant — it is not
-  a CLI flag — or shrinking `rollout_batch_size`.
-- **A full queue is idle rollout GPUs.** `await self._output.put(...)`
-  (`fully_async_rollout.py:329`) blocks the producer, so past R=5 the extra
-  rollout nodes are throttled by backpressure rather than generating. That is
-  the same ceiling "Choosing R" reaches from the `train_wait_time` side.
+  Reaching further up the staleness axis requires increasing
+  `--training-buffer-queue-size` or shrinking `rollout_batch_size`; increasing
+  the queue permits lag but does not create it unless production stays ahead of
+  consumption.
+- **A full queue is idle rollout GPUs.** Waiting on the completed-group capacity
+  semaphore blocks the producer, so past R=5 the extra rollout nodes are
+  throttled by backpressure rather than generating. That is the same ceiling
+  "Choosing R" reaches from the `train_wait_time` side.
 
 ### Second pass: the balance per bound, at 8 nodes (2026-08-08)
 
@@ -280,27 +284,140 @@ run, which split does that bound want?
   prints `gbs/dp` per point, and drops any split megatron would reject, at
   submission. Across the four splits dp is 4/8/12/16 and gbs/dp is
   768/384/256/192 — all four divide.
-- The launcher never deletes or repairs checkpoints. Its timestamped
-  `RUN_NAMESPACE` creates a fresh identity by default; explicitly reusing a
-  namespace is what opts into continuing that identity.
-- The interface is intentionally narrow: dry-run, `--submit`, and repeatable
-  `--point M:T:R`. Grid values and allocation details can be supplied through
-  environment variables. Log analysis and checkpoint administration are
-  separate tools, not branches in the submission script.
-- wandb project `async-rl-dapo-math-node-ratio`, separate from the convergence
-  study's `off-policy-<dataset>`, because these runs are a throughput
-  measurement and do not belong on the same board as the quality curves.
-  `train.sh` honours `WANDB_PROJECT` with the old value as its default, so
-  nothing else moves.
+- The launcher never repairs checkpoints and does not delete them by default.
+  Original-grid mode deletes only when `--clean-checkpoint` is explicitly
+  requested; matched mode rejects that option. Its timestamped `RUN_NAMESPACE`
+  creates a fresh identity by default; explicitly reusing a namespace is what
+  opts into continuing that identity.
+- The original-grid interface remains narrow: dry-run, `--submit`, and
+  repeatable `--point M:T:R`. The same launcher now has one fail-closed
+  `--matched-partial-concurrency` follow-up mode, documented below. Log
+  analysis and checkpoint administration remain separate tools.
+- The launcher uses wandb project `async-rl-dapo-math`. Cohorts are separated
+  by an explicit namespace and descriptive group/config tags rather than by
+  silently changing the project between the quality and throughput views.
 - The wandb group is `s<S>-t<T>r<R>-<namespace>`. The namespace prevents a new
   invocation from silently joining an earlier checkpoint or W&B run.
 
-All learning settings other than `MAX_WEIGHT_STALENESS` come from
+In original-grid mode, all learning settings other than `MAX_WEIGHT_STALENESS`
+come from
 `experiments/scripts/math/async/dapo-math-p10-90/qwen3-4b/run.sbatch`. In
-particular the launcher no longer copies LR, TIS, replay-buffer, checkpoint,
-batch-shape, reward, or telemetry defaults. It reads the few recipe values
-needed to validate the node split, then exports only staleness, placement, and
-run identity.
+particular the launcher no longer owns independent LR, TIS, replay-buffer,
+checkpoint, batch-shape, reward, or telemetry defaults. It reads recipe values
+needed to validate the node split and explicitly re-exports the derived safety
+settings together with staleness, placement, and run identity.
+
+### Matched colocated-partial/concurrency follow-up (2026-08-25)
+
+`--matched-partial-concurrency` owns exactly five arms: one colocated
+partial-rollout arm with `R=192`, `O=256`, and `n=16`, plus the four original
+train:rollout ratios at max weight staleness 4 with
+`ASYNC_MAX_CONCURRENT_SAMPLES=O*n=4096`. It is not an extra point in the old
+16-arm grid. The colocated comparison against the completed O=192 reference is
+an intentional compound treatment (cutoff concurrency and carry-over change
+together); each async comparison against its old same-ratio arm changes the
+global admitted concurrency from 3072 to 4096.
+
+Matched mode fixes the completed cohort's 8 nodes, `batch` partition, 4-hour
+wall limit, ten chained allocations, batch/model shape, save cadence, container,
+and memory/engine settings. It rejects ambient learning overrides, derives the
+five identities into fresh checkpoint namespaces, writes a submission manifest,
+and passes a content fingerprint to every allocation so a later chain fails
+before Ray startup if the mounted runtime checkout changed. Only the 4:4 async
+arm also matches the colocated arm's 32-engine count and nominal 128 trajectories
+per engine; the other ratios match global C but deliberately retain their
+placement-native engine counts.
+
+#### 2026-08-30 truncation-mode contamination and quarantine
+
+The terminal segments of two arms in namespace
+`sr-20260826-093358-p3980519` are not valid members of the intended
+zero-reward-on-truncated-only cohort. Resume allocations for these arms logged
+both `zero_reward_on_truncated=true` and `zero_loss_on_truncated=true`, and then
+performed optimizer updates:
+
+| arm | last clean checkpoint | contaminated updates | conflicting W&B run |
+|---|---:|---:|---|
+| async `s4-t1r7-c4096` | 229 | 230--259 | `20260828_084739-b906e664` |
+| colocated `s0-colocated-partial-o256` | 279 | 280--299 | `20260829_122345-nq9u7dva` |
+
+Do not use those contaminated update ranges as zero-reward-only training or as
+terminal matched-cohort checkpoints. They simultaneously changed the reward
+assigned to truncated samples and removed those samples' direct loss, so they
+cannot identify either truncation treatment. Checkpoints through 229 for t1r7
+and through 279 for partial remain useful as pre-contamination diagnostics, but
+the terminal comparison must come from a clean replacement. The t2r6, t3r5,
+and t4r4 arms reached checkpoint 299 under the intended zero-reward-only
+configuration; later processes that reported both flags loaded checkpoint 299
+but performed no optimizer update, so their saved training trajectories are not
+part of this quarantine.
+
+Rerun only the two affected arms from the original model under a fresh
+namespace; never resume either contaminated checkpoint. The dedicated command
+is:
+
+```bash
+RUN_NAMESPACE=hiso-matched-clean-t1r7-partial-20260830-v1 \
+    experiments/staleness_ratio_sweep.sh \
+    --rerun-clean-matched-arms \
+    --submit
+```
+
+This mode preserves the original matched allocation, concurrency, container,
+and training protocol while forcing `ZERO_REWARD_ON_TRUNCATED=1` and
+`ZERO_LOSS_ON_TRUNCATED=0`. It submits only async t1r7 and colocated partial,
+and the fresh namespace keeps their checkpoints separate from the quarantined
+ones. The old checkpoints should remain available for provenance, but
+evaluation and figures must select the replacement namespace for these two
+terminal arms.
+
+#### 2026-08-31 high-staleness queue-capacity correction
+
+All async arms with `MAX_WEIGHT_STALENESS >= 8` must use
+`TRAINING_BUFFER_QUEUE_SIZE=6000`. A 1000-group queue can constrain producer
+admission before the configured weight-staleness bound becomes the active
+limit, so it is not a controlled setting for the intended `s8+` comparisons.
+The sweep launcher derives this value per arm, including mixed grids, and the
+async DAPO math recipe rejects any `s8+` job that reaches runtime with another
+value.
+
+The queue argument counts completed prompt groups, not trajectories. For a
+global batch of `G` trajectories, `n` samples per prompt, and bound `S`, the
+minimum capacity enforced by this experiment is
+`ceil(G * S / n)` groups. With `G=3072` and `n=16`, the requirements for
+`S={8,16,20,24,28}` are `{1536,3072,3840,4608,5376}` groups, respectively, so
+6000 covers the current grid. `S=32` would require 6144 groups and therefore
+fails before submission instead of silently running queue-bound.
+
+Fourteen earlier async checkpoints are quarantined by this correction: the
+four `s8` ratio arms in `sr-20260819-212906`, all six arms in
+`hiso-zero-loss-trunc-s8-16-20-r12-20260827-v1`, and the four async arms in
+`hiso-reward-off-trunc-coloc-s8-16-r12-20260827-v1`. The colocated arm in the
+last namespace is not affected because the async training-buffer queue does not
+apply to it. Use `experiments/cleanup_tbq1000_staleness_checkpoints.sh` to audit
+the exact paths and its explicit `--delete` mode only after reviewing the dry
+run. Corrected runs must use fresh namespaces so their W&B groups and offline
+evaluation outputs cannot be confused with the quarantined runs.
+
+The completed zero-reward `s8` four-ratio cohort is retained for exploratory
+analysis and deferred until the pre-publication controlled rerun. The immediate
+correction targets only the ten incomplete truncation-ablation arms; select it
+with `--cohort truncation-ablations`. `--cohort baseline-s8` is a separate,
+explicit cleanup target so the completed reference cannot be removed by the
+current correction command.
+
+The CLI now declares the two truncation flags mutually exclusive. Effective
+configuration is validated again after YAML overrides, and both async and sync
+recipes reject nonzero values for both environment variables before training.
+This is a runtime setting guard; no commit-ID check is used.
+
+The content check is not an immutable source snapshot. Submit from a committed,
+clean, dedicated worktree and do not edit its runtime files until all chains
+finish. The completed colocated baseline predates the direction-specific switch
+metrics; compare it on full step time/time-to-quality, not by reconstructing
+switch components it never logged. The metric contract and validation evidence
+are in `experiments/notes/telemetry.md` under "Colocated train/rollout switching
+cost".
 
 For `queue-recycle`, the dequeue-time admission test uses the generation-side
 comparison version and requires `D_g - F_g < M`. Logging intentionally uses the
@@ -314,10 +431,11 @@ Join `step_s` and `tok/s/gpu` with `staleness/total/mean`,
 `stale_groups_recycled`, and `wasted_token_frac` in W&B. A split that wins on
 `step_s` while recycling a third of its generation has not won.
 
-**The s=8 row is not a fourth bound level.** The output queue caps realized lag
-at `(1000 + 192)/192 ~ 6.2` at k=1 (see the queue-ceiling section above), so a
-bound of 8 can never bite: that row measures the natural lag of each split and is
-the unbounded reference, not a point on the bound axis. Expect
+**The s=8 row is not a fourth bound level.** With the queue size used by those
+runs, the output queue caps realized lag at `(1000 + 192)/192 ~ 6.2` at k=1 (see
+the queue-ceiling section above), so a bound of 8 can never bite: that row
+measures the natural lag of each split and is the unbounded reference, not a
+point on the bound axis. Expect
 `stale_groups_recycled` 0 and `staleness/bound_exceeded_sample_frac` 0 there; if
 either is non-zero, the ceiling arithmetic or the batch shape has changed and
 both notes need revisiting.

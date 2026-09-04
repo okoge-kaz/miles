@@ -87,12 +87,22 @@ def convert_samples_to_train_data(
         if (training_step := metadata.get("training_step")) is not None:
             train_data["training_steps"] = [int(training_step)] * len(samples)
 
-    if getattr(args, "log_sample_staleness_metrics", False) or getattr(args, "dump_details", None) is not None:
+    require_staleness = getattr(args, "use_staleness_aware_loss", False)
+    if (
+        getattr(args, "log_sample_staleness_metrics", False)
+        or getattr(args, "dump_details", None) is not None
+        or require_staleness
+    ):
         staleness_rows = []
         for sample in samples:
             reference = sample.metadata.get(SAMPLE_REFERENCE_VERSION_KEY)
             train_version = sample.metadata.get(TRAIN_VERSION_KEY)
             if not isinstance(reference, int) or not isinstance(train_version, int):
+                if require_staleness:
+                    raise RuntimeError(
+                        "--use-staleness-aware-loss requires complete per-sample "
+                        f"training-staleness provenance; sample {sample.index} is missing a weight version"
+                    )
                 staleness_rows = []
                 break
             if train_version < reference:
@@ -115,10 +125,10 @@ def convert_samples_to_train_data(
         assert (
             len(sample.loss_mask) == sample.response_length
         ), f"loss mask length {len(sample.loss_mask)} != response length {sample.response_length}"
-        if sample.remove_sample or (
-            getattr(args, "zero_loss_on_truncated", False)
-            and sample.status == Sample.Status.TRUNCATED
-        ):
+        zero_truncated_loss = (
+            getattr(args, "zero_loss_on_truncated", False) and sample.status == Sample.Status.TRUNCATED
+        )
+        if sample.remove_sample or zero_truncated_loss:
             sample.loss_mask = [0] * sample.response_length
         loss_masks.append(sample.loss_mask)
     train_data["loss_masks"] = loss_masks
@@ -202,9 +212,7 @@ def _post_process_rewards(
 
     zero_truncated_rewards = getattr(args, "zero_reward_on_truncated", False)
     raw_rewards = [
-        0.0
-        if zero_truncated_rewards and sample.status == Sample.Status.TRUNCATED
-        else sample.get_reward_value(args)
+        0.0 if zero_truncated_rewards and sample.status == Sample.Status.TRUNCATED else sample.get_reward_value(args)
         for sample in samples
     ]
     if args.advantage_estimator in ["grpo", "gspo", "reinforce_plus_plus_baseline"] and args.rewards_normalization:

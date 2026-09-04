@@ -96,8 +96,7 @@ def _validate_shard(path: Path) -> tuple[dict[str, Any], int]:
     expected_file_size = data_start + expected_begin
     if path.stat().st_size != expected_file_size:
         raise ValueError(
-            f"incomplete or oversized shard {path}: "
-            f"size={path.stat().st_size}, expected={expected_file_size}"
+            f"incomplete or oversized shard {path}: " f"size={path.stat().st_size}, expected={expected_file_size}"
         )
     return tensors, expected_begin
 
@@ -114,8 +113,7 @@ def validate_checkpoint(path: Path) -> CheckpointInfo:
     for name, expected in EXPECTED_ARCHITECTURE.items():
         if config.get(name) != expected:
             raise ValueError(
-                f"expected Qwen3-4B {name}={expected}, got {config.get(name)!r} "
-                f"in {path / 'config.json'}"
+                f"expected Qwen3-4B {name}={expected}, got {config.get(name)!r} " f"in {path / 'config.json'}"
             )
     vocabulary_size = int(config["vocab_size"])
     context_length = int(config["max_position_embeddings"])
@@ -128,10 +126,7 @@ def validate_checkpoint(path: Path) -> CheckpointInfo:
         raise ValueError(f"weight_map is missing from {path / 'model.safetensors.index.json'}")
     shard_names = set(weight_map.values())
     if not all(
-        isinstance(name, str)
-        and name.endswith(".safetensors")
-        and Path(name).name == name
-        for name in shard_names
+        isinstance(name, str) and name.endswith(".safetensors") and Path(name).name == name for name in shard_names
     ):
         raise ValueError(f"invalid shard names in {path / 'model.safetensors.index.json'}")
 
@@ -144,9 +139,7 @@ def validate_checkpoint(path: Path) -> CheckpointInfo:
         if tensor_name not in shard_tensors[shard_name]:
             raise ValueError(f"{tensor_name} is absent from indexed shard {shard_name}")
     actual_weight_map = {
-        tensor_name: shard_name
-        for shard_name, tensors in shard_tensors.items()
-        for tensor_name in tensors
+        tensor_name: shard_name for shard_name, tensors in shard_tensors.items() for tensor_name in tensors
     }
     if actual_weight_map != weight_map:
         extra_tensors = sorted(set(actual_weight_map).difference(weight_map))
@@ -236,6 +229,9 @@ def main() -> None:
     assert args.checkpoint is not None
     try:
         info = validate_checkpoint(args.checkpoint.resolve())
+    except PermissionError as error:
+        print(f"unreadable checkpoint {args.checkpoint}: {error}", file=sys.stderr)
+        raise SystemExit(2) from error
     except VALIDATION_ERRORS as error:
         print(f"invalid checkpoint {args.checkpoint}: {error}", file=sys.stderr)
         raise SystemExit(1) from error

@@ -34,6 +34,7 @@ _SNAPSHOT_KEYS = (
     "rollout_seed",
     "lr",
     "max_weight_staleness",
+    "training_buffer_queue_size",
     "pause_generation_mode",
     "num_steps_per_rollout",
     "rollout_max_response_len",

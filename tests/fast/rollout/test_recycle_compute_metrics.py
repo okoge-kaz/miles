@@ -55,6 +55,20 @@ def _sample(index: int, response_length: int, loss_mask: list[int]) -> Sample:
     )
 
 
+def test_partial_shared_weighted_lag_reducer_matches_fully_async_primitives() -> None:
+    from miles.rollout.recycle_compute_metrics import (
+        _weighted_distribution_metrics,
+        _weighted_tail_metrics,
+        weighted_lag_distribution_metrics,
+    )
+
+    weights = {0: 5, 2: 3, 7: 1}
+
+    assert weighted_lag_distribution_metrics(weights) == (
+        _weighted_distribution_metrics(weights) | _weighted_tail_metrics(weights)
+    )
+
+
 def test_useful_rollout_accounting_is_an_exact_partition() -> None:
     samples = [_sample(1, 6, [1, 1, 1, 1, 1, 0]), _sample(2, 4, [1, 1, 1, 0])]
     metrics = {
@@ -73,6 +87,27 @@ def test_useful_rollout_accounting_is_an_exact_partition() -> None:
     assert metrics["rollout/fully_async/useful_rollout/efficiency"] == 0.4
     assert metrics["rollout/fully_async/useful_rollout/postprocess_trimmed_tokens"] == 2
     assert metrics["rollout/fully_async/useful_rollout/loss_masked_tokens"] == 2
+    assert metrics["rollout/fully_async/useful_rollout/accounting_error_tokens"] == 0
+
+
+def test_useful_rollout_accounting_includes_zero_loss_truncated_samples() -> None:
+    completed = _sample(1, 4, [1, 1, 1, 1])
+    truncated = _sample(2, 6, [1, 1, 1, 1, 1, 1])
+    truncated.status = Sample.Status.TRUNCATED
+    metrics = {
+        GENERATED_TOKENS_KEY: 10,
+        ADMITTED_TOKENS_KEY: 10,
+    }
+
+    finalize_useful_rollout_metrics(
+        [completed, truncated],
+        metrics,
+        has_custom_converter=False,
+        zero_loss_on_truncated=True,
+    )
+
+    assert metrics["rollout/fully_async/useful_rollout/loss_input_tokens"] == 4
+    assert metrics["rollout/fully_async/useful_rollout/loss_masked_tokens"] == 6
     assert metrics["rollout/fully_async/useful_rollout/accounting_error_tokens"] == 0
 
 
@@ -292,6 +327,7 @@ def test_pipeline_snapshot_yields_same_window_for_all_throughputs() -> None:
         pipeline_snapshot={
             "window_seconds": 2.0,
             "generated_tokens": 10.0,
+            "generated_groups": 4.0,
             "completed_training_batches": 1.0,
             "accepted_tokens": 3.0,
             "accepted_tokens_available": 1.0,
@@ -307,6 +343,9 @@ def test_pipeline_snapshot_yields_same_window_for_all_throughputs() -> None:
     )
 
     assert metrics["throughput/generated_tokens_per_second"] == 5
+    assert metrics["throughput/generated_groups_per_second"] == 2
+    assert metrics["throughput/generated_groups"] == 4
+    assert metrics["throughput/window_seconds"] == 2
     assert metrics["throughput/accepted_tokens_per_second"] == 1.5
     assert metrics["throughput/useful_tokens_per_second"] == 1.5
     assert metrics["throughput/window_useful_efficiency"] == 0.3

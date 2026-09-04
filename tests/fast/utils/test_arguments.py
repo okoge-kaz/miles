@@ -12,6 +12,7 @@ from miles.utils.arguments import (
     _maybe_apply_dumper_overrides,
     _resolve_ft_components,
     _resolve_rollout_functions,
+    _validate_truncation_behavior,
     get_miles_extra_args_provider,
     miles_validate_args,
     validate_async_off_policy_correction,
@@ -27,6 +28,7 @@ def _replay_buffer_args(**overrides) -> SimpleNamespace:
         "fully_async": True,
         "fully_async_queue_type": "queue-recycle",
         "fully_async_queue_factor": 1,
+        "training_buffer_queue_size": 1000,
         "max_weight_staleness": None,
         "staleness_reference": "completion",
         "use_replay_buffer": True,
@@ -233,6 +235,39 @@ def test_replay_buffer_cli_is_opt_in_with_rollout_as_the_default_type():
     assert inflight.replay_buffer_type == "inflight"
 
 
+def test_training_buffer_queue_size_cli_defaults_to_legacy_capacity_and_accepts_override():
+    parser = argparse.ArgumentParser()
+    get_miles_extra_args_provider()(parser)
+
+    defaults = parser.parse_args(REQUIRED_ARGS)
+    configured = parser.parse_args(["--training-buffer-queue-size", "6000"] + REQUIRED_ARGS)
+
+    assert defaults.training_buffer_queue_size == 1000
+    assert configured.training_buffer_queue_size == 6000
+
+
+def test_sample_staleness_histogram_defaults_to_32_and_accepts_override():
+    parser = argparse.ArgumentParser()
+    get_miles_extra_args_provider()(parser)
+
+    defaults = parser.parse_args(REQUIRED_ARGS)
+    configured = parser.parse_args(["--sample-staleness-max-bin", "48"] + REQUIRED_ARGS)
+
+    assert defaults.sample_staleness_max_bin == 32
+    assert configured.sample_staleness_max_bin == 48
+
+
+def test_zero_reward_on_truncated_cli_is_opt_in():
+    parser = argparse.ArgumentParser()
+    get_miles_extra_args_provider()(parser)
+
+    defaults = parser.parse_args(REQUIRED_ARGS)
+    assert not defaults.zero_reward_on_truncated
+
+    enabled = parser.parse_args(["--zero-reward-on-truncated"] + REQUIRED_ARGS)
+    assert enabled.zero_reward_on_truncated
+
+
 def test_replay_resume_metrics_cli_is_opt_in():
     parser = argparse.ArgumentParser()
     get_miles_extra_args_provider()(parser)
@@ -260,6 +295,170 @@ def test_truncated_handling_cli_is_opt_in(flag: str, attribute: str):
 
     enabled = parser.parse_args([flag] + REQUIRED_ARGS)
     assert getattr(enabled, attribute)
+
+
+def test_zero_loss_on_truncated_cli_is_opt_in():
+    parser = argparse.ArgumentParser()
+    get_miles_extra_args_provider()(parser)
+
+    defaults = parser.parse_args(REQUIRED_ARGS)
+    assert not defaults.zero_loss_on_truncated
+
+    enabled = parser.parse_args(["--zero-loss-on-truncated"] + REQUIRED_ARGS)
+    assert enabled.zero_loss_on_truncated
+
+
+def test_staleness_aware_loss_cli_is_opt_in_with_safe_default():
+    parser = argparse.ArgumentParser()
+    get_miles_extra_args_provider()(parser)
+
+    defaults = parser.parse_args(REQUIRED_ARGS)
+    enabled = parser.parse_args(
+        [
+            "--use-staleness-aware-loss",
+            "--safe-training-staleness",
+            "4",
+            "--log-staleness-aware-loss-details",
+        ]
+        + REQUIRED_ARGS
+    )
+
+    assert not defaults.use_staleness_aware_loss
+    assert defaults.safe_training_staleness == 2
+    assert not defaults.log_staleness_aware_loss_details
+    assert enabled.use_staleness_aware_loss
+    assert enabled.safe_training_staleness == 4
+    assert enabled.log_staleness_aware_loss_details
+
+
+def test_staleness_aware_loss_detail_logging_requires_scaling():
+    args = SimpleNamespace(
+        zero_reward_on_truncated=True,
+        zero_loss_on_truncated=False,
+        use_staleness_aware_loss=False,
+        log_staleness_aware_loss_details=True,
+        safe_training_staleness=2,
+    )
+
+    with pytest.raises(ValueError, match="requires --use-staleness-aware-loss"):
+        _validate_truncation_behavior(args)
+
+
+def test_staleness_aware_loss_detail_logging_requires_tis():
+    args = SimpleNamespace(
+        zero_reward_on_truncated=True,
+        zero_loss_on_truncated=False,
+        use_staleness_aware_loss=True,
+        log_staleness_aware_loss_details=True,
+        safe_training_staleness=2,
+        use_tis=False,
+    )
+
+    with pytest.raises(ValueError, match="requires --use-tis"):
+        _validate_truncation_behavior(args)
+
+
+def test_truncation_behavior_cli_flags_are_mutually_exclusive():
+    parser = argparse.ArgumentParser()
+    get_miles_extra_args_provider()(parser)
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--zero-reward-on-truncated", "--zero-loss-on-truncated"] + REQUIRED_ARGS)
+
+
+@pytest.mark.parametrize(
+    ("zero_reward", "zero_loss"),
+    [(False, False), (True, False), (False, True)],
+)
+def test_truncation_behavior_validation_accepts_non_conflicting_modes(zero_reward, zero_loss):
+    args = SimpleNamespace(
+        zero_reward_on_truncated=zero_reward,
+        zero_loss_on_truncated=zero_loss,
+    )
+
+    _validate_truncation_behavior(args)
+
+
+def test_truncation_behavior_validation_rejects_config_override_conflict():
+    args = SimpleNamespace(
+        zero_reward_on_truncated=True,
+        zero_loss_on_truncated=True,
+    )
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _validate_truncation_behavior(args)
+
+
+def test_staleness_aware_loss_validation_accepts_truncation_feedback_mode():
+    args = SimpleNamespace(
+        zero_reward_on_truncated=True,
+        zero_loss_on_truncated=False,
+        use_staleness_aware_loss=True,
+        safe_training_staleness=2,
+        fully_async=True,
+        loss_type="policy_loss",
+        custom_reward_post_process_path=None,
+        custom_convert_samples_to_train_data_path=None,
+    )
+
+    _validate_truncation_behavior(args)
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"zero_reward_on_truncated": False}, "requires --zero-reward-on-truncated"),
+        (
+            {"zero_reward_on_truncated": False, "zero_loss_on_truncated": True},
+            "overlong filtering",
+        ),
+        ({"fully_async": False}, "requires --fully-async"),
+        ({"safe_training_staleness": -1}, "must be non-negative"),
+        ({"loss_type": "value_loss"}, "built-in policy loss"),
+        ({"custom_reward_post_process_path": "custom.reward"}, "built-in reward post-processing"),
+        (
+            {"custom_convert_samples_to_train_data_path": "custom.convert"},
+            "built-in sample-to-train-data conversion",
+        ),
+    ],
+)
+def test_staleness_aware_loss_validation_rejects_unsupported_modes(override, message):
+    values = {
+        "zero_reward_on_truncated": True,
+        "zero_loss_on_truncated": False,
+        "use_staleness_aware_loss": True,
+        "safe_training_staleness": 2,
+        "fully_async": True,
+        "loss_type": "policy_loss",
+        "custom_reward_post_process_path": None,
+        "custom_convert_samples_to_train_data_path": None,
+    }
+    values.update(override)
+
+    with pytest.raises(ValueError, match=message):
+        _validate_truncation_behavior(SimpleNamespace(**values))
+
+
+def test_colocate_switch_telemetry_cli_is_opt_in():
+    parser = argparse.ArgumentParser()
+    get_miles_extra_args_provider()(parser)
+
+    defaults = parser.parse_args(REQUIRED_ARGS)
+    enabled = parser.parse_args(
+        [
+            "--log-colocate-switch-metrics",
+            "--log-colocate-transfer-bytes",
+            "--log-memory-usage",
+        ]
+        + REQUIRED_ARGS
+    )
+
+    assert not defaults.log_colocate_switch_metrics
+    assert not defaults.log_colocate_transfer_bytes
+    assert not defaults.log_memory_usage
+    assert enabled.log_colocate_switch_metrics
+    assert enabled.log_colocate_transfer_bytes
+    assert enabled.log_memory_usage
 
 
 def make_class_with_add_arguments():

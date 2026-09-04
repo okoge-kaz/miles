@@ -564,6 +564,7 @@ def finalize_useful_rollout_metrics(
     metrics: dict[str, Any] | None,
     *,
     has_custom_converter: bool,
+    zero_loss_on_truncated: bool = False,
 ) -> None:
     """Finalize efficiency after flattening/trimming, immediately before logging."""
     if metrics is None or GENERATED_TOKENS_KEY not in metrics:
@@ -576,7 +577,10 @@ def finalize_useful_rollout_metrics(
     generated_tokens = int(metrics[GENERATED_TOKENS_KEY])
     admitted_tokens = int(metrics[ADMITTED_TOKENS_KEY])
     selected_tokens = sum(sample.response_length for sample in samples)
-    loss_token_counts = [_loss_input_tokens(sample) for sample in samples]
+    loss_token_counts = [
+        0 if zero_loss_on_truncated and sample.status == Sample.Status.TRUNCATED else _loss_input_tokens(sample)
+        for sample in samples
+    ]
     loss_input_tokens = sum(loss_token_counts)
     postprocess_trimmed_tokens = admitted_tokens - selected_tokens
     loss_masked_tokens = selected_tokens - loss_input_tokens
@@ -694,6 +698,11 @@ def _weighted_tail_metrics(weight_by_value: dict[int, int | float]) -> dict[str,
         )
         for threshold in EXACT_LAG_TAIL_THRESHOLDS
     }
+
+
+def weighted_lag_distribution_metrics(weight_by_value: dict[int, int | float]) -> dict[str, float]:
+    """Return the shared token-weighted lag summary used by rollout modes."""
+    return _weighted_distribution_metrics(weight_by_value) | _weighted_tail_metrics(weight_by_value)
 
 
 def _add_weighted_lag_distribution(
@@ -1197,6 +1206,7 @@ def pipeline_throughput_metrics(
     """Render one completion-to-completion producer/trainer wall window."""
     window_seconds = float(pipeline_snapshot.get("window_seconds", 0.0))
     generated_tokens = float(pipeline_snapshot.get("generated_tokens", 0.0))
+    generated_groups = float(pipeline_snapshot.get("generated_groups", 0.0))
     completed_updates_available = "optimizer_updates" in pipeline_snapshot
     completed_updates = float(pipeline_snapshot.get("optimizer_updates", 0.0))
     window_accepted_available = bool(pipeline_snapshot.get("accepted_tokens_available", False))
@@ -1205,6 +1215,8 @@ def pipeline_throughput_metrics(
         "throughput/window_seconds": window_seconds,
         "throughput/generated_tokens": generated_tokens,
         "throughput/generated_tokens_per_second": (generated_tokens / window_seconds if window_seconds > 0.0 else 0.0),
+        "throughput/generated_groups": generated_groups,
+        "throughput/generated_groups_per_second": (generated_groups / window_seconds if window_seconds > 0.0 else 0.0),
         "throughput/completed_training_batches": float(pipeline_snapshot.get("completed_training_batches", 0.0)),
         "throughput/optimizer_updates_available": float(completed_updates_available),
         "throughput/window_accepted_loss_tokens_available": float(window_accepted_available),

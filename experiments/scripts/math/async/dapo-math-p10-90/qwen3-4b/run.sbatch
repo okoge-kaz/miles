@@ -14,13 +14,14 @@
 
 set -euo pipefail
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../../../.." &>/dev/null && pwd)}"
+REPO_ROOT="${MILES_REPO:-${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../../../.." &>/dev/null && pwd)}}"
 # Mount the selected checkpoint root directly so both SGLang and the tokenizer
 # read iter_0004000 in place. HF_CKPT_DIR lets validation jobs select another
 # converted model while the checked-in recipe remains the 4B default.
 : "${HF_CKPT_DIR:=${QWEN3_4B_BASE_HF_ROOT:-/lustre/fsw/portfolios/coreai/users/kfujii/checkpoints/huggingface/Qwen3-4B-Base/LR2.0e-5-SEQ32768-GBS128-MBS1-TP1-PP1-CP1-EP1-PACK1-standard-cp-STEPS4000}}"
 export HF_CKPT_DIR
 source "${REPO_ROOT}/experiments/env.sh"
+source "${REPO_ROOT}/experiments/common/staleness_buffer_policy.sh"
 
 if [[ "${WANDB_MODE:-online}" != offline && "${WANDB_MODE:-online}" != disabled ]]; then
     : "${WANDB_API_KEY:?set WANDB_API_KEY, use WANDB_MODE=offline, or disable wandb}"
@@ -54,6 +55,7 @@ PLACEMENT=async
 # training hyperparameters
 : "${LR:=1e-6}"
 : "${MAX_RESPONSE_LEN:=16384}"
+: "${ROLLOUT_MAX_CONTEXT_LEN:=32768}"
 : "${NUM_ROLLOUT:=300}"
 : "${TRAIN_SEED:=1234}"
 : "${ROLLOUT_SEED:=42}"
@@ -67,6 +69,7 @@ PLACEMENT=async
 # queue selection and what happens to in-flight generation at a weight update
 : "${QUEUE_TYPE:=queue-recycle}" # queue-recycle | queue-max | queue-drop
 : "${QUEUE_FACTOR:=1}"                       # queue-drop capacity in training batches
+: "${TRAINING_BUFFER_QUEUE_SIZE:=1000}"      # queue-recycle/queue-max completed groups
 if [[ "${QUEUE_TYPE}" == queue-drop ]]; then
    [[ -z "${MAX_WEIGHT_STALENESS:-}" ]] || {
       echo "QUEUE_TYPE=queue-drop does not use MAX_WEIGHT_STALENESS" >&2
@@ -75,10 +78,28 @@ if [[ "${QUEUE_TYPE}" == queue-drop ]]; then
    unset MAX_WEIGHT_STALENESS
 else
    : "${MAX_WEIGHT_STALENESS:=8}"
+   TRAINING_BUFFER_QUEUE_SIZE="$(
+      staleness_training_buffer_queue_size \
+         "${MAX_WEIGHT_STALENESS}" \
+         "${TRAINING_BUFFER_QUEUE_SIZE}"
+   )"
+   require_staleness_training_buffer_queue_size \
+      "${MAX_WEIGHT_STALENESS}" \
+      "${TRAINING_BUFFER_QUEUE_SIZE}" \
+      "${GLOBAL_BATCH_SIZE}" \
+      "${N_SAMPLES_PER_PROMPT}"
 fi
 : "${STALENESS_REFERENCE:=prefill}"   # completion | submission | prefill
 : "${PAUSE_GENERATION_MODE:=in_place}"
 : "${ASYNC_MAX_CONCURRENT_SAMPLES:=}"
+if [[ -n "${ASYNC_MAX_CONCURRENT_SAMPLES}" ]]; then
+   [[ "${ASYNC_MAX_CONCURRENT_SAMPLES}" =~ ^[1-9][0-9]*$ \
+      && "${ASYNC_MAX_CONCURRENT_SAMPLES}" -ge "${N_SAMPLES_PER_PROMPT}" \
+      && $(( ASYNC_MAX_CONCURRENT_SAMPLES % N_SAMPLES_PER_PROMPT )) -eq 0 ]] || {
+      echo "ASYNC_MAX_CONCURRENT_SAMPLES must be a positive multiple of N_SAMPLES_PER_PROMPT" >&2
+      exit 1
+   }
+fi
 : "${USE_REPLAY_BUFFER:=1}"
 : "${REPLAY_BUFFER_TYPE:=inflight}" # rollout | inflight
 : "${REPLAY_BUFFER_IDENTITY_TAG:=1}" # keep buffer types in separate checkpoint namespaces
@@ -109,6 +130,22 @@ fi
 # reward
 : "${RM_TYPE:=deepscaler}"
 : "${ZERO_REWARD_ON_TRUNCATED:=1}"
+: "${ZERO_LOSS_ON_TRUNCATED:=0}"
+: "${USE_STALENESS_AWARE_LOSS:=0}"
+: "${SAFE_TRAINING_STALENESS:=2}"
+: "${LOG_STALENESS_AWARE_LOSS_DETAILS:=0}"
+if [[ "${ZERO_REWARD_ON_TRUNCATED}" != "0" && "${ZERO_LOSS_ON_TRUNCATED}" != "0" ]]; then
+    echo "ZERO_REWARD_ON_TRUNCATED and ZERO_LOSS_ON_TRUNCATED are mutually exclusive" >&2
+    exit 2
+fi
+[[ "${LOG_STALENESS_AWARE_LOSS_DETAILS}" =~ ^[01]$ ]] || {
+    echo "LOG_STALENESS_AWARE_LOSS_DETAILS must be 0 or 1" >&2
+    exit 2
+}
+if [[ "${LOG_STALENESS_AWARE_LOSS_DETAILS}" == 1 && "${USE_STALENESS_AWARE_LOSS}" == 0 ]]; then
+    echo "LOG_STALENESS_AWARE_LOSS_DETAILS requires USE_STALENESS_AWARE_LOSS=1" >&2
+    exit 2
+fi
 
 # evaluation during training; the reported numbers come from src/offline_eval
 : "${EVAL_INTERVAL:=0}"       # 0 disables in-run eval; score HF exports offline
@@ -128,6 +165,7 @@ fi
 : "${FUSE_ONE_STEP_ACTOR_LOGPROBS:=1}"
 : "${VERIFY_FUSED_ONE_STEP_ACTOR_LOGPROBS:=0}"  # debug only; retains legacy forward
 : "${LOG_SAMPLE_STALENESS_METRICS:=1}"
+: "${SAMPLE_STALENESS_MAX_BIN:=32}"
 : "${LOG_SAMPLE_STALENESS_RATIO_HISTOGRAM:=0}"  # high-cardinality, debug only
 : "${LOG_UPDATE_DIAGNOSTICS:=1}"                 # no parameter/update tensor scan
 : "${SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS:=1}"  # compact exact token/version boundaries
@@ -170,20 +208,22 @@ esac
 export MODEL_NAME HF_MODEL_NAME MODEL_PROFILE PLACEMENT DATASET_TAG PROMPT_DATA
 export ADVANTAGE_ESTIMATOR ENTROPY_COEF KL_LOSS_COEF EPS_CLIP EPS_CLIP_HIGH EPS_CLIP_C
 export RATIO_DENOMINATOR IS_CORRECTION TIS_CLIP TIS_CLIP_LOW MIS_PROFILE M2PO_BUDGET USE_OPSM OPSM_DELTA
-export LR MAX_RESPONSE_LEN NUM_ROLLOUT TRAIN_SEED ROLLOUT_SEED
+export LR MAX_RESPONSE_LEN ROLLOUT_MAX_CONTEXT_LEN NUM_ROLLOUT TRAIN_SEED ROLLOUT_SEED
 export ROLLOUT_BATCH_SIZE N_SAMPLES_PER_PROMPT GLOBAL_BATCH_SIZE NUM_STEPS_PER_ROLLOUT
-export QUEUE_TYPE QUEUE_FACTOR MAX_WEIGHT_STALENESS STALENESS_REFERENCE
+export QUEUE_TYPE QUEUE_FACTOR TRAINING_BUFFER_QUEUE_SIZE MAX_WEIGHT_STALENESS STALENESS_REFERENCE
 export PAUSE_GENERATION_MODE ASYNC_MAX_CONCURRENT_SAMPLES
 export USE_REPLAY_BUFFER REPLAY_BUFFER_TYPE REPLAY_BUFFER_IDENTITY_TAG
 export ACTOR_NUM_NODES ACTOR_GPUS_PER_NODE ROLLOUT_NUM_GPUS
 export TENSOR_PARALLEL_SIZE CONTEXT_PARALLEL_SIZE EXPERT_PARALLEL_SIZE
 export MAX_TOKENS_PER_GPU RECOMPUTE_GRANULARITY OVERLAP_COMM
 export ROLLOUT_NUM_GPUS_PER_ENGINE SGLANG_MEM_FRACTION
-export RM_TYPE ZERO_REWARD_ON_TRUNCATED
+export RM_TYPE ZERO_REWARD_ON_TRUNCATED ZERO_LOSS_ON_TRUNCATED
+export USE_STALENESS_AWARE_LOSS SAFE_TRAINING_STALENESS LOG_STALENESS_AWARE_LOSS_DETAILS
 export EVAL_INTERVAL N_SAMPLES_PER_EVAL_PROMPT EVAL_MAX_RESPONSE_LEN SKIP_EVAL_BEFORE_TRAIN
 export SAVE_INTERVAL SAVE_RETAIN_INTERVAL SAVE_HF HF_SAVE_INTERVAL
 export DUMP_TRAIN_DATA DUMP_POLICY_LOSS_DEBUG FUSE_ONE_STEP_ACTOR_LOGPROBS VERIFY_FUSED_ONE_STEP_ACTOR_LOGPROBS
-export LOG_SAMPLE_STALENESS_METRICS LOG_SAMPLE_STALENESS_RATIO_HISTOGRAM LOG_UPDATE_DIAGNOSTICS
+export LOG_SAMPLE_STALENESS_METRICS SAMPLE_STALENESS_MAX_BIN
+export LOG_SAMPLE_STALENESS_RATIO_HISTOGRAM LOG_UPDATE_DIAGNOSTICS
 export SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS
 export DEBUG_EXIT_AFTER_ROLLOUT
 export MILES_NCCL_TRANSPORT ASYNC_SQSH_IMAGE_OVERRIDE NCCL_IB_DISABLE LD_LIBRARY_PATH

@@ -76,7 +76,8 @@ class FullyAsyncRolloutFn:
         if input.evaluation:
             raise ValueError(...)
         if self._worker is None:
-            self._output = asyncio.Queue(maxsize=OUTPUT_QUEUE_MAX_GROUPS)
+            self._output = asyncio.Queue()
+            self._output_slots = asyncio.Semaphore(self._queue_capacity_groups())
             self._worker = asyncio.create_task(self._worker_loop())
         return await self._drain(input.rollout_id)
 ```
@@ -89,6 +90,9 @@ Key points:
   loop — plain `asyncio.Queue`, no threads, no locks, no `atexit`.
 * **Errors are loud.** A failed generation task kills the worker, and the next drain
   raises instead of hanging.
+* **Bounded completed work.** `--training-buffer-queue-size` controls how many
+  completed prompt groups may wait in the queue (default 1000). The producer
+  waits on the semaphore once that capacity is exhausted.
 
 The worker keeps `--rollout-batch-size` groups in flight using
 `generate_and_rm_group`:
@@ -101,7 +105,7 @@ async def _worker_loop(self):
             active.add(self._submit_one_group())
         done, active = await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
         for task in done:
-            await self._output.put(task.result())
+            await self._enqueue_completed_group(task.result())
 ```
 
 And each training step simply drains, recycling aborted or stale groups back into the

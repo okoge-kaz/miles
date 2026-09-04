@@ -180,6 +180,133 @@ after the later training cutoff. Every artifact manifest must separately record
 actual one-byte open before a weight job is submitted. A permission failure is
 missing parameter evidence, never a zero displacement.
 
+## Colocated train/rollout switching cost (2026-08-25)
+
+The old timers were insufficient to answer how much of a colocated step is
+spent changing which subsystem owns the GPUs. `perf/sleep_time` and
+`perf/wake_up_time` are worker-local, while `perf/update_weights_time` excludes
+the rollout weight and KV/CUDA-graph onloads immediately around it.
+`perf/train_wait_time` contains checkpoint, switch, rollout, preprocessing, and
+driver gaps together. The post-train timers were also reported on the following
+step and the final switch in a process had no later perf row on which to appear.
+
+The sync driver now logs one sparse W&B row immediately after each colocated
+switch, with the same `rollout/step` that incurred it:
+
+| metric | contract |
+|---|---|
+| `perf/colocate/rollout_offload_block_time` | Driver wall time waiting for the existing rollout `offload(tags=...)` RPC. Under the study recipe the tags release weights, KV cache, and CUDA graphs. |
+| `perf/colocate/rollout_to_train_active_time` | Rollout-offload block above plus the maximum worker-local trainer wake-up duration across the successful ranks/cells. Trainer wake restores the tracked model, optimizer state, buffers, and process groups. |
+| `perf/colocate/actor_weight_snapshot_time_max` | Maximum trainer-worker time copying the updated actor shard to its pinned host backup. It occurs after `actor_train` and before the training RPC returns, so it is adjacent to but intentionally outside the directional headline metrics. |
+| `perf/colocate/actor_weight_snapshot_bytes_{max,sum}` | Exact tensor bytes copied GPU-to-pinned-CPU by that snapshot, reported per-rank maximum and sum. |
+| `perf/colocate/weight_update_payload_bytes_{max,sum}` | Exact logical tensor payload produced by trainer ranks for the colocated SGLang weight update, reported per-rank maximum and sum. This is payload handled, not a link-level PCIe/NVLink byte counter. |
+| `perf/colocate/trainer_offload_hbm_released_bytes_{max,sum}` | CUDA driver free-HBM increase around `torch_memory_saver.pause`. This measures physical HBM released, not exact host/device bytes transferred. |
+| `perf/colocate/trainer_offload_block_time` | Driver wall time waiting for trainer offload/clear immediately after checkpoint work. |
+| `perf/colocate/rollout_weight_onload_block_time` | Driver wall time waiting for rollout weights to be restored before fresh weights are published. Zero when rollout weight offload is disabled. |
+| `perf/colocate/weight_update_block_time` | Driver wall time publishing the freshly trained actor weights to the rollout engines. |
+| `perf/colocate/rollout_kv_onload_block_time` | Driver wall time restoring rollout KV-cache/CUDA-graph memory after weight publication. Zero when rollout offload is disabled. |
+| `perf/colocate/train_to_rollout_block_time` | One driver-clock critical path beginning after checkpoint work: trainer offload, rollout-weight onload, fresh-weight publication, and rollout KV/CUDA-graph onload. It ends only when generation can be accepted again. |
+| `perf/colocate/switch_total_active_time` | Sum of the two directional headline values. |
+
+`rollout_to_train_active_time` is deliberately named an *active component
+sum*, not an end-to-end wall time. Its rollout-release part is a driver wall
+measurement, but trainer wake is the maximum duration measured inside a worker.
+It excludes train-group cell refresh and Ray dispatch between those operations.
+Getting one same-clock end boundary would require a new readiness RPC/latch or
+an explicit trainer `onload()` call. That would change the control path being
+measured, and the v2 train group must refresh its surviving cells before it
+knows which workers to wake, so this observational implementation does not add
+one. In a critic run the first trainer ready is the critic. The matched study is
+GRPO without a critic, so that qualification does not affect its arm.
+
+`train_to_rollout_block_time` is an exact driver wall measurement for the
+requested memory switch and weight publication. Weight publication is included
+because the rollout cannot proceed without it, even though it is not a memory
+offload. The four phase metrics added on 2026-08-27 time its existing awaits
+individually with the same driver clock; their sum can differ from the outer
+timer by small Python scheduling gaps. Checkpoint work is stopped out of this
+timer. The following costs are
+also intentionally outside the directional metrics and must not be added to
+them a second time:
+
+- model/optimizer and partial-buffer checkpoint persistence; report both
+  checkpoint-inclusive allocation time and non-checkpoint steady-state time;
+- generation, partial-request abort/collection, resumed-prefix prefill, reward,
+  and rollout-data conversion;
+- evaluation, process initialization, recovery, and chain requeue gaps;
+- the W&B call that emits the completed switch row.
+
+One transition-adjacent cost is deliberately separate:
+`weights_backuper.backup("actor")` snapshots the updated actor after
+`actor_train` but before the training RPC returns. It is outside the existing
+`perf/train_time` and before the driver starts `train_to_rollout_block_time`.
+Runs after 2026-08-27 log the maximum worker duration as
+`perf/colocate/actor_weight_snapshot_time_max`. It is not added to
+`switch_total_active_time`, preserving that metric's contract. A claim about
+the complete optimizer-step-to-rollout-ready interval must combine it
+explicitly.
+
+The metrics are emitted only with `--log-colocate-switch-metrics`, which itself
+requires `--colocate`. Fully-async runs must leave them absent, not report zero.
+Byte summaries additionally require `--log-colocate-transfer-bytes`. Collection
+is opt-in all the way through the train group; the default worker arguments and
+return values are unchanged. The
+maximum successful-worker timer is used, and a failed/retried attempt is not
+accumulated into the successful switch. Logging on step N immediately after the
+train-to-rollout switch removes the old N+1 attribution and retains the final
+step of each chained allocation.
+
+For analysis, show two views: all allocated steps, which charges checkpoint and
+chain startup as real system costs, and steady state with the first step of each
+process plus checkpoint steps identified separately. Do not sum the directional
+metrics with `perf/train_wait_time`: they diagnose time already inside the
+larger step critical path. The completed colocated on-policy baseline predates
+these keys, so its overall step time and time-to-quality remain comparable, but
+its directional switch components cannot be reconstructed. A causal claim
+about a change in switch cost itself needs a contemporary instrumented
+O=192/partial-off control.
+
+### Runtime validation
+
+Interactive job 16617629 ran three real colocated partial-rollout steps on one
+8-GPU node (`R=4`, `O=8`, `n=4`, TP=2). Slurm and Ray both completed
+successfully, and the offline W&B protobuf contains all four switch keys on
+steps 0, 1, and 2:
+
+| step | rollout to train active | train to rollout block | total active |
+|---:|---:|---:|---:|
+| 0 | 1.406 s | 7.486 s | 8.892 s |
+| 1 | 2.494 s | 7.121 s | 9.615 s |
+| 2 | 2.457 s | 8.745 s | 11.202 s |
+
+The same W&B run proves that partial carry-over was active rather than merely
+configured: `staleness/partial_rollout/resumed_group_frac` was 0, 0.75, and 1;
+`staleness/total/mean` was 0, 0.75, and 1; and exact response- and loss-token
+coverage was 1 on every step. Async regression job 16617626 also completed
+three updates and retained its queue/sample-staleness telemetry, while neither
+its logs nor any of its three W&B writer fragments contained a `colocate` key.
+The selected CPU regression suite collected 246 tests and completed with no
+failure.
+
+Both short offline W&B jobs printed a non-fatal `BrokenPipeError` from a
+secondary writer during `atexit`. The colocated switch and partial-staleness
+rows above were already flushed. In the async smoke, the trainer-side
+sample-staleness rows covered all three steps but the rollout-side fragment
+covered only steps 0 and 1. This is a W&B multi-writer teardown/coverage issue,
+not a successful-training signal; every production export must therefore check
+expected step coverage instead of trusting process exit alone.
+
+Two-node 4B validation job 16751089 exercised the opt-in byte telemetry on 16
+H100s with W&B offline. Slurm and Ray completed successfully. The driver W&B
+protobuf contains the complete step-0 row: rollout-to-train 1.152 s,
+train-to-rollout 6.315 s, and total active switch 7.468 s. Exact per-rank
+snapshot bytes were 4,022,991,872 (0.0985 s), exact logical weight-update
+payload was 8,044,936,192 bytes, and the maximum CUDA-driver HBM release across
+trainer ranks was 20,336,082,944 bytes. With `LOG_MEMORY_USAGE=0`, the combined
+job log contained no `Memory-Usage` lines. The secondary W&B writers retained
+the same non-fatal `atexit` broken-pipe warning described above; the requested
+driver row was present in the offline file before teardown.
+
 ## Not yet observed
 
 `multi_turn/*` and `passrate/*` are registered but this task family never emits
@@ -223,21 +350,28 @@ warmup was added: one config is enough to pick a decay of 0.0 (the alternatives
 had worse provenance) but not enough to move the LR. Its `3.0e-6` belongs in the
 LR axis as a level, not as the default.
 
-**`--partial-rollout` removed from the `math/sync` recipes.** It recycles
-in-flight generations into the data buffer at abort time, and those samples
-resume against a newer policy in a later rollout step -- so any sample it
-collects is off-policy by construction. The colocated arm is the on-policy
-reference, so the flag contradicts the arm's definition.
+**`--partial-rollout` remains off in the colocated on-policy reference.** It
+recycles in-flight generations into the data buffer at abort time, and those
+samples resume against a newer policy in a later rollout step -- so any sample
+it collects is off-policy by construction. The completed colocated reference
+therefore used the sync recipe defaults `PARTIAL_ROLLOUT=0` and
+`OVER_SAMPLING_BATCH_SIZE=ROLLOUT_BATCH_SIZE`.
 
-It was in fact already inert. `generate_rollout_async` (`sglang_rollout.py:502`)
+It was in fact already inert. `generate_rollout_async` (`sglang_rollout.py:517`)
 exits its loop only when `len(data) >= rollout_batch_size`; with
 `over_sampling_batch_size == rollout_batch_size` (the default,
-`arguments.py:3101`) and no dynamic filter, every submitted group must complete
+`arguments.py:3477`) and no dynamic filter, every submitted group must complete
 before that count is reached, so `state.pendings` is empty when `abort()` runs
 and it collects nothing. But inertness that depends on two *other* settings
-staying put is not a property to rely on in the reference arm: enabling dynamic
-sampling or over-sampling later would silently make the on-policy baseline
-off-policy. The flag is now absent rather than merely ineffective.
+staying put is not a property to rely on in the reference arm. The sync recipe
+now makes both axes explicit and validates their combination: partial rollout
+is opt-in, and in this filter-free recipe it is rejected unless over-sampling
+exceeds the rollout batch. The matched follow-up deliberately sets
+`PARTIAL_ROLLOUT=1`, `R=192`, and `O=256`; it is a distinct off-policy
+partial-rollout protocol arm, not a continuation or relabeling of the on-policy
+reference. Changing both cutoff concurrency and carry-over behavior is the
+intended compound treatment. See "Colocated train/rollout switching cost" for
+the accompanying phase-switch telemetry.
 
 **`--balance-data`.** Repartitions each rollout batch across data-parallel ranks
 by total token count (Karmarkar-Karp) instead of the default strided
@@ -509,7 +643,7 @@ pull mid-chain without noting the rollout index where it happened.
 
 Both distributions contain `mean`, `variance`, `std`, `max`, `p50`, `p90`,
 `p99`, `frac_zero`, `num_groups`, and the fixed histogram `count_0` through
-`count_16` plus `count_ge_17`. There is no `frac_at_bound`: the admission check
+`count_32` plus `count_ge_33`. There is no `frac_at_bound`: the admission check
 uses dequeue staleness while these distributions use scheduled train
 staleness, and the exact boundary also depends on queue policy. Rejection is
 therefore recorded directly rather than inferred from a histogram bin.
@@ -624,8 +758,8 @@ deadlocking. While drain waits, training cannot publish a new version, so fresh
 groups eventually pass under the frozen version. The signatures are a high
 `wasted_token_frac`, many bound-exceeded groups, and rising retry counts.
 
-The staleness histograms resolve `count_0` through `count_16` plus
-`count_ge_17`. Dumps carry all four forward-provenance arrays, completion
+The staleness histograms resolve `count_0` through `count_32` plus
+`count_ge_33`. Dumps carry all four forward-provenance arrays, completion
 versions, and the queue lifecycle's ready/enqueue/dequeue/decision fields for
 offline reconstruction.
 
@@ -641,8 +775,9 @@ reward coverage rather than inventing zero rewards.
 ### Queue policies and the formula boundary
 
 - `queue-recycle` is the default: completion FIFO, immediate
-  next-batch prefetch by the driver, safety backpressure at 1000 completed
-  groups, and over-age groups returned to the prompt buffer. With
+  next-batch prefetch by the driver, safety backpressure at
+  `--training-buffer-queue-size` completed groups (default 1000), and over-age
+  groups returned to the prompt buffer. With
   `--staleness-reference prefill`, this is the former
   FIFO-prefill-age-cutoff configuration.
 - `queue-max` waits until the trainer requests a complete batch, takes the oldest
@@ -1185,6 +1320,8 @@ the first and final batches are not shifted into adjacent windows.
 
 It reports:
 
+- `throughput/generated_groups_per_second`, the direct completed prompt-group
+  service rate used by the producer/consumer balance model;
 - `throughput/{generated,accepted,useful}_tokens_per_second`;
 - `throughput/cumulative_accepted_loss_tokens`, with its availability flag;
 - `throughput/optimizer_updates_per_second`;

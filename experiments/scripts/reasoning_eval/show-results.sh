@@ -5,6 +5,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../../.." && pwd)"
 source "${REPO_ROOT}/experiments/env.sh"
+export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
 RUN_NAMESPACE="${RUN_NAMESPACE:-sr-20260819-212906}"
 EVAL_MODE="${EVAL_MODE:-full}"
@@ -42,6 +43,9 @@ if (( $# == 1 )); then
     RUN_NAMESPACE="$1"
     RESULT_STUDY_ROOT="${EVALUATION_ROOT}/staleness-ratio-sweep/${RUN_NAMESPACE}"
     ANALYSIS_ROOT="${RESULT_STUDY_ROOT}/analysis/${PROTOCOL_NAME}/${EVAL_MODE}"
+fi
+if [[ -f "${RESULT_STUDY_ROOT}/grid.env" ]]; then
+    source "${RESULT_STUDY_ROOT}/grid.env"
 fi
 
 python3 "${REPO_ROOT}/experiments/tools/reasoning_eval/summarize_results.py" \

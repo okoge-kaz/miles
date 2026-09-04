@@ -6,6 +6,13 @@ export PYTHONBUFFERED=16
 export HF_HOME=/root/.cache/huggingface
 export MILES_EXPERIMENTAL_ROLLOUT_REFACTOR=1
 
+: "${USE_STALENESS_AWARE_LOSS:=0}"
+: "${SAFE_TRAINING_STALENESS:=2}"
+if [[ "${ZERO_REWARD_ON_TRUNCATED:-0}" != "0" && "${ZERO_LOSS_ON_TRUNCATED:-0}" != "0" ]]; then
+   echo "ZERO_REWARD_ON_TRUNCATED and ZERO_LOSS_ON_TRUNCATED are mutually exclusive" >&2
+   exit 2
+fi
+
 NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
 HAS_NVLINK=$([ "$NVLINK_COUNT" -gt 0 ] && echo 1 || echo 0)
 
@@ -40,6 +47,7 @@ fi
 ROLLOUT_ARGS=(
    --fully-async
    --fully-async-queue-type "${QUEUE_TYPE}"
+   --training-buffer-queue-size "${TRAINING_BUFFER_QUEUE_SIZE}"
    --prompt-data "${PROMPT_DATA}"
    --input-key prompt
    --label-key label
@@ -49,7 +57,7 @@ ROLLOUT_ARGS=(
    --rollout-batch-size "${ROLLOUT_BATCH_SIZE}"
    --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT}"
    --rollout-max-response-len "${MAX_RESPONSE_LEN}"
-   --rollout-max-context-len 32768
+   --rollout-max-context-len "${ROLLOUT_MAX_CONTEXT_LEN}"
    --rollout-temperature 1
    --rollout-top-p 1
    --rollout-top-k -1
@@ -69,6 +77,15 @@ if [[ -n "${TOOL_KEY:-}" ]]; then
 fi
 if [[ "${ZERO_REWARD_ON_TRUNCATED}" != "0" ]]; then
    ROLLOUT_ARGS+=(--zero-reward-on-truncated)
+fi
+if [[ "${ZERO_LOSS_ON_TRUNCATED}" != "0" ]]; then
+   ROLLOUT_ARGS+=(--zero-loss-on-truncated)
+fi
+if [[ "${USE_STALENESS_AWARE_LOSS}" != "0" ]]; then
+   ROLLOUT_ARGS+=(--use-staleness-aware-loss --safe-training-staleness "${SAFE_TRAINING_STALENESS}")
+   if [[ "${LOG_STALENESS_AWARE_LOSS_DETAILS:-0}" != "0" ]]; then
+      ROLLOUT_ARGS+=(--log-staleness-aware-loss-details)
+   fi
 fi
 if [[ "${QUEUE_TYPE}" == queue-drop ]]; then
    ROLLOUT_ARGS+=(--fully-async-queue-factor "${QUEUE_FACTOR}")
@@ -102,7 +119,10 @@ else
    TELEMETRY_ARGS+=(--use-rollout-entropy)
 fi
 if [[ "${LOG_SAMPLE_STALENESS_METRICS:-0}" != "0" ]]; then
-   TELEMETRY_ARGS+=(--log-sample-staleness-metrics)
+   TELEMETRY_ARGS+=(
+      --log-sample-staleness-metrics
+      --sample-staleness-max-bin "${SAMPLE_STALENESS_MAX_BIN}"
+   )
 fi
 if [[ "${LOG_SAMPLE_STALENESS_RATIO_HISTOGRAM:-0}" != "0" ]]; then
    if [[ "${LOG_SAMPLE_STALENESS_METRICS:-0}" == "0" ]]; then

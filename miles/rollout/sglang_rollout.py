@@ -40,6 +40,12 @@ from .generate_utils.generate_endpoint_utils import (
     policy_uses_routing_key,
 )
 from .generate_utils.prefill_logprobs import recompute_samples_rollout_logprobs_via_prefill
+from .partial_rollout_telemetry import (
+    collect_partial_rollout_staleness_metrics,
+    collect_partial_rollout_work_metrics,
+    stamp_partial_rollout_start,
+)
+from .queue_telemetry import _iter_samples
 from .rm_hub import async_rm, batched_async_rm
 
 __all__ = ["generate_rollout", "get_model_url"]
@@ -202,8 +208,14 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
     else:
         prompt_ids = state.tokenizer.encode(sample.prompt, add_special_tokens=False)
 
-    if len(sample.response) > 0:
-        sampling_params["max_new_tokens"] -= len(sample.tokens) - len(prompt_ids)
+    if sample.response_length > 0:
+        persisted_response_tokens = len(sample.tokens) - len(prompt_ids)
+        if persisted_response_tokens != sample.response_length:
+            raise RuntimeError(
+                "Cannot resume legacy single-turn generation from an inconsistent token prefix: "
+                f"response_length={sample.response_length}, persisted_response_tokens={persisted_response_tokens}"
+            )
+        sampling_params["max_new_tokens"] -= persisted_response_tokens
 
     assert (
         sampling_params["max_new_tokens"] >= 0
@@ -250,7 +262,7 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         payload["image_data"] = [encode_image_for_rollout_engine(image) for image in image_data]
 
     # Use existing tokens for multi-turn or tokenize the new prompt
-    if len(sample.response) > 0:
+    if sample.response_length > 0:
         payload["input_ids"] = sample.tokens
     else:
         payload["input_ids"] = prompt_ids
@@ -452,9 +464,7 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
         # for partial rollout, collect the partial samples into the data buffer
         for task in done:
             group = task.result()
-            for sample in group:
-                if sample.response and "start_rollout_id" not in sample.metadata:
-                    sample.metadata["start_rollout_id"] = rollout_id
+            stamp_partial_rollout_start(group, rollout_id)
             aborted_samples.append(group)
             count += len(group)
 
@@ -497,12 +507,22 @@ async def generate_rollout_async(
 
     data = []
     all_data = []
+    dynamic_filter_discarded = []
+    completed_surplus_discarded = []
+    launched_groups = 0
+    launched_trajectories = 0
+    launched_existing_response_tokens = 0
     do_print = True
     pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc="Rollout generation")
     while len(data) < target_data_size:
         while state.remaining_batch_size < target_data_size:
             # get samples from the buffer and submit the generation requests.
             samples = data_source(args.over_sampling_batch_size)
+            launched_groups += len(samples)
+            launched_trajectories += sum(1 for group in samples for _ in _iter_samples(group))
+            launched_existing_response_tokens += sum(
+                sample.response_length for group in samples for sample in _iter_samples(group)
+            )
             state.submit_generate_tasks(samples)
 
         # wait for the generation to finish
@@ -525,6 +545,7 @@ async def generate_rollout_async(
             dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, group)
             if not dynamic_filter_output.keep:
                 metric_gatherer.on_dynamic_filter_drop(reason=dynamic_filter_output.reason)
+                dynamic_filter_discarded.append(group)
                 state.remaining_batch_size -= 1
                 continue
 
@@ -533,6 +554,8 @@ async def generate_rollout_async(
             if len(data) < target_data_size:
                 data.append(group)
                 pbar.update(args.n_samples_per_prompt)
+            else:
+                completed_surplus_discarded.append(group)
 
     pbar.close()
     sample = data[-1][0][0] if isinstance(data[-1][0], list) else data[-1][0]
@@ -570,7 +593,23 @@ async def generate_rollout_async(
         sampling_params=state.sampling_params,
     )
 
-    return RolloutFnTrainOutput(samples=data, metrics=metric_gatherer.collect()), aborted_samples
+    metrics = metric_gatherer.collect()
+    if args.partial_rollout:
+        metrics.update(collect_partial_rollout_staleness_metrics(data, rollout_id))
+        metrics.update(
+            collect_partial_rollout_work_metrics(
+                launched_groups=launched_groups,
+                launched_trajectories=launched_trajectories,
+                launched_existing_response_tokens=launched_existing_response_tokens,
+                accepted=data,
+                carried=aborted_samples,
+                dynamic_filter_discarded=dynamic_filter_discarded,
+                completed_surplus_discarded=completed_surplus_discarded,
+                generation_failed_groups=0,
+                rollout_id=rollout_id,
+            )
+        )
+    return RolloutFnTrainOutput(samples=data, metrics=metrics), aborted_samples
 
 
 EVAL_PROMPT_DATASET = {}
@@ -717,4 +756,6 @@ def generate_rollout(
 
     output, aborted_samples = run(generate_rollout_async(args, rollout_id, data_source.get_samples))
     data_source.add_samples(aborted_samples)
+    if args.partial_rollout:
+        output.metrics["rollout/partial_rollout/buffer_depth_after_abort"] = float(data_source.get_buffer_length())
     return output

@@ -38,7 +38,13 @@ from miles.rollout.base_types import (
 from miles.rollout.filter_hub.base_types import call_dynamic_filter
 from miles.rollout.fully_async_telemetry import FullyAsyncPipelineTelemetry
 from miles.rollout.inference_rollout.inference_rollout_common import GenerateState, generate_and_rm_group
-from miles.rollout.queue_policy import QUEUE_DROP_POLICY, QUEUE_MAX_POLICY, QUEUE_RECYCLE_POLICY
+from miles.rollout.queue_policy import (
+    DEFAULT_TRAINING_BUFFER_QUEUE_SIZE,
+    QUEUE_DROP_POLICY,
+    QUEUE_MAX_POLICY,
+    QUEUE_RECYCLE_POLICY,
+    fully_async_queue_capacity_groups,
+)
 from miles.rollout.queue_telemetry import (
     DEFAULT_RESPONSE_LENGTH_POPULATIONS,
     Group,
@@ -49,7 +55,6 @@ from miles.rollout.queue_telemetry import (
     _ResponseLengthMetrics,
     group_first_prefill_weight_version,
     group_oldest_weight_version,
-    group_queue_entry_weight_version,
     group_response_tokens,
     group_reward_values,
 )
@@ -112,17 +117,15 @@ from miles.utils.types import Sample
 
 logger = logging.getLogger(__name__)
 
-OUTPUT_QUEUE_MAX_GROUPS = 1000
 ACKED_BATCH_HISTORY_SIZE = 16
 NO_PROGRESS_WARN_SECS = 30.0
 WEIGHT_VERSION_QUERY_TIMEOUT_SECS = 2.0
 # Realized lag is a small integer; anything past this goes in one overflow bucket
 # so the metric count stays bounded no matter how far behind a run drifts.
 #
-# 16, not 8: unbounded runs and runs with a parked bound need enough resolution
-# in the tail to show how realized staleness maps to downstream score. At 8 the
-# tail collapsed into one overflow bucket.
-STALENESS_HISTOGRAM_MAX = 16
+# 32, not 16: the high-staleness cohort sweeps bounds through 28 and needs
+# enough resolution in the tail to map realized staleness to downstream score.
+STALENESS_HISTOGRAM_MAX = 32
 QueueItem = tuple[list[Sample], Group]
 _CONTINUATION_METADATA_KEYS = (
     SUBMISSION_VERSION_KEY,
@@ -638,6 +641,7 @@ class FullyAsyncRolloutFn:
 
     def __init__(self, input: RolloutFnConstructorInput):
         self.args = input.args
+        self._queue_capacity = fully_async_queue_capacity_groups(input.args)
         self.data_source = input.data_source
         self.state = GenerateState(input.args)
         self._dynamic_filter = load_function(input.args.dynamic_sampling_filter_path)
@@ -1304,13 +1308,7 @@ class FullyAsyncRolloutFn:
         return getattr(self.args, "fully_async_queue_type", QUEUE_RECYCLE_POLICY)
 
     def _queue_capacity_groups(self) -> int:
-        if self._queue_policy() == QUEUE_DROP_POLICY:
-            return getattr(self.args, "fully_async_queue_factor", 1) * self.args.rollout_batch_size
-        if self._queue_policy() == QUEUE_MAX_POLICY:
-            # queue-max waits for a whole batch before dequeueing. Its safety
-            # backpressure limit must therefore never be smaller than that batch.
-            return max(OUTPUT_QUEUE_MAX_GROUPS, self.args.rollout_batch_size)
-        return OUTPUT_QUEUE_MAX_GROUPS
+        return self._queue_capacity
 
     def _queue_size(self) -> int:
         if self._queue_policy() == QUEUE_RECYCLE_POLICY:
@@ -1525,9 +1523,9 @@ class FullyAsyncRolloutFn:
     async def _enqueue_completed_group(self, item: QueueItem) -> None:
         policy = self._queue_policy()
         if policy in (QUEUE_RECYCLE_POLICY, QUEUE_MAX_POLICY):
-            # These policies control age at selection time. The 1000-group limit
-            # is only a safety backpressure bound, not their experimental queue
-            # capacity.
+            # These policies control age at selection time. The configured
+            # completed-group limit is a safety backpressure bound, not their
+            # experimental selection capacity.
             backpressure_start = time.monotonic()
             await self._output_slots.acquire()
             self._pipeline_telemetry.add_rollout_backpressure(time.monotonic() - backpressure_start)
@@ -2099,6 +2097,11 @@ class FullyAsyncRolloutFn:
             "queue/config/type_is_queue_max": float(self._queue_policy() == QUEUE_MAX_POLICY),
             "queue/config/type_is_queue_drop": float(self._queue_policy() == QUEUE_DROP_POLICY),
             "queue/config/factor": getattr(args, "fully_async_queue_factor", 1),
+            "queue/config/training_buffer_queue_size": getattr(
+                args,
+                "training_buffer_queue_size",
+                DEFAULT_TRAINING_BUFFER_QUEUE_SIZE,
+            ),
             "rollout/fully_async/aborted_groups_recycled": progress.aborted_groups_recycled,
             "rollout/fully_async/stale_groups_recycled": progress.stale_groups_recycled,
             "rollout/fully_async/stale_groups_dropped": progress.stale_groups_dropped,

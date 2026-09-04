@@ -79,11 +79,13 @@ generation. If it is empty, rollout is still the bottleneck and async cannot hid
 | `--global-batch-size` | Number of samples the trainer drains per step |
 | `--num-steps-per-rollout` | Number of optimizer steps per queue drain cycle |
 | `--max-weight-staleness` | Maximum train-time policy-version gap for `queue-recycle`. Its strict dequeue rule is `D - F < max`, so the minimum usable bound is 1: a nonnegative gap can never satisfy `< 0`. This is independent of startup, where `T = D`; later prefetched batches normally have `T = D + 1`. |
+| `--training-buffer-queue-size` | Maximum number of completed prompt groups buffered by `queue-recycle` and `queue-max` (default: 1000). Increasing it permits more producer run-ahead and therefore potentially larger realized staleness, at the cost of CPU memory. |
 
-The worker caps its output queue at 1000 groups, so if training is slower than
-rollout the producer eventually blocks rather than growing the queue without
-bound. If the queue stays at zero, rollout is the bottleneck — scale rollout capacity
-or lower per-sample generation cost.
+The worker caps its output queue at `--training-buffer-queue-size` completed
+groups, so if training is slower than rollout the producer eventually blocks
+rather than growing the queue without bound. The default remains 1000 for
+backward compatibility. If the queue stays at zero, rollout is the bottleneck —
+scale rollout capacity or lower per-sample generation cost.
 
 ## What to monitor
 

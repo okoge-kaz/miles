@@ -356,6 +356,7 @@ class RolloutManager:
                 data,
                 metrics,
                 has_custom_converter=self.custom_convert_samples_to_train_data_func is not None,
+                zero_loss_on_truncated=getattr(self.args, "zero_loss_on_truncated", False),
             )
             append_final_consumed_records(
                 debug_metadata,
@@ -417,15 +418,17 @@ class RolloutManager:
         elif self.args.rollout_global_dataset:
             self.data_source.save(rollout_id)
         checkpoint_metrics = None
-        if getattr(self.args, "log_replay_resume_metrics", False) or getattr(
-            self.args,
-            "debug_fail_after_rollout",
-            None,
-        ) is not None:
+        if (
+            getattr(self.args, "log_replay_resume_metrics", False)
+            or getattr(
+                self.args,
+                "debug_fail_after_rollout",
+                None,
+            )
+            is not None
+        ):
             data_source_state = (
-                replay_state["data_source"]
-                if replay_state is not None
-                else self.data_source.checkpoint_state()
+                replay_state["data_source"] if replay_state is not None else self.data_source.checkpoint_state()
             )
             checkpoint_metrics = checkpoint_resume_metrics(
                 rollout_id=rollout_id,
@@ -453,11 +456,7 @@ class RolloutManager:
             ensure_no_replay_buffer(self.args.load, rollout_id)
             load_start = time.monotonic()
             self.data_source.load(rollout_id)
-            if (
-                getattr(self.args, "log_replay_resume_metrics", False)
-                and rollout_id is not None
-                and rollout_id >= 0
-            ):
+            if getattr(self.args, "log_replay_resume_metrics", False) and rollout_id is not None and rollout_id >= 0:
                 total_seconds = time.monotonic() - load_start
                 self._resume_benchmark_load_metrics = replay_load_metrics(
                     replay_type=None,

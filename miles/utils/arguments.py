@@ -12,6 +12,7 @@ from miles.backends.sglang_utils.arguments import add_sglang_arguments
 from miles.backends.sglang_utils.arguments import validate_args as sglang_validate_args
 from miles.dashboard.args import add_dashboard_arguments, validate_dashboard_args
 from miles.rollout.queue_policy import (
+    DEFAULT_TRAINING_BUFFER_QUEUE_SIZE,
     FULLY_ASYNC_QUEUE_POLICIES,
     validate_fully_async_queue_args,
 )
@@ -223,6 +224,33 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "Whether to colocate the inference engines and the actor. "
                     "Turning this on will also set --offload to true."
+                ),
+            )
+            parser.add_argument(
+                "--log-colocate-switch-metrics",
+                action="store_true",
+                default=False,
+                help=(
+                    "Log opt-in colocated switch phase timings. The timers only wrap existing blocking operations; "
+                    "metrics are emitted after the measured switch completes."
+                ),
+            )
+            parser.add_argument(
+                "--log-colocate-transfer-bytes",
+                action="store_true",
+                default=False,
+                help=(
+                    "Log opt-in per-rank byte summaries for colocated trainer offload, actor snapshots, and "
+                    "actor-to-rollout weight payloads. Requires --log-colocate-switch-metrics."
+                ),
+            )
+            parser.add_argument(
+                "--log-memory-usage",
+                action="store_true",
+                default=False,
+                help=(
+                    "Log hot-path GPU and CPU memory snapshots around offload, wake-up, and weight updates. "
+                    "This diagnostic can perturb timing and is disabled by default."
                 ),
             )
             parser.add_argument(
@@ -770,6 +798,17 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "queue-drop capacity q in training batches: capacity_groups = "
                     "q * rollout_batch_size. Must be at least 1. Other policies require 1."
+                ),
+            )
+            parser.add_argument(
+                "--training-buffer-queue-size",
+                type=int,
+                default=DEFAULT_TRAINING_BUFFER_QUEUE_SIZE,
+                help=(
+                    "Maximum number of completed prompt groups buffered by fully-async queue-recycle "
+                    "and queue-max before rollout production is backpressured. Defaults to 1000. "
+                    "queue-max raises an undersized value to rollout_batch_size so it can collect one "
+                    "complete training batch. queue-drop instead uses --fully-async-queue-factor."
                 ),
             )
             parser.add_argument(
@@ -1542,7 +1581,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 "--sample-staleness-max-bin",
                 dest="sample_staleness_max_bin",
                 type=int,
-                default=16,
+                default=32,
                 help=(
                     "Largest exact staleness bin for --log-sample-staleness-metrics; "
                     "larger values share one overflow bin."
@@ -2443,7 +2482,8 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 default=None,
                 help="Type of the reward model",
             )
-            parser.add_argument(
+            truncation_behavior = parser.add_mutually_exclusive_group()
+            truncation_behavior.add_argument(
                 "--zero-reward-on-truncated",
                 action="store_true",
                 default=False,
@@ -2451,6 +2491,47 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "Assign scalar reward 0 to responses that hit the generation/context limit, "
                     "without invoking the configured reward model. Off by default to preserve "
                     "the existing behavior of grading the truncated response text."
+                ),
+            )
+            truncation_behavior.add_argument(
+                "--zero-loss-on-truncated",
+                action="store_true",
+                default=False,
+                help=(
+                    "Set the token loss mask to zero for responses that hit the generation/context limit. "
+                    "The original reward remains in prompt-group baseline and advantage computation; only "
+                    "the truncated sample's gradient contribution is removed."
+                ),
+            )
+            parser.add_argument(
+                "--use-staleness-aware-loss",
+                action="store_true",
+                default=False,
+                help=(
+                    "Attenuate the policy-gradient loss from truncated zero-reward samples according to "
+                    "their training staleness. The sample multiplier is "
+                    "1 / (1 + max(0, training_staleness - safe_training_staleness)). Requires "
+                    "--fully-async and --zero-reward-on-truncated; incompatible with "
+                    "--zero-loss-on-truncated."
+                ),
+            )
+            parser.add_argument(
+                "--safe-training-staleness",
+                type=int,
+                default=2,
+                help=(
+                    "Largest per-sample training staleness receiving full truncation-feedback weight when "
+                    "--use-staleness-aware-loss is enabled (default: 2)."
+                ),
+            )
+            parser.add_argument(
+                "--log-staleness-aware-loss-details",
+                action="store_true",
+                default=False,
+                help=(
+                    "Log the absolute post-TIS policy-gradient objective mass before and after "
+                    "staleness-aware scaling. Off by default because it adds tokenwise diagnostic "
+                    "reductions. Requires --use-staleness-aware-loss and --use-tis."
                 ),
             )
             parser.add_argument(
@@ -3016,7 +3097,46 @@ def should_run_actor_logprob_forward(args: argparse.Namespace) -> bool:
     return not args.use_rollout_logprobs or args.get_mismatch_metrics
 
 
+def _validate_truncation_behavior(args: argparse.Namespace) -> None:
+    """Reject contradictory handling of generation-truncated samples."""
+    zero_reward = getattr(args, "zero_reward_on_truncated", False)
+    zero_loss = getattr(args, "zero_loss_on_truncated", False)
+    use_staleness_aware_loss = getattr(args, "use_staleness_aware_loss", False)
+    log_staleness_aware_loss_details = getattr(args, "log_staleness_aware_loss_details", False)
+    safe_training_staleness = getattr(args, "safe_training_staleness", 2)
+    if zero_reward and zero_loss:
+        raise ValueError(
+            "--zero-reward-on-truncated and --zero-loss-on-truncated are mutually exclusive; "
+            "select exactly one truncation behavior or leave both disabled"
+        )
+    if not isinstance(safe_training_staleness, int) or isinstance(safe_training_staleness, bool):
+        raise ValueError("--safe-training-staleness must be a non-negative integer")
+    if safe_training_staleness < 0:
+        raise ValueError("--safe-training-staleness must be non-negative")
+    if log_staleness_aware_loss_details and not use_staleness_aware_loss:
+        raise ValueError("--log-staleness-aware-loss-details requires --use-staleness-aware-loss")
+    if log_staleness_aware_loss_details and not getattr(args, "use_tis", False):
+        raise ValueError("--log-staleness-aware-loss-details requires --use-tis")
+    if not use_staleness_aware_loss:
+        return
+    if zero_loss:
+        raise ValueError(
+            "--use-staleness-aware-loss cannot be combined with --zero-loss-on-truncated " "(overlong filtering)"
+        )
+    if not zero_reward:
+        raise ValueError("--use-staleness-aware-loss requires --zero-reward-on-truncated")
+    if not getattr(args, "fully_async", False):
+        raise ValueError("--use-staleness-aware-loss requires --fully-async")
+    if getattr(args, "loss_type", "policy_loss") != "policy_loss":
+        raise ValueError("--use-staleness-aware-loss requires the built-in policy loss")
+    if getattr(args, "custom_reward_post_process_path", None) is not None:
+        raise ValueError("--use-staleness-aware-loss requires built-in reward post-processing")
+    if getattr(args, "custom_convert_samples_to_train_data_path", None) is not None:
+        raise ValueError("--use-staleness-aware-loss requires built-in sample-to-train-data conversion")
+
+
 def miles_validate_args(args):
+    _validate_truncation_behavior(args)
     validate_dashboard_args(args)
 
     args.ft_components = _resolve_ft_components(args)
@@ -3435,6 +3555,11 @@ def miles_validate_args(args):
             )
             args.rollout_num_gpus = args.actor_num_gpus_per_node * args.actor_num_nodes
 
+    if args.log_colocate_switch_metrics and not args.colocate:
+        raise ValueError("--log-colocate-switch-metrics requires --colocate")
+    if args.log_colocate_transfer_bytes and not args.log_colocate_switch_metrics:
+        raise ValueError("--log-colocate-transfer-bytes requires --log-colocate-switch-metrics")
+
     if args.use_critic and not args.debug_rollout_only:
         if args.offload_train is None:
             args.offload_train = True
@@ -3524,7 +3649,7 @@ def miles_validate_args(args):
             f"so one group already puts n_samples_per_prompt trajectories in flight"
         )
 
-    assert getattr(args, "sample_staleness_max_bin", 16) >= 0, "--sample-staleness-max-bin must be non-negative"
+    assert getattr(args, "sample_staleness_max_bin", 32) >= 0, "--sample-staleness-max-bin must be non-negative"
     if getattr(args, "log_sample_staleness_ratio_histogram", False):
         assert getattr(
             args, "log_sample_staleness_metrics", False
@@ -3596,6 +3721,10 @@ def miles_validate_args(args):
             if hasattr(args, k):
                 logger.info(f"Warning: Argument {k} is already set to {getattr(args, k)}, will override with {v}.")
             setattr(args, k, v)
+
+    # A custom config is applied after parsing and can bypass argparse's
+    # mutually-exclusive group, so validate the effective values again.
+    _validate_truncation_behavior(args)
 
     if args.use_rollout_indexer_replay:
         args.use_indexer_replay = True
