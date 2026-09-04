@@ -1,7 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=miles-convert-switch-sft
 #SBATCH --account=coreai_horizon_dilations
-#SBATCH --partition=interactive
+#SBATCH --partition=batch
+#SBATCH --qos=interactive
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -25,8 +26,9 @@ Usage:
   MODEL_VARIANT=qwen3-30b-a3b \
     sbatch experiments/scripts/switching_cost/convert-sft-checkpoint.sbatch
 
-The job uses the interactive partition. It refuses to start conversion until
-all safetensors shards listed by the HuggingFace index are present and nonempty.
+The job uses the batch partition with interactive QoS. It refuses to start
+conversion until all safetensors shards listed by the HuggingFace index are
+present and nonempty.
 EOF
 }
 

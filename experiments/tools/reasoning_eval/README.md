@@ -119,10 +119,10 @@ with ratios 1:7/2:6) and the six zero-loss settings (staleness 8/16/20 crossed
 with the same ratios):
 
 ```bash
-PARTITION=interactive \
+PARTITION=batch QOS=interactive \
 experiments/scripts/reasoning_eval/submit-truncation-ablation-sweeps.sh
 
-PARTITION=interactive \
+PARTITION=batch QOS=interactive \
 experiments/scripts/reasoning_eval/submit-truncation-ablation-sweeps.sh \
   --submit --max-submissions 0
 ```
@@ -284,7 +284,7 @@ ANALYSIS_ROOT=/path/to/analysis/protocol/full \
 STUDY_ROOT=/path/to/grpo-clip0.2-0.28-tis2.0 \
 RUN_NAMESPACE=sr-20260819-212906 \
 SEED_PARTS_ROOT=/path/to/earlier/staleness/checkpoint-displacements-parts \
-sbatch --partition=cpu_interactive --array=0-16%4 \
+sbatch --partition=cpu --qos=cpu-normal --array=0-16%4 \
   --export=ALL,ANALYSIS_ROOT,STUDY_ROOT,RUN_NAMESPACE,SEED_PARTS_ROOT \
   experiments/scripts/reasoning_eval/compute-checkpoint-displacements.sbatch
 

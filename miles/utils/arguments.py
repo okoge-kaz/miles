@@ -2535,17 +2535,6 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
-                "--zero-loss-on-truncated",
-                action="store_true",
-                default=False,
-                help=(
-                    "Set the response loss mask to zero for trajectories that hit the "
-                    "generation/context limit. Their scalar reward remains available for "
-                    "logging and advantage normalization; only their own policy-gradient "
-                    "contribution is removed."
-                ),
-            )
-            parser.add_argument(
                 "--search-r1-format-score",
                 type=float,
                 default=0.0,

@@ -135,6 +135,7 @@ for model_variant in "${MODEL_VARIANTS[@]}"; do
     sbatch_args=(
         -A "${ACCOUNT}"
         -p batch
+        --qos=normal
         -N "${SWITCH_NODES}"
         --time=04:00:00
         --job-name="switch-partial-${model_variant}"

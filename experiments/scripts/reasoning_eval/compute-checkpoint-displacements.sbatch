@@ -3,6 +3,7 @@
 #SBATCH --job-name=reason-eval-delta
 #SBATCH --account=coreai_horizon_dilations
 #SBATCH --partition=cpu
+#SBATCH --qos=cpu-normal
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8

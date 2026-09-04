@@ -68,7 +68,7 @@ done
 for model_variant in "${MODEL_VARIANTS[@]}"; do
     prompt_data=$(filtered_prompt_path "${model_variant}")
     job_id=$(sbatch --parsable \
-        -A "${ACCOUNT}" -p batch -N "${SWITCH_NODES}" --time=04:00:00 \
+        -A "${ACCOUNT}" -p batch --qos=normal -N "${SWITCH_NODES}" --time=04:00:00 \
         --job-name="switch-cost-${model_variant}" \
         --export="ALL,MODEL_VARIANT=${model_variant},PROMPT_DATA=${prompt_data},WANDB_MODE=${WANDB_MODE},LOG_COLOCATE_SWITCH_METRICS=1,LOG_COLOCATE_TRANSFER_BYTES=1,LOG_MEMORY_USAGE=0,ENABLE_MILES_DASHBOARD=0,ENABLE_DUMP_DETAILS=0,RAY_DEDUP_LOGS=1" \
         experiments/scripts/switching_cost/run-colocated.sbatch)

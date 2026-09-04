@@ -1,6 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=continue-switch-difficulty
-#SBATCH --partition=cpu_interactive
+#SBATCH --account=coreai_horizon_dilations
+#SBATCH --partition=cpu
+#SBATCH --qos=cpu-interactive
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -54,7 +56,7 @@ submit_shard() {
     audit="${AUDIT_OUTPUT%.jsonl}.shard-${shard}-of-2.jsonl"
 
     sbatch --parsable \
-        -A "${ACCOUNT}" -p interactive --time=04:00:00 \
+        -A "${ACCOUNT}" -p batch --qos=interactive --time=04:00:00 \
         --job-name="df${shard}-${FILTER_JOB_SUFFIX}" \
         --export="$(measurement_exports),OUTPUT=${output},START_INDEX=${start},END_INDEX=${end},DUMP_RESPONSES=${audit},DUMP_LIMIT=8" \
         experiments/tools/difficulty_filter/run_measure.sbatch
@@ -107,7 +109,7 @@ done
 
 dependency=$(IFS=:; echo "${jobs[*]}")
 continuation_job=$(sbatch --parsable \
-    -A "${ACCOUNT}" -p cpu_interactive --time=00:20:00 \
+    -A "${ACCOUNT}" -p cpu --qos=cpu-interactive --time=00:20:00 \
     --job-name="dfcont-${FILTER_JOB_SUFFIX}" \
     --dependency="afterany:${dependency}" \
     --export="ALL,HF_CKPT_DIR=${HF_CKPT_DIR},MODEL_VARIANT=${MODEL_VARIANT},FILTER_ROUND=${next_round},FILTER_MAX_ROUNDS=${FILTER_MAX_ROUNDS}" \

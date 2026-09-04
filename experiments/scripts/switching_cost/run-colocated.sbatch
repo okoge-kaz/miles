@@ -2,6 +2,7 @@
 #SBATCH --job-name=miles-colocated-switch
 #SBATCH --account=coreai_horizon_dilations
 #SBATCH --partition=batch
+#SBATCH --qos=normal
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128

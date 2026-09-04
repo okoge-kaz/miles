@@ -9,9 +9,9 @@ usage() {
 Usage:
   experiments/scripts/switching_cost/submit-difficulty-filters.sh [all|qwen3-8b|qwen3-30b-a3b]
 
-Each model first runs a 32-prompt smoke. Two four-hour interactive half-dataset
-shards then run after the smoke succeeds. A CPU continuation job resubmits
-incomplete shards and materializes the model-specific p10-90 dataset.
+Each model first runs a 32-prompt smoke. Two four-hour batch/interactive-QoS
+half-dataset shards then run after the smoke succeeds. A CPU continuation job
+resubmits incomplete shards and materializes the model-specific p10-90 dataset.
 EOF
 }
 
@@ -69,7 +69,7 @@ submit_model() {
         local smoke_output="/data/difficulty/smoke/${PASS_RATES##*/}"
         local smoke_audit="/data/difficulty/smoke/${AUDIT_OUTPUT##*/}"
         smoke_job=$(sbatch --parsable \
-            -A "${ACCOUNT}" -p interactive --time=01:00:00 \
+            -A "${ACCOUNT}" -p batch --qos=interactive --time=01:00:00 \
             --job-name="dfsmoke-${FILTER_JOB_SUFFIX}" \
             --export="$(measurement_exports),OUTPUT=${smoke_output},LIMIT=32,DUMP_RESPONSES=${smoke_audit},DUMP_LIMIT=8" \
             experiments/tools/difficulty_filter/run_measure.sbatch)
@@ -90,7 +90,7 @@ submit_model() {
         output="${PASS_RATES%.jsonl}.shard-${shard}-of-2.jsonl"
         audit="${AUDIT_OUTPUT%.jsonl}.shard-${shard}-of-2.jsonl"
         job=$(sbatch --parsable \
-            -A "${ACCOUNT}" -p interactive --time=04:00:00 \
+            -A "${ACCOUNT}" -p batch --qos=interactive --time=04:00:00 \
             --job-name="df${shard}-${FILTER_JOB_SUFFIX}" \
             "${smoke_dependency[@]}" \
             --export="$(measurement_exports),OUTPUT=${output},START_INDEX=${start},END_INDEX=${end},DUMP_RESPONSES=${audit},DUMP_LIMIT=8" \
@@ -103,7 +103,7 @@ submit_model() {
     dependency=$(IFS=:; echo "${shard_jobs[*]}")
     local continuation_job
     continuation_job=$(sbatch --parsable \
-        -A "${ACCOUNT}" -p cpu_interactive --time=00:20:00 \
+        -A "${ACCOUNT}" -p cpu --qos=cpu-interactive --time=00:20:00 \
         --job-name="dfcont-${FILTER_JOB_SUFFIX}" \
         --dependency="afterany:${dependency}" \
         --export="ALL,HF_CKPT_DIR=${HF_CKPT_DIR},MODEL_VARIANT=${MODEL_VARIANT},FILTER_ROUND=1,FILTER_MAX_ROUNDS=${FILTER_MAX_ROUNDS}" \

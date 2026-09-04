@@ -64,7 +64,7 @@ MODEL_VARIANT=qwen3-4b WANDB_MODE=offline NUM_ROLLOUT=2 \
 ROLLOUT_BATCH_SIZE=8 OVER_SAMPLING_BATCH_SIZE=12 N_SAMPLES_PER_PROMPT=2 \
 GLOBAL_BATCH_SIZE=16 MAX_RESPONSE_LEN=1024 MAX_TOKENS_PER_GPU=8192 \
 BANDWIDTH_BENCHMARK=0 \
-sbatch -A coreai_horizon_dilations -p interactive -N 2 --time=01:00:00 \
+sbatch -A coreai_horizon_dilations -p batch --qos=interactive -N 2 --time=01:00:00 \
   experiments/scripts/switching_cost/run-colocated.sbatch
 ```
 
@@ -161,9 +161,10 @@ experiments/scripts/switching_cost/submit-difficulty-filters.sh all
 ```
 
 For each model the wrapper submits a 32-prompt smoke followed by two four-hour
-`interactive` shards. A dependent `cpu_interactive` coordinator resubmits an
-incomplete shard for up to eight rounds and then merges the measurements and
-materializes the p10-90 dataset. Sampling matches the switching workload:
+`batch`/`interactive`-QoS shards. A dependent `cpu`/`cpu-interactive`-QoS
+coordinator resubmits an incomplete shard for up to eight rounds and then merges
+the measurements and materializes the p10-90 dataset. Sampling matches the
+switching workload:
 `n=16`, response length 16384, context length 32768, temperature 1, DeepScaler
 reward, and zero reward for truncation. The 8B inference sweep uses TP1/DP8;
 30B-A3B uses TP2/DP4 to leave a practical KV budget without consuming more than
