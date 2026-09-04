@@ -7,8 +7,11 @@ from miles.ray.rollout.metrics import (
     _compute_metrics_from_samples,
     _compute_passrate_from_samples,
     _compute_zero_std_metrics,
+    log_rollout_batch_consumption,
     log_rollout_data,
 )
+from miles.utils.tracking_utils.base import WandbBackend
+from miles.utils.tracking_utils.wandb_utils import _STEP_METRIC_PREFIXES
 
 
 class TestComputeZeroStdMetrics:
@@ -52,6 +55,61 @@ class TestComputeZeroStdMetrics:
         # No groups → no all_zero/all_one keys (the function guards on total_groups>0).
         assert "zero_std/all_zero_percentage" not in out
         assert "zero_std/all_one_percentage" not in out
+
+
+def test_log_rollout_batch_consumption_logs_precomputed_metrics(monkeypatch):
+    captured = []
+    monkeypatch.setattr("miles.ray.rollout.metrics.tracking.log", lambda *args, **kwargs: captured.append(args[1]))
+    args = make_args(wandb_always_use_train_step=False)
+
+    metrics = log_rollout_batch_consumption(
+        7,
+        args,
+        extra_metrics={"queue/consumption/wall_wait_seconds/mean": 0.25},
+    )
+
+    assert metrics == {
+        "queue/consumption/wall_wait_seconds/mean": 0.25,
+        "rollout/step": 7,
+    }
+    assert captured == [metrics]
+
+
+def test_log_rollout_data_preserves_top_level_partial_staleness_metrics(monkeypatch):
+    captured = []
+    monkeypatch.setattr("miles.ray.rollout.metrics.tracking.log", lambda *args, **kwargs: captured.append(args[1]))
+    args = make_args(wandb_always_use_train_step=False)
+    samples = make_samples_grouped(2, 4)
+    partial_metrics = {
+        "staleness/total/mean": 1.25,
+        "staleness/token_lag/exact/mean": 0.75,
+        "staleness/partial_rollout/resumed_group_frac": 0.5,
+    }
+
+    log_rollout_data(7, args, samples, partial_metrics, rollout_time=2.0)
+
+    assert len(captured) == 1
+    logged = captured[0]
+    assert logged["rollout/step"] == 7
+    assert {key: logged[key] for key in partial_metrics} == partial_metrics
+    assert "rollout/staleness/total/mean" not in logged
+
+
+def test_wandb_backend_preserves_partial_metric_keys(monkeypatch):
+    captured = []
+    monkeypatch.setattr("wandb.log", lambda metrics: captured.append(metrics))
+    metrics = {
+        "staleness/total/mean": 1.25,
+        "rollout/partial_rollout/carried/groups": 4.0,
+        "rollout/step": 7,
+    }
+
+    WandbBackend().log(metrics)
+
+    assert captured == [metrics]
+    assert captured[0] is metrics
+    assert "staleness" in _STEP_METRIC_PREFIXES["rollout/step"]
+    assert "rollout" in _STEP_METRIC_PREFIXES["rollout/step"]
 
 
 class TestTitoMismatchMetrics:

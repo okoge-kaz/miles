@@ -1,0 +1,16 @@
+# PopQA evaluation with the Search-R1 multi-turn generator.
+
+eval:
+  defaults:
+    n_samples_per_eval_prompt: 1
+    max_response_len: 512
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+    input_key: prompt
+    label_key: reward_model
+    custom_generate_function_path: generate_with_search.generate
+    rm_type: null
+  datasets:
+    - name: popqa
+      path: /data/search-r1/eval/popqa-miles.jsonl

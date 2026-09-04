@@ -1,0 +1,67 @@
+# Datasets to stage: LOCAL_NAME | HF_REPO
+# Downloaded into $DATASET_DIR/<LOCAL_NAME> (= /data/<LOCAL_NAME> in-container).
+# Sizes are the HF repo size; see notes/datasets.md for how to inspect them.
+#
+# --- math (RLVR) ---
+dapo-math-17k          | zhuzilin/dapo-math-17k                    # 10MB  training prompts (default recipe)
+aime-2024              | zhuzilin/aime-2024                        # small eval
+deepscaler-preview     | agentica-org/DeepScaleR-Preview-Dataset   # 21MB  matches --rm-type deepscaler
+openr1-math-220k       | open-r1/OpenR1-Math-220k                  # 12.6GB
+nemotron-rl-math-v2    | nvidia/Nemotron-RL-Math-v2                 # RL math prompts, verifiable answers
+#
+# --- Nemotron-3-Super RL blend components that need no sandbox / external service ---
+# (nvidia/Nemotron-RL-Super-Training-Blends; safety + SWE + Lean-proof splits omitted)
+skywork-or1-rl         | Skywork/Skywork-OR1-RL-Data                                # math, boxed answers + model pass rates
+nemotron-rl-reasoninggym | nvidia/Nemotron-RL-ReasoningGym-v1                       # 104 procedurally verifiable envs
+nemotron-rl-fncall-pivot | nvidia/Nemotron-RL-Agentic-Function-Calling-Pivot-v1      # single-step tool call vs expert
+nemotron-rl-conv-tooluse | nvidia/Nemotron-RL-Agentic-Conversational-Tool-Use-v1     # multi-turn tool call vs expert
+nemotron-rl-comp-coding | nvidia/Nemotron-RL-coding-competitive_coding               # python + unit tests
+nemotron-rl-ifollow    | nvidia/Nemotron-RL-instruction_following                    # verifiable constraints
+nemotron-rl-ifollow-struct | nvidia/Nemotron-RL-instruction_following-structured_outputs  # JSON schema
+nemotron-rl-mcqa       | nvidia/Nemotron-RL-knowledge-mcqa                           # MCQA
+#
+# --- eval sets and the remaining sandbox-free training sets ---
+mmlu-pro               | TIGER-Lab/MMLU-Pro                                     # knowledge MCQA eval
+nemotron-rl-arc-agi    | nvidia/Nemotron-RL-ARC-AGI-v1                          # abstract reasoning, train+validation
+bfcl                   | gorilla-llm/Berkeley-Function-Calling-Leaderboard      # tool-use eval (AST categories)
+nemotron-rl-swe-pivot  | nvidia/Nemotron-RL-Agentic-SWE-Pivot-v1                # SWE stage 1, no container
+math-500               | HuggingFaceH4/MATH-500                    # small eval
+aime-2024-maxwell      | Maxwell-Jia/AIME_2024                     # small eval
+aime-2025              | math-ai/aime25                            # small eval
+amc-2023               | math-ai/amc23                             # small eval
+#
+# --- code (RLVR) ---
+deepcoder-preview      | agentica-org/DeepCoder-Preview-Dataset    # 7.8GB
+livecodebench-lite     | livecodebench/code_generation_lite        # 4.5GB eval
+verifiable-coding      | PrimeIntellect/verifiable-coding-problems # 10.8GB
+apps                   | codeparrot/apps                           # 1.4GB
+code-contests          | deepmind/code_contests                    # 7.6GB
+# skipped: open-r1/codeforces (244GB) — add it explicitly if a run needs it
+#
+# --- SWE / agentic ---
+swe-bench-verified     | princeton-nlp/SWE-bench_Verified          # 2MB   the standard RL/eval split
+swe-bench-lite         | princeton-nlp/SWE-bench_Lite              # 1MB
+swe-bench-full         | princeton-nlp/SWE-bench                   # 120MB
+swe-gym                | SWE-Gym/SWE-Gym                           # 44MB  training instances
+swe-rebench-v2         | nebius/SWE-rebench-V2                     # 429MB, exact V2 schema
+swe-rebench-v2-filtered-verified | PrimeIntellect/SWE-rebench-V2-Filtered-Verified # distinct filtered provenance
+swe-smith              | SWE-bench/SWE-smith                       # 278MB
+r2e-gym-v1             | R2E-Gym/R2E-Gym-V1                        # 1.7GB
+#
+# --- other reward types miles ships (rm_hub) ---
+gpqa                   | Idavidrein/gpqa                           # 9MB   --rm-type gpqa
+ifbench-test           | allenai/IFBench_test                      # small --rm-type ifbench
+#
+# --- code, large ---
+codeforces             | open-r1/codeforces                        # 244GB (requested explicitly)
+#
+# --- SWE training sets (the eval splits above are not trainable on their own) ---
+swe-bench-extra        | nebius/SWE-bench-extra                    # training instances
+swe-bench-multilingual | SWE-bench/SWE-bench_Multilingual          # eval, non-Python
+swe-bench-multimodal   | princeton-nlp/SWE-bench_Multimodal        # eval, JS/visual
+#
+# --- search / retrieval agents (Search-R1 recipe) ---
+searchr1-nq-hotpotqa   | PeterJinGo/nq_hotpotqa_train              # 0.4GB training prompts
+wiki18-corpus          | PeterJinGo/wiki-18-corpus                 # 5.1GB retrieval corpus
+wiki18-e5-index        | PeterJinGo/wiki-18-e5-index               # 65GB  faiss index for the local retriever
+flashrag-datasets      | RUC-NLPIR/FlashRAG_datasets               # 32GB  NQ/TriviaQA/HotpotQA/2Wiki/Musique/Bamboogle evals

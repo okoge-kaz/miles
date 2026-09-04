@@ -21,6 +21,7 @@ from miles.backends.training_utils.log_utils import (
 )
 from miles.backends.training_utils.loss import compute_advantages_and_returns, get_log_probs_and_entropy, loss_function
 from miles.backends.training_utils.parallel import get_parallel_state, set_parallel_state
+from miles.ray.train.types import TrainResultWithTiming
 from miles.ray.train_actor import TrainRayActor
 from miles.utils import train_dump_utils, train_metric_utils
 from miles.utils.context_utils import with_defer
@@ -323,13 +324,15 @@ class FSDPTrainRayActor(TrainRayActor):
         if not self.args.offload_train:
             return
 
-        print_memory("before offload model")
+        if getattr(self.args, "log_memory_usage", False):
+            print_memory("before offload model")
 
         self.model.cpu()
         move_torch_optimizer(self.optimizer, "cpu")
         clear_memory()
         dist.barrier(group=get_gloo_group())
-        print_memory("after offload model")
+        if getattr(self.args, "log_memory_usage", False):
+            print_memory("after offload model")
 
     @timer
     def wake_up(self) -> None:
@@ -340,11 +343,19 @@ class FSDPTrainRayActor(TrainRayActor):
         self.model.cuda()
         move_torch_optimizer(self.optimizer, "cuda")
         dist.barrier(group=get_gloo_group())
-        print_memory("after wake_up model")
+        if getattr(self.args, "log_memory_usage", False):
+            print_memory("after wake_up model")
 
-    def save_model(self, rollout_id: int, force_sync: bool = False) -> None:
-        """Delegate checkpoint saving to the shared checkpoint utilities."""
-        if self.args.debug_rollout_only or self.args.save is None:
+    def save_model(
+        self, rollout_id: int, force_sync: bool = False, *, write_dist: bool = True, write_hf: bool = True
+    ) -> None:
+        """Delegate checkpoint saving to the shared checkpoint utilities.
+
+        This backend has no HuggingFace export path, so an HF-only save is a no-op
+        rather than an error -- ``--hf-save-interval`` is rejected at argument
+        validation unless ``--save-hf`` is set, which is Megatron-only.
+        """
+        if self.args.debug_rollout_only or self.args.save is None or not write_dist:
             return
 
         assert not self.args.async_save, "FSDPTrainRayActor does not support async_save yet."
@@ -442,22 +453,31 @@ class FSDPTrainRayActor(TrainRayActor):
         rollout_data_ref: Box,
         witness_info: "WitnessInfo | None" = None,
         attempt: int = 0,
-    ) -> None:
+        collect_wake_up_time: bool = False,
+    ) -> None | TrainResultWithTiming:
         """Run one training update over a rollout batch (``rollout_data_ref`` is a Box handle to the
         Ray object ref with the rollout tensors; fetched and partitioned by data-parallel rank)."""
         assert witness_info is None
         assert attempt == 0
 
         self._heartbeat.bump()
+        local_wake_up_time = 0.0
         if self.args.offload_train:
+            previous_wake_up_time = Timer().log_dict().get("wake_up", 0.0) if collect_wake_up_time else 0.0
             self.wake_up()
+            if collect_wake_up_time:
+                local_wake_up_time = Timer().log_dict().get("wake_up", 0.0) - previous_wake_up_time
 
         with inverse_timer("train_wait"), timer("train"), ExitStack() as stack:
             rollout_data, store_get_result = get_rollout_data(self.args, rollout_data_ref, witness_info=None)
             stack.enter_context(store_get_result)
             if self.args.debug_rollout_only:
-                return
-            self._train_core(rollout_id=rollout_id, rollout_data=rollout_data)
+                return (
+                    TrainResultWithTiming(result=None, local_wake_up_time=local_wake_up_time)
+                    if collect_wake_up_time
+                    else None
+                )
+            optimizer_updates = self._train_core(rollout_id=rollout_id, rollout_data=rollout_data)
 
         train_metric_utils.log_perf_data_raw(
             rollout_id=rollout_id,
@@ -468,11 +488,14 @@ class FSDPTrainRayActor(TrainRayActor):
                 if self._flops_args is not None
                 else None
             ),
+            extra_metrics={"perf/optimizer_updates": optimizer_updates},
         )
 
         self._heartbeat.bump()
+        if collect_wake_up_time:
+            return TrainResultWithTiming(result=None, local_wake_up_time=local_wake_up_time)
 
-    def _train_core(self, rollout_id: int, rollout_data) -> None:
+    def _train_core(self, rollout_id: int, rollout_data) -> int:
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
 
         routing_replay.fill(self.args, self.model, data_iterator, num_microbatches, rollout_data)
@@ -522,6 +545,12 @@ class FSDPTrainRayActor(TrainRayActor):
                             "returns",
                             "ref_log_probs",
                             "rollout_log_probs",
+                            "sample_staleness",
+                            "truncated",
+                            "sample_indices",
+                            "sample_group_indices",
+                            "generation_attempt_numbers",
+                            "training_steps",
                         ],
                         self.args.data_pad_size_multiplier,
                         self.args.qkv_format,
@@ -586,7 +615,11 @@ class FSDPTrainRayActor(TrainRayActor):
             self.ref_model.load_state_dict(actor_state)
             self.ref_model.cpu()
 
+        return num_steps_per_rollout
+
     def _train_step(self, batch, step_id, num_microbatches):
+        if getattr(self.args, "dump_details", None) is not None:
+            batch["optimizer_step_ids"] = [step_id] * len(batch["total_lengths"])
         model_args = self._get_model_inputs_args(batch)
         # bf16 logits (see log_probs phase); per-response chunks are upcast to fp32 in the loss path.
         with routing_replay.stage(routing_replay.REPLAY_FORWARD), precision_forward_context(self.precision_policy):

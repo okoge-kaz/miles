@@ -53,7 +53,15 @@ class _FakeModelChunk:
 
 
 class _Setup:
-    def __init__(self, num_params=3, numel=16, num_extras=1, check=False, shards=None):
+    def __init__(
+        self,
+        num_params=3,
+        numel=16,
+        num_extras=1,
+        check=False,
+        shards=None,
+        track_transfer_nbytes=False,
+    ):
         generator = torch.Generator().manual_seed(0)
         self.mains = {f"p{i}": torch.randn(numel, generator=generator) for i in range(num_params)}
         self.params = {name: main.to(torch.bfloat16) for name, main in self.mains.items()}
@@ -75,6 +83,7 @@ class _Setup:
         self.backuper = TensorBackuper.create(
             source_getter=lambda: iter({**self.params, **self.extras}.items()),
             main_cast_ctx=ctx,
+            track_transfer_nbytes=track_transfer_nbytes,
         )
 
     def corrupt_live_tensors(self):
@@ -207,3 +216,28 @@ def test_actor_restore_wins_after_ref_switch():
     setup.backuper.restore("actor")
     for name, tensor in {**setup.params, **setup.extras}.items():
         assert torch.equal(tensor, actor_values[name]), name
+
+
+def _make_normal_backuper(*, track_transfer_nbytes: bool):
+    source = {"weight": torch.arange(6, dtype=torch.float32).reshape(2, 3)}
+    return TensorBackuper.create(
+        source_getter=lambda: source.items(),
+        track_transfer_nbytes=track_transfer_nbytes,
+    )
+
+
+def test_normal_backup_transfer_bytes_are_only_collected_when_enabled():
+    disabled = _make_normal_backuper(track_transfer_nbytes=False)
+    disabled.backup("actor")
+    enabled = _make_normal_backuper(track_transfer_nbytes=True)
+    enabled.backup("actor")
+
+    assert disabled.backup_transfer_nbytes("actor") == 0
+    assert enabled.backup_transfer_nbytes("actor") == 6 * torch.float32.itemsize
+
+
+def test_main_cast_backup_counts_only_copied_extras():
+    setup = _Setup(num_extras=2, track_transfer_nbytes=True)
+    setup.backuper.backup("actor")
+
+    assert setup.backuper.backup_transfer_nbytes("actor") == 8 * torch.float32.itemsize

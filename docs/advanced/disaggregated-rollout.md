@@ -280,10 +280,12 @@ engine-local pause. Different replicas may converge at different times, so
 request constraints and served-version attribution become part of the RL data
 contract rather than optional serving metadata.
 
-miles already uses weight versions to measure fully async sample staleness. A
-service integration must preserve that information so
-`--max-weight-staleness` and custom data-buffer policies make decisions from
-the policy that generated each sample.
+miles already uses weight versions to measure fully async sample staleness. The
+v0.1-compatible `DataBuffer` path uses the completed samples' policy versions;
+explicit built-in queues can additionally use submission or first-prefill
+provenance. A service integration must preserve the versions required by its
+selected policy so `--max-weight-staleness` and custom data-buffer decisions
+refer to the policy that actually generated each sample.
 
 ## What to measure
 

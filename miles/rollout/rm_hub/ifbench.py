@@ -6,30 +6,67 @@ import os
 import subprocess
 import sys
 from collections.abc import Sequence
+from functools import cache
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
-_WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
-_WORKSPACE_PARENT = _WORKSPACE_ROOT.parent
-_LOCAL_IFBENCH_REQUIREMENTS = _WORKSPACE_ROOT / "examples" / "eval_multi_task" / "requirements_ifbench.txt"
+DEFAULT_IFBENCH_REPO = Path("/data/ifbench")
+DEFAULT_IFBENCH_DEPS = Path("/data/ifbench-deps")
+PINNED_IFBENCH_COMMIT = "db69a6f05689830b0068b8f1529ebcfd2f3b164c"
+PINNED_DEPS_MARKER = ".miles-ifbench-0.2.0-db69a6f"
 
 
 def _ensure_ifbench_repo() -> Path:
-    """Clone IFBench repo if needed and ensure it is available on sys.path."""
+    """Validate and expose the staged IFBench checkout without mutating it."""
 
-    repo_path = _WORKSPACE_PARENT / "IFBench"
+    repo_path = Path(os.environ.get("IFBENCH_REPO_PATH", str(DEFAULT_IFBENCH_REPO)))
+    if not (repo_path / "evaluation_lib.py").is_file():
+        raise ImportError(
+            f"IFBench is not staged at {repo_path}. Run "
+            "experiments/setup/environments/prepare_ifbench.sbatch or set "
+            "IFBENCH_REPO_PATH."
+        )
 
-    if not repo_path.exists():
-        clone_cmd = ["git", "clone", "https://github.com/allenai/IFBench.git", str(repo_path)]
-        try:
-            subprocess.run(clone_cmd, check=True, capture_output=True)
-        except Exception as exc:
-            raise ImportError(
-                "Unable to automatically clone IFBench. Please clone "
-                "https://github.com/allenai/IFBench.git into the repo root."
-            ) from exc
+    deps_path = Path(os.environ.get("IFBENCH_DEPS_PATH", str(DEFAULT_IFBENCH_DEPS)))
+    marker_path = deps_path / PINNED_DEPS_MARKER
+    nltk_data_path = deps_path / "nltk_data"
+    if not marker_path.is_file() or not nltk_data_path.is_dir():
+        raise ImportError(
+            f"pinned IFBench dependencies are not staged at {deps_path}. Run "
+            "experiments/setup/environments/prepare_ifbench.sbatch or set "
+            "IFBENCH_DEPS_PATH."
+        )
+
+    try:
+        revision = subprocess.run(
+            ["git", "-C", str(repo_path), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout.strip()
+        tracked_status = subprocess.run(
+            ["git", "-C", str(repo_path), "status", "--porcelain", "--untracked-files=no"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout.strip()
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        raise ImportError(f"could not validate official IFBench checkout: {repo_path}") from exc
+    if revision != PINNED_IFBENCH_COMMIT:
+        raise ImportError(
+            f"IFBench checkout is at {revision}, expected pinned commit {PINNED_IFBENCH_COMMIT}"
+        )
+    if tracked_status:
+        raise ImportError(f"IFBench checkout has modified tracked files: {repo_path}")
+
+    deps_str = str(deps_path)
+    if deps_str not in sys.path:
+        sys.path.append(deps_str)
+    os.environ.setdefault("NLTK_DATA", str(nltk_data_path))
 
     repo_str = str(repo_path)
     if repo_str not in sys.path:
@@ -44,39 +81,21 @@ def _ensure_ifbench_repo() -> Path:
     return repo_path
 
 
-def _ensure_ifbench_dependencies(repo_path: Path) -> None:
-    """Install IFBench requirements the first time the module is imported."""
-
-    requirements_file = _LOCAL_IFBENCH_REQUIREMENTS
-
-    if not requirements_file.exists():
-        logger.debug("Local IFBench requirements file not found at %s; skipping install.", requirements_file)
-        return
-
-    sentinel = repo_path / ".deps_installed"
-    if sentinel.exists():
-        return
-
-    install_cmd = [sys.executable, "-m", "pip", "install", "-r", str(requirements_file)]
-    try:
-        subprocess.run(install_cmd, check=True)
-    except Exception as exc:
-        logger.warning("Failed to install IFBench dependencies automatically: %s", exc)
-    else:
-        sentinel.write_text("installed\n")
-
-
+@cache
 def _load_evaluation_lib():
     repo_path = _ensure_ifbench_repo()
     try:
-        return importlib.import_module("evaluation_lib")
-    except ImportError:
-        _ensure_ifbench_dependencies(repo_path)
-        return importlib.import_module("evaluation_lib")
-
-
-evaluation_lib = _load_evaluation_lib()
-InputExample = evaluation_lib.InputExample
+        module = importlib.import_module("evaluation_lib")
+    except ModuleNotFoundError as exc:
+        raise ImportError(
+            f"IFBench dependency {exc.name!r} is unavailable. Run "
+            "experiments/setup/environments/prepare_ifbench.sbatch or set "
+            "IFBENCH_DEPS_PATH."
+        ) from exc
+    module_path = Path(module.__file__).resolve()
+    if module_path != (repo_path / "evaluation_lib.py").resolve():
+        raise ImportError(f"loaded IFBench evaluator from unexpected path: {module_path}")
+    return module
 
 
 JsonDict = dict[str, Any]
@@ -128,7 +147,9 @@ def _coerce_kwargs_list(
     return sanitized
 
 
-def _build_input_example(metadata: JsonDict) -> InputExample | None:
+def _build_input_example(metadata: JsonDict, evaluation_lib: Any | None = None) -> Any | None:
+    if evaluation_lib is None:
+        evaluation_lib = _load_evaluation_lib()
     instruction_ids = _normalize_instruction_ids(metadata.get("instruction_id_list") or [])
     if not instruction_ids:
         logger.debug("Missing instruction identifiers in metadata: %s", metadata)
@@ -143,7 +164,7 @@ def _build_input_example(metadata: JsonDict) -> InputExample | None:
     raw_kwargs = metadata.get("kwargs")
     kwargs_list = _coerce_kwargs_list(raw_kwargs, len(instruction_ids))
 
-    return InputExample(
+    return evaluation_lib.InputExample(
         key=int(metadata.get("record_id") or 0),
         instruction_id_list=instruction_ids,
         prompt=prompt_text,
@@ -161,7 +182,8 @@ def compute_ifbench_reward(response: str, label: Any, metadata: JsonDict | None 
     if response is None:
         return 0.0
 
-    inp = _build_input_example(metadata)
+    evaluation_lib = _load_evaluation_lib()
+    inp = _build_input_example(metadata, evaluation_lib=evaluation_lib)
     if inp is None:
         return 0.0
 

@@ -1,13 +1,30 @@
 import logging
 import os
+import secrets
 from copy import deepcopy
 
 import wandb
-from wandb.sdk.lib.runid import generate_id
 
 from miles.utils.env_report import decode_env_report
 
 logger = logging.getLogger(__name__)
+
+_STEP_METRIC_PREFIXES = {
+    "train/step": ("train", "sample_staleness"),
+    "rollout/step": (
+        "rollout",
+        "fully_async",
+        "resume",
+        "multi_turn",
+        "passrate",
+        "perf",
+        "staleness",
+        "selection_bias",
+        "throughput",
+        "queue",
+    ),
+    "eval/step": ("eval",),
+}
 
 
 def _is_offline_mode(args) -> bool:
@@ -47,10 +64,9 @@ def init_wandb_primary(args):
     if (not offline) and args.wandb_key is not None:
         wandb.login(key=args.wandb_key, host=args.wandb_host)
 
-    # Prepare wandb init parameters
-    # add random 6 length string with characters
+    # Add an eight-character random suffix to avoid run-name collisions.
     if args.wandb_random_suffix:
-        group = args.wandb_group + "_" + generate_id()
+        group = args.wandb_group + "_" + secrets.token_hex(4)
         run_name = f"{group}-RANK_{args.rank}"
     else:
         group = args.wandb_group
@@ -159,12 +175,7 @@ def init_wandb_secondary(args, router_addr=None):
 
 
 def _init_wandb_common():
-    wandb.define_metric("train/step")
-    wandb.define_metric("train/*", step_metric="train/step")
-    wandb.define_metric("rollout/step")
-    wandb.define_metric("rollout/*", step_metric="rollout/step")
-    wandb.define_metric("multi_turn/*", step_metric="rollout/step")
-    wandb.define_metric("passrate/*", step_metric="rollout/step")
-    wandb.define_metric("eval/step")
-    wandb.define_metric("eval/*", step_metric="eval/step")
-    wandb.define_metric("perf/*", step_metric="rollout/step")
+    for step_metric, prefixes in _STEP_METRIC_PREFIXES.items():
+        wandb.define_metric(step_metric)
+        for prefix in prefixes:
+            wandb.define_metric(f"{prefix}/*", step_metric=step_metric)

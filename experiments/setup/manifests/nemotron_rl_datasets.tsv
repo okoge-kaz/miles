@@ -1,0 +1,28 @@
+# hf_repo<TAB>local_name<TAB>role<TAB>optional pinned revision
+nvidia/Nemotron-3-Nano-RL-Training-Blend	nemotron-3-nano-rl-training-blend	train_blend
+livecodebench/code_generation_lite	livecodebench-lite	eval_only
+Idavidrein/gpqa	gpqa	eval_only
+BytedTsinghua-SIA/DAPO-Math-17k	dapo-math-17k-byted	train_static
+Skywork/Skywork-OR1-RL-Data	skywork-or1-rl	train_static
+nvidia/Nemotron-Math-Proofs-v1	nemotron-math-proofs-v1	train_lean
+nvidia/Nemotron-RL-Agentic-Conversational-Tool-Use-v1	nemotron-rl-conv-tooluse	train_static
+nvidia/Nemotron-RL-Agentic-Conversational-Tool-Use-Pivot-v1	nemotron-rl-conv-tooluse-pivot	train_static	9643c8103d7bfbc2d7fc4d15991d6739c612ff58
+nvidia/Nemotron-RL-Agentic-SWE-Pivot-v1	nemotron-rl-swe-pivot	train_pivot
+nvidia/Nemotron-RL-Identity-Following-v1	nemotron-rl-identity-following	judge_required
+nvidia/Nemotron-RL-Instruction-Following-Adversarial-v1	nemotron-rl-ifollow-adversarial	judge_required
+nvidia/Nemotron-RL-Instruction-Following-Calendar-v2	nemotron-rl-ifollow-calendar-v2	constraint_engine_required
+nvidia/Nemotron-RL-Instruction-Following-MultiTurnChat-v1	nemotron-rl-ifollow-multiturnchat	judge_required
+nvidia/Nemotron-RL-ReasoningGym-v1	nemotron-rl-reasoninggym	train_static
+nvidia/Nemotron-RL-Safety-v1	nemotron-rl-safety	reward_model_data
+nvidia/Nemotron-RL-agent-workplace_assistant	nemotron-rl-workplace-assistant	environment_required
+nvidia/Nemotron-RL-coding-competitive_coding	nemotron-rl-comp-coding	train_sandbox
+nvidia/Nemotron-RL-instruction_following-structured_outputs	nemotron-rl-ifollow-struct	train_static
+nvidia/Nemotron-RL-instruction_following	nemotron-rl-ifollow	train_static
+nvidia/Nemotron-RL-knowledge-mcqa	nemotron-rl-mcqa	train_static
+nvidia/Nemotron-RLHF-GenRM-v1	nemotron-rlhf-genrm-v1	genrm_training
+nvidia/Nemotron-RL-Agentic-Function-Calling-Pivot-v1	nemotron-rl-fncall-pivot	train_static
+R2E-Gym/R2E-Gym-V1	r2e-gym-v1	selective_swe_unadmitted
+nebius/SWE-rebench-V2	swe-rebench-v2	selective_swe_train
+PrimeIntellect/SWE-rebench-V2-Filtered-Verified	swe-rebench-v2-filtered-verified	selective_swe_train_filtered
+SWE-Gym/SWE-Gym	swe-gym	selective_swe_unadmitted
+princeton-nlp/SWE-bench_Verified	swe-bench-verified	selective_swe_eval

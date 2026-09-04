@@ -1,0 +1,73 @@
+{
+  "schema_version": "miles-swe-gym-exclusions-v1",
+  "dataset": {
+    "id": "SWE-Gym/SWE-Gym",
+    "revision": "bb94ed9e39bbeb96a7fcbfb533b80f25a7fd59cb",
+    "total_rows": 2438,
+    "unique_instance_ids": 2438
+  },
+  "evidence": {
+    "reason": "Harbor claims the upstream Docker image is missing",
+    "harbor_commit": "2ce5ba2af33a00c9fba0463f6403313996373f85",
+    "source": "https://github.com/harbor-framework/harbor/tree/2ce5ba2af33a00c9fba0463f6403313996373f85/adapters/swegym",
+    "sha256": {
+      "README.md": "2f714248a6e2b03449fb78f2c1fb2555a5d3d24a7983e2e1b50add95e57b2de9",
+      "adapter.py": "26244e254bff3b4a363c73d3995fc6231aec8b4ffcec4b6d5e0723a507c993bc",
+      "template/tests/test.sh": "268ec0feaa27c6e4dd8068d09a50aaf437110992fe4b9b3999db908fec376f3d",
+      "utils.py": "dad2c0acfa4bcec59be17c4ec15845efe193afbc8537e5debe4bed6eab39e9cd"
+    }
+  },
+  "pinned_dataset_audit": {
+    "status": "rejected_provenance_mismatch",
+    "parquet_sha256": "60569cea74bb281f7a5579467436a2bc1932c6e0c5f2f7fa0d084392abd9ad97",
+    "rows": 2438,
+    "unique_instance_ids": 2438,
+    "listed_exclusions_present": 37,
+    "listed_exclusions_absent": [
+      "project-monai__monai-7604"
+    ],
+    "rows_after_present_exclusions": 2401,
+    "harbor_claimed_oracle_passes": 2396,
+    "note": "Do not use this list as an admission allowlist until the five unexplained outcomes and absent ID are reconciled by a pinned live image/oracle audit."
+  },
+  "excluded_instance_ids": [
+    "bokeh__bokeh-13239",
+    "conan-io__conan-11803",
+    "conan-io__conan-13622",
+    "conan-io__conan-13623",
+    "conan-io__conan-14185",
+    "dask__dask-10723",
+    "dask__dask-10800",
+    "dask__dask-6683",
+    "dask__dask-6871",
+    "facebookresearch__hydra-1540",
+    "facebookresearch__hydra-609",
+    "iterative__dvc-10386",
+    "iterative__dvc-1603",
+    "iterative__dvc-4190",
+    "iterative__dvc-4872",
+    "iterative__dvc-6982",
+    "iterative__dvc-9533",
+    "modin-project__modin-6649",
+    "modin-project__modin-7042",
+    "modin-project__modin-7089",
+    "pandas-dev__pandas-47585",
+    "pandas-dev__pandas-47763",
+    "pandas-dev__pandas-47851",
+    "pandas-dev__pandas-47900",
+    "pandas-dev__pandas-50719",
+    "pandas-dev__pandas-50964",
+    "pandas-dev__pandas-52074",
+    "pandas-dev__pandas-52337",
+    "pandas-dev__pandas-52364",
+    "pandas-dev__pandas-53257",
+    "pandas-dev__pandas-53638",
+    "pandas-dev__pandas-53809",
+    "pandas-dev__pandas-53938",
+    "pandas-dev__pandas-55764",
+    "pandas-dev__pandas-57060",
+    "project-monai__monai-7604",
+    "pydantic__pydantic-5362",
+    "pydantic__pydantic-8262"
+  ]
+}

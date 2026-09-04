@@ -97,9 +97,13 @@ class TestCheckWeightSyncResults:
             _check_weight_sync_results(results, is_lora=False)
 
     def test_plain_tuple_results_pass(self):
-        """Non-dataclass results (e.g. (True, 'Success') tuples) should not raise."""
+        """FastAPI serializes the begin/end ``(success, message)`` reply as a pair."""
         results = [(True, "Success")]
         _check_weight_sync_results(results, is_lora=False)
+
+    def test_plain_list_failure_is_validated(self):
+        with pytest.raises(RuntimeError, match="finalize failed"):
+            _check_weight_sync_results([[False, "finalize failed"]], is_lora=False)
 
     def test_mixed_results_raises_on_first_failure(self):
         results = [
@@ -238,6 +242,7 @@ class TestUpdateWeightsZeroChunks:
         )
         updater.rollout_engines = [MagicMock()]
         updater.use_distribute = False
+        updater.rollout_manager = MagicMock()
 
         updater.update_weights()
 

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Miles Staleness"
+  short_description: "Audit Miles queue-recycle staleness formulas"
+  default_prompt: "Use $staleness to verify or change Miles fully-async staleness control and logging."

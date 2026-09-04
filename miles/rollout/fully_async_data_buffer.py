@@ -161,6 +161,10 @@ class DefaultDataBuffer(DataBuffer):
                 self._metric_stale_groups += 1
                 self._unused_handler_fn(entry.prompt_group)
 
+    def qsize(self) -> int:
+        """Return the current group count for shared pipeline telemetry."""
+        return len(self._buffer)
+
     def get_metrics(self) -> dict[str, float]:
         prefix = "rollout/fully_async/"
         metrics = {

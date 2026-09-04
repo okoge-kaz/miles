@@ -1,0 +1,14 @@
+# MMLU-Pro evaluation using the per-row valid answer alphabet.
+
+eval:
+  defaults:
+    n_samples_per_eval_prompt: 4
+    max_response_len: 16384
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+    rm_type: gpqa
+
+  datasets:
+    - name: mmlu_pro
+      path: /data/mmlu-pro/mmlu-pro-miles-2k.jsonl

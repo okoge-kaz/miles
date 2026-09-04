@@ -1,6 +1,7 @@
 # Adapt from https://github.com/OpenRLHF/OpenRLHF/blob/10c733694ed9fbb78a0a2ff6a05efc7401584d46/openrlhf/models/utils.py
 # and https://github.com/OpenRLHF/OpenRLHF/blob/10c733694ed9fbb78a0a2ff6a05efc7401584d46/openrlhf/trainer/ppo_utils/experience_maker.py
 
+import math
 from argparse import Namespace
 from pathlib import Path
 
@@ -83,6 +84,72 @@ def compute_ess_ratio_contribution(
         ess_ratio_sum = ess_ratio_sum * 0
 
     return ess_ratio_sum
+
+
+
+def compute_sequence_level_ess_parts(
+    log_ratio: torch.Tensor,
+    loss_masks: list[torch.Tensor],
+    total_lengths: list[int],
+    response_lengths: list[int],
+    qkv_format: str,
+    max_seq_lens: list[int] | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Parts of the *sequence-level* ESS ratio, as VCPO defines it.
+
+    VCPO (arXiv:2602.17616 eq. 4) sets ``rho_ess = ESS / B`` with
+    ``ESS = (sum_i w_i)^2 / sum_i w_i^2`` over **sequence-level** importance
+    weights ``w_i`` and ``B`` the number of sequences. That is a different
+    population from ``compute_ess_ratio_contribution`` above, which takes Kish's
+    formula over the *tokens within* one sample and then averages over samples:
+    the first asks how many of B trajectories are effectively independent, the
+    second how many of a sequence's T tokens dominate it. Both are useful and
+    neither substitutes for the other.
+
+    A caveat that matters at long response lengths: ``log w_i`` is the *sum* over
+    the sequence, so a per-token mismatch that is merely systematic -- measured
+    at -5.4e-04 here, framework numerics, identical on the on-policy arm -- turns
+    into a 17.6-nat spread across a 347..32677-token length distribution, and
+    collapses this ratio on its own. What it reports at 32k is mostly length
+    variation, not policy lag. VCPO divides by an on-policy reference to cancel
+    exactly this, but takes that reference as a constant from one early step,
+    which does not hold once training lengthens responses.
+
+    Returns ``(sum_w, sum_w2, n_seq)`` rather than the ratio, because the ratio
+    is not additive across micro-batches or data-parallel ranks. Every metric is
+    summed and then divided by the same normaliser, so the caller can recover
+    ``rho = a^2 / (b * c)`` from the three normalised values with the normaliser
+    cancelling exactly -- see ``aggregate_train_losses``.
+    """
+    parallel_state = get_parallel_state()
+    local_masks = slice_loss_masks_for_local_cp(
+        loss_masks, total_lengths, response_lengths, qkv_format, max_seq_lens
+    )
+    local_lengths = [mask.size(0) for mask in local_masks]
+    per_sample = log_ratio.detach().float().split(local_lengths, dim=0)
+
+    # One partial log-ratio sum per sample; under CP each rank holds a slice of
+    # the sequence, so the sums are completed before the nonlinearity.
+    log_w = torch.zeros(len(loss_masks), device=log_ratio.device, dtype=torch.float32)  # sums stay fp32
+    for i, (values, mask) in enumerate(zip(per_sample, local_masks, strict=False)):
+        log_w[i] = (values * mask.to(device=values.device, dtype=values.dtype)).sum()
+    if parallel_state.cp.size > 1:
+        dist.all_reduce(log_w, op=dist.ReduceOp.SUM, group=parallel_state.cp.group)
+
+    # float64, and a clamp placed where it cannot bind. rho is invariant to a
+    # constant shift of log_w -- numerator and denominator scale together -- so a
+    # clamp that saturates is worse than useless: it collapses the *differences*
+    # between sequences and reports rho = 1.0, "healthy", for the runs that are
+    # least healthy. float32 exp overflows near |log_w| = 88 and the measured
+    # range here is 17.8 at 32k tokens, which is close enough to want the headroom
+    # of float64's ~700.
+    weights = torch.exp(log_w.double().clamp(-700.0, 700.0))
+    n_seq = torch.tensor(float(len(loss_masks)), device=log_ratio.device, dtype=torch.float64)
+
+    if parallel_state.cp.size > 1 and parallel_state.cp.rank != 0:
+        zero = weights.new_zeros(())
+        return zero, zero, zero * n_seq
+    return weights.sum(), (weights * weights).sum(), n_seq
 
 
 _TOP_LOGPROB_BWD_DUMP_COUNTER = 0
@@ -178,6 +245,69 @@ def compute_approx_kl(
         kl = torch.clamp(kl, min=-10, max=10)
 
     return kl
+
+
+def compute_m2po_clip_bounds(
+    ppo_kl: torch.Tensor,
+    advantages: torch.Tensor,
+    loss_mask: torch.Tensor,
+    m2_budget: float,
+    miniclip_low: float,
+    miniclip_high: float,
+) -> tuple[float, float, float, float]:
+    """Derive the PPO clip range from a second-moment budget (M2PO).
+
+    `arXiv:2510.01161`. `ppo_kl` is delta = log pi_behav - log pi_theta, so the
+    per-token second moment is delta**2. Only *harmful* tokens are budgeted --
+    those the clip would act on, `(A > 0, ratio > 1)` and `(A < 0, ratio < 1)`.
+    A single threshold tau is chosen so that capping |delta| at tau brings their
+    mean delta**2 to `m2_budget`, and tau becomes the symmetric ratio bound.
+
+    Returns `(eps_clip_low, eps_clip_high, m2_before, m2_after)` as floats, in
+    miles' epsilon convention: the clamp is `[1 - eps_clip_low, 1 + eps_clip_high]`.
+
+    Scope is the microbatch, matching the reference implementation's placement
+    inside verl's per-microbatch `compute_policy_loss`.
+    """
+    active = loss_mask.bool()
+    ratio = _safe_exp_neg_ppo_kl(ppo_kl)
+    harmful = active & (((advantages > 0) & (ratio > 1.0)) | ((advantages < 0) & (ratio < 1.0)))
+
+    no_constraint = (miniclip_low, miniclip_high, 0.0, 0.0)
+    delta_sq = ppo_kl[harmful].float().pow(2)
+    n = delta_sq.numel()
+    if n == 0:
+        return no_constraint
+
+    m2_before = float(delta_sq.mean())
+    if m2_before <= m2_budget:
+        return (miniclip_low, miniclip_high, m2_before, m2_before)
+
+    # Capping every delta**2 above v[k] at v[k] leaves total
+    # cumsum[k] + v[k] * (n - 1 - k); take the first k that reaches the budget
+    # and cap at the value below it, as the reference does.
+    v, _ = torch.sort(delta_sq)
+    csum = torch.cumsum(v, dim=0)
+    idx = torch.arange(n, device=v.device, dtype=v.dtype)
+    reachable = csum + v * (n - 1 - idx)
+    hits = (reachable >= m2_budget * n).nonzero()
+    if hits.numel() == 0:
+        return no_constraint
+    k = int(hits[0])
+    if k == 0:
+        tau, m2_after = 0.0, float(csum[-1] / n)
+    else:
+        cap = float(v[k - 1])
+        tau = math.sqrt(cap)
+        m2_after = float(cap * (n - k) + float(csum[k - 1])) / n
+
+    # tau bounds |delta|, so the ratio lives in [exp(-tau), exp(tau)].
+    return (
+        max(miniclip_low, 1.0 - math.exp(-tau)),
+        max(miniclip_high, math.exp(tau) - 1.0),
+        m2_before,
+        m2_after,
+    )
 
 
 def compute_opsm_mask(

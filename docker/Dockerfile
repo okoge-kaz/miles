@@ -16,8 +16,9 @@ FROM lmsysorg/sglang:${SGLANG_IMAGE_TAG} AS sglang
 
 # ======================================== Arguments =============================================
 
-ARG SGLANG_BRANCH=sglang-miles
-ARG SGLANG_COMMIT=""
+ARG SGLANG_REPO=okoge-kaz/sglang
+ARG SGLANG_BRANCH=miles-staleness-weight-boundaries
+ARG SGLANG_COMMIT=f994b9aedfd0b1465dbb8f4e2a02eb789fc76dce
 
 ARG MEGATRON_REPO=radixark/Megatron-LM
 ARG MEGATRON_BRANCH=miles-main
@@ -25,6 +26,12 @@ ARG MEGATRON_BRANCH=miles-main
 ARG MEGATRON_COMMIT=""
 
 ARG ENABLE_CUDA_13=1
+
+# EFA installer 1.49.0 carries libfabric 2.4.0amzn5.0 and AWS OFI NCCL 1.20.0.
+# The checksum is for the versioned AWS release tarball, whose signature was
+# verified against the Amazon EC2 EFA release key (4E90...3CCC).
+ARG EFA_INSTALLER_VERSION=1.49.0
+ARG EFA_INSTALLER_SHA256=cf2e9281a2328a243c76f911a490faed43ca0fecfe4733c25e34b2e92a32c309
 
 ARG WHEELS_REPO=yueming-yuan/miles-wheels
 # Two complete wheels release tags (the wheels repo's own names). The build picks
@@ -42,6 +49,15 @@ WORKDIR /root/
 RUN apt update
 # ethtool for network diagnostics
 RUN apt install -y nvtop rsync dnsutils ethtool tmux
+
+# Include EFA userspace in every image, but do not auto-enable it. The installer
+# uses the named libnccl-net-ofi.so NGC layout, so non-AWS jobs keep the base
+# image's NCCL transport unless they explicitly select the named plugin and
+# NCCL_NET="AWS Libfabric".
+RUN --mount=type=bind,source=docker/install_aws_efa.sh,target=/tmp/install_aws_efa.sh \
+    EFA_INSTALLER_VERSION="${EFA_INSTALLER_VERSION}" \
+    EFA_INSTALLER_SHA256="${EFA_INSTALLER_SHA256}" \
+    bash /tmp/install_aws_efa.sh
 
 # nccl-tests for diagnostics
 RUN git clone https://github.com/NVIDIA/nccl-tests.git /tmp/nccl-tests && \
@@ -175,6 +191,25 @@ RUN pip install multi-storage-client --no-deps
 COPY requirements.txt /tmp/requirements.txt
 RUN rm -rf /usr/lib/python3/dist-packages/jwt /usr/lib/python3/dist-packages/PyJWT* && pip install -r /tmp/requirements.txt
 
+# Search-R1 keeps the 65 GB retrieval index on CPU. Pin the Python 3.12 wheels
+# by architecture and checksum so training/evaluation never install packages at
+# runtime and multi-arch builds do not accidentally consume an x86-only wheel.
+ARG SEARCH_R1_FAISS_CPU_VERSION=1.12.0
+ARG SEARCH_R1_FAISS_CPU_X86_URL=https://files.pythonhosted.org/packages/4c/c9/be4e52fd96be601fefb313c26e1259ac2e6b556fb08cc392db641baba8c7/faiss_cpu-1.12.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
+ARG SEARCH_R1_FAISS_CPU_X86_SHA256=c2e4963c7188f57cfba248f09ebd8a14c76b5ffb87382603ccd4576f2da39d74
+ARG SEARCH_R1_FAISS_CPU_ARM64_URL=https://files.pythonhosted.org/packages/19/89/a4ba4d285ea4f9b0824bf31ebded3171da08bfcf5376f4771cc5481f72cd/faiss_cpu-1.12.0-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl
+ARG SEARCH_R1_FAISS_CPU_ARM64_SHA256=016e391f49933875b8d60d47f282f2e93d8ea9f9ffbda82467aa771b11a237db
+RUN case "${TARGETARCH}" in \
+      amd64) FAISS_URL="${SEARCH_R1_FAISS_CPU_X86_URL}"; FAISS_SHA256="${SEARCH_R1_FAISS_CPU_X86_SHA256}" ;; \
+      arm64) FAISS_URL="${SEARCH_R1_FAISS_CPU_ARM64_URL}"; FAISS_SHA256="${SEARCH_R1_FAISS_CPU_ARM64_SHA256}" ;; \
+      *) echo "unsupported TARGETARCH for faiss-cpu: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac && \
+    curl -fsSL --retry 5 --retry-all-errors -o /tmp/faiss_cpu.whl "${FAISS_URL}" && \
+    echo "${FAISS_SHA256}  /tmp/faiss_cpu.whl" | sha256sum --check - && \
+    pip install --no-deps /tmp/faiss_cpu.whl && \
+    python3 -c 'import faiss, fastapi, numpy, uvicorn; assert faiss.__version__ == "1.12.0"; index = faiss.IndexFlatIP(4); vectors = numpy.eye(4, dtype="float32"); index.add(vectors); assert index.search(vectors[:1], 1)[1].tolist() == [[0]]' && \
+    rm -f /tmp/faiss_cpu.whl
+
 # The apt copy shadows the pip one in ldconfig and the loader interleaves the two,
 # so transformer_engine gets a mixed set of libcudnn sub-libraries. The packages are
 # held, hence --allow-change-held-packages.
@@ -201,7 +236,7 @@ RUN rm -rf /root/.cache/pip /root/flash-attention
 # the cu13 markers, and sglang's editable install makes them visible to every later pip
 # resolve, which would drag cu13 packages onto a cu12 image.
 RUN cd /sgl-workspace/sglang && \
-    git fetch origin ${SGLANG_BRANCH} && \
+    git fetch https://github.com/${SGLANG_REPO}.git ${SGLANG_BRANCH} && \
     if [ -n "${SGLANG_COMMIT}" ]; then \
       git checkout -f ${SGLANG_COMMIT}; \
     else \

@@ -35,7 +35,7 @@ The Dockerfile is the build recipe: it provides the cu13 defaults and emits one 
 
 ## Build script
 
-`docker/build.py` builds and pushes the images. Select a build with `--variant` and a tag mode with `--image-tag {dev,latest,custom}`. The `VARIANTS` table is the source of truth for each variant's image, target platforms, Dockerfile, and default build-args. Repeatable `--build-arg KEY=VALUE` options are appended after those defaults, so an explicit caller override wins.
+`docker/build.py` builds and pushes the images. Select a build with `--variant` and a tag mode with `--image-tag {dev,latest,custom}`. The `VARIANTS` table is the source of truth for each variant's image, target platforms, Dockerfile, and variant build-args. This branch additionally defaults `--sglang-repo`, `--sglang-branch`, and `--sglang-commit` to the validated B300 SGLang fork. Repeatable `--build-arg KEY=VALUE` options are appended after all of those defaults, so an explicit caller or release-lock override wins.
 
 
 | `--variant`    | Tag (`--image-tag dev`)            | Platforms                     | Notes                                          |
@@ -52,7 +52,7 @@ The cu13 variants share one multi-arch CUDA base image and differ only in platfo
 
 The **Tag** column is for `--image-tag dev`, which also pushes a timestamped `dev-<YYYYMMDDHHMM>` sibling; `latest` swaps the prefix to `latest`, `custom` uses `--custom-tag`. `cu13` / `cu13-x86` / `cu13-aarch64` intentionally share `radixark/miles:dev` — the daily build runs `cu13` (multi-arch), while a single-arch variant overwrites `dev` with one arch when run alone.
 
-A multi-arch build (`cu13`) needs Buildx's `docker-container` driver and is push-only — buildx writes the manifest straight to the registry, it can't load into the local image store. Use `cu13-x86` / `cu13-aarch64` (single-platform; the arm64 one cross-builds via QEMU on an x86 host) for local single-arch iteration. Other flags: `--push`, `--dry-run`, `--dockerfile`, `--custom-tag`, and repeatable `--build-arg KEY=VALUE`.
+A multi-arch build (`cu13`) needs Buildx's `docker-container` driver and is push-only — buildx writes the manifest straight to the registry, it can't load into the local image store. Use `cu13-x86` / `cu13-aarch64` (single-platform; the arm64 one cross-builds via QEMU on an x86 host) for local single-arch iteration. Other flags: `--push`, `--dry-run`, `--dockerfile`, `--custom-tag`, the three explicit SGLang source selectors, and repeatable `--build-arg KEY=VALUE`.
 
 ## PR build check (in `pr-test.yml`)
 

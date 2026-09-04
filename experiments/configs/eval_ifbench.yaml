@@ -1,0 +1,15 @@
+# Official IFBench held-out evaluation. The dataset is staged by
+# experiments/setup/environments/prepare_ifbench.sbatch.
+
+eval:
+  defaults:
+    n_samples_per_eval_prompt: 8
+    max_response_len: 16384
+    temperature: 0.6
+    top_p: 0.95
+    top_k: 20
+
+  datasets:
+    - name: ifbench
+      path: /data/ifbench/IFBench_test_miles.jsonl
+      rm_type: ifbench

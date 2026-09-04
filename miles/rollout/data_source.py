@@ -6,12 +6,15 @@ from pathlib import Path
 
 import torch
 
+from miles.rollout.replay_buffer import decode_group, encode_group
 from miles.utils.data import Dataset
 from miles.utils.misc import load_function
 from miles.utils.processing_utils import load_processor, load_tokenizer
 from miles.utils.types import Sample
 
 logger = logging.getLogger(__name__)
+
+PARTIAL_ROLLOUT_BUFFER_KEY = "partial_rollout_buffer"
 
 
 class DataSource(abc.ABC):
@@ -42,6 +45,10 @@ class DataSource(abc.ABC):
     def get_buffer_length(self) -> int | None:
         """Pending-sample backlog, or None for sources without a buffer."""
         return None
+
+    def checkpoint_retry_buffer_groups(self) -> list[list[Sample]]:
+        """Return retry groups in scheduling order for lifecycle checkpoints."""
+        return []
 
 
 # TODO may further refactor data-loading part later
@@ -125,16 +132,31 @@ class RolloutDataSource(DataSource):
         if not self.args.rollout_global_dataset:
             return
 
-        state_dict = {
+        state_dict = self.checkpoint_state()
+        path = os.path.join(self.args.save, f"rollout/global_dataset_state_dict_{rollout_id}.pt")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        torch.save(state_dict, path)
+
+    def checkpoint_state(self) -> dict:
+        """Return allocation state without transient retry buffers."""
+        return {
             "sample_offset": self.sample_offset,
             "epoch_id": self.epoch_id,
             "sample_group_index": self.sample_group_index,
             "sample_index": self.sample_index,
-            "metadata": self.metadata,
+            "metadata": copy.deepcopy(self.metadata),
         }
-        path = os.path.join(self.args.save, f"rollout/global_dataset_state_dict_{rollout_id}.pt")
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        torch.save(state_dict, path)
+
+    def restore_checkpoint_state(self, state_dict: dict) -> None:
+        """Restore the cursor; pending prompts are restored by their lifecycle owner."""
+        self.sample_offset = state_dict.get("sample_offset", 0)
+        self.epoch_id = state_dict.get("epoch_id", 0)
+        self.sample_group_index = state_dict.get("sample_group_index", 0)
+        self.sample_index = state_dict.get("sample_index", 0)
+        self.metadata = copy.deepcopy(state_dict.get("metadata", {}))
+
+        if self.args.rollout_global_dataset and self.args.rollout_shuffle:
+            self.dataset.shuffle(self.epoch_id)
 
     def load(self, rollout_id=None):
         if not self.args.rollout_global_dataset:
@@ -150,15 +172,8 @@ class RolloutDataSource(DataSource):
 
         logger.info(f"load metadata from {path}")
         logger.info(f"load metadata: {self.metadata}")
-        state_dict = torch.load(path)
-        self.sample_offset = state_dict.get("sample_offset", 0)
-        self.epoch_id = state_dict.get("epoch_id", 0)
-        self.sample_group_index = state_dict.get("sample_group_index", 0)
-        self.sample_index = state_dict.get("sample_index", 0)
-        self.metadata = state_dict.get("metadata", {})
-
-        if self.args.rollout_global_dataset and self.args.rollout_shuffle:
-            self.dataset.shuffle(self.epoch_id)
+        state_dict = torch.load(path, weights_only=False)
+        self.restore_checkpoint_state(state_dict)
 
 
 class RolloutDataSourceWithBuffer(RolloutDataSource):
@@ -205,6 +220,35 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
             ), f"the length of the elements of samples must be equal to n_samples_per_prompt, got {len(samples[i])} != {self.args.n_samples_per_prompt}"
             group = samples[i]  # type: ignore
             self.buffer.append(group)
+
+    def checkpoint_state(self) -> dict:
+        state = super().checkpoint_state()
+        if self._owns_partial_rollout_buffer():
+            state[PARTIAL_ROLLOUT_BUFFER_KEY] = [encode_group(group) for group in self.buffer]
+        return state
+
+    def restore_checkpoint_state(self, state_dict: dict) -> None:
+        super().restore_checkpoint_state(state_dict)
+        self.buffer.clear()
+        if not self._owns_partial_rollout_buffer():
+            return
+        encoded_buffer = state_dict.get(PARTIAL_ROLLOUT_BUFFER_KEY)
+        if encoded_buffer is None:
+            logger.warning("Checkpoint has no synchronous partial-rollout buffer; resuming with an empty buffer")
+            return
+        if not isinstance(encoded_buffer, list):
+            raise RuntimeError(f"Malformed {PARTIAL_ROLLOUT_BUFFER_KEY}: expected list")
+        self.add_samples([decode_group(group) for group in encoded_buffer])
+
+    def _owns_partial_rollout_buffer(self) -> bool:
+        return (
+            getattr(self.args, "partial_rollout", False)
+            and not getattr(self.args, "fully_async", False)
+            and not getattr(self.args, "use_replay_buffer", False)
+        )
+
+    def checkpoint_retry_buffer_groups(self) -> list[list[Sample]]:
+        return copy.deepcopy(self.buffer)
 
     # TODO remove
     def update_metadata(self, metadata: dict):

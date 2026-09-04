@@ -22,10 +22,17 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
 
     prompt_ids = compute_prompt_ids_from_sample(input.state, sample)
 
-    # Handle Partial Rollout resuming
-    if len(sample.response) > 0:
+    # Resume from persisted token ids. Text can be empty for special tokens, so
+    # response_length is the authoritative indication that a prefix exists.
+    if sample.response_length > 0:
         input_ids = sample.tokens
-        sampling_params["max_new_tokens"] -= len(sample.tokens) - len(prompt_ids)
+        persisted_response_tokens = len(sample.tokens) - len(prompt_ids)
+        if persisted_response_tokens != sample.response_length:
+            raise RuntimeError(
+                "Cannot resume single-turn generation from an inconsistent token prefix: "
+                f"response_length={sample.response_length}, persisted_response_tokens={persisted_response_tokens}"
+            )
+        sampling_params["max_new_tokens"] -= persisted_response_tokens
 
         assert sampling_params["max_new_tokens"] >= 0
         if sampling_params["max_new_tokens"] == 0:

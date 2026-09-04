@@ -61,6 +61,7 @@ def make_args(**overrides: Any) -> Namespace:
         reward_key=None,
         log_reward_category=None,
         log_passrate=False,
+        zero_loss_on_truncated=False,
         # placement / colocation
         debug_train_only=False,
         debug_rollout_only=False,

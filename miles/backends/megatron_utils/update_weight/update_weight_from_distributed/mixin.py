@@ -315,7 +315,11 @@ class DistBucketedWeightUpdateMixin:
             if mode != "in_place":
                 ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
 
-            begin_weight_update(self.rollout_engines, self._weight_update_selector)
+            begin_weight_update(
+                self.rollout_engines,
+                self._weight_update_selector,
+                self.weight_version,
+            )
 
     def _finalize_and_resume_engines(self) -> None:
         """Close the weight-update session and resume rollout engines."""
@@ -328,6 +332,7 @@ class DistBucketedWeightUpdateMixin:
                 ]
             )
             end_weight_update(self.rollout_engines)
+            ray.get(self.rollout_manager.set_applied_weight_version.remote(self.weight_version))
             ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
 
     def pop_metrics(self) -> dict[str, float]:

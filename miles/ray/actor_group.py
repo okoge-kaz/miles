@@ -8,6 +8,7 @@ import asyncio
 from ray.util.placement_group import PlacementGroup
 
 from miles.ray.train.actor_factory import allocate_gpus_for_actor
+from miles.ray.train.types import TrainResultWithTiming, unwrap_train_results_with_timing
 from miles.utils.ft_utils.indep_dp import IndepDPInfo
 
 
@@ -74,43 +75,58 @@ class RayTrainGroup:
             indep_dp_info=indep_dp_info,
         )
 
-    async def train(self, rollout_id, rollout_data_pack, external_data=None):
+    async def train(
+        self,
+        rollout_id,
+        rollout_data_pack,
+        external_data=None,
+        collect_wake_up_time: bool = False,
+    ):
         """Do one rollout training"""
         rollout_data_ref = rollout_data_pack["data_ref"]
+        train_kwargs = dict(witness_info=None, attempt=0)
+        if collect_wake_up_time:
+            train_kwargs["collect_wake_up_time"] = True
+
         if external_data is None:
-            return await self._broadcast(
+            results = await self._broadcast(
                 "train",
                 rollout_id,
                 rollout_data_ref,
-                witness_info=None,
-                attempt=0,
+                **train_kwargs,
             )
-        if isinstance(external_data, list):
+        elif isinstance(external_data, list):
             if len(external_data) != len(self._actor_handles):
                 raise ValueError("external_data must contain one payload per train worker")
             refs = [
                 actor.train.remote(
                     rollout_id,
                     rollout_data_ref,
-                    witness_info=None,
-                    attempt=0,
                     external_data=rank_data,
+                    **train_kwargs,
                 )
                 for actor, rank_data in zip(self._actor_handles, external_data, strict=False)
             ]
-            return await asyncio.gather(*refs)
-        return await self._broadcast(
-            "train",
-            rollout_id,
-            rollout_data_ref,
-            witness_info=None,
-            attempt=0,
-            external_data=external_data,
-        )
+            results = await asyncio.gather(*refs)
+        else:
+            results = await self._broadcast(
+                "train",
+                rollout_id,
+                rollout_data_ref,
+                external_data=external_data,
+                **train_kwargs,
+            )
 
-    async def save_model(self, rollout_id, force_sync=False):
+        if not collect_wake_up_time:
+            return results
+        results, local_wake_up_time = unwrap_train_results_with_timing(results)
+        return TrainResultWithTiming(result=results, local_wake_up_time=local_wake_up_time)
+
+    async def save_model(self, rollout_id, force_sync=False, *, write_dist=True, write_hf=True):
         """Save actor model"""
-        await self._broadcast("save_model", rollout_id, force_sync=force_sync)
+        await self._broadcast(
+            "save_model", rollout_id, force_sync=force_sync, write_dist=write_dist, write_hf=write_hf
+        )
 
     async def export_hf(self, rollout_id: int, path: str):
         """Export current weights as an HF checkpoint (collective across all ranks)."""
@@ -121,13 +137,23 @@ class RayTrainGroup:
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
 
+        if getattr(self.args, "use_replay_buffer", False):
+            current_version = await self.rollout_manager.get_current_applied_weight_version.remote()
+            await self.restore_weight_version(current_version)
+
         if self.args.use_fault_tolerance and "rollout" in self.args.ft_components:
             await self.rollout_manager.recover_updatable_engines.remote()
 
         info = await self.rollout_manager.get_updatable_engines_and_lock.remote()
         await self.rollout_manager.health_monitoring_pause.remote()
 
-        await self._broadcast("update_weights", info=info)
+        results = await self._broadcast("update_weights", info=info)
+        if getattr(self.args, "log_colocate_switch_metrics", False):
+            return results
+
+    async def restore_weight_version(self, version: int) -> None:
+        """Align every trainer rank before the next versioned weight push."""
+        await self._broadcast("restore_weight_version", version)
 
     async def reconcile_adapters(self) -> None:
         """Multi-LoRA: reconcile loaded adapters with the controller's active set
@@ -138,7 +164,9 @@ class RayTrainGroup:
         await self._broadcast("wake_up")
 
     async def offload(self):
-        await self._broadcast("sleep")
+        results = await self._broadcast("sleep")
+        if getattr(self.args, "log_colocate_switch_metrics", False):
+            return results
 
     async def clear_memory(self):
         await self._broadcast("clear_memory")

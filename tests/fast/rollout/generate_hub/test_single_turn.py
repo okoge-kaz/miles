@@ -182,6 +182,31 @@ class TestResumedSingleTurn:
             status=Sample.Status.COMPLETED,
         )
 
+    @pytest.mark.parametrize("variant", ["single_turn"], indirect=True)
+    def test_empty_partial_text_still_prefills_from_persisted_tokens(self, variant, generation_env):
+        partial_tokens = [59, 79075]
+        sample = _make_sample(
+            tokens=PROMPT_TOKENS + partial_tokens,
+            response="",
+            response_length=len(partial_tokens),
+            status=Sample.Status.ABORTED,
+        )
+        sample.rollout_log_probs = [-0.0, -0.0078125]
+        generation_env.mock_server.process_fn = lambda _: ProcessResult(text="{8}", finish_reason="stop")
+
+        result = _run_generate(variant, generation_env, sample)
+
+        assert result.requests == [
+            expected_request(
+                variant,
+                input_ids=PROMPT_TOKENS + partial_tokens,
+                sampling_params={"max_new_tokens": 14, "temperature": 0.7},
+            )
+        ]
+        assert result.sample.tokens == PROMPT_TOKENS + partial_tokens + [90, 23, 92]
+        assert result.sample.response_length == 5
+        assert result.sample.response == "{8}"
+
 
 class TestFinishReason:
     @pytest.mark.parametrize(

@@ -12,6 +12,7 @@ from miles.backends.megatron_utils.ft.types import TrainStepOutcome
 from miles.ray.train.actor_factory import allocate_gpus_for_actor
 from miles.ray.train.cell import RayTrainCell
 from miles.ray.train.cell_monitor import create_trainer_cell_health_checker
+from miles.ray.train.types import TrainResultWithTiming, unwrap_train_results_with_timing
 from miles.utils.async_utils import AsyncioGatherUtils
 from miles.utils.audit_utils.checksum_utils import flatten_inference_engine_checksums
 from miles.utils.audit_utils.event_analyzer import analyzer as event_analyzer
@@ -37,6 +38,21 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _RETRY_MAX_ATTEMPTS = 30
+
+
+def _unwrap_cell_train_results_with_timing(results: list) -> tuple[list, float]:
+    """Unwrap worker payloads and return the maximum local timer from surviving cells."""
+    local_wake_up_times = []
+    unwrapped_results = []
+    for cell_results in results:
+        if isinstance(cell_results, BaseException):
+            unwrapped_results.append(cell_results)
+            continue
+        cell_results, cell_wake_up_time = unwrap_train_results_with_timing(cell_results)
+        unwrapped_results.append(cell_results)
+        local_wake_up_times.append(cell_wake_up_time)
+
+    return unwrapped_results, max(local_wake_up_times, default=0.0)
 
 
 class RayTrainGroup:
@@ -132,12 +148,14 @@ class RayTrainGroup:
 
     # ------------------------ API :: train ------------------------
 
-    async def train(self, rollout_id: int, rollout_data_pack):
+    async def train(self, rollout_id: int, rollout_data_pack, collect_wake_up_time: bool = False):
         """Do one rollout training"""
 
         event_analyzer.run_analysis_from_args(self.args)
+        local_wake_up_time = 0.0
 
         async def _fn(attempt: int):
+            nonlocal local_wake_up_time
             witness_info = self._allocate_witness_info(
                 rollout_id=rollout_id,
                 attempt=attempt,
@@ -146,14 +164,20 @@ class RayTrainGroup:
 
             log_structured(logger.info, op="train", phase="start", rollout=rollout_id, attempt=attempt)
             await self._refresh_cells(rollout_id=rollout_id)
-            snapshot_alive_cells, results = await self._execute_all_alive_and_catch(
-                "train",
+            train_kwargs = dict(
                 rollout_id=rollout_id,
                 rollout_data_ref=rollout_data_pack["data_ref"],
                 witness_info=witness_info,
                 attempt=attempt,
             )
+            if collect_wake_up_time:
+                train_kwargs["collect_wake_up_time"] = True
+            snapshot_alive_cells, results = await self._execute_all_alive_and_catch("train", **train_kwargs)
+            if collect_wake_up_time:
+                results, attempt_wake_up_time = _unwrap_cell_train_results_with_timing(results)
             self._check_train_one_attempt(snapshot_alive_cells, results)
+            if collect_wake_up_time:
+                local_wake_up_time = attempt_wake_up_time
 
             self._log_step_end_event(
                 rollout_id=rollout_id,
@@ -164,6 +188,8 @@ class RayTrainGroup:
         await retry(_fn, max_attempts=_RETRY_MAX_ATTEMPTS)
 
         self._test_action_executor.run_after_step(rollout_id=rollout_id)
+        if collect_wake_up_time:
+            return TrainResultWithTiming(result=None, local_wake_up_time=local_wake_up_time)
 
     def _allocate_witness_info(self, *, rollout_id: int, attempt: int, sample_indices):
         if self._witness_allocator is None:
@@ -244,29 +270,45 @@ class RayTrainGroup:
         )
         return [item for sublist in cell_results for item in sublist]
 
-    async def save_model(self, rollout_id: int, force_sync: bool = False):
+    async def save_model(
+        self, rollout_id: int, force_sync: bool = False, *, write_dist: bool = True, write_hf: bool = True
+    ):
         """Save actor model. Only cell 0 saves to avoid file write conflicts."""
         # Catch with vanilla retry: cells w/ exceptions are auto marked errored, thus retry will find the next one
         await retry(
-            lambda _: self._execute_first_alive("save_model", rollout_id, force_sync=force_sync),
+            lambda _: self._execute_first_alive(
+                "save_model", rollout_id, force_sync=force_sync, write_dist=write_dist, write_hf=write_hf
+            ),
             max_attempts=_RETRY_MAX_ATTEMPTS,
         )
 
     async def update_weights(self, rollout_id: int | None = None):
         """Broadcast weights to rollout engines."""
         log_structured(logger.info, op="update_weights", phase="start", rollout=rollout_id)
+        if getattr(self.args, "use_replay_buffer", False):
+            current_version = await self._rollout_manager.get_current_applied_weight_version.remote()
+            await self.restore_weight_version(current_version)
         # TODO: allow using all cells to update weights (instead of first alive cell)
         # Fetch the updatable engines + lock once (like V1 RayActorGroup) so all
         # ranks observe a consistent engine set; the actor releases the lock itself.
         info = await self._rollout_manager.get_updatable_engines_and_lock.remote()
         await self._rollout_manager.health_monitoring_pause.remote()
         # Catch with vanilla retry: cells w/ exceptions are auto marked errored, thus retry will find the next one
-        await retry(
+        results = await retry(
             lambda _: self._execute_first_alive("update_weights", info=info),
             max_attempts=_RETRY_MAX_ATTEMPTS,
         )
 
         await self._maybe_log_inference_engine_weight_checksums(rollout_id=rollout_id)
+        if getattr(self.args, "log_colocate_switch_metrics", False):
+            return results
+
+    async def restore_weight_version(self, version: int) -> None:
+        """Align every failover cell before the next versioned weight push."""
+        _, results = await self._execute_all_alive_and_catch("restore_weight_version", version)
+        errors = [result for result in results if isinstance(result, BaseException)]
+        if errors:
+            raise RuntimeError(f"Failed to restore weight version {version} on trainer cells") from errors[0]
 
     async def _maybe_log_inference_engine_weight_checksums(self, *, rollout_id: int | None) -> None:
         if not is_event_logger_initialized():
@@ -291,7 +333,9 @@ class RayTrainGroup:
         for cell in self._cells:
             cell.health_checker.pause()
         # Catch *without* retry: cells w/ exceptions are auto marked errored, and will not be used
-        await self._execute_all_alive_and_catch("sleep")
+        _cells, results = await self._execute_all_alive_and_catch("sleep")
+        if getattr(self.args, "log_colocate_switch_metrics", False):
+            return results
 
     async def clear_memory(self):
         # Catch *without* retry: cells w/ exceptions are auto marked errored, and will not be used

@@ -425,9 +425,18 @@ collector is enabled:
 | `dashboard_columns/` | A per-token column mirror, so the token view never has to load a whole `.pt` |
 | `trajectory/` | A raw conversation sidecar, written for session and multi-turn runs |
 
-`DumpReader.load_joined()` reunites the rollout and train sides: every rollout sample plus, where
-a train dump exists, its per-token training row, deduplicated across tensor-parallel duplicate
-rank files.
+The train dumps are the expensive entry in that table, and the only one whose cost scales
+with the training world size: every rank writes its own file each rollout, `torch.save` runs
+inline on the training path, and tensor- and context-parallel ranks hold duplicate copies
+that are deduplicated only at read time. `--no-dump-train-data` drops them while keeping the
+collector, the rollout dumps and the trajectory sidecars, which is the cheap configuration
+for a long run. What it costs is the token view and every train-side column — `lp_diff`,
+`imp_ratio`, `advantages`, `returns`, `loss_mask`, entropy — since those exist only on the
+train side.
+
+`DumpReader.load_joined()` reunites the rollout and train sides: every rollout sample plus,
+where a train dump exists, its per-token training row, deduplicated across tensor-parallel
+duplicate rank files.
 
 ### Read side
 
@@ -450,11 +459,195 @@ run does not require reading its entire history.
 
 ### Reading a run that is still being written
 
-Two layers keep a live run from looking like a corrupt one. `DumpReader.rollout_ids()` hides dump
-files younger than ten seconds unless the train companion already exists, and a `torch.load`
-failure on a fresh file raises `DumpStillWriting`, which the server maps to HTTP 503 so the
-client retries. Other failures map to conventional statuses: a missing file or key returns 404,
-and a bad argument returns 400.
+Two layers keep a live run from looking like a corrupt one. `DumpReader.rollout_ids()`
+hides dump files younger than ten seconds unless the train companion already exists, and a
+`torch.load` failure on a fresh file raises `DumpStillWriting`, which the server maps to
+HTTP 503 so the client retries. Other failures map to conventional statuses: a missing file
+or key returns 404, and a bad argument returns 400.
+
+## Collecting telemetry
+
+Add both flags to the training command. `--use-miles-dashboard` asserts that
+`--dump-details` is set, because the telemetry lives under that directory and the
+trajectory views read the dumps.
+
+```bash
+python3 train.py ... \
+    --dump-details /path/to/dump \
+    --use-miles-dashboard \
+    --use-rollout-entropy
+```
+
+`--use-rollout-entropy` is optional. Without it the run still records everything else, and
+the launcher logs a warning that per token entropy will be missing from the token view.
+
+Cadence and scope can be tuned, though the defaults are appropriate for most runs:
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--dashboard-flush-interval` | `5.0` | Collector disk flush cadence, in seconds |
+| `--dashboard-gpu-sample-interval` | `1.0` | NVML sampling cadence, in seconds |
+| `--dashboard-sglang-scrape-interval` | `2.0` | Engine scrape cadence, in seconds |
+| `--dashboard-sglang-scrape-mode` | `auto` | `auto` scrapes `{router}/engine_metrics`, or each engine's `/metrics` under `--use-miles-router`. `router` and `direct` force one or the other |
+| `--dashboard-sglang-metrics` | whitelist | Comma separated override of the scraped sglang metric whitelist |
+| `--dashboard-forward-prometheus` | off | Also push dashboard gauges to the `--use-prometheus` collector for external Grafana |
+| `--no-dump-train-data` | off | Keep `--dump-details` and the collector, but skip the per-rank train dumps |
+
+A curated subset of the run's arguments, including the wandb identifiers, the parallelism
+layout, and the key sglang settings, is persisted into `meta.json` for the dashboard header.
+
+## Viewing
+
+The three runtime dependencies (`fastapi`, `uvicorn`, `polars`) are already present in the
+training image. To view from a machine that does not have them, install those three.
+
+```bash
+python -m miles.dashboard.serve --dump-details /path/to/dump
+```
+
+Then open `http://localhost:7788`. Any machine that can see the directory will do, whether
+that is a login node over NFS or the training node itself. For a remote run, forward the
+port over SSH:
+
+```bash
+ssh -L 7788:localhost:7788 <training-or-login-node>
+```
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--dump-details` | required | The run's `--dump-details` directory |
+| `--follow` | off | Tail the telemetry streams of a still running job |
+| `--port` | `7788` | Listen port |
+| `--host` | `0.0.0.0` | Listen address |
+| `--tensor-lru` | `2` | Rollout steps kept resident in tensor memory |
+| `--cache-dir` | `<dump>/dashboard/cache` | Summary cache directory |
+| `--use-utilization-overview` | auto | Always show the fleet overview instead of the per rank carpet. Enabled automatically above 64 lanes |
+| `--demo` | off | Serve generated demo data, which needs a repository checkout |
+
+## Views
+
+### Metrics
+
+A wandb style category sidebar over every logged metric, plus an `sglang` category holding
+the scraped engine series when one is present. Hover for values and drag to zoom.
+
+Metric keys from `metrics.jsonl` are served as recorded. Per step aggregates derived from the
+dumps are namespaced under `dump/`, which is what allows this view to work for runs where the
+collector was never enabled: `dump/reward_mean`, `dump/reward_std`,
+`dump/response_length_mean`, `dump/truncated_frac`, `dump/zero_std_group_frac`,
+`dump/mean_abs_lp_diff`, `dump/mean_entropy` and `dump/mixed_version_frac`.
+
+Two of those are worth calling out because nothing else reports them per step:
+`dump/zero_std_group_frac` is the fraction of GRPO groups whose reward standard deviation
+collapsed to zero, so a degenerating run is visible as that fraction climbing, and
+`dump/mixed_version_frac` is the fraction of samples that spanned more than one weight
+version, which is the staleness signal that matters in async runs.
+
+### Compute Utilization
+
+Below 64 GPUs, one lane per GPU, and each lane stacks four things:
+
+* **Phase band.** Which of the phases above that rank was in, at that moment. Because the
+  band is per rank rather than per run, a straggler shows up as one lane whose `actor_train`
+  starts late, and a rank stuck in `train_wait` while its peers compute is visible directly.
+* **NVML utilization and memory**, sampled once per second by default, so a phase that holds
+  the GPU without using it is distinguishable from one that is genuinely busy.
+* **An sglang overlay**, selectable between `sglang_num_running_reqs`,
+  `sglang_gen_throughput`, `sglang_token_usage` and `sglang_cache_hit_rate`, drawn against
+  the same time axis as the phases. This is what connects a rollout that ran long to the
+  engine state at the time, for example concurrency collapsing or KV cache saturating.
+* **A request lifecycle strip**, coloured by whether each request was queued, generating, or
+  waiting on a tool call, which separates slow generation from time spent outside the model.
+
+Typical questions it answers: which rank is late into a weight update, whether a phase
+boundary lines up with a utilization dip, whether rollout and training actually overlap in an
+async run, and how much of a step went to `train_wait`.
+
+`gpu_processes` samples additionally record which PIDs hold memory on each GPU, which is how
+a colocated run shows the trainer and the engine sharing a device.
+
+Above 64 GPUs a per lane rendering stops being readable, so the view switches to a scale
+invariant fleet overview showing phase composition and a utilization band. Lanes are
+selected with a small grammar (`g:`, `rank:`, `node:`, `every:`) alongside outlier quick
+picks, so a specific subset can still be brought up on a large cluster.
+
+This view also carries a configuration advisory panel, which compares what the engines
+actually did against what the run was configured to allow:
+
+| Trigger | Suggestion |
+|---|---|
+| Peak `sglang_num_running_reqs` stayed below 30% of `--sglang-max-running-requests` | Lower it, and under `--colocate` note that this frees memory for training |
+| Mean `sglang_cache_hit_rate` below 10%, non colocated runs only | Raise `--sglang-mem-fraction-static` for a bigger KV cache |
+| Mean `sglang_token_usage` above 95% | Warns that KV cache is the throughput bottleneck; more GPUs or a smaller rollout batch |
+
+These are heuristics rather than a guarantee, and the thresholds are expected to be tuned as
+real runs surface false positives and negatives. The panel is empty when no sglang series was
+scraped, since it has nothing to compare against.
+
+### Rollouts
+
+One row per sample for the selected step, sortable and plottable as a scatter. The columns
+come from joining the rollout dump with the training side dump, so both what was generated
+and what the trainer computed from it are on the same row:
+
+| Group | Columns |
+|---|---|
+| Identity and shape | `sample_index`, `group_index`, `status`, `response_length`, `total_length`, `truncated`, `remove_sample` |
+| Reward | `reward`, `raw_reward`, `normalized_reward` |
+| Advantage and return | `adv_mean`, `adv_std`, `return_mean` |
+| Train versus rollout agreement | `mean_abs_lp_diff`, `max_abs_lp_diff`, `mean_imp_ratio` |
+| Entropy | `mean_entropy`, `max_entropy`, `ref_entropy_mean` |
+| Staleness | `weight_version`, `weight_version_min`, `mixed_version`, `turns` |
+| Serving efficiency | `prefix_cache_hit_rate`, `spec_accept_rate`, `non_generation_time`, `tool_calls` |
+| Provenance | `dumped_rank` |
+
+A few of these are the reason to open this view at all:
+
+* **`mean_abs_lp_diff` and `mean_imp_ratio` per sample.** The run level
+  `train_rollout_logprob_abs_diff` tells you the average drifted; these tell you whether one
+  pathological sample carried it, and clicking through shows which tokens did.
+* **`mixed_version` and `weight_version_min`.** In an async run a single sample can span more
+  than one weight version. This flags exactly which samples did, rather than reporting a mean
+  staleness that hides it.
+* **`adv_std` per group.** GRPO degenerates when every sample in a group scores the same, and
+  the group view surfaces those zero variance groups directly.
+* **`non_generation_time` and `tool_calls`.** For agentic runs, how much of a trajectory's
+  wall clock was not the model generating.
+
+An eval tab shows the same shape for eval steps.
+
+### Sample view
+
+Selecting a trajectory from the Rollouts view opens it in two tabs.
+
+`conversation` shows role tagged turns including thinking blocks and tool calls, read from
+the trajectory sidecar. This is the view for reading what the model actually produced,
+including the parts a plain text dump would flatten.
+
+`tokens` loads lazily and aligns the decoded tokens with the per token series, so a metric
+can be read against the text that produced it:
+
+| Series | What it is |
+|---|---|
+| `token_ids`, `token_text` | The tokens, decoded one at a time so the text lines up with the series |
+| `rollout_log_probs` | What the engine reported while generating |
+| `train_log_probs` | What the trainer recomputed for the same tokens |
+| `lp_diff` | Their difference, per token |
+| `imp_ratio` | `exp(lp_diff)`, the per token importance ratio |
+| `entropy`, `ref_entropy` | Policy and reference entropy, present when `--use-rollout-entropy` was set |
+| `ref_log_probs` | Reference policy log probabilities |
+| `advantages`, `returns` | What the trainer assigned to each token |
+| `loss_mask` | Which positions contributed to the loss; masked regions are dimmed rather than hidden |
+
+`lp_diff` being a first class series is the point. A run level
+`train_rollout_logprob_abs_diff` tells you the two engines disagreed on average; this shows
+where, so the answer can be specific: the divergence begins at the first tool call boundary,
+or it is one low probability token rather than spread across the response. The same holds for
+`imp_ratio`, where a single outlier token is what actually drove a clipping fraction.
+
+Token ids and text cover the whole requested slice, while the per token series cover only the
+response region, and `response_offset` marks where the response starts within the returned
+slice. Prompt positions therefore have text but no statistics, which is expected.
 
 ## Runs recorded without the collector
 

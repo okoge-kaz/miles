@@ -28,6 +28,7 @@ from megatron.training.training import get_model
 from miles.backends.megatron_utils.ft.indep_dp import allreduce_grads_and_losses_across_replicas
 from miles.backends.megatron_utils.ft.types import TrainStepOutcome
 from miles.backends.megatron_utils.local_weight_checksum import dump_local_weight_checksums
+from miles.backends.training_utils.update_diagnostics import optimizer_step_diagnostics
 from miles.utils.audit_utils.witness.allocator import WitnessInfo
 from miles.utils.audit_utils.witness.module import witness_dump_and_clear_stale
 from miles.utils.dumper_utils import DumperMegatronUtil, DumperPhase
@@ -37,6 +38,7 @@ from miles.utils.test_utils.ft_test_actions import FTTestActionActorExecutor
 from miles.utils.tracking_utils.structured_log import log_structured
 
 from ...utils.misc import filter_keys
+from ..training_utils.batching_metrics import aggregate_batching_metrics, compute_local_batching_metrics
 from ..training_utils.ci_utils import check_grad_norm, check_kl
 from ..training_utils.data import DataIterator, get_batch
 from ..training_utils.log_utils import aggregate_forward_results, aggregate_train_losses, log_train_step
@@ -488,11 +490,18 @@ def train_one_step(
                 "response_lengths",
                 "loss_masks",
                 "log_probs",
+                "legacy_actor_log_probs",
                 "ref_log_probs",
                 "values",
                 "advantages",
                 "returns",
                 "rollout_log_probs",
+                "sample_staleness",
+                "truncated",
+                "sample_indices",
+                "sample_group_indices",
+                "generation_attempt_numbers",
+                "training_steps",
                 "max_seq_lens",
                 "witness_ids",
                 "opd_reverse_kl",
@@ -502,6 +511,8 @@ def train_one_step(
             args.qkv_format,
             allgather_cp=args.allgather_cp,
         )
+        if getattr(args, "dump_details", None) is not None:
+            batch["optimizer_step_ids"] = [step_id] * len(batch["total_lengths"])
 
         if "adapter_token_counts" in batch:
             from megatron.bridge.peft.multi_lora_layers import set_tokens_per_adapter_slot
@@ -571,6 +582,8 @@ def train_one_step(
 
     outcome = TrainStepOutcome.NORMAL
     grad_norm = 0.0
+    num_zeros_in_grad = None
+    optimizer_step_applied = False
     valid_step = True
     indep_dp_loss_reduced: dict[str, float] = {}
 
@@ -619,9 +632,11 @@ def train_one_step(
             grad_norm = step_stepped_adapter_slots(
                 args, model, optimizer, data_iterator[0].rollout_data, rollout_id, step_id
             )
+            optimizer_step_applied = True
         else:
             # Update parameters.
             update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+            optimizer_step_applied = bool(update_successful)
 
             # Update learning rate.
             assert update_successful
@@ -653,6 +668,14 @@ def train_one_step(
                 indep_dp_loss_reduced
                 if parallel_state.indep_dp.size > 1
                 else aggregate_train_losses(losses_reduced, metric_num_rollouts)
+            )
+            loss_reduced.update(
+                optimizer_step_diagnostics(
+                    args,
+                    optimizer_step_applied=optimizer_step_applied,
+                    grad_norm=grad_norm,
+                    num_zeros_in_grad=num_zeros_in_grad,
+                )
             )
             return loss_reduced, grad_norm, outcome
 
@@ -774,6 +797,19 @@ def train(
 
     # Run training iterations till done.
     for step_id in range(num_steps_per_rollout):
+        local_batching_metrics = compute_local_batching_metrics(
+            rollout_data=data_iterator[0].rollout_data,
+            micro_batch_size=data_iterator[0].micro_batch_size,
+            micro_batch_indices=data_iterator[0].micro_batch_indices,
+            num_microbatches_by_step=num_microbatches,
+            step_id=step_id,
+            qkv_format=args.qkv_format,
+            tp_size=parallel_state.tp.size,
+            cp_size=parallel_state.cp.size,
+            pad_multiplier=args.data_pad_size_multiplier,
+            allgather_cp=args.allgather_cp,
+        )
+        batching_metrics = aggregate_batching_metrics(local_batching_metrics, parallel_state.effective_dp)
 
         # Run training step.
         loss_dict, grad_norm, train_step_outcome = train_one_step(
@@ -829,6 +865,7 @@ def train(
             role_tag = "" if role == "actor" else f"{role}-"
 
             extra_metrics = {}
+            extra_metrics.update(batching_metrics)
             if args.enable_mtp_training and mtp_losses is not None:
                 extra_metrics["mtp_loss"] = mtp_losses
 

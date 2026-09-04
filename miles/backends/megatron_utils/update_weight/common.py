@@ -408,9 +408,22 @@ def collect_named_tensors_for_weight_transfer(
             yield name, tensor
 
 
-def begin_weight_update(rollout_engines: Sequence[ActorHandle], selector: str = "all"):
+def begin_weight_update(
+    rollout_engines: Sequence[ActorHandle],
+    selector: str = "all",
+    weight_version: int | None = None,
+) -> None:
     """Open a weight-update session on the selected rollout engines (restore packed weights)."""
-    ray.get([engine.begin_weight_update.remote(selector=selector) for engine in rollout_engines])
+    results = ray.get(
+        [
+            engine.begin_weight_update.remote(
+                selector=selector,
+                weight_version=None if weight_version is None else str(weight_version),
+            )
+            for engine in rollout_engines
+        ]
+    )
+    _check_weight_sync_results(results, is_lora=False)
 
 
 def weight_update_selector(args) -> str:
@@ -426,7 +439,8 @@ def weight_update_selector(args) -> str:
 
 def end_weight_update(rollout_engines: Sequence[ActorHandle]):
     """Close the weight-update session (post-load + quant post-process on the full model)."""
-    ray.get([engine.end_weight_update.remote() for engine in rollout_engines])
+    results = ray.get([engine.end_weight_update.remote() for engine in rollout_engines])
+    _check_weight_sync_results(results, is_lora=False)
 
 
 def _check_weight_sync_results(results: list, *, is_lora: bool) -> None:
@@ -439,10 +453,18 @@ def _check_weight_sync_results(results: list, *, is_lora: bool) -> None:
     for result in results:
         if isinstance(result, Mapping):
             success = result.get("success")
-            error_msg = result.get("error_message") or result.get("error") or "unknown error"
+            error_msg = result.get("error_message") or result.get("error") or result.get("message") or "unknown error"
+        elif isinstance(result, (list, tuple)) and result:
+            success = result[0]
+            error_msg = result[1] if len(result) > 1 else "unknown error"
         elif hasattr(result, "success"):
             success = result.success
-            error_msg = getattr(result, "error_message", "unknown error")
+            error_msg = (
+                getattr(result, "error_message", None)
+                or getattr(result, "error", None)
+                or getattr(result, "message", None)
+                or "unknown error"
+            )
         else:
             continue
 

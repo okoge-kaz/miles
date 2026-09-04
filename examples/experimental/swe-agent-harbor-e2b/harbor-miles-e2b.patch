@@ -1,0 +1,123 @@
+diff --git a/agent_server/models.py b/agent_server/models.py
+index bc42256..180cb7e 100644
+--- a/agent_server/models.py
++++ b/agent_server/models.py
+@@ -14,0 +15 @@ class RunRequest(BaseModel):
++    task_digest: str | None = None
+diff --git a/agent_server/trial_runner.py b/agent_server/trial_runner.py
+index 18ab764..4011845 100644
+--- a/agent_server/trial_runner.py
++++ b/agent_server/trial_runner.py
+@@ -15,0 +16 @@ import sys
++import tomllib
+@@ -29,0 +31,5 @@ from agent_server.state import _state, TrackedSessionServer
++from miles.rollout.harbor.environment_config import (
++    build_harbor_environment_config,
++    environment_uses_local_docker,
++)
++from miles.rollout.harbor.worker import stop_harbor_trial_worker
+@@ -37,0 +44 @@ _SAFE_INSTANCE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
++_SAFE_TASK_DIGEST = re.compile(r"^[0-9a-f]{64}$")
+@@ -47,0 +55,26 @@ def _env_flag(var: str) -> bool:
++def _trusted_task_digest(task_path: Path) -> str | None:
++    """Read a Miles task binding from trusted Harbor task metadata."""
++    config_path = task_path / "task.toml"
++    try:
++        config = tomllib.loads(config_path.read_text(encoding="utf-8"))
++    except (OSError, tomllib.TOMLDecodeError) as exc:
++        raise ValueError(f"Cannot read trusted task config: {config_path}") from exc
++    metadata = config.get("metadata") or {}
++    digest = metadata.get("task_digest") if isinstance(metadata, dict) else None
++    if digest is None:
++        return None
++    if not isinstance(digest, str) or _SAFE_TASK_DIGEST.fullmatch(digest) is None:
++        raise ValueError(f"Invalid trusted task_digest in {config_path}")
++    return digest
++
++
++def _task_digest_matches(task_path: Path, requested_digest: str | None) -> bool:
++    """Bind a Miles prompt row to the exact trusted task materialization."""
++    trusted_digest = _trusted_task_digest(task_path)
++    if trusted_digest is None:
++        return requested_digest is None
++    if requested_digest is None or _SAFE_TASK_DIGEST.fullmatch(requested_digest) is None:
++        return False
++    return hmac.compare_digest(trusted_digest, requested_digest)
++
++
+@@ -104,36 +137,2 @@ def _environment_config() -> Any:
+-    """Build the trial environment, including an optional memory override.
+-
+-    ``HARBOR_ENV_TYPE`` selects the backend (``docker`` by default, or
+-    ``daytona``). ``HARBOR_OVERRIDE_MEMORY_MB`` replaces the task's declared
+-    memory limit for either backend. This is useful for memory-heavy agents,
+-    while leaving it unset preserves each task's normal limit.
+-    """
+-    from harbor.models.trial.config import EnvironmentConfig
+-
+-    override_memory_mb = None
+-    if raw_memory_mb := os.getenv("HARBOR_OVERRIDE_MEMORY_MB"):
+-        override_memory_mb = int(raw_memory_mb)
+-        if override_memory_mb <= 0:
+-            raise ValueError(
+-                "HARBOR_OVERRIDE_MEMORY_MB must be a positive integer, "
+-                f"got {raw_memory_mb!r}"
+-            )
+-
+-    if os.getenv("HARBOR_ENV_TYPE", "docker").lower() == "daytona":
+-        disk_gb = int(os.getenv("HARBOR_DAYTONA_DISK_GB", "10"))
+-        auto_snap = os.getenv("HARBOR_DAYTONA_AUTO_SNAPSHOT", "1").lower() in ("1", "true", "t")
+-        return EnvironmentConfig(
+-            type="daytona",
+-            delete=os.getenv("HARBOR_KEEP_SANDBOX", "false").lower() not in ("true", "1", "t"),
+-            override_memory_mb=override_memory_mb,
+-            override_storage_mb=disk_gb * 1024,
+-            kwargs={"auto_snapshot": True} if auto_snap else {},
+-        )
+-    return EnvironmentConfig(
+-        type="docker",
+-        delete=os.getenv("HARBOR_DELETE_CONTAINERS", "false").lower() in ("true", "1", "t"),
+-        override_memory_mb=override_memory_mb,
+-        # Baseline allowlist: covers agent *setup* (in-sandbox installs) and the
+-        # verifier, which AgentConfig.extra_allowed_hosts does not.
+-        extra_allowed_hosts=_allowed_hosts("HARBOR_ENV_ALLOWED_HOSTS"),
+-    )
++    """Build Docker, Daytona, or E2B configuration through Miles."""
++    return build_harbor_environment_config()
+@@ -248,0 +248,4 @@ async def _run_trial(request: RunRequest) -> dict[str, Any]:
++        if not _task_digest_matches(task_path, request.task_digest):
++            logger.error("Task digest mismatch for instance_id=%r", raw_id)
++            return _error_response("TaskDigestMismatch")
++
+@@ -298 +301 @@ async def _run_trial(request: RunRequest) -> dict[str, Any]:
+-        # compose-project teardown is docker-only; daytona sandboxes are ephemeral
++        # Compose-project teardown only applies to the local Docker backend.
+@@ -300 +303 @@ async def _run_trial(request: RunRequest) -> dict[str, Any]:
+-        if os.getenv("HARBOR_ENV_TYPE", "docker").lower() != "daytona":
++        if environment_uses_local_docker():
+@@ -354,5 +357,3 @@ async def run_trial_in_subprocess(request: RunRequest) -> dict[str, Any]:
+-        # On /flush the awaiting task is cancelled; the child is NOT reaped
+-        # automatically, so it would keep running the full trial (and holding a
+-        # Daytona sandbox) until it finishes. Kill and reap it before re-raising.
+-        proc.kill()
+-        await proc.wait()
++        # Give Harbor's shielded environment cleanup a bounded chance to stop
++        # remote sandboxes before falling back to a hard process kill.
++        await stop_harbor_trial_worker(proc)
+diff --git a/miles_agent_server.py b/miles_agent_server.py
+index 687526d..c173b59 100644
+--- a/miles_agent_server.py
++++ b/miles_agent_server.py
+@@ -64,0 +65 @@ from agent_server.trial_runner import (
++from miles.rollout.harbor.environment_config import environment_uses_local_docker
+@@ -85,3 +86,2 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+-    # no local docker in daytona mode → skip the docker build-cache prune loop
+-    _daytona = os.getenv("HARBOR_ENV_TYPE", "docker").lower() == "daytona"
+-    prune_task = None if _daytona else asyncio.create_task(_docker_prune_loop())
++    # Cloud environments own their lifecycle and have no local Docker cache.
++    prune_task = asyncio.create_task(_docker_prune_loop()) if environment_uses_local_docker() else None
+@@ -391,2 +391,2 @@ def main():
+-    # daytona runs in the cloud (no local docker) → skip the Docker Hub login guard
+-    if os.getenv("HARBOR_ENV_TYPE", "docker").lower() != "daytona":
++    # Cloud environments build and run remotely, so no local Docker login is needed.
++    if environment_uses_local_docker():

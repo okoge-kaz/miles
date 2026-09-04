@@ -162,25 +162,47 @@ cannot hide it.
 
 ### Arguments: Buffer options
 
-Buffer capacity bounds how far generation can run ahead of training:
+Fully async has two compatible data paths. If `--fully-async-queue-type` is
+unset, Miles uses the v0.1.0 replaceable `DataBuffer` path described above.
+This remains the default and is controlled by:
 
 | Flag | Effect |
 |---|---|
 | `--async-data-buffer-capacity-factor` | Buffer holds `floor(factor * rollout_batch_size)` groups, `2.0` by default. When it is full the producer blocks until training consumes |
+| `--max-weight-staleness` | Maximum gap between a group's oldest weight version and the current engine version. Unset by default, which disables the filter |
+| `--async-unused-samples-handler` | What happens to a group training does not use, either aborted or too stale. The default `drop` discards it; `retry` recycles its prompts into the data source for regeneration. Dynamic-filter rejects are always dropped |
+| `--custom-async-data-buffer-path` | Replaces `DefaultDataBuffer`; the custom implementation owns storage, ordering, filtering, and unused-group handling |
 
-Staleness control decides which of those groups training is allowed to see:
+Set `--fully-async-queue-type` explicitly to select a B300 queue algorithm. This
+path adds policy-version lifecycle metadata, selectable staleness provenance
+(including first prefill), queue telemetry, and replay-buffer persistence while
+retaining the v0.1.0 submission scheduler and evaluation behavior:
 
 | Flag | Effect |
 |---|---|
-| `--max-weight-staleness` | Maximum gap between a group's oldest weight version and the current engine version. Unset by default, which disables the filter |
-| `--async-unused-samples-handler` | What happens to a group training does not use, either aborted or too stale. The default `drop` discards it; `retry` recycles its prompts into the data source for regeneration. Dynamic-filter rejects are always dropped |
+| `--fully-async-queue-type queue-recycle` | Completion-FIFO queue. At dequeue it admits only groups satisfying `D - R < max_weight_staleness`; rejected prompts are regenerated |
+| `--fully-async-queue-type queue-max` | Completion-FIFO queue with a prefill-referenced age cutoff. It admits equality and drops only `D - F > max_weight_staleness` |
+| `--fully-async-queue-type queue-drop` | Bounded completion-FIFO queue that evicts the oldest completed group on overflow |
+| `--training-buffer-queue-size` | Backpressure capacity in completed prompt groups for `queue-recycle` and `queue-max` (default 1000) |
+| `--fully-async-queue-factor` | `queue-drop` capacity measured in training batches |
+| `--staleness-reference` | Selects `completion`, `submission`, or scheduler-authoritative `prefill` as `R`; use `prefill` to control the full realized policy lag from first prefill |
+| `--use-replay-buffer` | Saves prepared batches, partial drains, ready groups, active prompt leases, data-source state, and applied policy version with the training checkpoint |
 
-When those knobs are not enough, `--custom-async-data-buffer-path` replaces the buffer
-itself. This is a larger step than setting any flag above: your `DataBuffer` subclass
-takes over all three methods and therefore every group-level decision, and the flags in
-this section apply only if your class reads them. The one decision that stays outside is
-`--rollout-sample-filter-path`, which runs on the assembled batch rather than on
-individual groups.
+For the intended `queue-recycle` prefill policy, let `F` be the first-prefill
+version and `D` the version observed while fetching training data. Admission is
+strict: `D - F < M`, where `M = max_weight_staleness`. The fetch precedes the
+scheduled policy update, so the normal prefetched step trains at `T = D + 1` and
+therefore satisfies `T - F <= M`. At startup there is no preceding update and
+`T = D`. The minimum usable strict bound is 1.
+
+Replay persistence is available only with an explicit built-in queue type, not a
+custom `DataBuffer`. Its purpose is to restore the same queued and prepared
+population after a training restart, avoiding an artificial jump in the realized
+training-staleness distribution. See the replay-buffer notes under
+`experiments/notes/replay-buffer.md` for its checkpoint and continuation contract.
+
+On either path, `--rollout-sample-filter-path` remains outside the buffer and runs
+on the assembled batch.
 
 ## Evaluation
 
@@ -297,6 +319,11 @@ alongside the standard rollout metrics:
 
 ```text
 rollout/fully_async/queue_size
+```
+
+The default v0.1.0 `DataBuffer` path additionally reports:
+
+```text
 rollout/fully_async/aborted_groups_filtered
 rollout/fully_async/stale_groups_filtered
 rollout/fully_async/avg_staleness, rollout/fully_async/max_staleness
@@ -307,6 +334,29 @@ rollout/dynamic_filter/drop_<reason>
 The `avg_staleness` and `max_staleness` pair covers the groups training actually
 consumed, while the `buffer_` pair covers the groups still sitting in the buffer when
 the step drained it.
+
+An explicit B300 queue path instead reports its lifecycle and control metrics:
+
+```text
+rollout/fully_async/aborted_groups_recycled
+rollout/fully_async/stale_groups_recycled
+fully_async/train_weight_version
+staleness/rollout/{mean,max,p50,p90,p99}
+staleness/{pre_queue,in_queue,total}/{mean,max,p50,p90,p99}
+staleness/bound_exceeded_{samples,groups,tokens}
+staleness/bound_exceeded_sample_frac
+```
+
+With `--staleness-reference prefill`, let `F` be first-prefill version, `Q` the
+group-ready version, `D` dequeue version, and `T` scheduled train version. The
+logged decomposition is `pre_queue = Q - F`, `in_queue = T - Q`, and
+`total = T - F`. `staleness/rollout/*` uses the same train-time endpoint for all
+groups examined before admission. Under the normal `queue-recycle` prefetch
+schedule, `T = D + 1`; the strict dequeue check `D - F < max` therefore ensures
+`T - F <= max`.
+
+A `No completed rollout groups for <N>s` warning in the logs means the drain is
+starved — rollout is the bottleneck.
 
 A `queue_size` pinned at zero means rollout is the bottleneck, so scale rollout capacity
 or lower per-sample generation cost. A `queue_size` pinned at capacity means training is

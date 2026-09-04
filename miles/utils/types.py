@@ -43,6 +43,15 @@ class Sample:
     reward: float | dict[str, Any] | None = None
     loss_mask: list[int] | None = None
     weight_versions: list[str] = field(default_factory=list)
+    first_prefill_weight_versions: list[int] = field(default_factory=list)
+    min_forward_weight_versions: list[int] = field(default_factory=list)
+    max_forward_weight_versions: list[int] = field(default_factory=list)
+    last_forward_weight_versions: list[int] = field(default_factory=list)
+    response_weight_versions: list[str] = field(default_factory=list)
+    # One entry per generation call. Each inner list contains compact
+    # [response_start, response_end, weight_version] segments and is populated
+    # only when the SGLang boundary feature is enabled.
+    response_weight_version_segments: list[list[list[int]]] = field(default_factory=list)
     rollout_log_probs: list[float] | None = None  # Log probabilities from rollout engine
     rollout_routed_experts: numpy.ndarray | None = (
         None  # Routed experts from rollout engine. shape: (num_tokens-1, num_layers, moe_router_topk), dtype=int32
@@ -70,6 +79,10 @@ class Sample:
     generate_function_path: str | None = None
     # metadata used during training, e.g., what loss to use for this sample.
     train_metadata: dict | None = None
+    # How many times this prompt has been regenerated from scratch. Identity, not
+    # output: `reset_for_retry` must leave it alone or the count resets on the very
+    # event it is counting.
+    retry_count: int = 0
 
     # MultiLoRA: which adapter this sample trains/infers with
     adapter: AdapterRef | None = None
@@ -225,6 +238,7 @@ class Sample:
         assert (
             n <= self.response_length
         ), f"cannot strip {n} tokens: only {self.response_length} output tokens available"
+        self._clip_complete_response_weight_version_segments(retained_tokens=self.response_length - n)
         self.tokens = self.tokens[:-n]
         self.response_length -= n
         if self.rollout_log_probs is not None:
@@ -243,12 +257,37 @@ class Sample:
         if self.rollout_indexer_topk is not None:
             self.rollout_indexer_topk = self.rollout_indexer_topk[:-n]
 
+    def _clip_complete_response_weight_version_segments(self, *, retained_tokens: int) -> None:
+        """Clip exact provenance only when it covers every response token."""
+        covered_tokens = sum(
+            end - start for turn in self.response_weight_version_segments for start, end, _version in turn
+        )
+        if covered_tokens != self.response_length:
+            return
+
+        remaining = retained_tokens
+        clipped_turns = []
+        for turn in self.response_weight_version_segments:
+            clipped_segments = []
+            for start, end, version in turn:
+                if remaining <= 0:
+                    break
+                retained_end = min(end, remaining)
+                if retained_end > start:
+                    clipped_segments.append([start, retained_end, version])
+            clipped_turns.append(clipped_segments)
+            remaining -= sum(end - start for start, end, _version in turn)
+        self.response_weight_version_segments = clipped_turns
+
     def reset_for_retry(self) -> None:
         """Reset generated outputs so the original prompt can be re-sampled.
 
         Keeps identity / prompt fields (group_index, index, prompt, label,
-        multimodal_inputs, metadata, generate_function_path, routing_key) and
-        restores everything else to dataclass defaults.
+        multimodal_inputs, metadata, generate_function_path, routing_key,
+        retry_count) and restores everything else to dataclass defaults.
+
+        `retry_count` is deliberately not reset: it counts calls to this method,
+        so zeroing it here would make it permanently zero.
         """
         self.tokens = []
         self.multimodal_train_inputs = None
@@ -257,6 +296,12 @@ class Sample:
         self.reward = None
         self.loss_mask = None
         self.weight_versions = []
+        self.first_prefill_weight_versions = []
+        self.min_forward_weight_versions = []
+        self.max_forward_weight_versions = []
+        self.last_forward_weight_versions = []
+        self.response_weight_versions = []
+        self.response_weight_version_segments = []
         self.rollout_log_probs = None
         self.rollout_routed_experts = None
         self.rollout_indexer_topk = None
@@ -273,6 +318,18 @@ class Sample:
         numeric = [int(v) for v in self.weight_versions if str(v).isdigit()]
         return min(numeric) if numeric else None
 
+    @property
+    def newest_weight_version(self) -> int | None:
+        """Maximum weight version across all turns (generation calls) for this trajectory.
+
+        The version this trajectory was *finished* under. Each entry is stamped by
+        the engine when it builds a reply, so for a group this is the version at
+        which the last sample landed -- which is when the group becomes available
+        to the trainer.
+        """
+        numeric = [int(v) for v in self.weight_versions if str(v).isdigit()]
+        return max(numeric) if numeric else None
+
     def update_from_meta_info(self, args, meta_info: dict):
         """
         Update the sample with new information from meta_info returned by the rollout engine.
@@ -285,8 +342,7 @@ class Sample:
         # Collect prefix cache statistics
         self.prefix_cache_info.add(meta_info=meta_info)
 
-        if "weight_version" in meta_info:
-            self.weight_versions.append(meta_info["weight_version"])
+        self.update_policy_version_from_meta_info(meta_info)
 
         match meta_info["finish_reason"]["type"]:
             case "length":
@@ -295,6 +351,29 @@ class Sample:
                 self.status = Sample.Status.ABORTED
             case "stop":
                 self.status = Sample.Status.COMPLETED
+
+    def update_policy_version_from_meta_info(self, meta_info: dict) -> None:
+        """Append per-generation policy provenance returned by SGLang."""
+        if "weight_version" in meta_info:
+            self.weight_versions.append(meta_info["weight_version"])
+
+        for key, field_name in (
+            ("first_prefill_weight_version", "first_prefill_weight_versions"),
+            ("min_forward_weight_version", "min_forward_weight_versions"),
+            ("max_forward_weight_version", "max_forward_weight_versions"),
+            ("last_forward_weight_version", "last_forward_weight_versions"),
+        ):
+            if key in meta_info:
+                getattr(self, field_name).append(int(meta_info[key]))
+
+        if "response_weight_version" in meta_info:
+            self.response_weight_versions.append(str(meta_info["response_weight_version"]))
+        if "response_weight_version_segments" in meta_info:
+            segments = [
+                [int(start), int(end), int(version)]
+                for start, end, version in meta_info["response_weight_version_segments"]
+            ]
+            self.response_weight_version_segments.append(segments)
 
 
 @dataclass(frozen=True)

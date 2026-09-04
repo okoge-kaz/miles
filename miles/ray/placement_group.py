@@ -180,6 +180,10 @@ async def create_training_models(args, pgs, rollout_manager):
     await actor_model.set_rollout_manager()
     if args.rollout_global_dataset:
         await rollout_manager.load.remote(args.start_rollout_id - 1)
+    if getattr(args, "use_replay_buffer", False):
+        restored_version = await rollout_manager.get_restored_applied_weight_version.remote()
+        if restored_version is not None:
+            await actor_model.restore_weight_version(restored_version)
 
     return actor_model, critic_model
 

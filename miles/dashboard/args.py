@@ -34,6 +34,23 @@ _SNAPSHOT_KEYS = (
     "router_policy",
     "sglang_router_policy",
     "router_assignment_mode",
+    # Off-policy knobs. A run has to be attributable to a cell of an experiment
+    # grid from its own artifacts; without these the only record of what a run
+    # was is its directory name, which is built from a subset of them.
+    "seed",
+    "rollout_seed",
+    "lr",
+    "max_weight_staleness",
+    "training_buffer_queue_size",
+    "pause_generation_mode",
+    "num_steps_per_rollout",
+    "rollout_max_response_len",
+    "advantage_estimator",
+    "eps_clip",
+    "eps_clip_high",
+    "use_tis",
+    "fully_async",
+    "true_on_policy_mode",
 )
 
 

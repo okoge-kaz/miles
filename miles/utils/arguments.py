@@ -2,6 +2,7 @@ import argparse
 import json
 import logging
 import os
+from collections.abc import Sequence
 from typing import Any
 
 import yaml
@@ -11,6 +12,12 @@ from miles.backends.sglang_utils.arguments import add_sglang_arguments, collect_
 from miles.backends.sglang_utils.arguments import validate_args as sglang_validate_args
 from miles.dashboard.args import add_dashboard_arguments, validate_dashboard_args
 from miles.rollout.checkpoint_eval import is_checkpoint_eval_fn
+from miles.rollout.queue_policy import (
+    DEFAULT_TRAINING_BUFFER_QUEUE_SIZE,
+    FULLY_ASYNC_QUEUE_POLICIES,
+    validate_fully_async_queue_args,
+)
+from miles.rollout.replay_buffer import REPLAY_BUFFER_INFLIGHT, REPLAY_BUFFER_ROLLOUT, REPLAY_BUFFER_TYPES
 from miles.utils.chat_template_utils.tito_tokenizer import TITOTokenizerType
 from miles.utils.environ import enable_experimental_ft_trainer, use_legacy_rollout_v1
 from miles.utils.eval_config import EvalDatasetConfig, build_eval_dataset_configs, ensure_dataset_list
@@ -25,6 +32,16 @@ from miles.utils.object_store import ObjectStoreBackend
 from miles.utils.tracking_utils.ci_history import RECORD_DIR_ENV
 
 logger = logging.getLogger(__name__)
+
+_REPLAY_BUFFER_VALIDATED_CUSTOM_RM_PATHS = frozenset(
+    {
+        "experiments.src.reward_sets.code.reward",
+        "experiments.src.reward_sets.instruction_following.reward",
+        "experiments.src.reward_sets.math_code_stem.reward",
+        "experiments.src.reward_sets.stem.reward",
+        "experiments.src.reward_sets.tool_call_pivot.reward",
+    }
+)
 
 
 def resolve_rollout_function_paths(args) -> tuple[str, str]:
@@ -41,12 +58,99 @@ def resolve_rollout_function_paths(args) -> tuple[str, str]:
     return rollout_path, eval_path
 
 
+def _validate_replay_buffer(args) -> None:
+    replay_buffer_enabled = getattr(args, "use_replay_buffer", False)
+    replay_buffer_type = getattr(args, "replay_buffer_type", REPLAY_BUFFER_ROLLOUT)
+    if replay_buffer_type not in REPLAY_BUFFER_TYPES:
+        raise ValueError(f"--replay-buffer-type must be one of {REPLAY_BUFFER_TYPES}, got {replay_buffer_type!r}")
+    if replay_buffer_enabled and not args.fully_async:
+        raise ValueError("--use-replay-buffer requires --fully-async")
+    if not replay_buffer_enabled:
+        if replay_buffer_type != REPLAY_BUFFER_ROLLOUT:
+            raise ValueError("--replay-buffer-type inflight requires --use-replay-buffer")
+        return
+
+    checks = (
+        (args.train_backend == "megatron", "the Megatron training backend"),
+        (args.rollout_global_dataset, "the global rollout dataset"),
+        (
+            args.data_source_path == "miles.rollout.data_source.RolloutDataSourceWithBuffer",
+            "--data-source-path miles.rollout.data_source.RolloutDataSourceWithBuffer",
+        ),
+        (args.advantage_estimator == "grpo", "--advantage-estimator grpo"),
+        (not args.use_critic, "a critic-free GRPO run"),
+        (
+            args.custom_rm_path is None or args.custom_rm_path in _REPLAY_BUFFER_VALIDATED_CUSTOM_RM_PATHS,
+            "the built-in reward-model function or a replay-validated custom reward-model function",
+        ),
+        (args.custom_reward_post_process_path is None, "the built-in reward post-processing path"),
+        (args.custom_convert_samples_to_train_data_path is None, "the built-in train-data conversion path"),
+        (args.rollout_data_postprocess_path is None, "the built-in rollout data post-processing path"),
+        (args.buffer_filter_path is None, "the default FIFO rollout retry buffer"),
+        (args.rollout_sample_filter_path is None, "no post-generation rollout sample filter"),
+        (
+            getattr(args, "custom_async_data_buffer_path", None) is None,
+            "the built-in fully-async queue rather than --custom-async-data-buffer-path",
+        ),
+        (
+            getattr(args, "fully_async_queue_type", None) in FULLY_ASYNC_QUEUE_POLICIES,
+            "an explicit --fully-async-queue-type",
+        ),
+        (not args.load_debug_rollout_data, "live rollout generation rather than --load-debug-rollout-data"),
+        (args.ci_inject_rollout_data_path is None, "no CI rollout-data injection"),
+        (not args.debug_train_only, "rollout generation enabled"),
+        (not args.debug_rollout_only, "trainer consumption enabled"),
+        (not getattr(args, "debug_skip_weight_update", False), "real rollout-engine weight updates"),
+        (getattr(args, "lora_rank", 0) <= 0, "dense model training rather than LoRA"),
+        (
+            not any(
+                getattr(args, flag, False)
+                for flag in (
+                    "use_routing_replay",
+                    "use_rollout_routing_replay",
+                    "use_indexer_replay",
+                    "use_rollout_indexer_replay",
+                )
+            ),
+            "no routing/indexer replay",
+        ),
+        (args.update_weight_transfer_mode != "disk-delta", "a non-delta weight transfer mode"),
+        (args.update_weights_interval == 1, "--update-weights-interval 1"),
+        (args.save is not None, "--save for the durable replay buffer"),
+        (
+            args.save_interval is not None and args.save_interval > 0,
+            "a positive --save-interval for the durable replay buffer",
+        ),
+        (args.replay_buffer_keep_last >= 1, "a positive replay-buffer retention count"),
+    )
+    for valid, requirement in checks:
+        if not valid:
+            raise ValueError(f"--use-replay-buffer requires {requirement}")
+
+    custom_generate_path = getattr(args, "custom_generate_function_path", None)
+    if replay_buffer_type == REPLAY_BUFFER_INFLIGHT and custom_generate_path is not None:
+        try:
+            custom_generate = load_function(custom_generate_path)
+        except (AttributeError, ImportError, ValueError) as error:
+            raise ValueError(
+                "--replay-buffer-type inflight could not load the custom generate function "
+                f"{custom_generate_path!r}"
+            ) from error
+        if getattr(custom_generate, "supports_inflight_replay", False) is not True:
+            raise ValueError(
+                "--replay-buffer-type inflight requires the built-in generate function or a custom "
+                "generate function declaring supports_inflight_replay=True"
+            )
+
+
 def _resolve_rollout_functions(args) -> None:
     if args.partial_rollout and args.mask_offpolicy_in_partial_rollout and not use_legacy_rollout_v1():
         raise ValueError(
             "--mask-offpolicy-in-partial-rollout does not re-extend the loss mask on the "
             "class-based rollout path yet; set MILES_USE_LEGACY_ROLLOUT_V1=1"
         )
+    validate_fully_async_queue_args(args)
+    _validate_replay_buffer(args)
     if args.fully_async:
         assert (
             not use_legacy_rollout_v1()
@@ -147,6 +251,33 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "Whether to colocate the inference engines and the actor. "
                     "Turning this on will also set --offload to true."
+                ),
+            )
+            parser.add_argument(
+                "--log-colocate-switch-metrics",
+                action="store_true",
+                default=False,
+                help=(
+                    "Log opt-in colocated switch phase timings. The timers only wrap existing blocking operations; "
+                    "metrics are emitted after the measured switch completes."
+                ),
+            )
+            parser.add_argument(
+                "--log-colocate-transfer-bytes",
+                action="store_true",
+                default=False,
+                help=(
+                    "Log opt-in per-rank byte summaries for colocated trainer offload, actor snapshots, and "
+                    "actor-to-rollout weight payloads. Requires --log-colocate-switch-metrics."
+                ),
+            )
+            parser.add_argument(
+                "--log-memory-usage",
+                action="store_true",
+                default=False,
+                help=(
+                    "Log hot-path GPU and CPU memory snapshots around offload, wake-up, and weight updates. "
+                    "This diagnostic can perturb timing and is disabled by default."
                 ),
             )
             parser.add_argument(
@@ -497,8 +628,45 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "Run fully async rollout: a persistent worker keeps generating while the trainer "
                     "drains completed groups. Selects `FullyAsyncRolloutFn` as the rollout function; "
-                    "evaluation keeps the standard rollout function, which fully async does not serve. "
-                    "Requires train_async.py."
+                    "shared-engine evaluation pauses producer submissions, while a dedicated eval fleet "
+                    "runs independently. Requires train_async.py."
+                ),
+            )
+            parser.add_argument(
+                "--use-replay-buffer",
+                action="store_true",
+                default=False,
+                help=(
+                    "Persist fully-async rollout state next to distributed model checkpoints and restore it "
+                    "into the training replay buffer on resume."
+                ),
+            )
+            parser.add_argument(
+                "--replay-buffer-type",
+                choices=REPLAY_BUFFER_TYPES,
+                default=REPLAY_BUFFER_ROLLOUT,
+                help=(
+                    "Replay-buffer payload. 'rollout' stores completed rollouts and regenerates active requests "
+                    "from their original prompts. 'inflight' additionally stores partial token prefixes and "
+                    "continues them after a full prefill; KV cache is never persisted."
+                ),
+            )
+            parser.add_argument(
+                "--replay-buffer-keep-last",
+                type=int,
+                default=2,
+                help=(
+                    "Number of recent replay buffers to retain. Checkpoints selected by "
+                    "--save-retain-interval are retained in addition to these recent buffers."
+                ),
+            )
+            parser.add_argument(
+                "--log-replay-resume-metrics",
+                action="store_true",
+                default=False,
+                help=(
+                    "Log checkpoint sample conservation and resume state-load timing. "
+                    "This is intended for controlled replay-buffer ablations."
                 ),
             )
             parser.add_argument(
@@ -669,14 +837,76 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--fully-async-queue-type",
+                dest="fully_async_queue_type",
+                type=str,
+                default=None,
+                choices=FULLY_ASYNC_QUEUE_POLICIES,
+                help=(
+                    "Optional B300 queue implementation used by --fully-async. Unset preserves the v0.1 "
+                    "replaceable DataBuffer path, including --async-data-buffer-capacity-factor and "
+                    "--async-unused-samples-handler. "
+                    "'queue-recycle' preserves the existing completion-FIFO, prefetched-drain "
+                    "behavior and recycles groups that would exceed --max-weight-staleness at training under the "
+                    "selected --staleness-reference. 'queue-max' consumes completion-FIFO "
+                    "groups when the trainer is ready and drops groups above a required "
+                    "prefill-referenced max staleness. 'queue-drop' uses a bounded "
+                    "completion-FIFO queue and evicts its oldest group on overflow."
+                ),
+            )
+            parser.add_argument(
+                "--fully-async-queue-factor",
+                type=int,
+                default=1,
+                help=(
+                    "queue-drop capacity q in training batches: capacity_groups = "
+                    "q * rollout_batch_size. Must be at least 1. Other policies require 1."
+                ),
+            )
+            parser.add_argument(
+                "--training-buffer-queue-size",
+                type=int,
+                default=DEFAULT_TRAINING_BUFFER_QUEUE_SIZE,
+                help=(
+                    "Maximum number of completed prompt groups buffered by fully-async queue-recycle "
+                    "and queue-max before rollout production is backpressured. Defaults to 1000. "
+                    "queue-max raises an undersized value to rollout_batch_size so it can collect one "
+                    "complete training batch. queue-drop instead uses --fully-async-queue-factor."
+                ),
+            )
+            parser.add_argument(
                 "--max-weight-staleness",
                 type=int,
                 default=None,
                 help=(
-                    "Maximum allowed gap between a group's oldest weight version and the current "
-                    "engine weight version. Groups exceeding this threshold are recycled back to "
-                    "the data buffer instead of being sent to training. Only effective in fully "
-                    "async mode. None (default) disables staleness filtering."
+                    "Maximum policy-version staleness in fully async mode. With no explicit queue type, "
+                    "the v0.1 DefaultDataBuffer compares the current version with the group's oldest "
+                    "completion version and accepts equality. Explicit queue-recycle admits only when the "
+                    "dequeue gap under --staleness-reference is strictly below the threshold. The threshold "
+                    "must be at least 1; at startup the train version equals the dequeue version, while a "
+                    "normally prefetched batch trains at dequeue version + 1. Explicit queue-max bounds the "
+                    "dequeue gap, drops groups above the threshold, and accepts equality. None (default) "
+                    "disables staleness filtering."
+                ),
+            )
+            parser.add_argument(
+                "--staleness-reference",
+                type=str,
+                default="completion",
+                choices=["completion", "submission", "prefill"],
+                help=(
+                    "Which generation lifecycle version explicit built-in queues use as the reference for "
+                    "--max-weight-staleness. The v0.1 DefaultDataBuffer path always uses the group's oldest "
+                    "completion version. "
+                    "'completion' (default) uses the group's oldest completed weight version, so "
+                    "the bound covers queue residency but not weight updates crossed during "
+                    "generation, and 0 does not imply on-policy. 'submission' uses the version the "
+                    "group was submitted under, so a bound of N allows N older policy versions end "
+                    "to end and 0 is genuinely on-policy. "
+                    "'prefill' uses the scheduler-authoritative version at the first "
+                    "prefill forward and requires the patched SGLang provenance metadata. "
+                    "staleness/total ends at the scheduled train version and uses the selected reference. "
+                    "All references remain available for historical reproduction."
                 ),
             )
             parser.add_argument(
@@ -695,11 +925,10 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 type=float,
                 default=2.0,
                 help=(
-                    "Capacity of the finished-group data buffer between rollout production and "
-                    "training consumption in fully async mode, as a multiple of rollout_batch_size "
-                    "(floor(factor * rollout_batch_size) groups). When the buffer is full the "
-                    "producer blocks until training consumes, so generation cannot run "
-                    "unboundedly ahead of training."
+                    "Capacity of the v0.1 DefaultDataBuffer, used when --fully-async-queue-type is unset, "
+                    "as a multiple of rollout_batch_size (floor(factor * rollout_batch_size) groups). "
+                    "When full, the producer blocks until training consumes. A custom DataBuffer may "
+                    "interpret this option itself; explicit built-in queues do not use it."
                 ),
             )
             parser.add_argument(
@@ -708,11 +937,10 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 choices=["retry", "drop"],
                 default="drop",
                 help=(
-                    "What to do with a finished group fully async mode does not train on "
-                    "(aborted, or beyond --max-weight-staleness): drop "
-                    "(default) discards the group; retry recycles its prompts into the data "
-                    "source for regeneration. Groups rejected by "
-                    "--dynamic-sampling-filter-path are always dropped."
+                    "What the v0.1 DefaultDataBuffer does with aborted or stale groups when no explicit "
+                    "queue type is selected: drop (default) discards them; retry recycles their prompts "
+                    "for regeneration. Dynamic-filter rejects are always dropped. Explicit queue-recycle "
+                    "always recycles age rejects, while queue-max drops them."
                 ),
             )
             parser.add_argument(
@@ -723,7 +951,8 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "Path to a custom DataBuffer subclass replacing the fully async finished-group "
                     "data buffer (see miles/rollout/fully_async_data_buffer.py). Constructed with "
                     "DataBufferConstructorInput; it takes over dataflow/staleness control, so the "
-                    "--async-data-buffer-* args apply only if the custom class reads them."
+                    "--async-data-buffer-* args apply only if the custom class reads them. Incompatible "
+                    "with an explicit --fully-async-queue-type and replay-buffer persistence."
                 ),
             )
             parser.add_argument(
@@ -989,6 +1218,51 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 type=int,
                 default=None,
                 help="Exit training after this many rollouts (for testing checkpoint resume with consistent scheduler params).",
+            )
+            parser.add_argument(
+                "--debug-fail-after-rollout",
+                type=int,
+                default=None,
+                help=(
+                    "Send SIGKILL to the training driver after this many rollouts, but only after a "
+                    "distributed checkpoint has committed. Intended for whole-job resume validation."
+                ),
+            )
+            parser.add_argument(
+                "--debug-failure-marker",
+                type=str,
+                default=None,
+                help="Durable JSON marker written immediately before --debug-fail-after-rollout terminates the driver.",
+            )
+            parser.add_argument(
+                "--debug-failure-min-outstanding-groups",
+                type=int,
+                default=0,
+                help="Minimum outstanding prompt groups required at the injected-failure checkpoint.",
+            )
+            parser.add_argument(
+                "--debug-failure-min-completed-groups",
+                type=int,
+                default=0,
+                help="Minimum completed replay groups required at the injected-failure checkpoint.",
+            )
+            parser.add_argument(
+                "--debug-failure-min-inflight-groups",
+                type=int,
+                default=0,
+                help="Minimum partial inflight groups required at the injected-failure checkpoint.",
+            )
+            parser.add_argument(
+                "--debug-failure-min-inflight-tokens",
+                type=int,
+                default=0,
+                help="Minimum saved partial response tokens required at the injected-failure checkpoint.",
+            )
+            parser.add_argument(
+                "--debug-failure-min-regenerate-groups",
+                type=int,
+                default=0,
+                help="Minimum prompt groups requiring regeneration at the injected-failure checkpoint.",
             )
             parser.add_argument(
                 "--num-epoch",
@@ -1331,6 +1605,17 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--hf-save-interval",
+                type=int,
+                default=None,
+                help=(
+                    "Rollout interval for HuggingFace exports, independent of `--save-interval`. "
+                    "When unset, HF exports follow `--save-interval` as before. Set it lower than "
+                    "`--save-interval` to get frequent inference-only checkpoints without paying for "
+                    "the much larger resumable distributed checkpoint at the same cadence."
+                ),
+            )
+            parser.add_argument(
                 "--save-trigger-sentinel",
                 type=str,
                 default=None,
@@ -1470,6 +1755,49 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--lambd", type=float, default=1.0, help="PPO GAE lambd")
             parser.add_argument("--normalize-advantages", action="store_true", default=False)
             parser.add_argument(
+                "--log-sample-staleness-metrics",
+                dest="log_sample_staleness_metrics",
+                action="store_true",
+                default=False,
+                help=(
+                    "Log trainer-side diagnostics conditioned on each sample's train-time staleness. "
+                    "With the prefill reference, this is train weight version minus that sample's "
+                    "first-prefill weight version. Every token in a sample uses this one bin; this is "
+                    "distinct from exact per-token generation-version staleness. Uses tensors already "
+                    "present in policy loss and performs no extra model forward."
+                ),
+            )
+            parser.add_argument(
+                "--sample-staleness-max-bin",
+                dest="sample_staleness_max_bin",
+                type=int,
+                default=32,
+                help=(
+                    "Largest exact staleness bin for --log-sample-staleness-metrics; "
+                    "larger values share one overflow bin."
+                ),
+            )
+            parser.add_argument(
+                "--log-sample-staleness-ratio-histogram",
+                dest="log_sample_staleness_ratio_histogram",
+                action="store_true",
+                default=False,
+                help=(
+                    "Also log a fixed signed log-ratio histogram and histogram-derived p95 in each "
+                    "staleness bin. This adds metric cardinality but stores no raw token arrays."
+                ),
+            )
+            parser.add_argument(
+                "--log-update-diagnostics",
+                action="store_true",
+                default=False,
+                help=(
+                    "Log optimizer-step status, pre-clip gradient norm, clip coefficient, final loss-token "
+                    "count, and advantage dispersion. This reuses the optimizer result and tensors already "
+                    "present in policy loss; it does not scan parameters or enable gradient-zero counting."
+                ),
+            )
+            parser.add_argument(
                 "--disable-grpo-std-normalization",
                 action="store_false",
                 dest="grpo_std_normalization",
@@ -1534,6 +1862,26 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "optimizer step. The skipped pass's rollout/log_probs metric is not emitted."
                 ),
             )
+            parser.add_argument(
+                "--fuse-one-step-actor-logprobs",
+                action="store_true",
+                default=False,
+                help=(
+                    "For a one-optimizer-step GRPO rollout batch, skip the standalone actor "
+                    "log-probability forward and anchor PPO plus behavior correction to the "
+                    "gradient-enabled current log-probabilities via current_logprobs.detach()."
+                ),
+            )
+            parser.add_argument(
+                "--verify-fused-one-step-actor-logprobs",
+                action="store_true",
+                default=False,
+                help=(
+                    "Debug-only shadow validation for --fuse-one-step-actor-logprobs. Execute "
+                    "the legacy no-grad actor forward for comparison while keeping the fused "
+                    "detached anchor as the loss denominator. Do not use for performance runs."
+                ),
+            )
             # Off-Policy Correction using Importance Sampling: https://fengyao.notion.site/off-policy-rl
             parser.add_argument(
                 "--use-tis",
@@ -1591,6 +1939,33 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 action="store_true",
                 default=False,
                 help="Replay indexer topk from rollout during training.",
+            )
+            parser.add_argument(
+                "--use-m2po",
+                action="store_true",
+                default=False,
+                help="Second-Moment Trust Policy Optimization (https://arxiv.org/abs/2510.01161): "
+                "replace the static PPO clip range with the widest one whose harmful tokens keep "
+                "mean (log pi_behav - log pi_theta)^2 under --m2po-budget.",
+            )
+            parser.add_argument(
+                "--m2po-budget",
+                type=float,
+                default=0.04,
+                help="The second-moment budget for M2PO. 0.04 is the value used across every "
+                "experiment in the paper.",
+            )
+            parser.add_argument(
+                "--m2po-miniclip-low",
+                type=float,
+                default=0.3,
+                help="Floor on M2PO's derived lower clip epsilon.",
+            )
+            parser.add_argument(
+                "--m2po-miniclip-high",
+                type=float,
+                default=0.5,
+                help="Floor on M2PO's derived upper clip epsilon.",
             )
             parser.add_argument(
                 "--use-opsm",
@@ -2099,6 +2474,34 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help=("Dump all details of training for post-hoc analysis and visualization."),
             )
             parser.add_argument(
+                "--dump-train-data",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help=(
+                    "Whether --dump-details also writes the per-rank training dumps. "
+                    "These are the expensive part of --dump-details: every rank saves its "
+                    "shard inline on the training path each rollout, and tensor- and "
+                    "context-parallel ranks hold duplicate copies. Pass "
+                    "--no-dump-train-data to keep the dashboard collector, the rollout "
+                    "dumps and the trajectory sidecars while dropping them; the token "
+                    "view and the train-side columns are unavailable without them."
+                ),
+            )
+            parser.add_argument(
+                "--dump-policy-loss-debug",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help=(
+                    "Whether --dump-details also writes the per-call policy-loss tensors "
+                    "under policy_loss_debug/. One file per micro-batch per rank, so it "
+                    "scales with training calls rather than rollout steps and dominates "
+                    "the dump: measured 1.17 GB in 2512 files over 12 rollout steps of a "
+                    "4B run, against 287 MB for the rollout dumps over the same steps. "
+                    "Pass --no-dump-policy-loss-debug when the run is not being debugged "
+                    "for a loss-level discrepancy."
+                ),
+            )
+            parser.add_argument(
                 "--dumper-enable",
                 action="store_true",
                 default=False,
@@ -2290,6 +2693,67 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 type=str,
                 default=None,
                 help="Type of the reward model",
+            )
+            truncation_behavior = parser.add_mutually_exclusive_group()
+            truncation_behavior.add_argument(
+                "--zero-reward-on-truncated",
+                action="store_true",
+                default=False,
+                help=(
+                    "Assign scalar reward 0 to responses that hit the generation/context limit, "
+                    "without invoking the configured reward model. Off by default to preserve "
+                    "the existing behavior of grading the truncated response text."
+                ),
+            )
+            truncation_behavior.add_argument(
+                "--zero-loss-on-truncated",
+                action="store_true",
+                default=False,
+                help=(
+                    "Set the token loss mask to zero for responses that hit the generation/context limit. "
+                    "The original reward remains in prompt-group baseline and advantage computation; only "
+                    "the truncated sample's gradient contribution is removed."
+                ),
+            )
+            parser.add_argument(
+                "--use-staleness-aware-loss",
+                action="store_true",
+                default=False,
+                help=(
+                    "Attenuate the policy-gradient loss from truncated zero-reward samples according to "
+                    "their training staleness. The sample multiplier is "
+                    "1 / (1 + max(0, training_staleness - safe_training_staleness)). Requires "
+                    "--fully-async and --zero-reward-on-truncated; incompatible with "
+                    "--zero-loss-on-truncated."
+                ),
+            )
+            parser.add_argument(
+                "--safe-training-staleness",
+                type=int,
+                default=2,
+                help=(
+                    "Largest per-sample training staleness receiving full truncation-feedback weight when "
+                    "--use-staleness-aware-loss is enabled (default: 2)."
+                ),
+            )
+            parser.add_argument(
+                "--log-staleness-aware-loss-details",
+                action="store_true",
+                default=False,
+                help=(
+                    "Log the absolute post-TIS policy-gradient objective mass before and after "
+                    "staleness-aware scaling. Off by default because it adds tokenwise diagnostic "
+                    "reductions. Requires --use-staleness-aware-loss and --use-tis."
+                ),
+            )
+            parser.add_argument(
+                "--search-r1-format-score",
+                type=float,
+                default=0.0,
+                help=(
+                    "Partial reward for a valid Search-R1 action/answer sequence when "
+                    "--rm-type search_r1 is selected. Outcome-only training uses 0."
+                ),
             )
             parser.add_argument(
                 "--reward-key",
@@ -2845,7 +3309,130 @@ def _validate_rematerialize_param_from_master_weight(args):
         args.check_rematerialize_param_from_master_weight = True
 
 
+_FUSED_ONE_STEP_REPLAY_FLAGS = (
+    "use_routing_replay",
+    "use_rollout_routing_replay",
+    "use_indexer_replay",
+    "use_rollout_indexer_replay",
+)
+
+
+def validate_fused_one_step_actor_logprobs(args: argparse.Namespace) -> None:
+    """Validate configuration invariants known before training data is consumed."""
+    enabled = getattr(args, "fuse_one_step_actor_logprobs", False)
+    verify = getattr(args, "verify_fused_one_step_actor_logprobs", False)
+    if verify and not enabled:
+        raise ValueError("--verify-fused-one-step-actor-logprobs requires --fuse-one-step-actor-logprobs")
+    if not enabled:
+        return
+    if getattr(args, "skip_actor_forward_only", False):
+        raise ValueError(
+            "--fuse-one-step-actor-logprobs and --skip-actor-forward-only both replace the standalone "
+            "actor forward; select only one"
+        )
+
+    configured_steps = getattr(args, "num_steps_per_rollout", None)
+    rollout_batch_size = getattr(args, "rollout_batch_size", None)
+    n_samples_per_prompt = getattr(args, "n_samples_per_prompt", None)
+    global_batch_size = getattr(args, "global_batch_size", None)
+    if configured_steps is None:
+        configured_one_step = (
+            rollout_batch_size is not None
+            and n_samples_per_prompt is not None
+            and global_batch_size is not None
+            and rollout_batch_size * n_samples_per_prompt == global_batch_size
+        )
+        step_requirement = (
+            "a one-step batch shape: rollout_batch_size * n_samples_per_prompt " "must equal global_batch_size"
+        )
+    else:
+        configured_one_step = configured_steps == 1
+        step_requirement = "--num-steps-per-rollout 1"
+    checks = (
+        (getattr(args, "train_backend", None) == "megatron", "the Megatron training backend"),
+        (configured_one_step, step_requirement),
+        (getattr(args, "advantage_estimator", None) == "grpo", "--advantage-estimator grpo"),
+        (getattr(args, "kl_coef", None) == 0, "--kl-coef 0"),
+        (not getattr(args, "use_rollout_logprobs", False), "--use-rollout-logprobs disabled"),
+        (not getattr(args, "keep_old_actor", False), "--keep-old-actor disabled"),
+        (not getattr(args, "use_opd", False), "--use-opd disabled"),
+        (getattr(args, "attention_dropout", None) == 0, "--attention-dropout 0"),
+        (getattr(args, "hidden_dropout", None) == 0, "--hidden-dropout 0"),
+    )
+    for valid, requirement in checks:
+        if not valid:
+            raise ValueError(f"--fuse-one-step-actor-logprobs requires {requirement}")
+
+    enabled_replays = [flag for flag in _FUSED_ONE_STEP_REPLAY_FLAGS if getattr(args, flag, False)]
+    if enabled_replays:
+        flags = ", ".join(f"--{flag.replace('_', '-')}" for flag in enabled_replays)
+        raise ValueError(
+            "--fuse-one-step-actor-logprobs does not yet support routing/indexer replay; " f"disable {flags}"
+        )
+
+
+def validate_fused_one_step_actor_logprobs_runtime(
+    args: argparse.Namespace,
+    num_microbatches: Sequence[int],
+) -> None:
+    """Validate the effective optimizer-step count after dynamic batch sizing."""
+    if not getattr(args, "fuse_one_step_actor_logprobs", False):
+        return
+    if len(num_microbatches) != 1:
+        raise RuntimeError(
+            "--fuse-one-step-actor-logprobs requires exactly one optimizer step for the "
+            f"consumed rollout batch, but get_data_iterator produced {len(num_microbatches)} "
+            f"steps with num_microbatches={list(num_microbatches)}"
+        )
+
+
+def should_run_actor_logprob_forward(args: argparse.Namespace) -> bool:
+    """Whether the standalone actor scoring forward is required for this batch."""
+    if getattr(args, "fuse_one_step_actor_logprobs", False):
+        return getattr(args, "verify_fused_one_step_actor_logprobs", False)
+    return not args.use_rollout_logprobs or args.get_mismatch_metrics
+
+
+def _validate_truncation_behavior(args: argparse.Namespace) -> None:
+    """Reject contradictory handling of generation-truncated samples."""
+    zero_reward = getattr(args, "zero_reward_on_truncated", False)
+    zero_loss = getattr(args, "zero_loss_on_truncated", False)
+    use_staleness_aware_loss = getattr(args, "use_staleness_aware_loss", False)
+    log_staleness_aware_loss_details = getattr(args, "log_staleness_aware_loss_details", False)
+    safe_training_staleness = getattr(args, "safe_training_staleness", 2)
+    if zero_reward and zero_loss:
+        raise ValueError(
+            "--zero-reward-on-truncated and --zero-loss-on-truncated are mutually exclusive; "
+            "select exactly one truncation behavior or leave both disabled"
+        )
+    if not isinstance(safe_training_staleness, int) or isinstance(safe_training_staleness, bool):
+        raise ValueError("--safe-training-staleness must be a non-negative integer")
+    if safe_training_staleness < 0:
+        raise ValueError("--safe-training-staleness must be non-negative")
+    if log_staleness_aware_loss_details and not use_staleness_aware_loss:
+        raise ValueError("--log-staleness-aware-loss-details requires --use-staleness-aware-loss")
+    if log_staleness_aware_loss_details and not getattr(args, "use_tis", False):
+        raise ValueError("--log-staleness-aware-loss-details requires --use-tis")
+    if not use_staleness_aware_loss:
+        return
+    if zero_loss:
+        raise ValueError(
+            "--use-staleness-aware-loss cannot be combined with --zero-loss-on-truncated " "(overlong filtering)"
+        )
+    if not zero_reward:
+        raise ValueError("--use-staleness-aware-loss requires --zero-reward-on-truncated")
+    if not getattr(args, "fully_async", False):
+        raise ValueError("--use-staleness-aware-loss requires --fully-async")
+    if getattr(args, "loss_type", "policy_loss") != "policy_loss":
+        raise ValueError("--use-staleness-aware-loss requires the built-in policy loss")
+    if getattr(args, "custom_reward_post_process_path", None) is not None:
+        raise ValueError("--use-staleness-aware-loss requires built-in reward post-processing")
+    if getattr(args, "custom_convert_samples_to_train_data_path", None) is not None:
+        raise ValueError("--use-staleness-aware-loss requires built-in sample-to-train-data conversion")
+
+
 def miles_validate_args(args):
+    _validate_truncation_behavior(args)
     validate_dashboard_args(args)
 
     args.ft_components = _resolve_ft_components(args)
@@ -3075,6 +3662,9 @@ def miles_validate_args(args):
     if args.save_interval is not None:
         assert args.save is not None, "'--save' is required when save_interval is set."
 
+    if args.hf_save_interval is not None:
+        assert args.save_hf is not None, "'--save-hf' is required when hf_save_interval is set."
+
     if args.save_trigger_sentinel is not None:
         assert args.save is not None, "'--save' is required when save_trigger_sentinel is set."
 
@@ -3142,6 +3732,13 @@ def miles_validate_args(args):
     if args.use_rollout_logprobs:
         assert not args.use_tis, "use_rollout_logprobs and use_tis cannot be set at the same time."
 
+    if args.use_m2po:
+        assert not args.use_tis, "use_m2po replaces the clip range; it cannot be combined with use_tis."
+        # M2PO budgets (log pi_behav - log pi_theta)^2. Without this the
+        # denominator is the current actor, the delta is identically zero at one
+        # step per rollout, and the budget is never binding.
+        assert args.use_rollout_logprobs, "use_m2po requires --use-rollout-logprobs as the ratio denominator."
+
     if args.get_mismatch_metrics:
         assert (
             args.custom_tis_function_path is not None
@@ -3182,7 +3779,8 @@ def miles_validate_args(args):
 
     if args.dump_details is not None:
         args.save_debug_rollout_data = f"{args.dump_details}/rollout_data/{{rollout_id}}.pt"
-        args.save_debug_train_data = f"{args.dump_details}/train_data/{{rollout_id}}_{{rank}}.pt"
+        if args.dump_train_data:
+            args.save_debug_train_data = f"{args.dump_details}/train_data/{{rollout_id}}_{{rank}}.pt"
         args.save_debug_trajectory_data = f"{args.dump_details}/trajectory/{{rollout_id}}.jsonl"
         args.save_debug_event_data = f"{args.dump_details}/events"
 
@@ -3316,6 +3914,11 @@ def miles_validate_args(args):
             )
             args.rollout_num_gpus = args.actor_num_gpus_per_node * args.actor_num_nodes
 
+    if args.log_colocate_switch_metrics and not args.colocate:
+        raise ValueError("--log-colocate-switch-metrics requires --colocate")
+    if args.log_colocate_transfer_bytes and not args.log_colocate_switch_metrics:
+        raise ValueError("--log-colocate-transfer-bytes requires --log-colocate-switch-metrics")
+
     if args.use_critic and not args.debug_rollout_only:
         if args.offload_train is None:
             args.offload_train = True
@@ -3404,6 +4007,25 @@ def miles_validate_args(args):
             f"so one group already puts n_samples_per_prompt trajectories in flight"
         )
 
+    assert getattr(args, "sample_staleness_max_bin", 32) >= 0, "--sample-staleness-max-bin must be non-negative"
+    if getattr(args, "log_sample_staleness_ratio_histogram", False):
+        assert getattr(
+            args, "log_sample_staleness_metrics", False
+        ), "--log-sample-staleness-ratio-histogram requires --log-sample-staleness-metrics"
+    if getattr(args, "log_sample_staleness_metrics", False):
+        assert args.fully_async, "--log-sample-staleness-metrics requires --fully-async"
+        assert (
+            args.loss_type == "policy_loss"
+        ), "--log-sample-staleness-metrics currently instruments the built-in policy loss"
+        assert getattr(args, "custom_pg_loss_reducer_function_path", None) is None, (
+            "--log-sample-staleness-metrics cannot infer exact objective normalization from "
+            "a custom policy-gradient loss reducer"
+        )
+        assert getattr(args, "custom_convert_samples_to_train_data_path", None) is None, (
+            "--log-sample-staleness-metrics requires the built-in sample-to-train-data "
+            "converter to carry sample staleness"
+        )
+
     _resolve_rollout_functions(args)
 
     # Both snapshot postures drive the same RolloutManager._eval_checkpoint path.
@@ -3479,9 +4101,20 @@ def miles_validate_args(args):
                 logger.info(f"Warning: Argument {k} is already set to {getattr(args, k)}, will override with {v}.")
             setattr(args, k, v)
 
+    # A custom config is applied after parsing and can bypass argparse's
+    # mutually-exclusive group, so validate the effective values again.
+    _validate_truncation_behavior(args)
+
     if args.use_rollout_indexer_replay:
         args.use_indexer_replay = True
         assert args.context_parallel_size == 1, "indexer replay does not support context parallelism yet"
+
+    # Custom config is applied after rollout-path resolution, so repeat the
+    # safety validation here to prevent YAML overrides from bypassing guards.
+    validate_fully_async_queue_args(args)
+    _validate_replay_buffer(args)
+
+    validate_fused_one_step_actor_logprobs(args)
 
     if args.eval_max_context_len is None:
         logger.info(
@@ -3634,6 +4267,7 @@ def _maybe_apply_dumper_overrides(args) -> None:
     args.save = None
     args.save_interval = None
     args.save_retain_interval = None
+    args.hf_save_interval = None
 
 
 def resolve_fsdp_num_layers(hf_config) -> int | None:

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 import uuid
 from argparse import Namespace
 from collections.abc import Callable
@@ -19,12 +20,54 @@ from miles.rollout.base_types import (
 from miles.rollout.generate_hub.single_turn import generate
 from miles.rollout.generate_utils.generate_endpoint_utils import policy_uses_routing_key
 from miles.rollout.inference_rollout.compatibility import load_generate_function
+from miles.rollout.recycle_compute_metrics import (
+    GROUP_GENERATION_COMPLETE_TIME_KEY,
+    GROUP_GENERATION_COMPLETE_VERSION_KEY,
+    LIFECYCLE_EXACT_KEY,
+    SAMPLE_GENERATION_COMPLETE_TIME_KEY,
+    SAMPLE_GENERATION_COMPLETE_VERSION_KEY,
+    TRAJECTORY_START_TIME_KEY,
+    TRAJECTORY_START_VERSION_KEY,
+    add_apportioned_reward_seconds,
+    stamp_sample_lifecycle_boundary,
+)
 from miles.rollout.rm_hub import async_rm, batched_async_rm
 from miles.utils.lifecycle import TrajectoryLifecycle
 from miles.utils.processing_utils import load_processor, load_tokenizer
 from miles.utils.types import Sample
 
 logger = logging.getLogger(__name__)
+
+
+def _flat_generation_output(output: Sample | list[Sample]) -> list[Sample]:
+    return output if isinstance(output, list) else [output]
+
+
+def _finish_generation_lifecycle(
+    output: Sample | list[Sample],
+    *,
+    start_version: int | None,
+    start_time: float | None,
+    lifecycle_version_provider: Callable[[], int] | None,
+) -> None:
+    if lifecycle_version_provider is None or start_version is None or start_time is None:
+        return
+    samples = _flat_generation_output(output)
+    for generated_sample in samples:
+        stamp_sample_lifecycle_boundary(
+            [generated_sample],
+            version_key=TRAJECTORY_START_VERSION_KEY,
+            version=start_version,
+            time_key=TRAJECTORY_START_TIME_KEY,
+            wall_time=start_time,
+        )
+    stamp_sample_lifecycle_boundary(
+        samples,
+        version_key=SAMPLE_GENERATION_COMPLETE_VERSION_KEY,
+        version=lifecycle_version_provider(),
+        time_key=SAMPLE_GENERATION_COMPLETE_TIME_KEY,
+        wall_time=time.time(),
+    )
 
 
 class GenerateState:
@@ -60,8 +103,21 @@ async def generate_and_rm(
     sample: Sample | list[Sample],
     sampling_params: dict[str, Any],
     evaluation: bool = False,
+    *,
+    on_generation_complete: Callable[[Sample | list[Sample]], None] | None = None,
+    lifecycle_version_provider: Callable[[], int] | None = None,
 ) -> Sample | list[Sample]:
     args = state.args
+
+    def finish_generation(output: Sample | list[Sample], start_version: int | None, start_time: float | None) -> None:
+        _finish_generation_lifecycle(
+            output,
+            start_version=start_version,
+            start_time=start_time,
+            lifecycle_version_provider=lifecycle_version_provider,
+        )
+        if on_generation_complete is not None:
+            on_generation_complete(output)
 
     # mask previous off-policy generation for partial rollout
     if args.partial_rollout and args.mask_offpolicy_in_partial_rollout and sample.response_length > 0:
@@ -72,6 +128,9 @@ async def generate_and_rm(
         assert sample.response is not None
         if not args.group_rm:
             assert sample.reward is not None
+        start_version = lifecycle_version_provider() if lifecycle_version_provider is not None else None
+        start_time = time.time() if lifecycle_version_provider is not None else None
+        finish_generation(sample, start_version, start_time)
         return sample
 
     # dashboard lifecycle probe: the semaphore wait is the queue; attempt_end fires before reward
@@ -84,8 +143,11 @@ async def generate_and_rm(
     logger.debug(f"{log_prefix} Waiting for semaphore...")
     try:
         async with state.generate_fn_semaphore:
+            start_version = lifecycle_version_provider() if lifecycle_version_provider is not None else None
+            start_time = time.time() if lifecycle_version_provider is not None else None
             if state.aborted:
                 sample.status = Sample.Status.ABORTED
+                finish_generation(sample, start_version, start_time)
                 return sample
 
             logger.debug(f"{log_prefix} Acquired semaphore, calling generate_function")
@@ -107,6 +169,8 @@ async def generate_and_rm(
         if sink is not None:
             sink.attempt_end(sample)
 
+    finish_generation(sample, start_version, start_time)
+
     # TODO change to `if not args.group_rm: do reward model` for more clarity after the refactor below
     # for the rm that need the whole group, we will not do the rm here
     if args.group_rm:
@@ -121,14 +185,19 @@ async def generate_and_rm(
 
         # for multi agent system, the reward of some sample is calculated during generation.
         samples_need_reward = [sample for sample in samples if sample.reward is None]
-        await batched_async_rm(args, samples_need_reward, inplace_set_reward_field=True)
+        if samples_need_reward:
+            reward_start = time.monotonic()
+            await batched_async_rm(args, samples_need_reward, inplace_set_reward_field=True)
+            add_apportioned_reward_seconds(samples_need_reward, time.monotonic() - reward_start)
         return samples
     else:
         if sample.status == Sample.Status.ABORTED:
             return sample
         # for multi-turn environment, a reward could be assigned to the agent.
         if sample.reward is None:
+            reward_start = time.monotonic()
             sample.reward = await async_rm(args, sample)
+            add_apportioned_reward_seconds([sample], time.monotonic() - reward_start)
 
     logger.debug(f"{log_prefix} generate_and_rm complete")
     return sample
@@ -140,11 +209,30 @@ async def generate_and_rm_group(
     sampling_params: dict[str, Any],
     evaluation: bool = False,
     sample_done_callback: Callable[[], None] | None = None,
+    *,
+    lifecycle_version_provider: Callable[[], int] | None = None,
+    on_group_generation_complete: Callable[[list[Sample]], None] | None = None,
 ) -> list[Sample]:
     args = state.args
 
     if state.aborted:
         return group
+
+    remaining_generation_tasks = len(group)
+    group_completion_version: int | None = None
+    group_completion_time: float | None = None
+    completed_generation_samples: list[Sample] = []
+
+    def record_generation_completion(output: Sample | list[Sample]) -> None:
+        nonlocal remaining_generation_tasks, group_completion_version, group_completion_time
+        completed_generation_samples.extend(_flat_generation_output(output))
+        remaining_generation_tasks -= 1
+        if remaining_generation_tasks == 0:
+            if lifecycle_version_provider is not None:
+                group_completion_version = lifecycle_version_provider()
+                group_completion_time = time.time()
+            if on_group_generation_complete is not None:
+                on_group_generation_complete(list(completed_generation_samples))
 
     if policy_uses_routing_key(args):
         for sample in group:
@@ -158,7 +246,16 @@ async def generate_and_rm_group(
         current_sampling_params = sampling_params.copy()
         if getattr(args, "sglang_enable_deterministic_inference", False):
             current_sampling_params["sampling_seed"] = args.rollout_seed + idx
-        task = asyncio.create_task(generate_and_rm(state, sample, current_sampling_params, evaluation=evaluation))
+        task = asyncio.create_task(
+            generate_and_rm(
+                state,
+                sample,
+                current_sampling_params,
+                evaluation=evaluation,
+                on_generation_complete=record_generation_completion,
+                lifecycle_version_provider=lifecycle_version_provider,
+            )
+        )
         if sample_done_callback is not None:
             # fires on success, exception, and cancellation, so in-flight accounting is conserved
             task.add_done_callback(lambda _task: sample_done_callback())
@@ -174,11 +271,29 @@ async def generate_and_rm_group(
         await asyncio.gather(*tasks, return_exceptions=True)
         raise
     logger.debug(f"{log_prefix} [group] All {len(group)} samples completed")
+    if lifecycle_version_provider is not None:
+        exact = group_completion_version is not None and group_completion_time is not None
+        if not exact:
+            group_completion_version = lifecycle_version_provider()
+            group_completion_time = time.time()
+        flat_group = [sample for item in group for sample in (item if isinstance(item, list) else [item])]
+        stamp_sample_lifecycle_boundary(
+            flat_group,
+            version_key=GROUP_GENERATION_COMPLETE_VERSION_KEY,
+            version=group_completion_version,
+            time_key=GROUP_GENERATION_COMPLETE_TIME_KEY,
+            wall_time=group_completion_time,
+        )
+        for sample in flat_group:
+            sample.metadata[LIFECYCLE_EXACT_KEY] = exact
     if state.aborted:
         return group
 
     if args.group_rm:
+        reward_start = time.monotonic()
         await batched_async_rm(args, group, inplace_set_reward_field=True)
+        flat_group = [sample for item in group for sample in (item if isinstance(item, list) else [item])]
+        add_apportioned_reward_seconds(flat_group, time.monotonic() - reward_start)
 
     return group
 
@@ -223,6 +338,10 @@ class InferenceRolloutFn:
             self.state, input.rollout_id, self.data_source.get_samples
         )
         self.data_source.add_samples(aborted_samples)
+        if self.state.args.partial_rollout:
+            output.metrics["rollout/partial_rollout/buffer_depth_after_abort"] = float(
+                self.data_source.get_buffer_length()
+            )
         return output
 
     async def _call_eval(self, input: RolloutFnEvalInput) -> RolloutFnEvalOutput:

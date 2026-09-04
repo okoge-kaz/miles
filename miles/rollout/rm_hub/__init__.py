@@ -14,6 +14,7 @@ from .gpqa import compute_gpqa_reward
 from .math_dapo_utils import compute_score as compute_score_dapo
 from .math_utils import extract_answer as extract_boxed_answer
 from .math_utils import grade_answer_verl
+from .search_r1 import compute_search_r1_reward
 
 
 async def remote_rm(args, sample: Sample):
@@ -41,6 +42,9 @@ def _resolve_reward_config(args, sample: Sample) -> tuple[str | None, str]:
 
 
 async def async_rm(args, sample: Sample, **kwargs):
+    if getattr(args, "zero_reward_on_truncated", False) is True and sample.status == Sample.Status.TRUNCATED:
+        return 0
+
     custom_rm_path, rm_type = _resolve_reward_config(args, sample)
 
     if custom_rm_path is not None:
@@ -68,6 +72,13 @@ async def async_rm(args, sample: Sample, **kwargs):
         return 1 if grade_answer_verl(response, label) else 0
     elif rm_type == "f1":
         return f1_score(response, label)[0]
+    elif rm_type == "search_r1":
+        return compute_search_r1_reward(
+            prompt=sample.prompt,
+            response=response,
+            label=label,
+            format_score=getattr(args, "search_r1_format_score", 0.0),
+        )
     elif rm_type == "gpqa":
         return compute_gpqa_reward(response, label, metadata=metadata)
     elif rm_type == "ifbench":
@@ -103,7 +114,13 @@ async def batched_async_rm(
 
     if args.custom_rm_path is not None and not is_multi_lora_enabled(args):
         rm_function = load_function(args.custom_rm_path)
-        return await rm_function(args, samples, **kwargs)
+        rewards = await rm_function(args, samples, **kwargs)
+        if getattr(args, "zero_reward_on_truncated", False) is True:
+            rewards = [
+                0 if sample.status == Sample.Status.TRUNCATED else reward
+                for sample, reward in zip(samples, rewards, strict=True)
+            ]
+        return rewards
     tasks = [async_rm(args, sample, **kwargs) for sample in samples]
     rewards = await asyncio.gather(*tasks)
     return rewards

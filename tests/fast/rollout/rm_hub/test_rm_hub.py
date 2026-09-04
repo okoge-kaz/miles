@@ -45,6 +45,18 @@ class TestAsyncRm:
         reward = run(async_rm(mock_args, sample))
         assert 0 < reward < 1
 
+    @pytest.mark.parametrize("zero_reward_on_truncated,expected", [(False, 1), (True, 0)])
+    def test_truncated_reward_is_opt_in(self, mock_args, zero_reward_on_truncated, expected):
+        mock_args.rm_type = "deepscaler"
+        mock_args.zero_reward_on_truncated = zero_reward_on_truncated
+        sample = Sample(
+            prompt="",
+            response=r"</think>\boxed{42}",
+            label="42",
+            status=Sample.Status.TRUNCATED,
+        )
+        assert run(async_rm(mock_args, sample)) == expected
+
     def test_random_rm(self, mock_args):
         mock_args.rm_type = "random"
         sample = Sample(prompt="", response="anything", label="anything")

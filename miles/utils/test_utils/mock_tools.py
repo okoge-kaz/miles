@@ -3,6 +3,8 @@ from collections.abc import Callable
 from copy import deepcopy
 from typing import Any
 
+from miles.rollout.generate_hub.agentic_types import AgentFunctionOutput
+
 from miles.utils.processing_utils import load_tokenizer
 from miles.utils.test_utils.mock_sglang_server import ProcessResult
 
@@ -59,7 +61,7 @@ async def execute_tool_call(name: str, params: dict) -> str:
     return TOOL_EXECUTORS[name](params)
 
 
-AGENTIC_RETURN_METADATA: dict[str, Any] | Callable | None = None
+AGENTIC_RETURN_METADATA: dict[str, Any] | AgentFunctionOutput | Callable | None = None
 
 
 async def run_agentic_tool_call(
@@ -68,7 +70,7 @@ async def run_agentic_tool_call(
     request_kwargs: dict[str, Any] | None = None,
     max_turns: int = 8,
     **kwargs,
-) -> dict[str, Any] | None:
+) -> dict[str, Any] | AgentFunctionOutput | None:
     if AGENTIC_MAX_TURNS is not None:
         max_turns = AGENTIC_MAX_TURNS
     messages = deepcopy(prompt) if isinstance(prompt, list) else [{"role": "user", "content": prompt}]

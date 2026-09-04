@@ -1,16 +1,61 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 from tests.fast.ray.rollout.conftest import make_args, make_dataclass_group
 
+from miles.ray.rollout.addr_allocator import PortCursors
 from miles.ray.rollout.rollout_server import (
+    ROLLOUT_SERVER_START_MAX_ATTEMPTS,
     RolloutServer,
     _compute_megatron_num_gpus,
     _compute_rollout_offset,
+    _initialize_server_groups_with_retry,
     _resolve_sglang_config,
 )
+
+
+class TestInitializeServerGroupsWithRetry:
+    @patch("miles.ray.rollout.rollout_server.ray.get")
+    def test_success_does_not_restart_groups(self, mock_ray_get):
+        group = MagicMock()
+        indices = [[0, 1]]
+
+        result = _initialize_server_groups_with_retry([group], ["initial"], indices, PortCursors.empty())
+
+        assert result == indices
+        mock_ray_get.assert_called_once_with(["initial"])
+        group.stop_engines.assert_not_called()
+        group.start_engines.assert_not_called()
+
+    @patch("miles.ray.rollout.rollout_server.ray.get")
+    def test_failure_restarts_with_fresh_port_cursor(self, mock_ray_get):
+        mock_ray_get.side_effect = [RuntimeError("address already in use"), None]
+        group = MagicMock()
+        group.start_engines.return_value = (["retry"], [0, 1])
+        port_cursors = PortCursors.empty()
+
+        result = _initialize_server_groups_with_retry([group], ["initial"], [[0, 1]], port_cursors)
+
+        assert result == [[0, 1]]
+        group.stop_engines.assert_called_once_with(engine_indices=[0, 1])
+        group.start_engines.assert_called_once_with(port_cursors, start_indices=[0, 1])
+        assert mock_ray_get.call_args_list == [call(["initial"]), call(["retry"])]
+
+    @patch("miles.ray.rollout.rollout_server.ray.get")
+    def test_last_failure_is_propagated_after_cleanup(self, mock_ray_get):
+        error = RuntimeError("server process terminated unexpectedly")
+        mock_ray_get.side_effect = [error] * ROLLOUT_SERVER_START_MAX_ATTEMPTS
+        group = MagicMock()
+        group.start_engines.return_value = (["retry"], [0])
+
+        with pytest.raises(RuntimeError, match="terminated unexpectedly"):
+            _initialize_server_groups_with_retry([group], ["initial"], [[0]], PortCursors.empty())
+
+        assert group.stop_engines.call_count == ROLLOUT_SERVER_START_MAX_ATTEMPTS
+        assert group.start_engines.call_count == ROLLOUT_SERVER_START_MAX_ATTEMPTS - 1
 
 
 class TestRolloutServerPureFunctions:

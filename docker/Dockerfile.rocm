@@ -17,8 +17,9 @@ FROM ${SGLANG_IMAGE_REPO}:${SGLANG_IMAGE_TAG} AS sglang
 SHELL ["/bin/bash", "-ceuxo", "pipefail"]
 
 # ======================================== Arguments ============================================
-ARG SGLANG_BRANCH=sglang-miles
-ARG SGLANG_COMMIT=""
+ARG SGLANG_REPO=okoge-kaz/sglang
+ARG SGLANG_BRANCH=miles-staleness-weight-boundaries
+ARG SGLANG_COMMIT=f994b9aedfd0b1465dbb8f4e2a02eb789fc76dce
 
 ARG MEGATRON_REPO=radixark/Megatron-LM
 ARG MEGATRON_BRANCH=miles-main
@@ -125,7 +126,7 @@ RUN rm -rf /root/Megatron-LM && \
 
 RUN cd /sgl-workspace/sglang && \
     git reset --hard && \
-    git fetch origin ${SGLANG_BRANCH} && \
+    git fetch https://github.com/${SGLANG_REPO}.git ${SGLANG_BRANCH} && \
     if [ -n "${SGLANG_COMMIT}" ]; then \
       git checkout ${SGLANG_COMMIT}; \
     else \

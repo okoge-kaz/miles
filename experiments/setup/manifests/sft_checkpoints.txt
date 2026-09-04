@@ -1,0 +1,11 @@
+# SFT checkpoints already exported to Hugging Face format on aws-pdx.
+#
+# MODEL_NAME | HF_CKPT_DIR | HF_MODEL_NAME | MEGATRON_MODEL_TYPE
+#
+# MODEL_NAME becomes /ckpt/megatron/${MODEL_NAME}_torch_dist after conversion.
+# HF_CKPT_DIR is mounted at /ckpt/hf for that job, and HF_MODEL_NAME is the
+# directory below it. The converter writes a portable torch_dist checkpoint;
+# the training recipe may load it with a different data/model-parallel layout.
+Qwen3-4B-Base-LR2e-5-Step4000 | /lustre/fsw/portfolios/coreai/users/kfujii/checkpoints/huggingface/Qwen3-4B-Base/LR2.0e-5-SEQ32768-GBS128-MBS1-TP1-PP1-CP1-EP1-PACK1-standard-cp-STEPS4000 | iter_0004000 | qwen3-4B
+Qwen3-8B-Base-LR1.5e-5-Step4000 | /lustre/fsw/portfolios/coreai/users/kfujii/checkpoints/huggingface/Qwen3-8B-Base/LR1.5e-5-SEQ32768-GBS128-MBS1-TP2-PP1-CP1-EP1-PACK1-standard-cp-STEPS4000 | iter_0004000 | qwen3-8B
+Qwen3-30B-A3B-Base-LR2e-5-Step4000 | /lustre/fsw/portfolios/coreai/users/kfujii/checkpoints/huggingface/Qwen3-30B-A3B-Base/LR2.0e-5-SEQ32768-GBS128-MBS1-TP1-PP1-CP2-EP8-PACK1-standard-cp-STEPS4000 | iter_0004000 | qwen3-30B-A3B

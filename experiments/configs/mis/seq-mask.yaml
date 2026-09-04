@@ -1,0 +1,20 @@
+# Sequence-level masked importance sampling.
+# Consumed by --custom-config-path via IS_CORRECTION=mis, MIS_PROFILE=seq-mask.
+# Schema: examples/infra_features/train_infer_mismatch_helper/mis.yaml
+# Rationale and the open question on the bounds: notes/algorithm-ablation.md
+
+use_tis: true
+use_rs: false
+
+tis_level: "sequence"
+rs_level: "sequence"
+
+tis_mode: "mask"
+tis_lower_bound: 0.5
+tis_upper_bound: 2.0
+
+rs_lower_bound: null
+rs_upper_bound: null
+rs_veto_threshold: 1.0e-4
+
+tis_batch_normalize: true

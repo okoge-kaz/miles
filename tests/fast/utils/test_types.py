@@ -100,8 +100,57 @@ class TestStripLastOutputTokens:
         # response should be re-decoded from the remaining response tokens
         assert s.response == tokenizer.decode(s.tokens[-s.response_length :])
 
+    def test_strip_clips_complete_response_weight_version_segments(self, tokenizer):
+        s = _make_sample([1, 2], [3, 4, 5])
+        s.response_weight_version_segments = [[[0, 1, 10], [1, 3, 11]]]
+
+        s.strip_last_output_tokens(1, tokenizer)
+
+        assert s.response_weight_version_segments == [[[0, 1, 10], [1, 2, 11]]]
+
+    def test_strip_does_not_guess_when_exact_segments_have_partial_coverage(self, tokenizer):
+        s = _make_sample([1, 2], [3, 4, 5])
+        s.response_weight_version_segments = [[[0, 2, 10]]]
+
+        s.strip_last_output_tokens(1, tokenizer)
+
+        assert s.response_weight_version_segments == [[[0, 2, 10]]]
+
     def test_strip_negative_is_noop(self, tokenizer):
         s = _make_sample([1, 2], [3, 4])
         original_tokens = list(s.tokens)
         s.strip_last_output_tokens(-1, tokenizer)
         assert s.tokens == original_tokens
+
+
+def test_policy_version_metadata_is_typed_and_reset_for_retry():
+    sample = Sample()
+    sample.update_policy_version_from_meta_info(
+        {
+            "weight_version": "11",
+            "first_prefill_weight_version": 10,
+            "min_forward_weight_version": 10,
+            "max_forward_weight_version": 11,
+            "last_forward_weight_version": 11,
+            "response_weight_version": "11",
+            "response_weight_version_segments": [[0, 2, 10], [2, 4, 11]],
+        }
+    )
+
+    assert sample.weight_versions == ["11"]
+    assert sample.first_prefill_weight_versions == [10]
+    assert sample.min_forward_weight_versions == [10]
+    assert sample.max_forward_weight_versions == [11]
+    assert sample.last_forward_weight_versions == [11]
+    assert sample.response_weight_versions == ["11"]
+    assert sample.response_weight_version_segments == [[[0, 2, 10], [2, 4, 11]]]
+
+    sample.reset_for_retry()
+
+    assert sample.weight_versions == []
+    assert sample.first_prefill_weight_versions == []
+    assert sample.min_forward_weight_versions == []
+    assert sample.max_forward_weight_versions == []
+    assert sample.last_forward_weight_versions == []
+    assert sample.response_weight_versions == []
+    assert sample.response_weight_version_segments == []

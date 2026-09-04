@@ -23,3 +23,19 @@ The maintained recipe lives in
 with synchronous and fully-async launchers. Follow the
 [recipe README](https://github.com/radixark/miles/blob/main/examples/swe-agent-harbor-docker/README.md)
 for the architecture, Harbor server setup, task format, and launch scripts.
+
+## E2B sandboxes
+
+The Miles-specific Harbor server can use Harbor's native E2B provider without
+changing the training-side `/run` or reward API. The maintained integration is
+under `examples/experimental/swe-agent-harbor-e2b`: it wires the pinned Harbor
+Miles server to `EnvironmentConfig(type="e2b")`, skips local Docker maintenance,
+and gives Harbor a graceful cleanup window when a rollout is flushed.
+
+E2B credentials are read only from the agent-server process environment. The
+launcher never reads `.env`, never adds the key to task metadata, and never
+passes it on the command line. See the example README for the exact Harbor
+commit, offline preflight, network topology, and task-image requirements.
+Repository-level tasks bind each prompt row to its trusted materialization with
+a SHA-256 task digest; the server rejects stale or mismatched task trees before
+starting a sandbox.

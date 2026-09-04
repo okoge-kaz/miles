@@ -1,0 +1,14 @@
+# MATH-500 training-aligned diagnostic.
+
+eval:
+  defaults:
+    n_samples_per_eval_prompt: 4
+    max_response_len: 16384
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+
+  datasets:
+    - name: math500
+      path: /data/math-500/math-500.jsonl
+      rm_type: math

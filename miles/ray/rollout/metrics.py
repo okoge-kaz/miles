@@ -18,6 +18,48 @@ from miles.utils.types import Sample
 logger = logging.getLogger(__name__)
 
 
+def log_rollout_batch_consumption(
+    rollout_id: int,
+    args,
+    *,
+    extra_metrics: dict[str, float | int] | None = None,
+) -> dict[str, float | int]:
+    """Log diagnostics computed immediately before the batch is trained."""
+    log_dict = dict(extra_metrics or {})
+    logger.info(f"rollout batch consumption {rollout_id}: {log_dict}")
+    step = compute_rollout_step(args, rollout_id)
+    log_dict["rollout/step"] = step
+    tracking.log(args, log_dict, step_key="rollout/step")
+    return log_dict
+
+
+def log_rollout_pipeline_throughput(
+    rollout_id: int,
+    args,
+    metrics: dict[str, float | int],
+) -> dict[str, float | int]:
+    """Log the wall window closed by a successful actor train call."""
+    log_dict = dict(metrics)
+    logger.info(f"rollout pipeline throughput {rollout_id}: {log_dict}")
+    log_dict["rollout/step"] = compute_rollout_step(args, rollout_id)
+    tracking.log(args, log_dict, step_key="rollout/step")
+    return log_dict
+
+
+def log_replay_resume_checkpoint(
+    rollout_id: int,
+    args,
+    metrics: dict[str, float],
+) -> dict[str, float | int]:
+    """Log sample conservation at a restartable checkpoint."""
+
+    log_dict: dict[str, float | int] = dict(metrics)
+    logger.info(f"replay resume checkpoint {rollout_id}: {log_dict}")
+    log_dict["rollout/step"] = compute_rollout_step(args, rollout_id)
+    tracking.log(args, log_dict, step_key="rollout/step")
+    return log_dict
+
+
 def log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any] | None = None):
     if (x := args.custom_eval_rollout_log_function_path) is not None:
         custom_log_func = load_function(x)
@@ -107,7 +149,21 @@ def _compute_metrics_from_samples(args, samples):
     oldest_versions = [s.oldest_weight_version for s in samples if s.oldest_weight_version is not None]
     if oldest_versions:
         log_dict |= dict_add_prefix(compute_statistics(oldest_versions), "weight_version/")
-        mixed = sum(1 for s in samples if len(set(s.weight_versions)) > 1)
+
+    first_prefill_versions = [min(s.first_prefill_weight_versions) for s in samples if s.first_prefill_weight_versions]
+    if first_prefill_versions:
+        log_dict |= dict_add_prefix(
+            compute_statistics(first_prefill_versions),
+            "first_prefill_weight_version/",
+        )
+
+    mixed = 0
+    for sample in samples:
+        if sample.min_forward_weight_versions and sample.max_forward_weight_versions:
+            mixed += min(sample.min_forward_weight_versions) != max(sample.max_forward_weight_versions)
+        else:
+            mixed += len(set(sample.weight_versions)) > 1
+    if samples:
         log_dict["weight_version/mixed_version_ratio"] = mixed / len(samples)
 
     tito_vals = [s.metadata.get("tito_session_mismatch") for s in samples]

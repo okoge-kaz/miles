@@ -1,17 +1,55 @@
 import asyncio
 import dataclasses
 import logging
+import os
 
 import ray
 
 from miles.backends.sglang_utils.arguments import collect_eval_sglang_overrides
 from miles.backends.sglang_utils.sglang_config import ModelConfig, ServerGroupConfig, SglangConfig
-from miles.ray.rollout.addr_allocator import PortCursors
+from miles.ray.rollout.addr_allocator import PortCursors, choose_rollout_engine_base_port
 from miles.ray.rollout.router_manager import start_router
 from miles.ray.rollout.server_engine import ServerEngine
 from miles.ray.rollout.server_group import ServerGroup
 
 logger = logging.getLogger(__name__)
+
+ROLLOUT_SERVER_START_MAX_ATTEMPTS = 3
+
+
+def _initialize_server_groups_with_retry(
+    server_groups: list[ServerGroup],
+    init_handles: list,
+    new_engine_indices_per_group: list[list[int]],
+    port_cursors: PortCursors,
+) -> list[list[int]]:
+    """Initialize server groups, moving to fresh port blocks after a startup failure."""
+    for attempt in range(1, ROLLOUT_SERVER_START_MAX_ATTEMPTS + 1):
+        try:
+            ray.get(init_handles)
+            return new_engine_indices_per_group
+        except Exception:
+            for group, engine_indices in zip(server_groups, new_engine_indices_per_group, strict=True):
+                group.stop_engines(engine_indices=engine_indices)
+
+            if attempt == ROLLOUT_SERVER_START_MAX_ATTEMPTS:
+                raise
+
+            logger.warning(
+                "Rollout server startup failed on attempt %d/%d; retrying with fresh ports.",
+                attempt,
+                ROLLOUT_SERVER_START_MAX_ATTEMPTS,
+                exc_info=True,
+            )
+            init_handles = []
+            retried_indices_per_group = []
+            for group, engine_indices in zip(server_groups, new_engine_indices_per_group, strict=True):
+                handles, retried_indices = group.start_engines(port_cursors, start_indices=engine_indices)
+                init_handles.extend(handles)
+                retried_indices_per_group.append(retried_indices)
+            new_engine_indices_per_group = retried_indices_per_group
+
+    raise AssertionError("unreachable")
 
 
 def start_rollout_servers(args, pg) -> dict[str, "RolloutServer"]:
@@ -41,7 +79,9 @@ def start_rollout_servers(args, pg) -> dict[str, "RolloutServer"]:
         server_groups: list[ServerGroup] = []
         all_init_handles: list = []
         new_engine_indices_per_group: list[list[int]] = []
-        port_cursors = PortCursors.empty()
+        base_port = choose_rollout_engine_base_port(os.environ.get("SLURM_JOB_ID"))
+        logger.info("Using rollout engine port slot starting at %d", base_port)
+        port_cursors = PortCursors.empty(base_port=base_port)
 
         for group_cfg in model_cfg.server_groups:
             gpus_per_engine = group_cfg.num_gpus_per_engine
@@ -85,7 +125,15 @@ def start_rollout_servers(args, pg) -> dict[str, "RolloutServer"]:
             gpu_offset += group_cfg.num_gpus
 
         if all_init_handles:
-            ray.get(all_init_handles)
+            if args.rollout_external:
+                ray.get(all_init_handles)
+            else:
+                new_engine_indices_per_group = _initialize_server_groups_with_retry(
+                    server_groups,
+                    all_init_handles,
+                    new_engine_indices_per_group,
+                    port_cursors,
+                )
 
         for group, new_engine_indices in zip(server_groups, new_engine_indices_per_group, strict=True):
             group.mark_alive(engine_indices=new_engine_indices)

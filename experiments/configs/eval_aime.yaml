@@ -1,0 +1,21 @@
+# AIME 2024--2026 training-aligned diagnostic. Reportable AIME evaluation uses
+# experiments/scripts/reasoning_eval and its separately pinned protocol.
+
+eval:
+  defaults:
+    n_samples_per_eval_prompt: 16
+    max_response_len: 16384
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+
+  datasets:
+    - name: aime24
+      path: /data/aime-2024/aime-2024.jsonl
+      rm_type: math
+    - name: aime25
+      path: /data/aime-2025/aime-2025.jsonl
+      rm_type: math
+    - name: aime26
+      path: /data/aime-2026/aime-2026.jsonl
+      rm_type: math

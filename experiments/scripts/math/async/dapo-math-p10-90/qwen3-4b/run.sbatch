@@ -1,0 +1,298 @@
+#!/bin/bash
+#SBATCH --job-name=miles-dapo-math-p10-90-async-qwen3-4b
+#SBATCH --account=coreai_horizon_dilations
+#SBATCH --partition=batch
+#SBATCH --qos=interactive
+#SBATCH --nodes=2
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=128
+#SBATCH --gres=gpu:8
+#SBATCH --exclusive
+#SBATCH --mem=0
+#SBATCH --time=04:00:00
+#SBATCH --output=experiments/outputs/training/math/dapo-math-p10-90/qwen3-4b/%x-%j.log
+
+set -euo pipefail
+
+REPO_ROOT="${MILES_REPO:-${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../../../.." &>/dev/null && pwd)}}"
+# Mount the selected checkpoint root directly so both SGLang and the tokenizer
+# read iter_0004000 in place. HF_CKPT_DIR lets validation jobs select another
+# converted model while the checked-in recipe remains the 4B default.
+: "${HF_CKPT_DIR:=${QWEN3_4B_BASE_HF_ROOT:-/lustre/fsw/portfolios/coreai/users/kfujii/checkpoints/huggingface/Qwen3-4B-Base/LR2.0e-5-SEQ32768-GBS128-MBS1-TP1-PP1-CP1-EP1-PACK1-standard-cp-STEPS4000}}"
+export HF_CKPT_DIR
+source "${REPO_ROOT}/experiments/env.sh"
+source "${REPO_ROOT}/experiments/common/staleness_buffer_policy.sh"
+
+if [[ "${WANDB_MODE:-online}" != offline && "${WANDB_MODE:-online}" != disabled ]]; then
+    : "${WANDB_API_KEY:?set WANDB_API_KEY, use WANDB_MODE=offline, or disable wandb}"
+fi
+
+# run identity
+: "${MODEL_NAME:=Qwen3-4B-Base-LR2e-5-Step4000}"
+: "${HF_MODEL_NAME:=iter_0004000}"
+: "${MODEL_PROFILE:=qwen3-4B}"
+PLACEMENT=async
+: "${DATASET_TAG:=dapo-math-p10-90-qwen3-4b-base-lr2e-5-step4000}"
+: "${PROMPT_DATA:=/data/dapo-math-p10-90-qwen3-4b-base-lr2e-5-step4000/dapo-math-p10-90-qwen3-4b-base-lr2e-5-step4000.jsonl}"
+
+# rl algorithm: these derive RL_ALGORITHM in common/run_identity.sh, and every
+# one of them is turned into a flag by train.sh
+: "${ADVANTAGE_ESTIMATOR:=grpo}"
+: "${ENTROPY_COEF:=0.00}"
+: "${KL_LOSS_COEF:=0.00}"
+: "${EPS_CLIP:=0.2}"
+: "${EPS_CLIP_HIGH:=0.28}"
+: "${EPS_CLIP_C:=}"                 # empty disables Dual-clip PPO
+: "${RATIO_DENOMINATOR:=actor}"     # actor | rollout-logprobs | old-actor
+: "${IS_CORRECTION:=tis}"           # none | tis | icepop | mis
+: "${TIS_CLIP:=2.0}"
+: "${TIS_CLIP_LOW:=0}"
+: "${MIS_PROFILE:=}"                # experiments/configs/mis/<profile>.yaml
+: "${M2PO_BUDGET:=0.04}"
+: "${USE_OPSM:=0}"
+: "${OPSM_DELTA:=1e-4}"
+
+# training hyperparameters
+: "${LR:=1e-6}"
+: "${MAX_RESPONSE_LEN:=16384}"
+: "${ROLLOUT_MAX_CONTEXT_LEN:=32768}"
+: "${NUM_ROLLOUT:=300}"
+: "${TRAIN_SEED:=1234}"
+: "${ROLLOUT_SEED:=42}"
+
+# batch shape: miles asserts rollout_batch * n_samples == global_batch * num_steps
+: "${ROLLOUT_BATCH_SIZE:=192}"
+: "${N_SAMPLES_PER_PROMPT:=16}"
+: "${GLOBAL_BATCH_SIZE:=3072}"
+: "${NUM_STEPS_PER_ROLLOUT:=1}"
+
+# queue selection and what happens to in-flight generation at a weight update
+: "${QUEUE_TYPE:=queue-recycle}" # queue-recycle | queue-max | queue-drop
+: "${QUEUE_FACTOR:=1}"                       # queue-drop capacity in training batches
+: "${TRAINING_BUFFER_QUEUE_SIZE:=1000}"      # queue-recycle/queue-max completed groups
+if [[ "${QUEUE_TYPE}" == queue-drop ]]; then
+   [[ -z "${MAX_WEIGHT_STALENESS:-}" ]] || {
+      echo "QUEUE_TYPE=queue-drop does not use MAX_WEIGHT_STALENESS" >&2
+      exit 1
+   }
+   unset MAX_WEIGHT_STALENESS
+else
+   : "${MAX_WEIGHT_STALENESS:=8}"
+   TRAINING_BUFFER_QUEUE_SIZE="$(
+      staleness_training_buffer_queue_size \
+         "${MAX_WEIGHT_STALENESS}" \
+         "${TRAINING_BUFFER_QUEUE_SIZE}"
+   )"
+   require_staleness_training_buffer_queue_size \
+      "${MAX_WEIGHT_STALENESS}" \
+      "${TRAINING_BUFFER_QUEUE_SIZE}" \
+      "${GLOBAL_BATCH_SIZE}" \
+      "${N_SAMPLES_PER_PROMPT}"
+fi
+: "${STALENESS_REFERENCE:=prefill}"   # completion | submission | prefill
+: "${PAUSE_GENERATION_MODE:=in_place}"
+: "${ASYNC_MAX_CONCURRENT_SAMPLES:=}"
+if [[ -n "${ASYNC_MAX_CONCURRENT_SAMPLES}" ]]; then
+   [[ "${ASYNC_MAX_CONCURRENT_SAMPLES}" =~ ^[1-9][0-9]*$ \
+      && "${ASYNC_MAX_CONCURRENT_SAMPLES}" -ge "${N_SAMPLES_PER_PROMPT}" \
+      && $(( ASYNC_MAX_CONCURRENT_SAMPLES % N_SAMPLES_PER_PROMPT )) -eq 0 ]] || {
+      echo "ASYNC_MAX_CONCURRENT_SAMPLES must be a positive multiple of N_SAMPLES_PER_PROMPT" >&2
+      exit 1
+   }
+fi
+: "${USE_REPLAY_BUFFER:=1}"
+: "${REPLAY_BUFFER_TYPE:=inflight}" # rollout | inflight
+: "${REPLAY_BUFFER_IDENTITY_TAG:=1}" # keep buffer types in separate checkpoint namespaces
+[[ "${USE_REPLAY_BUFFER}" =~ ^[01]$ ]] || {
+   echo "USE_REPLAY_BUFFER must be 0 or 1" >&2
+   exit 1
+}
+[[ "${REPLAY_BUFFER_TYPE}" =~ ^(rollout|inflight)$ ]] || {
+   echo "REPLAY_BUFFER_TYPE must be rollout or inflight" >&2
+   exit 1
+}
+
+# distributed setting
+: "${ACTOR_NUM_NODES:=1}"
+: "${ACTOR_GPUS_PER_NODE:=8}"
+: "${ROLLOUT_NUM_GPUS:=8}"
+: "${TENSOR_PARALLEL_SIZE:=2}"
+: "${CONTEXT_PARALLEL_SIZE:=1}"
+: "${EXPERT_PARALLEL_SIZE:=1}"
+
+# throughput / memory
+: "${MAX_TOKENS_PER_GPU:=32768}"
+: "${RECOMPUTE_GRANULARITY:=full}"
+: "${OVERLAP_COMM:=0}"
+: "${ROLLOUT_NUM_GPUS_PER_ENGINE:=1}"
+: "${SGLANG_MEM_FRACTION:=0.70}"
+
+# reward
+: "${RM_TYPE:=deepscaler}"
+: "${ZERO_REWARD_ON_TRUNCATED:=1}"
+: "${ZERO_LOSS_ON_TRUNCATED:=0}"
+: "${USE_STALENESS_AWARE_LOSS:=0}"
+: "${SAFE_TRAINING_STALENESS:=2}"
+: "${LOG_STALENESS_AWARE_LOSS_DETAILS:=0}"
+if [[ "${ZERO_REWARD_ON_TRUNCATED}" != "0" && "${ZERO_LOSS_ON_TRUNCATED}" != "0" ]]; then
+    echo "ZERO_REWARD_ON_TRUNCATED and ZERO_LOSS_ON_TRUNCATED are mutually exclusive" >&2
+    exit 2
+fi
+[[ "${LOG_STALENESS_AWARE_LOSS_DETAILS}" =~ ^[01]$ ]] || {
+    echo "LOG_STALENESS_AWARE_LOSS_DETAILS must be 0 or 1" >&2
+    exit 2
+}
+if [[ "${LOG_STALENESS_AWARE_LOSS_DETAILS}" == 1 && "${USE_STALENESS_AWARE_LOSS}" == 0 ]]; then
+    echo "LOG_STALENESS_AWARE_LOSS_DETAILS requires USE_STALENESS_AWARE_LOSS=1" >&2
+    exit 2
+fi
+
+# evaluation during training; the reported numbers come from src/offline_eval
+: "${EVAL_INTERVAL:=0}"       # 0 disables in-run eval; score HF exports offline
+: "${N_SAMPLES_PER_EVAL_PROMPT:=8}"
+: "${EVAL_MAX_RESPONSE_LEN:=16384}"
+: "${SKIP_EVAL_BEFORE_TRAIN:=0}"
+
+# checkpointing: torch_dist for resume, hf for offline eval, on separate cadences
+: "${SAVE_INTERVAL:=10}"
+: "${SAVE_RETAIN_INTERVAL:=100}"
+: "${SAVE_HF:=1}"
+: "${HF_SAVE_INTERVAL:=10}"
+
+# diagnostics
+: "${DUMP_TRAIN_DATA:=0}"
+: "${DUMP_POLICY_LOSS_DEBUG:=0}"
+: "${FUSE_ONE_STEP_ACTOR_LOGPROBS:=1}"
+: "${VERIFY_FUSED_ONE_STEP_ACTOR_LOGPROBS:=0}"  # debug only; retains legacy forward
+: "${LOG_SAMPLE_STALENESS_METRICS:=1}"
+: "${SAMPLE_STALENESS_MAX_BIN:=32}"
+: "${LOG_SAMPLE_STALENESS_RATIO_HISTOGRAM:=0}"  # high-cardinality, debug only
+: "${LOG_UPDATE_DIAGNOSTICS:=1}"                 # no parameter/update tensor scan
+: "${SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS:=1}"  # compact exact token/version boundaries
+: "${DEBUG_EXIT_AFTER_ROLLOUT:=}"               # validation only; empty runs the full schedule
+
+: "${MILES_NCCL_TRANSPORT:=efa}"
+: "${ASYNC_SQSH_IMAGE_OVERRIDE:=/lustre/fsw/portfolios/coreai/users/kfujii/containers/miles-staleness-weight-boundaries-f994b9aed-efa-1.49.0.sqsh}"
+case "${MILES_NCCL_TRANSPORT}" in
+   efa)
+      [[ "${NCCL_IB_DISABLE:-0}" != 1 ]] || {
+         echo "EFA mode refuses NCCL_IB_DISABLE=1" >&2
+         exit 1
+      }
+      [[ "${NCCL_NET_PLUGIN:-ofi}" == ofi ]] || {
+         echo "EFA mode requires NCCL_NET_PLUGIN=ofi" >&2
+         exit 1
+      }
+      NCCL_IB_DISABLE=0
+      NCCL_NET_PLUGIN=ofi
+      NCCL_TUNER_PLUGIN=ofi
+      NCCL_NET="AWS Libfabric"
+      FI_PROVIDER=efa
+      LD_LIBRARY_PATH="/opt/amazon/efa/lib:/opt/amazon/ofi-nccl/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+      ;;
+   tcp)
+      NCCL_IB_DISABLE=1
+      NCCL_NET=Socket
+      unset NCCL_NET_PLUGIN NCCL_TUNER_PLUGIN FI_PROVIDER
+      ;;
+   system)
+      NCCL_IB_DISABLE=0
+      unset NCCL_NET NCCL_NET_PLUGIN NCCL_TUNER_PLUGIN FI_PROVIDER
+      ;;
+   *)
+      echo "unknown MILES_NCCL_TRANSPORT=${MILES_NCCL_TRANSPORT}; expected efa, tcp, or system" >&2
+      exit 1
+      ;;
+esac
+
+export MODEL_NAME HF_MODEL_NAME MODEL_PROFILE PLACEMENT DATASET_TAG PROMPT_DATA
+export ADVANTAGE_ESTIMATOR ENTROPY_COEF KL_LOSS_COEF EPS_CLIP EPS_CLIP_HIGH EPS_CLIP_C
+export RATIO_DENOMINATOR IS_CORRECTION TIS_CLIP TIS_CLIP_LOW MIS_PROFILE M2PO_BUDGET USE_OPSM OPSM_DELTA
+export LR MAX_RESPONSE_LEN ROLLOUT_MAX_CONTEXT_LEN NUM_ROLLOUT TRAIN_SEED ROLLOUT_SEED
+export ROLLOUT_BATCH_SIZE N_SAMPLES_PER_PROMPT GLOBAL_BATCH_SIZE NUM_STEPS_PER_ROLLOUT
+export QUEUE_TYPE QUEUE_FACTOR TRAINING_BUFFER_QUEUE_SIZE MAX_WEIGHT_STALENESS STALENESS_REFERENCE
+export PAUSE_GENERATION_MODE ASYNC_MAX_CONCURRENT_SAMPLES
+export USE_REPLAY_BUFFER REPLAY_BUFFER_TYPE REPLAY_BUFFER_IDENTITY_TAG
+export ACTOR_NUM_NODES ACTOR_GPUS_PER_NODE ROLLOUT_NUM_GPUS
+export TENSOR_PARALLEL_SIZE CONTEXT_PARALLEL_SIZE EXPERT_PARALLEL_SIZE
+export MAX_TOKENS_PER_GPU RECOMPUTE_GRANULARITY OVERLAP_COMM
+export ROLLOUT_NUM_GPUS_PER_ENGINE SGLANG_MEM_FRACTION
+export RM_TYPE ZERO_REWARD_ON_TRUNCATED ZERO_LOSS_ON_TRUNCATED
+export USE_STALENESS_AWARE_LOSS SAFE_TRAINING_STALENESS LOG_STALENESS_AWARE_LOSS_DETAILS
+export EVAL_INTERVAL N_SAMPLES_PER_EVAL_PROMPT EVAL_MAX_RESPONSE_LEN SKIP_EVAL_BEFORE_TRAIN
+export SAVE_INTERVAL SAVE_RETAIN_INTERVAL SAVE_HF HF_SAVE_INTERVAL
+export DUMP_TRAIN_DATA DUMP_POLICY_LOSS_DEBUG FUSE_ONE_STEP_ACTOR_LOGPROBS VERIFY_FUSED_ONE_STEP_ACTOR_LOGPROBS
+export LOG_SAMPLE_STALENESS_METRICS SAMPLE_STALENESS_MAX_BIN
+export LOG_SAMPLE_STALENESS_RATIO_HISTOGRAM LOG_UPDATE_DIAGNOSTICS
+export SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS
+export DEBUG_EXIT_AFTER_ROLLOUT
+export MILES_NCCL_TRANSPORT ASYNC_SQSH_IMAGE_OVERRIDE NCCL_IB_DISABLE LD_LIBRARY_PATH
+export NCCL_NET NCCL_NET_PLUGIN NCCL_TUNER_PLUGIN FI_PROVIDER
+
+source "${REPO_ROOT}/experiments/common/run_identity.sh"
+export RUN_NAME CONFIG_TAG CKPT_PATH
+
+source "${REPO_ROOT}/experiments/common/placement.sh"
+
+RAY_HEAD_IP="$(getent hosts "$(hostname)" | awk '{print $1; exit}')"
+if [[ -z "${RAY_HEAD_IP}" || "${RAY_HEAD_IP}" == 169.254.* ]]; then
+    RAY_HEAD_IP="$(ip route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p')"
+fi
+if [[ -z "${RAY_HEAD_IP}" || "${RAY_HEAD_IP}" == 169.254.* ]]; then
+    echo "no routable address for the ray head on $(hostname): got '${RAY_HEAD_IP}'" >&2
+    exit 1
+fi
+export RAY_HEAD_IP
+export RAY_DONE_FLAG="/root/miles/experiments/outputs/.ray/${RUN_NAME}-${SLURM_JOB_ID}.done"
+export RAY_HEAD_IP_FILE="${RAY_DONE_FLAG}.head-ip"
+mkdir -p "${OUTPUT_DIR}/.ray"
+rm -f \
+   "${OUTPUT_DIR}/.ray/${RUN_NAME}-${SLURM_JOB_ID}.done" \
+   "${OUTPUT_DIR}/.ray/${RUN_NAME}-${SLURM_JOB_ID}.done.head-ip"
+
+source "${REPO_ROOT}/experiments/common/clean_checkpoint.sh"
+
+echo "run ${RUN_NAME}"
+echo "checkpoints ${CKPT_PATH}"
+
+# The validation jobs are submitted by a small CPU finalizer.  Explicit step
+# resources prevent its exported SLURM_MEM_PER_NODE / SLURM_CPUS_PER_TASK from
+# constraining the two-node Ray step instead of the GPU allocation.
+STEP_CPUS_PER_NODE="${SLURM_CPUS_PER_TASK:-${SLURM_JOB_CPUS_PER_NODE%%\(*}}"
+[[ "${STEP_CPUS_PER_NODE}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "invalid SLURM_JOB_CPUS_PER_NODE=${SLURM_JOB_CPUS_PER_NODE:-unset}" >&2
+    exit 1
+}
+MOUNTS="${CONTAINER_MOUNTS},/usr/bin/bwrap:/usr/local/bin/bwrap"
+
+if [[ "${MILES_NCCL_TRANSPORT}" == efa ]]; then
+   echo "running EFA fail-closed preflight on every node"
+   srun \
+      --nodes="${SLURM_JOB_NUM_NODES}" \
+      --ntasks="${SLURM_JOB_NUM_NODES}" \
+      --ntasks-per-node=1 \
+      --cpus-per-task=8 \
+      --mem=0 \
+      --container-image="${SQSH_IMAGE}" \
+      --container-mounts="${MOUNTS}" \
+      --no-container-mount-home \
+      --export=ALL \
+      bash /root/miles/experiments/common/check_efa.sh
+fi
+
+container_command=(bash /root/miles/experiments/scripts/math/async/dapo-math-p10-90/qwen3-4b/train.sh)
+if [[ "${MILES_NCCL_TRANSPORT}" == efa ]]; then
+   container_command=(bash /root/miles/experiments/common/run_with_efa_env.sh "${container_command[@]}")
+fi
+
+srun \
+    --nodes="${SLURM_JOB_NUM_NODES}" \
+    --ntasks-per-node=1 \
+    --cpus-per-task="${STEP_CPUS_PER_NODE}" \
+    --mem=0 \
+    --container-image="${SQSH_IMAGE}" \
+    --container-mounts="${MOUNTS}" \
+    --container-writable \
+    --no-container-mount-home \
+    --export=ALL \
+    "${container_command[@]}"

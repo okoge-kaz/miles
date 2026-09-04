@@ -32,6 +32,7 @@ class RolloutFnBaseInput:
 class RolloutFnTrainInput(RolloutFnBaseInput):
     # engine weight version, None before the first weight update
     weight_version: int | None = None
+    updates_before_train: int = 0
 
     @property
     def evaluation(self):
@@ -54,6 +55,9 @@ class RolloutFnEvalInput(RolloutFnBaseInput):
 class RolloutFnTrainOutput:
     samples: list[list[Sample]]
     metrics: dict[str, Any] = None
+    # Optional primitive-only diagnostics that belong in the rollout dump but
+    # must not be copied into the trainer's object-store payload.
+    debug_metadata: dict[str, Any] | None = None
 
 
 # TODO make it frozen

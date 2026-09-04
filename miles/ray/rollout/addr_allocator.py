@@ -1,24 +1,47 @@
 import logging
+import zlib
 from dataclasses import dataclass
 
 import ray
 
 logger = logging.getLogger(__name__)
 
+ROLLOUT_ENGINE_BASE_PORT = 22000
+ROLLOUT_ENGINE_PORT_UPPER_BOUND = 32768
+ROLLOUT_ENGINE_PORT_SLOT_SIZE = 1024
+ROLLOUT_ENGINE_PORT_SLOT_COUNT = (
+    ROLLOUT_ENGINE_PORT_UPPER_BOUND - ROLLOUT_ENGINE_BASE_PORT
+) // ROLLOUT_ENGINE_PORT_SLOT_SIZE
+
+
+def choose_rollout_engine_base_port(job_id: str | None) -> int:
+    """Choose a stable per-job port slot below the ephemeral port range."""
+    if not job_id:
+        return ROLLOUT_ENGINE_BASE_PORT
+
+    try:
+        job_hash = int(job_id)
+    except ValueError:
+        job_hash = zlib.crc32(job_id.encode())
+
+    slot = job_hash % ROLLOUT_ENGINE_PORT_SLOT_COUNT
+    return ROLLOUT_ENGINE_BASE_PORT + slot * ROLLOUT_ENGINE_PORT_SLOT_SIZE
+
 
 @dataclass
 class PortCursors:
     _values: dict[int, int]
+    _base_port: int = ROLLOUT_ENGINE_BASE_PORT
 
     @staticmethod
-    def empty() -> "PortCursors":
-        return PortCursors(_values={})
+    def empty(base_port: int = ROLLOUT_ENGINE_BASE_PORT) -> "PortCursors":
+        return PortCursors(_values={}, _base_port=base_port)
 
     def assign(self, other: "PortCursors"):
         self._values = other._values.copy()
 
     def next_base_port(self) -> int:
-        return max(self._values.values()) if self._values else 15000
+        return max(self._values.values()) if self._values else self._base_port
 
 
 # NOTE: May re-implement this in a potentially easier way if needed
@@ -29,7 +52,7 @@ def allocate_rollout_engine_addr_and_ports_normal(
     worker_type="regular",
     num_gpus_per_engine=None,
     rank_offset=0,
-    base_port=15000,
+    base_port=ROLLOUT_ENGINE_BASE_PORT,
 ):
     # get ports
     # there are 4 ports we need to allocate
@@ -57,8 +80,8 @@ def allocate_rollout_engine_addr_and_ports_normal(
         num_engines_on_this_node = num_engines_per_node - (local_rank % num_engines_per_node)
 
         def get_addr_and_ports(engine, node_idx):
-            # use small ports to prevent ephemeral port between 32768 and 65536.
-            # also, ray uses port 10002-19999, thus we avoid near-10002 to avoid racing condition
+            # Stay above Ray's worker ports (10002-19999) and the trainer's
+            # rendezvous range (20000-21000), but below ephemeral ports (32768+).
             start_port = node_port_cursor.get(node_idx, base_port)
 
             def port(consecutive=1):
