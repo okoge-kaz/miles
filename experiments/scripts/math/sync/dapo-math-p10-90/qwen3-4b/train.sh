@@ -17,7 +17,10 @@ NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
 HAS_NVLINK=$([ "$NVLINK_COUNT" -gt 0 ] && echo 1 || echo 0)
 
 cd /root/miles
-source /root/miles/scripts/models/qwen3-4B.sh
+MODEL_ARGS_LINE="$(
+   python3 miles/utils/external_utils/model_args_utils.py qwen3-4B
+)" || exit 1
+read -ra MODEL_ARGS <<< "${MODEL_ARGS_LINE}"
 source /root/miles/experiments/common/ray_cluster.sh
 
 CKPT_ARGS=(

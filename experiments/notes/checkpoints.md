@@ -53,14 +53,15 @@ The exact HF source roots and model-argument scripts are recorded in
 `experiments/setup/models/convert_checkpoint.sbatch` wraps:
 
 ```bash
-source scripts/models/qwen3-4B.sh          # MODEL_ARGS: layers, hidden size, rotary base, …
+MODEL_ARGS_LINE="$(python3 miles/utils/external_utils/model_args_utils.py qwen3-4B)"
+read -ra MODEL_ARGS <<< "${MODEL_ARGS_LINE}"
 PYTHONPATH=/root/Megatron-LM torchrun --nproc-per-node 8 \
-    tools/convert_hf_to_torch_dist.py ${MODEL_ARGS[@]} \
+    tools/convert_hf_to_torch_dist.py "${MODEL_ARGS[@]}" \
     --hf-checkpoint /ckpt/hf/Qwen3-4B \
     --save /ckpt/megatron/Qwen3-4B_torch_dist
 ```
 
-- The `MODEL_ARGS` file must match the model. `scripts/models/` holds one per
+- The `MODEL_ARGS` module must match the model. `scripts/models/` holds one per
   architecture; a mismatch produces wrong-shaped weights rather than a clean error.
 - Success is recorded in `latest_checkpointed_iteration.txt` containing `release`.
   miles' own helper (`convert_checkpoint` in

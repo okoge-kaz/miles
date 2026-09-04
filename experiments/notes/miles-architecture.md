@@ -83,7 +83,7 @@ Our two recipes sit at different depths:
 
 ```
 run.sbatch  → one srun task per Slurm node (pyxis) → train.sh
-                                                      ├─ source scripts/models/<type>.sh
+                                                      ├─ expand scripts/models/<type>.py with model_args_utils.py
                                                       ├─ source experiments/common/ray_cluster.sh
                                                       │    ├─ node 0: start Ray head
                                                       │    └─ other nodes: join and wait

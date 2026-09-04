@@ -4,7 +4,7 @@
 #   experiments/setup/download/stage_model.sh <MODEL_NAME>
 #
 # MODEL_NAME is looked up in models.txt, which supplies the HF repo, the
-# MODEL_ARGS file and any per-model convert overrides. Use this instead of
+# MODEL_ARGS module and any per-model convert overrides. Use this instead of
 # stage_all.sh when only one model is needed: stage_all.sh walks the whole list
 # and would submit a conversion for every entry that is not already converted.
 #
@@ -50,11 +50,11 @@ type=$(echo "${type}" | xargs)
 extra=$(echo "${extra:-}" | xargs)
 nodes=$(echo "${nodes:-1}" | xargs); nodes=${nodes:-1}
 
-[[ -f "scripts/models/${type}.sh" ]] || { echo "no MODEL_ARGS file: scripts/models/${type}.sh"; exit 1; }
+[[ -f "scripts/models/${type}.py" ]] || { echo "no MODEL_ARGS file: scripts/models/${type}.py"; exit 1; }
 
 echo "model   ${name}"
 echo "repo    ${repo}"
-echo "args    scripts/models/${type}.sh"
+echo "args    scripts/models/${type}.py"
 echo "extra   ${extra:-none}"
 echo "nodes   ${nodes}"
 echo

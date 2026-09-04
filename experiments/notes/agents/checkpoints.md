@@ -22,8 +22,8 @@ hack inside the checkpoint tree.
 
 ### Conversion
 
-`tools/convert_hf_to_torch_dist.py` with the architecture description sourced
-from `scripts/models/<type>.sh` (`MODEL_ARGS`). The helper
+`tools/convert_hf_to_torch_dist.py` with the architecture description expanded
+from `scripts/models/<type>.py` into `MODEL_ARGS`. The helper
 `miles/utils/external_utils/command_utils.py:33` shows the canonical invocation
 and the skip condition:
 

@@ -42,8 +42,8 @@ while IFS='|' read -r model_name hf_root hf_model_name model_type; do
         echo "missing ${source_config}" >&2
         exit 1
     }
-    [[ -f "scripts/models/${model_type}.sh" ]] || {
-        echo "missing scripts/models/${model_type}.sh" >&2
+    [[ -f "scripts/models/${model_type}.py" ]] || {
+        echo "missing scripts/models/${model_type}.py" >&2
         exit 1
     }
 

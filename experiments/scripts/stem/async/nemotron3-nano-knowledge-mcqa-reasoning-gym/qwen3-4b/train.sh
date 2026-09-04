@@ -16,12 +16,10 @@ cd /root/miles
     echo "invalid MODEL_PROFILE=${MODEL_PROFILE}" >&2
     exit 1
 }
-MODEL_PROFILE_PATH="/root/miles/scripts/models/${MODEL_PROFILE}.sh"
-[[ -r "${MODEL_PROFILE_PATH}" ]] || {
-    echo "model profile is not readable: ${MODEL_PROFILE_PATH}" >&2
-    exit 1
-}
-source "${MODEL_PROFILE_PATH}"
+MODEL_ARGS_LINE="$(
+    python3 miles/utils/external_utils/model_args_utils.py "${MODEL_PROFILE}"
+)" || exit 1
+read -ra MODEL_ARGS <<< "${MODEL_ARGS_LINE}"
 source /root/miles/experiments/common/ray_cluster.sh
 
 CKPT_ARGS=(

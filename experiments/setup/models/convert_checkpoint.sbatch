@@ -35,7 +35,7 @@ source "${REPO_ROOT}/experiments/env.sh"
 
 MODEL_NAME="${MODEL_NAME:-Qwen3-4B}"
 HF_MODEL_NAME="${HF_MODEL_NAME:-${MODEL_NAME}}"
-MEGATRON_MODEL_TYPE="${MEGATRON_MODEL_TYPE:-qwen3-4B}"   # scripts/models/<type>.sh
+MEGATRON_MODEL_TYPE="${MEGATRON_MODEL_TYPE:-qwen3-4B}"   # scripts/models/<type>.py
 # Per-model overrides from models.txt, e.g. parallelism for large MoE or a
 # fusion flag a given architecture cannot use.
 CONVERT_EXTRA_ARGS="${CONVERT_EXTRA_ARGS:-}"
@@ -46,6 +46,14 @@ echo "converting ${HF_MODEL_NAME} -> ${MODEL_NAME}_torch_dist (${MEGATRON_MODEL_
 
 [[ -f "${HF_CKPT_DIR}/${HF_MODEL_NAME}/config.json" ]] || {
     echo "missing HF checkpoint: ${HF_CKPT_DIR}/${HF_MODEL_NAME}/config.json" >&2
+    exit 1
+}
+[[ "${MEGATRON_MODEL_TYPE}" =~ ^[A-Za-z0-9._-]+$ ]] || {
+    echo "invalid MEGATRON_MODEL_TYPE=${MEGATRON_MODEL_TYPE}" >&2
+    exit 1
+}
+[[ -f "${REPO_ROOT}/scripts/models/${MEGATRON_MODEL_TYPE}.py" ]] || {
+    echo "missing model args: scripts/models/${MEGATRON_MODEL_TYPE}.py" >&2
     exit 1
 }
 
@@ -68,7 +76,10 @@ set -euo pipefail
 cd /root/miles
 
 # MODEL_ARGS: the Megatron-side description of the architecture.
-source scripts/models/${MEGATRON_MODEL_TYPE}.sh
+MODEL_ARGS_LINE=\$(
+    python3 miles/utils/external_utils/model_args_utils.py "${MEGATRON_MODEL_TYPE}"
+) || exit 1
+read -ra MODEL_ARGS <<< "\${MODEL_ARGS_LINE}"
 
 # /root/miles is on the path too: Qwen3.5/3.6 MODEL_ARGS reference specs that
 # live in miles_plugins (--spec miles_plugins.models.qwen3_5 ...).

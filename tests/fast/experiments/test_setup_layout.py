@@ -256,5 +256,5 @@ def test_model_manifest_entries_reference_existing_model_args(
     for row in rows:
         assert len(row) > model_type_index
         model_type = row[model_type_index]
-        model_args = REPO_ROOT / "scripts/models" / f"{model_type}.sh"
+        model_args = REPO_ROOT / "scripts/models" / f"{model_type}.py"
         assert model_args.is_file(), f"missing model args for {model_type}: {_relative(model_args)}"

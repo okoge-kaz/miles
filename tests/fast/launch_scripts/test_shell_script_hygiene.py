@@ -24,6 +24,22 @@ class TestShellScriptHygiene:
 
         assert offenders == []
 
+    def test_no_runtime_shell_script_sources_a_removed_model_script(self):
+        """Every shell entry point must expand the Python model definition used by v0.1."""
+        roots = (
+            REPO_ROOT / "experiments",
+            REPO_ROOT / "tests" / "manual",
+        )
+        offenders = [
+            path.relative_to(REPO_ROOT).as_posix()
+            for root in roots
+            for pattern in ("*.sh", "*.sbatch")
+            for path in root.rglob(pattern)
+            if _REMOVED_MODEL_SCRIPTS.search(path.read_text(errors="replace"))
+        ]
+
+        assert offenders == []
+
 
 class TestDockerPatchHygiene:
     def test_no_patch_calls_the_removed_exec_command_helper(self):

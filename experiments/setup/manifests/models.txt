@@ -1,6 +1,6 @@
 # Models to stage:
 #   MODEL_NAME | HF_REPO | MEGATRON_MODEL_TYPE | [CONVERT_EXTRA_ARGS] | [NODES]
-# MEGATRON_MODEL_TYPE names a scripts/models/<type>.sh MODEL_ARGS file.
+# MEGATRON_MODEL_TYPE names a scripts/models/<type>.py model-args module.
 # CONVERT_EXTRA_ARGS is appended to tools/convert_hf_to_torch_dist.py.
 # NODES > 1 runs the conversion across that many 8-GPU nodes.
 # Everything <= 120B that has a MODEL_ARGS file in the repo and a public HF repo.
@@ -13,7 +13,7 @@
 # 0.68. Usable as a collapse detector, not as a model with headroom.
 #
 # Qwen3-4B-Instruct-2507 is the non-thinking instruct: same architecture (its
-# MODEL_ARGS file just re-sources qwen3-4B.sh with rotary base 5e6), so it is a
+# model-args module delegates to qwen3-4B.py with rotary base 5e6), so it is a
 # drop-in checkpoint swap, but a much lower math ceiling means real headroom.
 # It keeps the tools-aware chat template, which the multi-turn tool recipe
 # structurally requires (generate_endpoint_utils.py:30 applies the template with
