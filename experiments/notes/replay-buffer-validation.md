@@ -9,6 +9,88 @@ out, so the numerical sections are an audit record rather than a fully
 reproducible current-tree package. Current admission status is stated
 separately below.
 
+## v0.1.0 plus B300 current-tree validation (2026-09-04)
+
+The merge branch `merge/v0.1.0-b300-aws-pdx` was validated at revision
+`2a506cee`. Its merge commit `efdb5848` has the official v0.1.0 commit
+`78527b9` and B300 source commit `b6341c8` as its two parents. This validation
+used the explicit B300 queue path; the unset queue-type path continues to use
+the v0.1.0 `DefaultDataBuffer` or custom data buffer and its
+`SubmissionScheduler` behavior.
+
+| Segment | Slurm job | Trained rollouts | Result |
+|---|---:|---|---|
+| fresh | 376027 | 0--1, with rollout 2 prepared | `COMPLETED`, exit `0:0` |
+| resume | 376028 | 2--3 | `COMPLETED`, exit `0:0` |
+
+Both jobs used two B300 nodes: eight actor GPUs and eight rollout GPUs. The
+smoke shape was eight prompt groups x eight samples, global batch 64, one
+optimizer update per rollout, an 8,192-token response cap, a 32,768-token
+context cap, and concurrency 64. The queue was `queue-recycle` with prefill
+staleness reference, maximum staleness 8, in-place generation pause, and
+`inflight` replay. DeepScaler reward and zero reward on truncation were enabled.
+MCore, Hugging Face, replay, and AIME25 evaluation were deliberately requested
+at every trained rollout.
+
+The strict recycle invariant was active: a group is admitted only when
+`dequeue_version - first_prefill_version < max_weight_staleness`; equality is
+recycled. The corresponding normally prefetched training batch uses the next
+weight version. Across trained rollouts 0--3, total staleness was respectively
+0, 1, 2, and 3. No rollout reported a group, sample, or token beyond the bound;
+exact-token provenance coverage was one and invalid provenance counts were
+zero.
+
+### Restart-boundary continuity
+
+The fresh step-1 save captured one prepared step-2 batch together with 39
+pending groups, 23 ready groups, and eight inflight groups containing 62,019
+response tokens. It recorded applied weight version 2. The resume loaded model
+iteration 1 and restored exactly those lifecycle counts and the prepared batch,
+then advanced the applied/train weight version to 3. It reported
+`warm_prepared_batch_hit=1` and logged `Reusing prepared fully-async rollout
+batch 2`.
+
+The fresh prepared rollout-2 record and the first resumed rollout-2 record each
+contained 363 `staleness/*` metrics. Their key sets and every value were exactly
+equal. The resumed batch had raw reward 0.59375, truncation ratio 0.09375, total
+staleness 2, and no bound violation. The next resumed batch had raw reward 0.5,
+truncation ratio 0.078125, and total staleness 3. Its group histogram was the
+same point distribution shifted by the expected single policy update; after
+aligning that one-bin shift, total-variation distance was zero. Thus restart
+neither reset the warm queue to staleness zero nor introduced an extra jump.
+
+Each of the four optimizer updates was applied with finite loss and gradient
+norm. AIME25 completed after every update with scores 0.30, 0.2167, 0.30, and
+0.20; all evaluation records had zero mixed-version ratio and zero missing
+reward ratio. These short scores are execution checks, not a convergence
+measurement.
+
+### Publication and artifact checks
+
+At both fresh checkpoints, replay publication preceded the visible MCore save:
+
+- step 0: capture `15:56:51.560`, publish `15:56:52.032`, model save start
+  `15:56:52.039`;
+- step 1: capture `15:57:58.423`, publish `15:57:58.773`, model save start
+  `15:57:58.799`.
+
+The resume repeated this ordering for steps 2 and 3. Before normal rolling
+retention removed intermediate generations, iterations 0 and 1 each had all 16
+nonempty distributed-checkpoint shards plus metadata. Replay-buffer file,
+external-part, total-size, and SHA-256 manifest checks passed. HF exports 0 and
+1 each had their completion marker, all 16 indexed safetensor shards, and no
+missing or extra shard; resume also completed HF exports 2 and 3. Evaluation
+ZIP/Parquet and debug JSONL integrity checks passed.
+
+The first submitted attempt, job 375989, stopped before training because the
+B300 recipes still sourced model-profile shell files removed by v0.1.0; its
+dependent resume job 375990 was consequently cancelled. Revision `2a506cee`
+converted all affected experiment, setup, and manual-validation callers to the
+v0.1.0 Python model-argument loader and added regression coverage. Jobs
+376027/376028 are the clean rerun after that fix. W&B `BrokenPipeError` messages
+occurred only during Ray atexit teardown after each Ray job had reported
+success; both Slurm jobs exited zero.
+
 ## Scope and revisions
 
 - MILES branch: `experiments/cw-dfw-math-rl`
