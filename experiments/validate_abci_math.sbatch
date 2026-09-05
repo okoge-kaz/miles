@@ -18,7 +18,8 @@ export DATASET_TAG=dapo-math-17k
 export PROMPT_DATA=/data/dapo-math-17k/dapo-math-17k.jsonl
 export VALIDATION_NAMESPACE="${VALIDATION_NAMESPACE:-v01-abci-math-${PBS_JOBID}}"
 export TRAIN_CKPT_DIR="${PWD}/experiments/outputs/abci-validation/checkpoints"
-source experiments/env.sh
+export MILES_REPO="${MILES_REPO:-${PWD}}"
+source "${MILES_REPO}/experiments/env.sh"
 
 export ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-$((MILES_JOB_NUM_NODES / 2))}"
 export ACTOR_GPUS_PER_NODE=8
@@ -52,5 +53,5 @@ if [[ "${CHECKPOINT_SELECTION_PREFLIGHT:-0}" == 1 ]]; then
         '
 fi
 printf 'ABCI validation: revision=%s nodes=%s namespace=%s\n' \
-    "$(git rev-parse HEAD)" "${MILES_JOB_NUM_NODES}" "${VALIDATION_NAMESPACE}"
-exec bash experiments/scripts/math/async/dapo-math-p10-90/qwen3-4b/run.sbatch
+    "$(git -C "${MILES_REPO}" rev-parse HEAD)" "${MILES_JOB_NUM_NODES}" "${VALIDATION_NAMESPACE}"
+exec bash "${MILES_REPO}/experiments/scripts/math/async/dapo-math-p10-90/qwen3-4b/run.sbatch"
