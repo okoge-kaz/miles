@@ -67,7 +67,37 @@ def verify_prepared_batches(checkpoint: Path, state: dict) -> list[dict]:
     return reports
 
 
-def verify_replay(checkpoint: Path) -> list[dict]:
+def _sample_dicts(group):
+    for item in group:
+        if isinstance(item, list):
+            yield from _sample_dicts(item)
+        else:
+            yield item
+
+
+def verify_policy_provenance(state: dict) -> dict:
+    groups = [item["result"] for item in state["ready_items"]]
+    groups.extend(item["generation_group"] for item in state["inflight_items"])
+    groups.extend(group for batch in state["prepared_batches"] for group in batch["samples"])
+    samples = 0
+    response_tokens = 0
+    for sample in _sample_dicts(groups):
+        covered = 0
+        for turn in sample["response_weight_version_segments"]:
+            expected_start = 0
+            for start, end, version in turn:
+                assert start == expected_start and end > start, (sample["index"], "invalid segment")
+                assert 0 <= version <= state["applied_weight_version"], (sample["index"], "invalid version")
+                covered += end - start
+                expected_start = end
+        assert covered == sample["response_length"], (sample["index"], "incomplete policy provenance")
+        samples += 1
+        response_tokens += covered
+    assert samples > 0, "No materialized samples in replay"
+    return {"samples": samples, "response_tokens": response_tokens, "complete": True}
+
+
+def verify_replay(checkpoint: Path, *, require_complete_policy_provenance: bool = False) -> list[dict]:
     reports = []
     paths = sorted(
         (checkpoint / "rollout").glob("replay_buffer_*.pt"), key=lambda path: int(path.stem.rsplit("_", 1)[1])
@@ -92,6 +122,8 @@ def verify_replay(checkpoint: Path) -> list[dict]:
                 "prepared_batches": verify_prepared_batches(checkpoint, state),
             }
         )
+        if require_complete_policy_provenance:
+            reports[-1]["policy_provenance"] = verify_policy_provenance(state)
         del state
     return reports
 
@@ -115,6 +147,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--require-complete-policy-provenance", action="store_true")
     args = parser.parse_args()
     latest = int((args.checkpoint / "latest_checkpointed_iteration.txt").read_text())
     model_iterations = sorted(
@@ -123,7 +156,7 @@ def main() -> None:
         if (path / ".metadata").is_file()
     )
     assert latest in model_iterations, "Latest distributed model metadata is missing"
-    replay = verify_replay(args.checkpoint)
+    replay = verify_replay(args.checkpoint, require_complete_policy_provenance=args.require_complete_policy_provenance)
     missing_replay = set(model_iterations) - {entry["iteration"] for entry in replay}
     assert not missing_replay, f"Retained model iterations lack verified replay snapshots: {sorted(missing_replay)}"
     report = {

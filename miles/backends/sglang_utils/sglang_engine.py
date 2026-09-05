@@ -20,6 +20,7 @@ from miles.backends.megatron_utils.lora_utils import (
     lora_base_cpu_backup_enabled,
     sglang_lora_target_all_sentinel,
 )
+from miles.backends.sglang_utils.abort_provenance import install_abort_policy_provenance
 from miles.ray.ray_actor import RayActor
 from miles.utils.env_report import collect_and_print_node_env_report
 from miles.utils.http_utils import get_host_info
@@ -69,11 +70,19 @@ def _get_gpu_uuids(gpu_ids: list[int]) -> list[str | None]:
         return [None] * len(gpu_ids)
 
 
-def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
+def _launch_server(server_args: ServerArgs) -> None:
+    # Runtime hooks belong in the spawned process, which starts with a fresh
+    # interpreter and does not inherit parent-process class patches.
     from sglang.srt.entrypoints.http_server import launch_server
 
+    if getattr(server_args, "enable_response_weight_version_segments", False):
+        install_abort_policy_provenance()
+    launch_server(server_args)
+
+
+def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     multiprocessing.set_start_method("spawn", force=True)
-    p = multiprocessing.Process(target=launch_server, args=(server_args,))
+    p = multiprocessing.Process(target=_launch_server, args=(server_args,))
     p.start()
     process_pid = p.pid
     assert process_pid is not None
@@ -105,8 +114,7 @@ def _process_tree_listens_on_port(*, root_pid: int, port: int) -> bool:
         except (psutil.Error, OSError):
             continue
         owns_listener = any(
-            connection.status == psutil.CONN_LISTEN and connection.laddr.port == port
-            for connection in connections
+            connection.status == psutil.CONN_LISTEN and connection.laddr.port == port for connection in connections
         )
         if owns_listener:
             return True

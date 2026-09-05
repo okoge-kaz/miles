@@ -10,11 +10,15 @@ from pathlib import Path
 from experiments.tools.replay_buffer_validation.log_parser import merge_step_records, parse_log
 
 
-def _read_segment(path: Path, max_staleness: int, *, allow_zero_gradients: bool = False) -> dict:
+def _read_segment(
+    path: Path, max_staleness: int, *, allow_zero_gradients: bool = False, first_step: int | None = None
+) -> dict:
     text = path.read_text(errors="replace")
     assert "succeeded" in text, f"No successful Ray job termination in {path}"
     records = merge_step_records(parse_log(path))
     train = {r["step"]: r["metrics"] for r in records if "train/loss" in r["metrics"]}
+    excluded_steps = sorted(step for step in train if first_step is not None and step < first_step)
+    train = {step: metrics for step, metrics in train.items() if step not in excluded_steps}
     rollout = {r["step"]: r["metrics"] for r in records if "staleness/total/mean" in r["metrics"]}
     assert train, f"No optimizer metrics in {path}"
     for step, metrics in train.items():
@@ -25,6 +29,8 @@ def _read_segment(path: Path, max_staleness: int, *, allow_zero_gradients: bool 
         sample_metrics = rollout[step]
         assert 0 <= sample_metrics["staleness/total/max"] <= max_staleness, (path, step)
         assert sample_metrics["staleness/token_lag/exact/covered_response_token_frac"] == 1, (path, step)
+        assert sample_metrics["staleness/token_lag/exact/loss_token/covered_loss_token_frac"] == 1, (path, step)
+        assert sample_metrics["staleness/token_lag/exact/loss_token/covered_sample_frac"] == 1, (path, step)
         for key in (
             "staleness/token_lag/exact/invalid_segments",
             "staleness/token_lag/exact/invalid_samples",
@@ -32,7 +38,7 @@ def _read_segment(path: Path, max_staleness: int, *, allow_zero_gradients: bool 
         ):
             assert sample_metrics[key] == 0, (path, step, key)
     assert any(metrics["train/grad_norm"] > 0 for metrics in train.values()), (path, "no nonzero gradients")
-    return {"path": str(path), "train": train, "rollout": rollout}
+    return {"path": str(path), "train": train, "rollout": rollout, "excluded_steps": excluded_steps}
 
 
 def _summarize(segment: dict) -> list[dict]:
@@ -59,6 +65,9 @@ def main() -> None:
     parser.add_argument("--resume-log", type=Path, required=True)
     parser.add_argument("--baseline-log", type=Path)
     parser.add_argument(
+        "--fresh-start-rollout-id", type=int, help="Audit the source log from this update; report earlier exclusions"
+    )
+    parser.add_argument(
         "--checkpoint-rollout-id",
         type=int,
         help="Selected checkpoint update, when resuming an archive or discarding later unsaved updates",
@@ -69,7 +78,12 @@ def main() -> None:
     )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    fresh = _read_segment(args.fresh_log, args.max_staleness, allow_zero_gradients=args.allow_zero_gradients)
+    fresh = _read_segment(
+        args.fresh_log,
+        args.max_staleness,
+        allow_zero_gradients=args.allow_zero_gradients,
+        first_step=args.fresh_start_rollout_id,
+    )
     resumed = _read_segment(args.resume_log, args.max_staleness, allow_zero_gradients=args.allow_zero_gradients)
     first_resume = min(resumed["train"])
     saved_step = args.checkpoint_rollout_id
@@ -94,6 +108,7 @@ def main() -> None:
     assert resume["current_applied_weight_version"] == resume["applied_weight_version_restored"] + 1
     report = {
         "fresh_log": fresh["path"],
+        "excluded_fresh_updates": fresh["excluded_steps"],
         "resume_log": resumed["path"],
         "fresh_updates": _summarize(fresh),
         "resumed_updates": _summarize(resumed),

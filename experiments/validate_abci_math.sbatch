@@ -52,6 +52,19 @@ if [[ "${CHECKPOINT_SELECTION_PREFLIGHT:-0}" == 1 ]]; then
             tests/fast/backends/megatron_utils/test_in_memory_checkpoint.py
         '
 fi
+if [[ "${PROVENANCE_PREFLIGHT:-0}" == 1 ]]; then
+    miles_srun --nodes=1 --image="${CONTAINER_IMAGE}" --bind="${CONTAINER_MOUNTS}" \
+        --no-home --export=ALL bash -lc '
+        cd /root/miles
+        PYTHONPATH=/root/miles python3 -m pytest -q \
+            tests/fast/backends/sglang_utils/test_abort_provenance.py \
+            tests/fast/backends/sglang_utils/test_sglang_engine.py \
+            tests/fast/rollout/test_recycle_compute_metrics.py \
+            tests/fast/rollout/test_fully_async_rollout.py \
+            tests/fast/rollout/test_queue_telemetry.py \
+            tests/fast/utils/test_types.py
+        '
+fi
 printf 'ABCI validation: revision=%s nodes=%s namespace=%s\n' \
     "$(git -C "${MILES_REPO}" rev-parse HEAD)" "${MILES_JOB_NUM_NODES}" "${VALIDATION_NAMESPACE}"
 exec bash "${MILES_REPO}/experiments/scripts/math/async/dapo-math-p10-90/qwen3-4b/run.sbatch"

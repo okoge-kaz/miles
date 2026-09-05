@@ -236,8 +236,59 @@ Commit `8661acbb` lets the Math/artifact validators use a fixed `MILES_REPO`.
 The replacement eight-node resume `2226346.pbs1` uses the detached checkout
 `experiments/outputs/abci-validation/source/8661acbb` and the same checkpoint
 namespace, batch shape, placement, and two-hour walltime. It resumes saved
-update 11 for four further updates. Final acceptance is pending its completion
-and CPU artifact audit `2226347.pbs1`, which depends on its PBS success.
+update 11 for four further updates. It completed updates 12--15 and exited
+with PBS status 0 in 34m44s. All four losses/gradient norms were finite with
+positive gradients. CPU artifact audit `2226347.pbs1` exited 0 in 54s;
+model 15 had its verified replay pair, replay 13/15 passed checksums, prepared
+batches 14/16 matched all 18 fields and normalized masks, and HF exports
+contained all 16 indexed shards. The ignored W&B `atexit` BrokenPipe messages
+occurred after offline run finalization and did not change Ray/PBS success.
+
+However, the strict final log audit rejected update 14: exact response-token
+coverage was 0.9984355506704807 and exact loss-token coverage was
+0.9971485200289981. Five of 3072 samples lacked metadata for 40,400 prefix
+tokens generated before the restart. Their IDs are 42078, 42079, 42853,
+42857, and 42858. The original samples and descriptors are preserved in
+`incomplete-provenance-step14.pt/json`; CPU inspection was `2226406.pbs1`.
+Earlier progress commentary incorrectly generalized complete coverage to all
+resumed updates; the final auditor caught this and that statement was corrected.
+
+The pinned SGLang `TokenizerManager._handle_abort_req` returns accumulated
+tokens for a synthetic abort echo with only the coarse `weight_version`,
+omitting scheduler first-prefill/forward versions and token-version segments.
+The regular batch-output path has those fields. The new scoped server hook
+caches the scheduler-authored metadata per live request and preserves it on
+synthetic abort replies, even after an intermediate output has been consumed.
+It does not infer missing versions or modify the SIF. The hook is installed
+inside the spawned HTTP server when exact segments are enabled. Regression
+tests cover consumed intermediate outputs, clipped prefixes, missing scheduler
+output, duplicate installation/finished requests, already authoritative abort
+metadata, and the actual installed SGLang abort handler.
+
+CPU inspection `2226415.pbs1` found complete provenance in every materialized
+sample of checkpoint 15, so it is a valid source for the corrected restart.
+The corrected run will audit source update 15 and prepared batch 16; earlier
+source updates 12--14 remain explicitly excluded from that boundary audit.
+The original update-14 failure remains evidence, not a passing result. Final
+acceptance is pending the corrected real run and the stronger artifact audit,
+which also checks all ready/inflight/prepared token provenance.
+
+CPU source audit `2226361.pbs1` completed with exit 0 in 2m43s, using about
+20GB peak memory, before the restart's checkpoint pruning. It verified all
+six replay snapshots (1, 3, 5, 7, 9, 11), the retained model 11's replay pair,
+and all corresponding 16-shard HF exports. Prepared batch 12 contains 3072
+samples and 25,120,908 response tokens; all 18 audited sample fields and
+normalized loss masks match the original rollout dump. This audit is preserved
+as `math-8node-resume-source-artifacts.json`.
+
+The restart loaded model/replay 11 and restored the actor's weight-version
+counter to 12. Replay restored 526 pending groups, 124 ready groups, one
+prepared batch, 210 inflight groups, and 17,174,786 prefix tokens, regenerating
+no active group. Read plus restore took 75.275s. Prepared batch 12 hit the
+warm path and all 365 staleness values matched before/after restart. Besides
+the 363 fields seen in the initial two-node uniform-lag batch, this batch
+also has the existing reward/length correlation fields, which are only
+reported when the inputs have sufficient variance.
 
 The first eight-node snapshot, at update 1, contains 318 inflight groups and
 40,277,569 generated prefix tokens, totaling 1,682,249,411 bytes. Capture took
@@ -248,5 +299,5 @@ peak memory. It verified the complete replay payload and 16 HF shards;
 be run with `experiments/validate_abci_artifacts.sbatch`, setting
 `VALIDATION_CHECKPOINT_RELATIVE` beneath the validation checkpoint root and
 `ARTIFACT_REPORT_NAME` beneath the validation output root. Final CPU audit
-`2226347.pbs1` uses the same detached source and will produce
+`2226347.pbs1` used the same detached source and produced
 `math-8node-artifacts.json` in the original submission checkout.

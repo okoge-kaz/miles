@@ -707,6 +707,16 @@ boundaries often have the same numeric version. The current `in_queue` metric
 starts at Q and therefore contains both ready-to-put backpressure and
 put-to-train queue residence.
 
+When exact segments are enabled, the Miles HTTP-server startup hook retains
+the latest scheduler-authored provenance for each live tokenizer request.
+Synthetic abort replies in the pinned SGLang image otherwise omit these
+fields even when they return a generated prefix (for example after a request
+is retracted into the waiting queue). The hook carries the cached provenance
+into that reply, clipped to its returned token count. It does not substitute
+the server's current version for missing token history. Existing authoritative
+abort metadata takes precedence. Check both response- and loss-token coverage:
+zero invalid-segment counts alone do not prove complete coverage.
+
 The `prefill` reference comes from scheduler-authoritative engine provenance.
 Missing provenance stays missing rather than becoming zero; `prefill`
 enforcement fails fast if those fields are absent or misaligned.

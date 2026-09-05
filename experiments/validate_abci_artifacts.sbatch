@@ -17,7 +17,11 @@ miles_srun --image="${CONTAINER_IMAGE}" \
     --no-home --export=ALL bash -lc '
 set -euo pipefail
 cd /root/miles
+provenance_args=()
+if [[ "${REQUIRE_COMPLETE_POLICY_PROVENANCE:-0}" == 1 ]]; then
+    provenance_args+=(--require-complete-policy-provenance)
+fi
 PYTHONPATH=/root/miles python3 -m experiments.tools.analyze_abci_artifacts \
     --checkpoint "/ckpt/training/${VALIDATION_CHECKPOINT_RELATIVE:?}" \
-    --output "/validation/${ARTIFACT_REPORT_NAME:?}"
+    --output "/validation/${ARTIFACT_REPORT_NAME:?}" "${provenance_args[@]}"
 '
