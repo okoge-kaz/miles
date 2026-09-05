@@ -16,6 +16,24 @@ Validation uses the staged public Qwen3-4B HF/MCore checkpoints and the
 17,398-row DAPO-Math file. The historical step-4000 SFT model is not staged
 here; its configurable recipe remains available.
 
+## Accepted results
+
+| Check | Evidence | Result |
+| --- | --- | --- |
+| Eight-node Math and checkpoint resume | `2226432.pbs1`, fixed revision `aa9290b1` | PBS exit 0, 22m04s; updates 16/17, finite positive gradients, complete response/loss-token coverage |
+| Full replay payload and provenance | `2226434.pbs1` | PBS exit 0, 1m07s; model 17 paired, replay 15/17 verified, all 8704 samples / 80,091,002 tokens in snapshot 17 covered |
+| Archived checkpoint zero restart | `2226244.pbs1`, `2226274.pbs1` | PBS exit 0; model/replay retention aligned and archive 0 actually resumed |
+| Math/Code/STEM simultaneous RL and resume | `2226150.pbs1`, `2226156.pbs1` | PBS exit 0; all four verifiers represented in 2048 unique trained samples |
+| Focused regressions | GPU preflights and replay suite | 111 SGLang/staleness/Sample, 24 checkpoint, and 65 replay/resume tests passed |
+
+The initial eight-node run completed 12 updates in 1h36m46s but had a
+post-training shell failure caused by editing an active launcher. Its first
+restart then exposed a synthetic-abort provenance gap in update 14. Both
+findings, fixes, and the successful fixed-checkout reruns are detailed below;
+the failed historical checks are not counted as successful acceptance.
+All PBS terminal results are preserved in `pbs-job-results.json` under
+`experiments/outputs/abci-validation/`.
+
 ## CPU verification
 
 The first focused run passed 339 tests and skipped one. Its single failure
@@ -154,6 +172,12 @@ qsub -P gai51740 -q R9920261300 -N v01-math8-resume \
   -v "RTYPE=rt_HF,VALIDATION_NAMESPACE=my-math8-validation,DEBUG_EXIT_AFTER_ROLLOUT=4,MILES_REPO=$validation_source" \
   -o "$PWD/experiments/outputs/abci-validation/" experiments/validate_abci_math.sbatch
 
+# After the resumed job succeeds, audit its finalized checkpoints on a CPU node.
+validation_checkpoint_relative="math/dapo-math-17k/Qwen3-4B/grpo-clip0.2-0.28-tis2.0/async/off-policy/max-weight-staleness-8-from-prefill/my-math8-validation-zero-trunc-rb-inflight-concurrency-3072-tbq6000"
+qsub -P gai51740 -q R9920261300 \
+  -v "RTYPE=rt_HC,MILES_REPO=$validation_source,REQUIRE_COMPLETE_POLICY_PROVENANCE=1,VALIDATION_CHECKPOINT_RELATIVE=$validation_checkpoint_relative,ARTIFACT_REPORT_NAME=my-math8-artifacts.json" \
+  -o "$PWD/experiments/outputs/abci-validation/" experiments/validate_abci_artifacts.sbatch
+
 # Run preparation once; wait for its successful completion before training.
 qsub -P gai51740 -q R9920261300 -v RTYPE=rt_HC \
   experiments/prepare_abci_multi_env.sbatch
@@ -269,9 +293,56 @@ CPU inspection `2226415.pbs1` found complete provenance in every materialized
 sample of checkpoint 15, so it is a valid source for the corrected restart.
 The corrected run will audit source update 15 and prepared batch 16; earlier
 source updates 12--14 remain explicitly excluded from that boundary audit.
-The original update-14 failure remains evidence, not a passing result. Final
-acceptance is pending the corrected real run and the stronger artifact audit,
-which also checks all ready/inflight/prepared token provenance.
+The original update-14 failure remains evidence, not a passing result. The
+corrected real run and stronger artifact audit below also check complete
+ready/inflight/prepared token provenance.
+
+Corrected validation `2226432.pbs1` uses detached revision `aa9290b1`, two
+updates from checkpoint 15, and the unchanged eight-node placement/batch
+settings. Its GPU preflight passed all 111 SGLang/abort/fully-async/queue/
+staleness/Sample tests, including the real installed abort handler. CPU audit
+`2226434.pbs1` depends on its success and enables
+`REQUIRE_COMPLETE_POLICY_PROVENANCE=1`; its report is
+`math-8node-provenance-fixed-artifacts.json`. The source-window resume audit
+uses `--fresh-start-rollout-id 15 --checkpoint-rollout-id 15` and reports all
+excluded earlier updates explicitly. It retains the strict 100% response- and
+loss-token coverage requirements for every accepted update. The corrected
+training run finished with PBS exit 0 in 22m04s. Updates 16/17 had finite
+losses and positive gradient norms; maximum staleness was 4/5. Response-token,
+loss-token, and loss-sample coverage were all 1, with invalid counts 0.
+Prepared batch 16's 365 staleness values matched exactly across this restart.
+Replay restored 509 pending groups, 92 ready groups, one prepared batch,
+225 inflight groups, and 28,951,398 prefix tokens, with no regeneration.
+Read plus restore took 86.063s. `math-8node-resume-report.json` records the
+accepted boundary audit; `math-8node-original-provenance-failure.json` retains
+the earlier failing update separately.
+
+Actual KV-cache retractions were logged during the corrected run. The final
+snapshot 17 contains 222 inflight groups and 31,823,008 prefix tokens, totaling
+1,386,438,599 bytes. Capture took 381.681s and publication 3.771s. Capture time
+remains a material overhead at this concurrency, even after fixing metadata
+preservation. The original incomplete samples also passed a negative-control
+check: the stronger artifact auditor rejects sample 42078's missing prefix.
+
+Final CPU audit `2226434.pbs1` completed with PBS exit 0 in 1m07s. Retained
+model 17 has its verified replay pair. Replay 15 contains 8144 materialized
+samples and 74,144,894 response tokens; replay 17 contains 8704 samples and
+80,091,002 tokens. Every ready/inflight/prepared response has complete,
+contiguous, valid version segments. Prepared batches 16 and 18 each contain
+3072 samples and match all 18 audited fields and normalized loss masks.
+All nine HF exports (odd iterations 1--17) contain their 16 nonempty indexed
+shards. No acceptance work remains pending.
+
+Reproduce the accepted restart log audit from this checkout:
+
+```bash
+python -m experiments.tools.analyze_abci_resume \
+  --fresh-log experiments/outputs/abci-validation/2226346.pbs1.live.log \
+  --resume-log experiments/outputs/abci-validation/2226432.pbs1.live.log \
+  --fresh-start-rollout-id 15 --checkpoint-rollout-id 15 \
+  --baseline-log /groups/gai51740/kazuki_fujii/src/miles-v0.0/experiments/outputs/training/math/dapo-math-p10-90/qwen3-4b/2211415.pbs1.OU \
+  --output experiments/outputs/abci-validation/math-8node-resume-report.json
+```
 
 CPU source audit `2226361.pbs1` completed with exit 0 in 2m43s, using about
 20GB peak memory, before the restart's checkpoint pruning. It verified all
