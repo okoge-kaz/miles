@@ -95,6 +95,13 @@ def _args(**overrides) -> Namespace:
         "n_samples_per_prompt": 2,
         "max_weight_staleness": None,
         "async_max_concurrent_samples": 2,
+        "async_data_buffer_capacity_factor": 2.0,
+        "async_unused_samples_handler": "retry",
+        "custom_async_data_buffer_path": None,
+        "rollout_submission_granularity": None,
+        "fully_async_queue_type": "queue-recycle",
+        "fully_async_queue_factor": 1,
+        "training_buffer_queue_size": 1000,
         "dynamic_sampling_filter_path": None,
         "rollout_sample_filter_path": None,
         "sglang_router_ip": "127.0.0.1",
@@ -151,6 +158,7 @@ def _queue_args(policy: str, **overrides) -> Namespace:
     policy_args = {
         "fully_async_queue_type": policy,
         "fully_async_queue_factor": 1,
+        "training_buffer_queue_size": 1000,
     }
     if policy == "queue-max":
         policy_args |= {"max_weight_staleness": 0, "staleness_reference": "prefill"}
@@ -230,6 +238,15 @@ async def test_replay_buffer_rejects_cross_policy_and_capacity_restore(monkeypat
     )
     with pytest.raises(RuntimeError, match="missing required queue_config"):
         await restored_recycle.restore_replay_buffer_state(state_without_queue_config)
+
+    different_recycle_capacity = _make_fn(
+        monkeypatch,
+        _queue_args("queue-recycle", training_buffer_queue_size=6000),
+        _DataSource(),
+        lambda *args, **kwargs: None,
+    )
+    with pytest.raises(RuntimeError, match="queue configuration"):
+        await different_recycle_capacity.restore_replay_buffer_state(recycle_state)
 
     queue_drop = _make_fn(
         monkeypatch,
@@ -354,6 +371,10 @@ async def test_prepared_batch_is_a_warm_resume_hit_and_active_prompt_is_regenera
     warm_output = await restored(RolloutFnTrainInput(rollout_id=0))
     assert warm_output.samples[0][0].index == output.samples[0][0].index
     assert warm_output.debug_metadata == output.debug_metadata
+    original_staleness = {key: value for key, value in output.metrics.items() if key.startswith("staleness/")}
+    resumed_staleness = {key: value for key, value in warm_output.metrics.items() if key.startswith("staleness/")}
+    assert resumed_staleness == original_staleness
+    assert warm_output.metrics["fully_async/train_weight_version"] == output.metrics["fully_async/train_weight_version"]
     assert warm_output.metrics["resume/replay_buffer/warm_prepared_batch_hit"] == 1
     assert restored._worker is None
     assert [group[0].group_index for group in restored_source.buffer] == [2]
@@ -672,9 +693,9 @@ def test_restored_overfull_queue_does_not_release_capacity_early(monkeypatch):
     async def generate(state, group, sampling_params, evaluation=False):
         return _complete(group, 5)
 
-    fn = _make_fn(monkeypatch, _args(), _DataSource(), generate)
+    fn = _make_fn(monkeypatch, _args(training_buffer_queue_size=3), _DataSource(), generate)
     fn._output = asyncio.Queue()
-    for group_id in range(fully_async.OUTPUT_QUEUE_MAX_GROUPS + 2):
+    for group_id in range(fn._queue_capacity_groups() + 2):
         prompt = _prompt_group(group_id)
         fn._output.put_nowait((prompt, _complete(prompt, 5)))
     fn._output_slots = asyncio.Semaphore(0)
@@ -693,11 +714,11 @@ def test_restored_overfull_queue_does_not_release_capacity_early(monkeypatch):
 async def test_restored_overfull_queue_max_does_not_release_capacity_early(monkeypatch):
     fn = _make_fn(
         monkeypatch,
-        _queue_args("queue-max"),
+        _queue_args("queue-max", training_buffer_queue_size=3),
         _DataSource(),
         lambda *args, **kwargs: None,
     )
-    fn._policy_output = deque(_ready_item(group_id) for group_id in range(fully_async.OUTPUT_QUEUE_MAX_GROUPS + 2))
+    fn._policy_output = deque(_ready_item(group_id) for group_id in range(fn._queue_capacity_groups() + 2))
     fn._output_slots = asyncio.Semaphore(0)
 
     await fn._take_policy_groups(1)

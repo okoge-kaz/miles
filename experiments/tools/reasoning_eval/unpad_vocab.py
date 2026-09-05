@@ -4,20 +4,19 @@
 The Miles Qwen3-4B export records the tokenizer vocabulary size in config.json,
 but the embedding tensor can retain Megatron's padded row count. vLLM rejects
 that mismatch. This tool creates a runtime checkpoint whose embedding has the
-configured number of rows. Unchanged safetensor shards are hard-linked where
-possible and absolute-symlinked otherwise.
+configured number of rows. Unchanged shards are copied into the runtime
+checkpoint so parallel vLLM workers read node-local storage instead of
+repeatedly reading the shared source checkpoint.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import shutil
 import struct
 from pathlib import Path
 from typing import Any
-
 
 EMBEDDING_NAME = "model.embed_tokens.weight"
 COPY_CHUNK_BYTES = 64 << 20
@@ -82,7 +81,7 @@ def _rewrite_shard(*, source: Path, destination: Path, tensor_name: str, keep_ro
     temporary.replace(destination)
 
 
-def _link_or_copy_metadata(*, source: Path, destination: Path, rewritten_shard: str) -> None:
+def _copy_checkpoint_files(*, source: Path, destination: Path, rewritten_shard: str) -> None:
     destination.mkdir(parents=True, exist_ok=True)
     for item in source.iterdir():
         target = destination / item.name
@@ -90,12 +89,7 @@ def _link_or_copy_metadata(*, source: Path, destination: Path, rewritten_shard: 
             target.unlink()
         if item.name == rewritten_shard:
             continue
-        if item.name.endswith(".safetensors"):
-            try:
-                os.link(item, target)
-            except OSError:
-                target.symlink_to(item.resolve())
-        elif item.is_file():
+        if item.is_file():
             shutil.copy2(item, target)
 
 
@@ -124,11 +118,9 @@ def unpad_checkpoint(*, source: Path, destination: Path) -> bool:
     removed_bytes = (embedding_rows - vocabulary_size) * columns * item_size
     original_total_size = index.get("metadata", {}).get("total_size")
     if original_total_size is None:
-        original_total_size = sum(
-            _tensor_data_size(source / name) for name in set(index["weight_map"].values())
-        )
+        original_total_size = sum(_tensor_data_size(source / name) for name in set(index["weight_map"].values()))
 
-    _link_or_copy_metadata(source=source, destination=destination, rewritten_shard=shard_name)
+    _copy_checkpoint_files(source=source, destination=destination, rewritten_shard=shard_name)
     _rewrite_shard(
         source=shard_path,
         destination=destination / shard_name,
@@ -142,8 +134,7 @@ def unpad_checkpoint(*, source: Path, destination: Path) -> bool:
     index_path_out.write_text(json.dumps(index, indent=2) + "\n", encoding="utf-8")
     after, _ = _read_header(destination / shard_name)
     print(
-        f"{source} -> {destination}: {EMBEDDING_NAME} "
-        f"{embedding_rows} -> {after[EMBEDDING_NAME]['shape'][0]} rows"
+        f"{source} -> {destination}: {EMBEDDING_NAME} " f"{embedding_rows} -> {after[EMBEDDING_NAME]['shape'][0]} rows"
     )
     return True
 

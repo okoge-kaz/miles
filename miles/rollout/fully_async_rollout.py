@@ -2,16 +2,18 @@
 
 A persistent background worker keeps up to ``rollout_batch_size`` prompt groups in
 flight at all times; each training step only drains already-completed groups from the
-worker's output queue. Rollout production and training consumption run in parallel,
-so per-iteration wall time moves from ``rollout_time + train_time`` toward
-``max(rollout_time, train_time)``.
+data buffer (see ``fully_async_data_buffer.py``). Rollout production and training
+consumption run in parallel, so per-iteration wall time moves from
+``rollout_time + train_time`` toward ``max(rollout_time, train_time)``.
 
-Selected by ``train_async.py --fully-async``, which also requires the class-based
-rollout API (``MILES_EXPERIMENTAL_ROLLOUT_REFACTOR=1``).
+Selected by ``train_async.py --fully-async``, which requires the class-based
+rollout API (the default; incompatible with ``MILES_USE_LEGACY_ROLLOUT_V1=1``).
 
-Evaluation is not served by this function; ``--fully-async`` therefore points
-``--eval-function-path`` at the standard inference rollout unless it is set
-explicitly.
+Evaluation targets whatever ``GenerateState`` ``RolloutManager`` passes via
+``RolloutFnEvalInput.generate_state`` (see ``miles/rollout/checkpoint_eval.py``
+for how the dedicated-fleet state is built). When unset, eval shares the
+rollout engines, pausing producer submissions for the duration of the
+(blocking) eval.
 """
 
 import asyncio
@@ -30,18 +32,35 @@ import numpy as np
 
 from miles.rollout.base_types import (
     RolloutFnConstructorInput,
+    RolloutFnEvalInput,
+    RolloutFnEvalOutput,
     RolloutFnInput,
     RolloutFnOutput,
     RolloutFnTrainInput,
     RolloutFnTrainOutput,
 )
+from miles.rollout.fully_async_data_buffer import (
+    DataBuffer,
+    DataBufferConstructorInput,
+    DataBufferInput,
+    DefaultDataBuffer,
+    Group,
+    first_sample,
+)
 from miles.rollout.filter_hub.base_types import call_dynamic_filter
 from miles.rollout.fully_async_telemetry import FullyAsyncPipelineTelemetry
+from miles.rollout.generate_utils.sample_utils import reward_log_summary, sample_text_preview
 from miles.rollout.inference_rollout.inference_rollout_common import GenerateState, generate_and_rm_group
-from miles.rollout.queue_policy import QUEUE_DROP_POLICY, QUEUE_MAX_POLICY, QUEUE_RECYCLE_POLICY
+from miles.rollout.inference_rollout.inference_rollout_eval import run_eval_datasets
+from miles.rollout.queue_policy import (
+    DEFAULT_TRAINING_BUFFER_QUEUE_SIZE,
+    QUEUE_DROP_POLICY,
+    QUEUE_MAX_POLICY,
+    QUEUE_RECYCLE_POLICY,
+    fully_async_queue_capacity_groups,
+)
 from miles.rollout.queue_telemetry import (
     DEFAULT_RESPONSE_LENGTH_POPULATIONS,
-    Group,
     _distribution_metrics,
     _first_sample,
     _iter_samples,
@@ -49,7 +68,6 @@ from miles.rollout.queue_telemetry import (
     _ResponseLengthMetrics,
     group_first_prefill_weight_version,
     group_oldest_weight_version,
-    group_queue_entry_weight_version,
     group_response_tokens,
     group_reward_values,
 )
@@ -106,23 +124,22 @@ from miles.rollout.replay_buffer_codec import (
     ReplayBufferSampleEncoder,
     materialize_replay_buffer_state,
 )
+from miles.rollout.submission_scheduler import make_submission_scheduler
 from miles.utils.http_utils import get, post, router_worker_base_urls
 from miles.utils.misc import call_agent_abort_hook, load_function
 from miles.utils.types import Sample
 
 logger = logging.getLogger(__name__)
 
-OUTPUT_QUEUE_MAX_GROUPS = 1000
 ACKED_BATCH_HISTORY_SIZE = 16
 NO_PROGRESS_WARN_SECS = 30.0
 WEIGHT_VERSION_QUERY_TIMEOUT_SECS = 2.0
 # Realized lag is a small integer; anything past this goes in one overflow bucket
 # so the metric count stays bounded no matter how far behind a run drifts.
 #
-# 16, not 8: unbounded runs and runs with a parked bound need enough resolution
-# in the tail to show how realized staleness maps to downstream score. At 8 the
-# tail collapsed into one overflow bucket.
-STALENESS_HISTOGRAM_MAX = 16
+# 32, not 16: the high-staleness cohort sweeps bounds through 28 and needs
+# enough resolution in the tail to map realized staleness to downstream score.
+STALENESS_HISTOGRAM_MAX = 32
 QueueItem = tuple[list[Sample], Group]
 _CONTINUATION_METADATA_KEYS = (
     SUBMISSION_VERSION_KEY,
@@ -629,19 +646,35 @@ class FullyAsyncRolloutFn:
     """Continuous rollout generation decoupled from training steps.
 
     The worker runs as a long-lived task on the shared rollout event loop, created
-    lazily on the first train call. Groups whose samples were aborted (e.g. by a
-    weight update pausing generation) are recycled back into the data source.
-    Age-bound failures are recycled by ``queue-recycle`` and discarded by
-    queue-max; queue-drop instead discards the oldest completed group when its
-    bounded queue overflows.
+    lazily on the first train call. The v0.1 data-buffer path keeps group-level
+    admission replaceable. Explicit B300 queue policies add strict train-version
+    staleness control and durable replay across ready, active, drained, and prepared
+    lifecycle states.
     """
 
     def __init__(self, input: RolloutFnConstructorInput):
         self.args = input.args
+        self._queue_capacity = fully_async_queue_capacity_groups(input.args)
         self.data_source = input.data_source
         self.state = GenerateState(input.args)
+        # default to sample level backfill for fully async rollout
+        self._scheduler = make_submission_scheduler(input.args, default="sample")
+        assert input.args.async_unused_samples_handler in ("retry", "drop")
+        # applied to every group we do not train on; "drop" discards instead of recycling
+        self._handle_unused = (
+            self._recycle if input.args.async_unused_samples_handler == "retry" else (lambda prompt_group: None)
+        )
         self._dynamic_filter = load_function(input.args.dynamic_sampling_filter_path)
         self._sample_filter = load_function(input.args.rollout_sample_filter_path)
+        self._uses_data_buffer = getattr(input.args, "fully_async_queue_type", None) is None
+        self._data_buffer_cls = (
+            load_function(input.args.custom_async_data_buffer_path) or DefaultDataBuffer
+            if self._uses_data_buffer
+            else None
+        )
+        self._eval_prompt_dataset_cache: dict = {}
+        self._producer_resumed = asyncio.Event()
+        self._producer_resumed.set()
         self._weight_version = _CachedWeightVersion()
         self._applied_weight_version = AppliedWeightVersionTracker()
         self._queue_lifecycle = _QueueLifecycleRecorder(
@@ -655,11 +688,12 @@ class FullyAsyncRolloutFn:
         self._queue_evicted_groups = 0
         self._queue_evicted_tokens = 0
         generate_group_parameters = inspect.signature(generate_and_rm_group).parameters
+        self._sample_completion_callback_supported = "sample_done_callback" in generate_group_parameters
         self._generation_lifecycle_supported = "lifecycle_version_provider" in generate_group_parameters
         self._generation_completion_callback_supported = "on_group_generation_complete" in generate_group_parameters
         self._pipeline_telemetry = FullyAsyncPipelineTelemetry()
         self._worker: asyncio.Task | None = None
-        self._output: asyncio.Queue[QueueItem] | None = None
+        self._output: asyncio.Queue[QueueItem] | DataBuffer | None = None
         self._output_slots: asyncio.Semaphore | None = None
         self._policy_output: deque[QueueItem] | None = None
         self._policy_output_ready: asyncio.Event | None = None
@@ -696,7 +730,7 @@ class FullyAsyncRolloutFn:
     async def pipeline_telemetry_snapshot(self) -> dict[str, float]:
         """Sample producer/consumer counters on the rollout event loop."""
         return self._pipeline_telemetry.snapshot(
-            active_groups=len(self._active),
+            active_groups=self._telemetry_active_groups(),
             max_active_groups=self._max_in_flight_groups(),
         )
 
@@ -712,7 +746,7 @@ class FullyAsyncRolloutFn:
             optimizer_updates=optimizer_updates,
         )
         return self._pipeline_telemetry.snapshot(
-            active_groups=len(self._active),
+            active_groups=self._telemetry_active_groups(),
             max_active_groups=self._max_in_flight_groups(),
         )
 
@@ -740,6 +774,8 @@ class FullyAsyncRolloutFn:
         """Capture one coherent lifecycle snapshot on the rollout event loop."""
         if not self._replay_buffer_enabled:
             raise RuntimeError("Replay buffer is disabled")
+        if self._uses_data_buffer:
+            raise RuntimeError("Replay buffer requires an explicit built-in fully-async queue policy")
         if self._replay_buffer_type == REPLAY_BUFFER_INFLIGHT:
             return await self._capture_inflight_replay_buffer_state(rollout_id)
         with _defer_cyclic_gc():
@@ -1244,13 +1280,18 @@ class FullyAsyncRolloutFn:
 
     async def __call__(self, input: RolloutFnInput) -> RolloutFnOutput:
         if input.evaluation:
-            raise ValueError(
-                "FullyAsyncRolloutFn does not serve eval; set --eval-function-path to "
-                "miles.rollout.inference_rollout.inference_rollout_common.InferenceRolloutFn"
-            )
+            return await self._call_eval(input)
         assert isinstance(input, RolloutFnTrainInput)
         if input.updates_before_train < 0:
             raise ValueError("updates_before_train must be non-negative")
+        if (
+            self._queue_policy() == QUEUE_RECYCLE_POLICY
+            and self.args.max_weight_staleness is not None
+            and input.updates_before_train > 1
+        ):
+            raise ValueError(
+                "Bounded queue-recycle supports at most one scheduled update between dequeue and training"
+            )
         if prepared := self._prepared_batches.get(input.rollout_id):
             prepared.output.metrics = {
                 **(prepared.output.metrics or {}),
@@ -1262,6 +1303,8 @@ class FullyAsyncRolloutFn:
             return prepared.output
 
         self._ensure_worker()
+        if self._uses_data_buffer:
+            return await self._drain_data_buffer(input)
         output = await self._drain(input.rollout_id, input.updates_before_train)
         if self._replay_buffer_enabled:
             group_ids = tuple(prompt_group_id([_first_sample(group)]) for group in output.samples)
@@ -1273,10 +1316,28 @@ class FullyAsyncRolloutFn:
             self._prepared_batches[input.rollout_id] = prepared
         return output
 
+    async def _call_eval(self, input: RolloutFnEvalInput) -> RolloutFnEvalOutput:
+        if input.generate_state is not None:
+            results = await run_eval_datasets(input.generate_state, self._eval_prompt_dataset_cache)
+            return RolloutFnEvalOutput(data=results)
+
+        logger.info("Pausing fully-async producer submissions for shared-engine eval")
+        self._producer_resumed.clear()
+        try:
+            results = await run_eval_datasets(self.state, self._eval_prompt_dataset_cache)
+        finally:
+            self._producer_resumed.set()
+            logger.info("Resumed fully-async producer submissions after eval")
+        return RolloutFnEvalOutput(data=results)
+
     def _ensure_worker(self) -> None:
         if self._worker is not None:
             return
-        if self._queue_policy() == QUEUE_RECYCLE_POLICY:
+        if self._uses_data_buffer:
+            self._output = self._data_buffer_cls(
+                DataBufferConstructorInput(args=self.args, unused_handler_fn=self._handle_unused)
+            )
+        elif self._queue_policy() == QUEUE_RECYCLE_POLICY:
             if self._output is None:
                 self._output = asyncio.Queue()
             if self._output_slots is None:
@@ -1291,28 +1352,25 @@ class FullyAsyncRolloutFn:
                 available_slots = max(0, self._queue_capacity_groups() - len(self._policy_output))
                 self._output_slots = asyncio.Semaphore(available_slots)
         self._pipeline_telemetry.set_queue_depth(self._queue_size())
-        self._pipeline_telemetry.set_active_groups(len(self._active), self._max_in_flight_groups())
+        self._pipeline_telemetry.set_active_groups(self._telemetry_active_groups(), self._max_in_flight_groups())
         self._pipeline_telemetry.reset_window()
         self._worker = asyncio.create_task(self._worker_loop())
         logger.info(
             "Started fully-async rollout worker (queue_type=%s, capacity_groups=%d)",
-            self._queue_policy(),
+            self._queue_policy() or "data-buffer",
             self._queue_capacity_groups(),
         )
 
-    def _queue_policy(self) -> str:
-        return getattr(self.args, "fully_async_queue_type", QUEUE_RECYCLE_POLICY)
+    def _queue_policy(self) -> str | None:
+        return getattr(self.args, "fully_async_queue_type", None)
 
     def _queue_capacity_groups(self) -> int:
-        if self._queue_policy() == QUEUE_DROP_POLICY:
-            return getattr(self.args, "fully_async_queue_factor", 1) * self.args.rollout_batch_size
-        if self._queue_policy() == QUEUE_MAX_POLICY:
-            # queue-max waits for a whole batch before dequeueing. Its safety
-            # backpressure limit must therefore never be smaller than that batch.
-            return max(OUTPUT_QUEUE_MAX_GROUPS, self.args.rollout_batch_size)
-        return OUTPUT_QUEUE_MAX_GROUPS
+        return self._queue_capacity
 
     def _queue_size(self) -> int:
+        if self._uses_data_buffer:
+            qsize = getattr(self._output, "qsize", None)
+            return qsize() if qsize is not None else 0
         if self._queue_policy() == QUEUE_RECYCLE_POLICY:
             return self._output.qsize()
         return len(self._policy_output)
@@ -1341,16 +1399,28 @@ class FullyAsyncRolloutFn:
             return max(1, x // self.args.n_samples_per_prompt)
         return self.args.rollout_batch_size
 
+    def _telemetry_active_groups(self) -> int:
+        """Return group-equivalent occupied capacity for either scheduler."""
+        samples_in_flight = getattr(self._scheduler, "samples_in_flight", None)
+        if samples_in_flight is None:
+            return len(self._active)
+        group_size = self.args.n_samples_per_prompt
+        occupied = (max(0, samples_in_flight) + group_size - 1) // group_size
+        return min(occupied, self._max_in_flight_groups())
+
     def _submit_one_group(self) -> asyncio.Task:
         if self._inflight_replay:
             item = self._inflight_replay.popleft()
+            self._scheduler.on_submit([item.generation_group])
             return asyncio.create_task(
                 self._generate_group(
                     item.prompt_group,
                     generation_group=item.generation_group,
                 )
             )
-        [prompt_group] = self.data_source.get_samples(1)
+        groups = self.data_source.get_samples(1)
+        self._scheduler.on_submit(groups)
+        [prompt_group] = groups
         if self._replay_buffer_enabled:
             group_id = prompt_group_id(prompt_group)
             if group_id not in self._pending_prompts:
@@ -1369,6 +1439,16 @@ class FullyAsyncRolloutFn:
         trajectory into several samples, and ``generate_and_rm_group`` does not accept
         that shape back.
         """
+        if self._uses_data_buffer:
+            generate_kwargs = {
+                "sampling_params": self.state.sampling_params.copy(),
+                "evaluation": False,
+            }
+            if self._sample_completion_callback_supported:
+                generate_kwargs["sample_done_callback"] = self._scheduler.sample_done_callback
+            result = await generate_and_rm_group(self.state, prompt_group, **generate_kwargs)
+            return prompt_group, result
+
         attempt_start = time.monotonic()
         continuation = generation_group is not None
         generation_group = prompt_group if generation_group is None else generation_group
@@ -1400,6 +1480,8 @@ class FullyAsyncRolloutFn:
             "sampling_params": self.state.sampling_params.copy(),
             "evaluation": False,
         }
+        if self._sample_completion_callback_supported:
+            generate_kwargs["sample_done_callback"] = self._scheduler.sample_done_callback
         if self._generation_lifecycle_supported:
             generate_kwargs["lifecycle_version_provider"] = self._applied_weight_version.current
         generation_count_recorded = False
@@ -1505,16 +1587,30 @@ class FullyAsyncRolloutFn:
 
     async def _worker_loop(self):
         while True:
-            while self._completed_waiting:
+            await self._producer_resumed.wait()
+            while not self._uses_data_buffer and self._completed_waiting:
                 task_id, item = next(iter(self._completed_waiting.items()))
                 await self._enqueue_completed_group(item)
                 del self._completed_waiting[task_id]
-            while len(self._active) < self._max_in_flight_groups():
+            while self._scheduler.has_capacity(
+                pending_groups=len(self._active),
+                group_budget=self._max_in_flight_groups(),
+            ):
                 self._active.add(self._submit_one_group())
-            self._pipeline_telemetry.set_active_groups(len(self._active), self._max_in_flight_groups())
-            done, self._active = await asyncio.wait(self._active, return_when=asyncio.FIRST_COMPLETED)
-            self._pipeline_telemetry.set_active_groups(len(self._active), self._max_in_flight_groups())
+            self._pipeline_telemetry.set_active_groups(
+                self._telemetry_active_groups(),
+                self._max_in_flight_groups(),
+            )
+            done, self._active = await self._scheduler.wait_for_progress(self._active)
+            self._pipeline_telemetry.set_active_groups(
+                self._telemetry_active_groups(),
+                self._max_in_flight_groups(),
+            )
             completed = [(id(task), task.result()) for task in done]
+            if self._uses_data_buffer:
+                for _, (prompt_group, group) in completed:
+                    await self._output.put(DataBufferInput(prompt_group=prompt_group, group=group))
+                continue
             if self._replay_buffer_enabled:
                 self._completed_waiting.update(completed)
             for task_id, item in completed:
@@ -1522,12 +1618,33 @@ class FullyAsyncRolloutFn:
                 if self._replay_buffer_enabled:
                     del self._completed_waiting[task_id]
 
+    # -------------------------- consumer --------------------------
+
+    async def _next_data_buffer_group(self, current_version: int | None) -> DataBufferInput:
+        queue_get = asyncio.create_task(self._output.get(current_version=current_version))
+        try:
+            while True:
+                done, _ = await asyncio.wait(
+                    {queue_get, self._worker},
+                    return_when=asyncio.FIRST_COMPLETED,
+                    timeout=NO_PROGRESS_WARN_SECS,
+                )
+                if self._worker in done:
+                    self._worker.result()
+                    raise RuntimeError("fully-async rollout worker exited without an exception")
+                if queue_get in done:
+                    return queue_get.result()
+                logger.warning(f"No completed rollout groups for {NO_PROGRESS_WARN_SECS}s")
+        finally:
+            if not queue_get.done():
+                queue_get.cancel()
+
     async def _enqueue_completed_group(self, item: QueueItem) -> None:
         policy = self._queue_policy()
         if policy in (QUEUE_RECYCLE_POLICY, QUEUE_MAX_POLICY):
-            # These policies control age at selection time. The 1000-group limit
-            # is only a safety backpressure bound, not their experimental queue
-            # capacity.
+            # These policies control age at selection time. The configured
+            # completed-group limit is a safety backpressure bound, not their
+            # experimental selection capacity.
             backpressure_start = time.monotonic()
             await self._output_slots.acquire()
             self._pipeline_telemetry.add_rollout_backpressure(time.monotonic() - backpressure_start)
@@ -1616,6 +1733,38 @@ class FullyAsyncRolloutFn:
                 self._queue_gets.discard(queue_get)
             if not queue_get.done():
                 queue_get.cancel()
+
+    async def _drain_data_buffer(self, input: RolloutFnTrainInput) -> RolloutFnTrainOutput:
+        args = self.args
+        assert args.rollout_global_dataset
+
+        data: list[Group] = []
+        do_print = True
+        while len(data) < args.rollout_batch_size:
+            entry = await self._next_data_buffer_group(input.weight_version)
+            assert len(entry.group) == args.n_samples_per_prompt
+            if do_print:
+                sample = first_sample(entry.group)
+                logger.info(
+                    "First rollout sample: text_preview=%s, label=%s, reward_summary=%s",
+                    sample_text_preview(sample),
+                    str(sample.label)[:100],
+                    reward_log_summary(sample.reward),
+                )
+                do_print = False
+            data.append(entry.group)
+
+        sample = first_sample(data[-1])
+        logger.info(
+            "Finish rollout: text_preview=%s, label=%s, reward_summary=%s",
+            sample_text_preview(sample),
+            str(sample.label)[:100],
+            reward_log_summary(sample.reward),
+        )
+        data.sort(key=lambda group: first_sample(group).index)
+        if self._sample_filter is not None:
+            self._sample_filter(args, data)
+        return RolloutFnTrainOutput(samples=data, metrics=self._output.get_metrics())
 
     async def _take_policy_groups(self, count: int) -> list[tuple[QueueItem, int]]:
         """Wait for and atomically remove ``count`` oldest completed groups."""
@@ -1938,6 +2087,11 @@ class FullyAsyncRolloutFn:
                         f"max={max_staleness}, train={train_version}, train_staleness={train_staleness})"
                     )
                     continue
+                if strict_bound and max_staleness is not None and train_staleness > max_staleness:
+                    raise RuntimeError(
+                        "queue-recycle admitted a group outside its train-time staleness bound: "
+                        f"train={train_version}, reference={reference}, max={max_staleness}"
+                    )
 
             # Not gated on the bound: the bound tests one derived quantity, and every
             # arm -- including an unbounded one -- needs the decomposition.
@@ -2014,8 +2168,10 @@ class FullyAsyncRolloutFn:
             if progress.do_print:
                 sample = _first_sample(group)
                 logger.info(
-                    f"First rollout sample: {[str(sample.prompt) + sample.response]}, "
-                    f"label: {sample.label}, reward: {sample.reward}"
+                    "First rollout sample: text_preview=%s, label=%s, reward_summary=%s",
+                    sample_text_preview(sample),
+                    str(sample.label)[:100],
+                    reward_log_summary(sample.reward),
                 )
                 progress.do_print = False
 
@@ -2062,13 +2218,15 @@ class FullyAsyncRolloutFn:
             data.append(group)
             progress.group_ids.append(prompt_group_id(prompt_group))
 
-        sample = _first_sample(data[-1])
+        sample = first_sample(data[-1])
         logger.info(
-            f"Finish rollout: {[str(sample.prompt) + sample.response]}, "
-            f"label: {sample.label}, reward: {sample.reward}"
+            "Finish rollout: text_preview=%s, label=%s, reward_summary=%s",
+            sample_text_preview(sample),
+            str(sample.label)[:100],
+            reward_log_summary(sample.reward),
         )
 
-        data.sort(key=lambda group: _first_sample(group).index)
+        data.sort(key=lambda group: first_sample(group).index)
 
         admitted_tokens_before_sample_filter = sum(group_response_tokens(group) for group in data)
         if self._sample_filter is not None:
@@ -2099,6 +2257,11 @@ class FullyAsyncRolloutFn:
             "queue/config/type_is_queue_max": float(self._queue_policy() == QUEUE_MAX_POLICY),
             "queue/config/type_is_queue_drop": float(self._queue_policy() == QUEUE_DROP_POLICY),
             "queue/config/factor": getattr(args, "fully_async_queue_factor", 1),
+            "queue/config/training_buffer_queue_size": getattr(
+                args,
+                "training_buffer_queue_size",
+                DEFAULT_TRAINING_BUFFER_QUEUE_SIZE,
+            ),
             "rollout/fully_async/aborted_groups_recycled": progress.aborted_groups_recycled,
             "rollout/fully_async/stale_groups_recycled": progress.stale_groups_recycled,
             "rollout/fully_async/stale_groups_dropped": progress.stale_groups_dropped,

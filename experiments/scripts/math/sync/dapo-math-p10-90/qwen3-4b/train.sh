@@ -8,11 +8,28 @@ if [[ "${WANDB_MODE:-online}" == offline || "${WANDB_MODE:-online}" == disabled 
    unset WANDB_API_KEY
 fi
 
+if [[ "${ZERO_REWARD_ON_TRUNCATED:-0}" != "0" && "${ZERO_LOSS_ON_TRUNCATED:-0}" != "0" ]]; then
+   echo "ZERO_REWARD_ON_TRUNCATED and ZERO_LOSS_ON_TRUNCATED are mutually exclusive" >&2
+   exit 2
+fi
+
 NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
 HAS_NVLINK=$([ "$NVLINK_COUNT" -gt 0 ] && echo 1 || echo 0)
 
 cd /root/miles
-source /root/miles/scripts/models/qwen3-4B.sh
+MODEL_ARGS_LINE="$(
+   python3 miles/utils/external_utils/model_args_utils.py qwen3-4B
+)" || exit 1
+read -ra MODEL_ARGS <<< "${MODEL_ARGS_LINE}"
+# ABCI exposes the full-node GPU allocation as UUIDs in
+# CUDA_VISIBLE_DEVICES. Ray preserves those values in ray.get_gpu_ids(), while
+# the current rollout launcher expects numeric IDs. This recipe uses every GPU
+# on each exclusive node, so normalize the in-container view before Ray starts.
+[[ "${GPUS_PER_NODE}" =~ ^[1-9][0-9]*$ ]] || {
+   echo "GPUS_PER_NODE must be a positive integer: ${GPUS_PER_NODE}" >&2
+   exit 1
+}
+export CUDA_VISIBLE_DEVICES="$(seq -s, 0 "$(( GPUS_PER_NODE - 1 ))")"
 source /root/miles/experiments/common/ray_cluster.sh
 
 CKPT_ARGS=(
@@ -39,6 +56,7 @@ ROLLOUT_ARGS=(
    --rm-type "${RM_TYPE}"
    --num-rollout "${NUM_ROLLOUT}"
    --rollout-batch-size "${ROLLOUT_BATCH_SIZE}"
+   --over-sampling-batch-size "${OVER_SAMPLING_BATCH_SIZE}"
    --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT}"
    --rollout-max-response-len "${MAX_RESPONSE_LEN}"
    --rollout-max-context-len 32768
@@ -51,6 +69,15 @@ ROLLOUT_ARGS=(
 )
 if [[ "${ZERO_REWARD_ON_TRUNCATED}" != "0" ]]; then
    ROLLOUT_ARGS+=(--zero-reward-on-truncated)
+fi
+if [[ "${ZERO_LOSS_ON_TRUNCATED}" != "0" ]]; then
+   ROLLOUT_ARGS+=(--zero-loss-on-truncated)
+fi
+if [[ "${PARTIAL_ROLLOUT:-0}" != "0" ]]; then
+   ROLLOUT_ARGS+=(--partial-rollout)
+fi
+if [[ "${MASK_OFFPOLICY_IN_PARTIAL_ROLLOUT:-0}" != "0" ]]; then
+   ROLLOUT_ARGS+=(--mask-offpolicy-in-partial-rollout)
 fi
 
 TELEMETRY_ARGS=(
@@ -174,6 +201,8 @@ MISC_ARGS=(
    --attention-backend "${TRAINING_ATTENTION_BACKEND}"
 )
 
+# WANDB_API_KEY is inherited through --export=ALL. Never put it in this argv:
+# both shell xtrace and Ray's "Running entrypoint" line are persisted in job logs.
 WANDB_ARGS=(
    --use-wandb
    --wandb-project "${WANDB_PROJECT:-off-policy-${DATASET_TAG}}"

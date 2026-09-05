@@ -105,10 +105,12 @@ def build_and_push(
     dockerfile: str,
     push: bool = False,
     custom_tag: str = "",
+    extra_build_args: list[str] | None = None,
     sglang_repo: str = "",
     sglang_branch: str = "",
     sglang_commit: str = "",
 ) -> None:
+    extra_build_args = extra_build_args or []
     config = VARIANTS[variant]
     # A variant may pin its own Dockerfile (e.g. ROCm); otherwise use the CLI default.
     dockerfile = config.get("dockerfile", dockerfile)
@@ -162,6 +164,13 @@ def build_and_push(
     ):
         if value:
             cmd += ["--build-arg", f"{key}={value}"]
+
+    # Caller overrides (e.g. release builds pinning SGLANG_COMMIT / MILES_COMMIT
+    # from release-lock.json) come last so they win over all defaults above.
+    for spec in extra_build_args:
+        assert "=" in spec, f"--build-arg expects KEY=VALUE, got {spec!r}"
+        cmd += ["--build-arg", spec]
+
     for tag in tags:
         cmd += ["-t", tag]
 
@@ -195,6 +204,7 @@ def main(
     dry_run: bool = typer.Option(False, help="Print commands without executing them."),  # noqa: B008
     push: bool = typer.Option(False, help="Push images to registry after building."),  # noqa: B008
     custom_tag: str = typer.Option("", help="Custom tag name (required when --image-tag is custom)."),  # noqa: B008
+    build_arg: list[str] = typer.Option([], help="Extra KEY=VALUE build-arg (repeatable)."),  # noqa: B008
     sglang_repo: str = typer.Option(  # noqa: B008
         DEFAULT_SGLANG_REPO,
         help="GitHub owner/repo for the SGLang fork.",
@@ -215,6 +225,7 @@ def main(
         dockerfile,
         push=push,
         custom_tag=custom_tag,
+        extra_build_args=build_arg,
         sglang_repo=sglang_repo,
         sglang_branch=sglang_branch,
         sglang_commit=sglang_commit,

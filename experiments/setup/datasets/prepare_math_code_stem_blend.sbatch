@@ -13,6 +13,7 @@ set -euo pipefail
 
 REPO_ROOT="${PBS_O_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
 source "${REPO_ROOT}/experiments/env.sh"
+export MATH_PROMPT_DATA="${MATH_PROMPT_DATA:-/data/dapo-math-p10-90-qwen3-4b-base-lr2e-5-step4000/dapo-math-p10-90-qwen3-4b-base-lr2e-5-step4000.jsonl}"
 
 miles_srun \
     --image="${CONTAINER_IMAGE}" \
@@ -28,7 +29,7 @@ export PYTHONPATH=/root/miles
 OUT=/data/nemotron-performance-transfer
 python3 -m experiments.src.datasets.common.merge \
     --input \
-        /data/dapo-math-p10-90-qwen3-4b-base-lr2e-5-step4000/dapo-math-p10-90-qwen3-4b-base-lr2e-5-step4000.jsonl \
+        "${MATH_PROMPT_DATA}" \
         "${OUT}/nemotron3-nano-competitive-code-train.jsonl" \
         "${OUT}/nemotron3-nano-knowledge-mcqa-reasoning-gym-train.jsonl" \
     --output "${OUT}/math-code-stem-balanced-train.jsonl" \

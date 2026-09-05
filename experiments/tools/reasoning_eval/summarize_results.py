@@ -8,18 +8,19 @@ import csv
 import json
 import os
 import re
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
+
+from experiments.tools.reasoning_eval.grid import reasoning_eval_grid_from_environment
 
 
 TASKS = ("aime24", "aime25", "aime26")
-DEFAULT_PROTOCOL = (
-    "eval-factory-26.03-vllm-0.20.2-cu130-qwen3-rl-"
-    "thinking-t0.6-p0.95-k20-aime64-v1"
-)
+DEFAULT_PROTOCOL = "eval-factory-26.03-vllm-0.20.2-cu130-qwen3-rl-" "thinking-t0.6-p0.95-k20-aime64-v1"
 ASYNC_ARM_PATTERN = re.compile(r"^s(?P<staleness>\d+)-t(?P<train>\d+)r(?P<rollout>\d+)$")
+EVALUATION_GRID = reasoning_eval_grid_from_environment()
 
 
 @dataclass(frozen=True)
@@ -44,7 +45,7 @@ class ScoreRecord:
 
 @dataclass(frozen=True)
 class AggregateRecord:
-    """Three-task macro score for one arm and training step."""
+    """Three-task AIME mean for one arm and training step."""
 
     arm: str
     placement: str
@@ -61,12 +62,7 @@ class AggregateRecord:
 
 
 def _expected_arms() -> tuple[str, ...]:
-    async_arms = tuple(
-        f"s{staleness}-t{train_nodes}r{8 - train_nodes}"
-        for staleness in (1, 2, 4, 8)
-        for train_nodes in (1, 2, 3, 4)
-    )
-    return (*async_arms, "s0-colocated")
+    return EVALUATION_GRID.all_arms
 
 
 def _arm_metadata(arm: str) -> tuple[str, int, int, int]:
@@ -140,9 +136,7 @@ def _collect_score(
     )
 
 
-def _collect_records(
-    *, root: Path, protocol: str, mode: str, steps: Iterable[int]
-) -> list[ScoreRecord]:
+def _collect_records(*, root: Path, protocol: str, mode: str, steps: Iterable[int]) -> list[ScoreRecord]:
     records: list[ScoreRecord] = []
     for arm in _expected_arms():
         for step in steps:
@@ -188,9 +182,7 @@ def _aggregate_records(records: Iterable[ScoreRecord], steps: Iterable[int]) -> 
     return aggregates
 
 
-def _write_csv(
-    path: Path, rows: list[dict[str, Any]], *, fieldnames: list[str] | None = None
-) -> None:
+def _write_csv(path: Path, rows: list[dict[str, Any]], *, fieldnames: list[str] | None = None) -> None:
     columns = fieldnames or (list(rows[0]) if rows else None)
     if columns is None:
         raise ValueError(f"CSV columns are required for empty output: {path}")
@@ -209,11 +201,7 @@ def _write_json(path: Path, value: Any) -> None:
 
 
 def _latest_complete(aggregates: Iterable[AggregateRecord], arm: str) -> AggregateRecord | None:
-    candidates = [
-        record
-        for record in aggregates
-        if record.arm == arm and record.aime_macro_mean_percent is not None
-    ]
+    candidates = [record for record in aggregates if record.arm == arm and record.aime_macro_mean_percent is not None]
     return max(candidates, key=lambda record: record.training_step) if candidates else None
 
 
@@ -232,7 +220,7 @@ def _render_markdown(
         "",
         "## Latest complete checkpoint per arm",
         "",
-        "| Arm | Step | AIME24 | AIME25 | AIME26 | Macro mean |",
+        "| Arm | Step | AIME24 | AIME25 | AIME26 | AIME mean |",
         "|---|---:|---:|---:|---:|---:|",
     ]
     for arm in _expected_arms():
@@ -248,7 +236,7 @@ def _render_markdown(
     lines.extend(
         [
             "",
-            "The macro mean is emitted only when all three AIME tasks completed for that checkpoint.",
+            "The AIME mean is emitted only when all three AIME tasks completed for that checkpoint.",
             "Detailed and aggregate machine-readable data are in `task-results.csv`, "
             "`aggregate-results.csv`, and `summary.json`.",
             "",
@@ -295,9 +283,7 @@ def main() -> None:
         "tasks": list(TASKS),
         "completed_task_evaluations": len(records),
         "expected_task_evaluations": len(aggregates) * len(TASKS),
-        "complete_checkpoint_suites": sum(
-            record.aime_macro_mean_percent is not None for record in aggregates
-        ),
+        "complete_checkpoint_suites": sum(record.aime_macro_mean_percent is not None for record in aggregates),
         "records": record_rows,
         "aggregates": aggregate_rows,
     }

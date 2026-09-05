@@ -31,6 +31,9 @@ def make_args(**overrides: Any) -> Namespace:
         # rollout core
         rollout_num_gpus=8,
         rollout_num_gpus_per_engine=1,
+        eval_num_gpus=0,
+        eval_num_gpus_per_engine=1,
+        eval_uses_snapshots=False,
         num_gpus_per_node=8,
         rollout_batch_size=8,
         n_samples_per_prompt=4,
@@ -58,6 +61,7 @@ def make_args(**overrides: Any) -> Namespace:
         reward_key=None,
         log_reward_category=None,
         log_passrate=False,
+        zero_loss_on_truncated=False,
         # placement / colocation
         debug_train_only=False,
         debug_rollout_only=False,

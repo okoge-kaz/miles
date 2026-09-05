@@ -24,14 +24,14 @@ reuse inside one rollout batch, where the lag is deterministic (`0..N-1`
 gradient steps) rather than a distribution over generation latency. Both are
 swept; they are not the same axis.
 
-## The realized lag has a hard ceiling, and a hard-coded constant sets it (2026-08-07)
+## The realized lag has a hard ceiling, and the completed queue sets it (2026-08-07)
 
 Over-provisioning rollout does not send the lag off to infinity. Production is
 bounded on two sides in `fully_async_rollout.py`:
 
 ```python
-OUTPUT_QUEUE_MAX_GROUPS = 1000                                  # :34
-self._output = asyncio.Queue(maxsize=OUTPUT_QUEUE_MAX_GROUPS)   # :267
+queue_capacity = args.training_buffer_queue_size  # default 1000
+self._output_slots = asyncio.Semaphore(queue_capacity)
 
 def _max_in_flight_groups(self):                                # :290
     if (x := self.args.async_max_concurrent_samples) is not None:
@@ -40,16 +40,22 @@ def _max_in_flight_groups(self):                                # :290
 
 async def _worker_loop(self):                                   # :320
     ...
-    await self._output.put(task.result())                       # :329  blocks when full
+    await self._output_slots.acquire()  # blocks when the completed queue is full
+    self._output.put_nowait(task.result())
+
+async def _next_group(self):
+    group = self._output.get_nowait()
+    self._output_slots.release()
+    return group
 ```
 
-`await put` is backpressure: with the queue full the worker stops submitting, so
-the engines stall rather than the queue growing. Run-ahead is therefore at most
-`OUTPUT_QUEUE_MAX_GROUPS + rollout_batch_size` groups, and the trainer drains
+The semaphore is backpressure: with the queue full the worker stops submitting,
+so the engines stall rather than the queue growing. Run-ahead is therefore at most
+`training_buffer_queue_size + rollout_batch_size` groups, and the trainer drains
 `rollout_batch_size` per step, so
 
-    ceiling(L) ~ OUTPUT_QUEUE_MAX_GROUPS / rollout_batch_size + O(1)
-               = 1000 / 192 + 1 ~ 6
+    ceiling(L) ~ training_buffer_queue_size / rollout_batch_size + O(1)
+               = 1000 / 192 + 1 ~ 6  # at the default
 
 Measured, T=1, gbs 3072, n 16, rbs 192, 12 rollouts, uncapped (`MAX_WEIGHT_STALENESS=64`):
 
@@ -68,10 +74,10 @@ settles immediately.
 Two consequences.
 
 **The "natural" staleness of an over-provisioned run is a property of the
-framework, not of the workload.** At `OUTPUT_QUEUE_MAX_GROUPS = 100` the ceiling
-would be ~0.5; at 10000, ~52. The constant has to be reported alongside any
-realized-lag histogram, and a staleness level above the ceiling is bit-for-bit
-the uncapped run.
+framework, not of the workload.** At `--training-buffer-queue-size 100` the
+ceiling would be ~0.5; at 10000, ~52. The queue size has to be reported alongside
+any realized-lag histogram, and a staleness level above the ceiling is
+bit-for-bit the uncapped run.
 
 **Raising the queue is a way to induce lag, and it is not free.** It costs no GPU
 time — it converts engine stall into stale samples — but the queue holds whole
@@ -82,8 +88,9 @@ scaling linearly with the queue and with response length as training lengthens
 responses. The larger cost is methodological: enlarging the buffer to reach a
 target lag *is* imposing staleness artificially, which is the practice this study
 exists to distinguish itself from. `ASYNC_MAX_CONCURRENT_SAMPLES` bounds the
-other side and is already a swept variable; `OUTPUT_QUEUE_MAX_GROUPS` is not an
-argument and would need a code change.
+other side and is already a swept variable; the completed side is configurable
+with `--training-buffer-queue-size`. Keep it fixed across comparison arms so the
+queue itself does not become an unreported experimental axis.
 
 ## The bound measures queue residency, not the whole off-policy distance (2026-08-09)
 

@@ -34,9 +34,10 @@ fi
     exit 1
 }
 [[ "${MODEL_PROFILE}" =~ ^[A-Za-z0-9._-]+$ ]]
-MODEL_PROFILE_PATH="/root/miles/scripts/models/${MODEL_PROFILE}.sh"
-[[ -r "${MODEL_PROFILE_PATH}" ]]
-source "${MODEL_PROFILE_PATH}"
+MODEL_ARGS_LINE="$(
+    python3 miles/utils/external_utils/model_args_utils.py "${MODEL_PROFILE}"
+)" || exit 1
+read -ra MODEL_ARGS <<< "${MODEL_ARGS_LINE}"
 
 python3 - <<'PY'
 import importlib.metadata

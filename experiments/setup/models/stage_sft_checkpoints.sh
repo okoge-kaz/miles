@@ -78,8 +78,8 @@ validate_all_inputs() {
             echo "missing ${source_config}" >&2
             missing_sources=$((missing_sources + 1))
         fi
-        if [[ ! -f "scripts/models/${model_type}.sh" ]]; then
-            echo "missing scripts/models/${model_type}.sh" >&2
+        if [[ ! -f "scripts/models/${model_type}.py" ]]; then
+            echo "missing scripts/models/${model_type}.py" >&2
             return 1
         fi
     done < "${MANIFEST}"

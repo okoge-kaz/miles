@@ -6,15 +6,19 @@ from unittest.mock import patch
 
 import pytest
 
-from miles.backends.sglang_utils.arguments import add_sglang_arguments
+from miles.backends.sglang_utils.arguments import add_sglang_arguments, collect_eval_sglang_overrides
 from miles.backends.sglang_utils.arguments import validate_args as validate_sglang_args
 from miles.utils.arguments import (
     _maybe_apply_dumper_overrides,
     _resolve_ft_components,
     _resolve_rollout_functions,
+    _validate_rematerialize_param_from_master_weight,
+    _validate_truncation_behavior,
     get_miles_extra_args_provider,
     miles_validate_args,
+    resolve_rollout_function_paths,
     validate_async_off_policy_correction,
+    validate_skip_actor_forward_only,
 )
 from miles.utils.misc import function_registry
 
@@ -27,6 +31,9 @@ def _replay_buffer_args(**overrides) -> SimpleNamespace:
         "fully_async": True,
         "fully_async_queue_type": "queue-recycle",
         "fully_async_queue_factor": 1,
+        "training_buffer_queue_size": 1000,
+        "async_data_buffer_capacity_factor": 2.0,
+        "custom_async_data_buffer_path": None,
         "max_weight_staleness": None,
         "staleness_reference": "completion",
         "use_replay_buffer": True,
@@ -37,8 +44,10 @@ def _replay_buffer_args(**overrides) -> SimpleNamespace:
         "eval_function_path": None,
         "colocate": False,
         "partial_rollout": False,
+        "pause_generation_mode": "retract",
         "recompute_logprobs_via_prefill": False,
         "rollout_all_samples_process_path": None,
+        "eval_num_gpus": 0,
         "train_backend": "megatron",
         "rollout_global_dataset": True,
         "data_source_path": "miles.rollout.data_source.RolloutDataSourceWithBuffer",
@@ -85,6 +94,8 @@ def _replay_buffer_args(**overrides) -> SimpleNamespace:
         ({"rollout_data_postprocess_path": "custom.postprocess"}, "built-in rollout data post-processing"),
         ({"buffer_filter_path": "custom.buffer"}, "default FIFO"),
         ({"rollout_sample_filter_path": "custom.sample_filter"}, "no post-generation rollout sample filter"),
+        ({"fully_async_queue_type": None}, "explicit --fully-async-queue-type"),
+        ({"custom_async_data_buffer_path": "custom.Buffer"}, "cannot be combined"),
         ({"load_debug_rollout_data": True}, "live rollout generation"),
         ({"ci_inject_rollout_data_path": "dump-{rollout_id}.pt"}, "no CI rollout-data injection"),
         ({"debug_train_only": True}, "rollout generation enabled"),
@@ -104,7 +115,7 @@ def _replay_buffer_args(**overrides) -> SimpleNamespace:
     ],
 )
 def test_use_replay_buffer_guards(monkeypatch, override, message):
-    monkeypatch.setattr("miles.utils.arguments.enable_experimental_rollout_refactor", lambda: True)
+    monkeypatch.setattr("miles.utils.arguments.use_legacy_rollout_v1", lambda: False)
     args = _replay_buffer_args(**override)
     with pytest.raises((AssertionError, ValueError), match=message):
         _resolve_rollout_functions(args)
@@ -119,56 +130,56 @@ def test_use_replay_buffer_guards(monkeypatch, override, message):
     ],
 )
 def test_use_replay_buffer_accepts_supported_grpo_configuration(monkeypatch, queue_config):
-    monkeypatch.setattr("miles.utils.arguments.enable_experimental_rollout_refactor", lambda: True)
+    monkeypatch.setattr("miles.utils.arguments.use_legacy_rollout_v1", lambda: False)
     args = _replay_buffer_args(**queue_config)
     _resolve_rollout_functions(args)
     assert args.rollout_function_path == "miles.rollout.fully_async_rollout.FullyAsyncRolloutFn"
 
 
 def test_use_replay_buffer_accepts_replay_validated_instruction_following_reward(monkeypatch):
-    monkeypatch.setattr("miles.utils.arguments.enable_experimental_rollout_refactor", lambda: True)
+    monkeypatch.setattr("miles.utils.arguments.use_legacy_rollout_v1", lambda: False)
     args = _replay_buffer_args(custom_rm_path="experiments.src.reward_sets.instruction_following.reward")
     _resolve_rollout_functions(args)
     assert args.rollout_function_path == "miles.rollout.fully_async_rollout.FullyAsyncRolloutFn"
 
 
 def test_use_replay_buffer_accepts_replay_validated_code_reward(monkeypatch):
-    monkeypatch.setattr("miles.utils.arguments.enable_experimental_rollout_refactor", lambda: True)
+    monkeypatch.setattr("miles.utils.arguments.use_legacy_rollout_v1", lambda: False)
     args = _replay_buffer_args(custom_rm_path="experiments.src.reward_sets.code.reward")
     _resolve_rollout_functions(args)
     assert args.rollout_function_path == "miles.rollout.fully_async_rollout.FullyAsyncRolloutFn"
 
 
 def test_use_replay_buffer_accepts_replay_validated_stem_reward(monkeypatch):
-    monkeypatch.setattr("miles.utils.arguments.enable_experimental_rollout_refactor", lambda: True)
+    monkeypatch.setattr("miles.utils.arguments.use_legacy_rollout_v1", lambda: False)
     args = _replay_buffer_args(custom_rm_path="experiments.src.reward_sets.stem.reward")
     _resolve_rollout_functions(args)
     assert args.rollout_function_path == "miles.rollout.fully_async_rollout.FullyAsyncRolloutFn"
 
 
 def test_use_replay_buffer_accepts_replay_validated_multi_env_reward(monkeypatch):
-    monkeypatch.setattr("miles.utils.arguments.enable_experimental_rollout_refactor", lambda: True)
+    monkeypatch.setattr("miles.utils.arguments.use_legacy_rollout_v1", lambda: False)
     args = _replay_buffer_args(custom_rm_path="experiments.src.reward_sets.math_code_stem.reward")
     _resolve_rollout_functions(args)
     assert args.rollout_function_path == "miles.rollout.fully_async_rollout.FullyAsyncRolloutFn"
 
 
 def test_use_replay_buffer_accepts_replay_validated_tool_call_reward(monkeypatch):
-    monkeypatch.setattr("miles.utils.arguments.enable_experimental_rollout_refactor", lambda: True)
+    monkeypatch.setattr("miles.utils.arguments.use_legacy_rollout_v1", lambda: False)
     args = _replay_buffer_args(custom_rm_path="experiments.src.reward_sets.tool_call_pivot.reward")
     _resolve_rollout_functions(args)
     assert args.rollout_function_path == "miles.rollout.fully_async_rollout.FullyAsyncRolloutFn"
 
 
 def test_use_replay_buffer_rejects_broad_all_domain_reward(monkeypatch):
-    monkeypatch.setattr("miles.utils.arguments.enable_experimental_rollout_refactor", lambda: True)
+    monkeypatch.setattr("miles.utils.arguments.use_legacy_rollout_v1", lambda: False)
     args = _replay_buffer_args(custom_rm_path="experiments.src.reward_sets.all_domains.blend_reward")
     with pytest.raises(ValueError, match="replay-validated custom reward-model"):
         _resolve_rollout_functions(args)
 
 
 def test_inflight_replay_buffer_rejects_custom_generate_function_without_capability(monkeypatch):
-    monkeypatch.setattr("miles.utils.arguments.enable_experimental_rollout_refactor", lambda: True)
+    monkeypatch.setattr("miles.utils.arguments.use_legacy_rollout_v1", lambda: False)
 
     async def custom_generate(_input):
         return None
@@ -183,7 +194,7 @@ def test_inflight_replay_buffer_rejects_custom_generate_function_without_capabil
 
 
 def test_inflight_replay_buffer_accepts_capable_custom_generate_function(monkeypatch):
-    monkeypatch.setattr("miles.utils.arguments.enable_experimental_rollout_refactor", lambda: True)
+    monkeypatch.setattr("miles.utils.arguments.use_legacy_rollout_v1", lambda: False)
 
     async def custom_generate(_input):
         return None
@@ -200,7 +211,7 @@ def test_inflight_replay_buffer_accepts_capable_custom_generate_function(monkeyp
 
 
 def test_inflight_replay_buffer_requires_opt_in(monkeypatch):
-    monkeypatch.setattr("miles.utils.arguments.enable_experimental_rollout_refactor", lambda: True)
+    monkeypatch.setattr("miles.utils.arguments.use_legacy_rollout_v1", lambda: False)
     args = _replay_buffer_args(
         use_replay_buffer=False,
         replay_buffer_type="inflight",
@@ -210,7 +221,7 @@ def test_inflight_replay_buffer_requires_opt_in(monkeypatch):
 
 
 def test_replay_buffer_rejects_unknown_type_from_config(monkeypatch):
-    monkeypatch.setattr("miles.utils.arguments.enable_experimental_rollout_refactor", lambda: True)
+    monkeypatch.setattr("miles.utils.arguments.use_legacy_rollout_v1", lambda: False)
     args = _replay_buffer_args(replay_buffer_type="unknown")
     with pytest.raises(ValueError, match="must be one of"):
         _resolve_rollout_functions(args)
@@ -231,6 +242,52 @@ def test_replay_buffer_cli_is_opt_in_with_rollout_as_the_default_type():
     inflight = parser.parse_args(["--use-replay-buffer", "--replay-buffer-type", "inflight"] + REQUIRED_ARGS)
     assert inflight.use_replay_buffer
     assert inflight.replay_buffer_type == "inflight"
+
+
+def test_training_buffer_queue_size_cli_defaults_to_legacy_capacity_and_accepts_override():
+    parser = argparse.ArgumentParser()
+    get_miles_extra_args_provider()(parser)
+
+    defaults = parser.parse_args(REQUIRED_ARGS)
+    configured = parser.parse_args(["--training-buffer-queue-size", "6000"] + REQUIRED_ARGS)
+
+    assert defaults.training_buffer_queue_size == 1000
+    assert configured.training_buffer_queue_size == 6000
+
+
+def test_fully_async_queue_type_defaults_to_v01_data_buffer_path():
+    parser = argparse.ArgumentParser()
+    get_miles_extra_args_provider()(parser)
+
+    defaults = parser.parse_args(REQUIRED_ARGS)
+    configured = parser.parse_args(["--fully-async-queue-type", "queue-recycle"] + REQUIRED_ARGS)
+
+    assert defaults.fully_async_queue_type is None
+    assert defaults.async_data_buffer_capacity_factor == 2.0
+    assert defaults.async_unused_samples_handler == "drop"
+    assert configured.fully_async_queue_type == "queue-recycle"
+
+
+def test_sample_staleness_histogram_defaults_to_32_and_accepts_override():
+    parser = argparse.ArgumentParser()
+    get_miles_extra_args_provider()(parser)
+
+    defaults = parser.parse_args(REQUIRED_ARGS)
+    configured = parser.parse_args(["--sample-staleness-max-bin", "48"] + REQUIRED_ARGS)
+
+    assert defaults.sample_staleness_max_bin == 32
+    assert configured.sample_staleness_max_bin == 48
+
+
+def test_zero_reward_on_truncated_cli_is_opt_in():
+    parser = argparse.ArgumentParser()
+    get_miles_extra_args_provider()(parser)
+
+    defaults = parser.parse_args(REQUIRED_ARGS)
+    assert not defaults.zero_reward_on_truncated
+
+    enabled = parser.parse_args(["--zero-reward-on-truncated"] + REQUIRED_ARGS)
+    assert enabled.zero_reward_on_truncated
 
 
 def test_replay_resume_metrics_cli_is_opt_in():
@@ -260,6 +317,170 @@ def test_truncated_handling_cli_is_opt_in(flag: str, attribute: str):
 
     enabled = parser.parse_args([flag] + REQUIRED_ARGS)
     assert getattr(enabled, attribute)
+
+
+def test_zero_loss_on_truncated_cli_is_opt_in():
+    parser = argparse.ArgumentParser()
+    get_miles_extra_args_provider()(parser)
+
+    defaults = parser.parse_args(REQUIRED_ARGS)
+    assert not defaults.zero_loss_on_truncated
+
+    enabled = parser.parse_args(["--zero-loss-on-truncated"] + REQUIRED_ARGS)
+    assert enabled.zero_loss_on_truncated
+
+
+def test_staleness_aware_loss_cli_is_opt_in_with_safe_default():
+    parser = argparse.ArgumentParser()
+    get_miles_extra_args_provider()(parser)
+
+    defaults = parser.parse_args(REQUIRED_ARGS)
+    enabled = parser.parse_args(
+        [
+            "--use-staleness-aware-loss",
+            "--safe-training-staleness",
+            "4",
+            "--log-staleness-aware-loss-details",
+        ]
+        + REQUIRED_ARGS
+    )
+
+    assert not defaults.use_staleness_aware_loss
+    assert defaults.safe_training_staleness == 2
+    assert not defaults.log_staleness_aware_loss_details
+    assert enabled.use_staleness_aware_loss
+    assert enabled.safe_training_staleness == 4
+    assert enabled.log_staleness_aware_loss_details
+
+
+def test_staleness_aware_loss_detail_logging_requires_scaling():
+    args = SimpleNamespace(
+        zero_reward_on_truncated=True,
+        zero_loss_on_truncated=False,
+        use_staleness_aware_loss=False,
+        log_staleness_aware_loss_details=True,
+        safe_training_staleness=2,
+    )
+
+    with pytest.raises(ValueError, match="requires --use-staleness-aware-loss"):
+        _validate_truncation_behavior(args)
+
+
+def test_staleness_aware_loss_detail_logging_requires_tis():
+    args = SimpleNamespace(
+        zero_reward_on_truncated=True,
+        zero_loss_on_truncated=False,
+        use_staleness_aware_loss=True,
+        log_staleness_aware_loss_details=True,
+        safe_training_staleness=2,
+        use_tis=False,
+    )
+
+    with pytest.raises(ValueError, match="requires --use-tis"):
+        _validate_truncation_behavior(args)
+
+
+def test_truncation_behavior_cli_flags_are_mutually_exclusive():
+    parser = argparse.ArgumentParser()
+    get_miles_extra_args_provider()(parser)
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--zero-reward-on-truncated", "--zero-loss-on-truncated"] + REQUIRED_ARGS)
+
+
+@pytest.mark.parametrize(
+    ("zero_reward", "zero_loss"),
+    [(False, False), (True, False), (False, True)],
+)
+def test_truncation_behavior_validation_accepts_non_conflicting_modes(zero_reward, zero_loss):
+    args = SimpleNamespace(
+        zero_reward_on_truncated=zero_reward,
+        zero_loss_on_truncated=zero_loss,
+    )
+
+    _validate_truncation_behavior(args)
+
+
+def test_truncation_behavior_validation_rejects_config_override_conflict():
+    args = SimpleNamespace(
+        zero_reward_on_truncated=True,
+        zero_loss_on_truncated=True,
+    )
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _validate_truncation_behavior(args)
+
+
+def test_staleness_aware_loss_validation_accepts_truncation_feedback_mode():
+    args = SimpleNamespace(
+        zero_reward_on_truncated=True,
+        zero_loss_on_truncated=False,
+        use_staleness_aware_loss=True,
+        safe_training_staleness=2,
+        fully_async=True,
+        loss_type="policy_loss",
+        custom_reward_post_process_path=None,
+        custom_convert_samples_to_train_data_path=None,
+    )
+
+    _validate_truncation_behavior(args)
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"zero_reward_on_truncated": False}, "requires --zero-reward-on-truncated"),
+        (
+            {"zero_reward_on_truncated": False, "zero_loss_on_truncated": True},
+            "overlong filtering",
+        ),
+        ({"fully_async": False}, "requires --fully-async"),
+        ({"safe_training_staleness": -1}, "must be non-negative"),
+        ({"loss_type": "value_loss"}, "built-in policy loss"),
+        ({"custom_reward_post_process_path": "custom.reward"}, "built-in reward post-processing"),
+        (
+            {"custom_convert_samples_to_train_data_path": "custom.convert"},
+            "built-in sample-to-train-data conversion",
+        ),
+    ],
+)
+def test_staleness_aware_loss_validation_rejects_unsupported_modes(override, message):
+    values = {
+        "zero_reward_on_truncated": True,
+        "zero_loss_on_truncated": False,
+        "use_staleness_aware_loss": True,
+        "safe_training_staleness": 2,
+        "fully_async": True,
+        "loss_type": "policy_loss",
+        "custom_reward_post_process_path": None,
+        "custom_convert_samples_to_train_data_path": None,
+    }
+    values.update(override)
+
+    with pytest.raises(ValueError, match=message):
+        _validate_truncation_behavior(SimpleNamespace(**values))
+
+
+def test_colocate_switch_telemetry_cli_is_opt_in():
+    parser = argparse.ArgumentParser()
+    get_miles_extra_args_provider()(parser)
+
+    defaults = parser.parse_args(REQUIRED_ARGS)
+    enabled = parser.parse_args(
+        [
+            "--log-colocate-switch-metrics",
+            "--log-colocate-transfer-bytes",
+            "--log-memory-usage",
+        ]
+        + REQUIRED_ARGS
+    )
+
+    assert not defaults.log_colocate_switch_metrics
+    assert not defaults.log_colocate_transfer_bytes
+    assert not defaults.log_memory_usage
+    assert enabled.log_colocate_switch_metrics
+    assert enabled.log_colocate_transfer_bytes
+    assert enabled.log_memory_usage
 
 
 def make_class_with_add_arguments():
@@ -384,6 +605,45 @@ class TestMaybeApplyDumperOverrides:
         assert args.num_rollout == 6
 
 
+def test_fully_async_eval_resolves_to_the_producer_itself():
+    """Only the producer's own instance pauses on eval, and RolloutManager reuses one
+    instance only when both paths match."""
+    path = "miles.rollout.fully_async_rollout.FullyAsyncRolloutFn"
+    default = SimpleNamespace(rollout_function_path=None, eval_function_path=None, fully_async=True)
+    assert resolve_rollout_function_paths(default) == (path, path)
+
+    override = SimpleNamespace(rollout_function_path=None, eval_function_path="pkg.CustomEval", fully_async=True)
+    assert resolve_rollout_function_paths(override) == (path, "pkg.CustomEval")
+
+
+def test_fully_async_rejects_abort_pause_mode():
+    """Generation is always in flight, so aborting on every weight update would kill it."""
+    args = SimpleNamespace(
+        fully_async=True,
+        multi_lora=False,
+        rollout_function_path=None,
+        eval_function_path=None,
+        colocate=False,
+        partial_rollout=False,
+        pause_generation_mode="abort",
+        recompute_logprobs_via_prefill=False,
+        rollout_all_samples_process_path=None,
+        eval_num_gpus=0,
+        fully_async_queue_type=None,
+        fully_async_queue_factor=1,
+        training_buffer_queue_size=1000,
+        async_data_buffer_capacity_factor=2.0,
+        custom_async_data_buffer_path=None,
+        max_weight_staleness=None,
+    )
+
+    with pytest.raises(AssertionError, match="pause-generation-mode abort"):
+        _resolve_rollout_functions(args)
+
+    args.pause_generation_mode = "retract"
+    _resolve_rollout_functions(args)
+
+
 def test_recompute_logprobs_via_prefill_flag_is_parsed():
     parser = argparse.ArgumentParser()
     get_miles_extra_args_provider()(parser)
@@ -433,6 +693,41 @@ def test_sglang_parallel_sizes_keep_server_args_destinations():
     assert args.sglang_attn_cp_size == 5
 
 
+class TestEvalSglangOverrides:
+    """Unset means "inherit --sglang-*", so an unset flag must leave no attribute at all."""
+
+    def _parse(self, argv):
+        return add_sglang_arguments(argparse.ArgumentParser()).parse_args(argv)
+
+    def test_unset_flags_produce_no_overrides(self):
+        args = self._parse(["--sglang-mem-fraction-static", "0.7"])
+
+        assert collect_eval_sglang_overrides(args) == {}
+        assert not hasattr(args, "eval_sglang_mem_fraction_static")
+
+    def test_set_flag_becomes_an_override_without_touching_the_base_family(self):
+        args = self._parse(["--sglang-mem-fraction-static", "0.7", "--eval-sglang-mem-fraction-static", "0.9"])
+
+        assert collect_eval_sglang_overrides(args) == {"mem_fraction_static": 0.9}
+        assert args.sglang_mem_fraction_static == 0.7
+
+    def test_boolean_can_be_turned_back_off(self):
+        args = self._parse(["--sglang-enable-dp-attention", "--no-eval-sglang-enable-dp-attention"])
+
+        assert args.sglang_enable_dp_attention is True
+        assert collect_eval_sglang_overrides(args) == {"enable_dp_attention": False}
+
+    def test_parallel_sizes_keep_server_args_destinations(self):
+        args = self._parse(["--eval-sglang-data-parallel-size", "2", "--eval-sglang-expert-parallel-size", "4"])
+
+        assert collect_eval_sglang_overrides(args) == {"dp_size": 2, "ep_size": 4}
+
+    def test_tp_size_is_not_exposed(self):
+        """A second TP knob could move tp_size off the bundles --eval-num-gpus-per-engine placed."""
+        with pytest.raises(SystemExit):
+            self._parse(["--eval-sglang-tp-size", "2"])
+
+
 def test_custom_megatron_post_save_hook_path_is_parsed():
     parser = argparse.ArgumentParser()
     get_miles_extra_args_provider()(parser)
@@ -454,6 +749,114 @@ def test_custom_megatron_post_save_hook_path_requires_save():
         match="'--save' is required when custom_megatron_post_save_hook_path is set.",
     ):
         miles_validate_args(args)
+
+
+def test_dynamic_global_batch_size_requires_dynamic_batch_size():
+    parser = argparse.ArgumentParser()
+    get_miles_extra_args_provider()(parser)
+    args = parser.parse_args(["--use-dynamic-global-batch-size", "--num-rollout", "1"] + REQUIRED_ARGS)
+
+    with pytest.raises(AssertionError, match="requires --use-dynamic-batch-size"):
+        miles_validate_args(args)
+
+
+class TestCriticSaveDerivation:
+    def _validate(self, extra):
+        parser = argparse.ArgumentParser()
+        get_miles_extra_args_provider()(parser)
+        args = parser.parse_args(extra + ["--num-rollout", "1"] + REQUIRED_ARGS)
+        miles_validate_args(args)
+        return args
+
+    def test_derives_sibling_dir_from_save(self):
+        args = self._validate(["--advantage-estimator", "ppo", "--save", "/ckpts/run1"])
+        assert args.critic_save == "/ckpts/run1_critic"
+
+    def test_trailing_slash_is_stripped(self):
+        args = self._validate(["--advantage-estimator", "ppo", "--save", "/ckpts/run1/"])
+        assert args.critic_save == "/ckpts/run1_critic"
+
+    def test_explicit_critic_save_is_respected(self):
+        args = self._validate(
+            ["--advantage-estimator", "ppo", "--save", "/ckpts/run1", "--critic-save", "/elsewhere/critic"]
+        )
+        assert args.critic_save == "/elsewhere/critic"
+
+    def test_stays_none_without_save(self):
+        args = self._validate(["--advantage-estimator", "ppo"])
+        assert args.critic_save is None
+
+
+class TestSessionServerV2Validation:
+    def _parse(self, extra):
+        parser = argparse.ArgumentParser()
+        get_miles_extra_args_provider()(parser)
+        return parser.parse_args(extra + ["--num-rollout", "1"] + REQUIRED_ARGS)
+
+    @pytest.mark.parametrize(
+        ("extra", "flag"),
+        [
+            (["--group-rm"], "--group-rm"),
+            (["--partial-rollout"], "--partial-rollout"),
+            (
+                ["--true-on-policy-mode", "--recompute-logprobs-via-prefill"],
+                "--recompute-logprobs-via-prefill",
+            ),
+        ],
+    )
+    def test_rejects_unsupported_list_consumers(self, extra, flag):
+        args = self._parse(["--use-session-server", "v2", *extra])
+
+        with pytest.raises(ValueError) as exc_info:
+            miles_validate_args(args)
+
+        assert str(exc_info.value) == (f"--use-session-server v2 does not support {flag}; v2 returns list[Sample]")
+
+
+class TestSessionMessageMatcherArgument:
+    def _parse(self, extra):
+        parser = argparse.ArgumentParser()
+        get_miles_extra_args_provider()(parser)
+        return parser.parse_args(extra + ["--num-rollout", "1"] + REQUIRED_ARGS)
+
+    def test_defaults_to_strict(self):
+        assert self._parse([]).session_message_matcher == "strict"
+
+    @pytest.mark.parametrize(
+        "selector",
+        [
+            "strict",
+            "loose_tool_call",
+            "role_content_only",
+            "not_installed.matchers.same_message",
+        ],
+    )
+    def test_preserves_selector_without_importing(self, selector):
+        args = self._parse(["--session-message-matcher", selector])
+
+        assert args.session_message_matcher == selector
+
+
+class TestSessionServerPauseGenerationMode:
+    def _parse(self, extra):
+        parser = argparse.ArgumentParser()
+        get_miles_extra_args_provider()(parser)
+        return parser.parse_args(extra + ["--num-rollout", "1"] + REQUIRED_ARGS)
+
+    def test_session_server_rejects_abort(self):
+        args = self._parse(["--use-session-server", "--pause-generation-mode", "abort"])
+
+        with pytest.raises(
+            AssertionError, match="--use-session-server is incompatible with --pause-generation-mode=abort"
+        ):
+            miles_validate_args(args)
+
+    def test_abort_without_session_server_passes(self):
+        miles_validate_args(self._parse(["--pause-generation-mode", "abort"]))
+
+    @pytest.mark.parametrize("mode", ["retract", "in_place"])
+    def test_session_server_accepts_non_abort_modes(self, mode):
+        miles_validate_args(self._parse(["--use-session-server", "--pause-generation-mode", mode]))
 
 
 class TestTitoFixedTemplateConfiguration:
@@ -837,3 +1240,282 @@ class TestValidateAsyncOffPolicyCorrection:
 
     def test_non_ppo_estimators_are_unaffected(self):
         validate_async_off_policy_correction(_make_async_ppo_args(use_critic=False))
+
+
+class TestValidateRematerializeParamFromMasterWeight:
+    def _make_args(self, **overrides) -> SimpleNamespace:
+        args = SimpleNamespace(
+            rematerialize_param_from_master_weight=True,
+            train_backend="megatron",
+            lora_rank=0,
+            lora_adapter_path=None,
+            debug_disable_optimizer=False,
+            indep_dp=False,
+            colocate=True,
+            offload_train=True,
+            offload_train_target="cpu",
+            use_distributed_optimizer=True,
+            keep_old_actor=False,
+            kl_coef=0,
+            use_kl_loss=False,
+            opd_teacher_load=None,
+            use_precision_aware_optimizer=False,
+            optimizer_cpu_offload=False,
+            overlap_param_gather=False,
+            compute_advantages_and_returns=True,
+            num_critic_only_steps=0,
+            debug_train_only=False,
+            ci_test=False,
+            check_rematerialize_param_from_master_weight=False,
+            disable_param_buffers_cpu_backup=False,
+        )
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return args
+
+    def test_valid_config_forces_no_param_buffer_cpu_backup(self):
+        args = self._make_args()
+        _validate_rematerialize_param_from_master_weight(args)
+        assert args.disable_param_buffers_cpu_backup is True
+
+    def test_accepts_precision_aware_with_cpu_offload(self):
+        args = self._make_args(use_precision_aware_optimizer=True, optimizer_cpu_offload=True)
+        _validate_rematerialize_param_from_master_weight(args)
+        assert args.disable_param_buffers_cpu_backup is True
+
+    def test_ci_test_auto_enables_the_check(self):
+        args = self._make_args(ci_test=True)
+        _validate_rematerialize_param_from_master_weight(args)
+        assert args.check_rematerialize_param_from_master_weight is True
+
+    def test_check_stays_off_outside_ci(self):
+        args = self._make_args()
+        _validate_rematerialize_param_from_master_weight(args)
+        assert args.check_rematerialize_param_from_master_weight is False
+
+    def test_accepts_ref_and_teacher_tags(self):
+        for overrides in ({"use_kl_loss": True}, {"kl_coef": 0.1}, {"opd_teacher_load": "/path/to/teacher"}):
+            _validate_rematerialize_param_from_master_weight(self._make_args(**overrides))
+
+    def test_debug_train_only_silently_disables(self):
+        args = self._make_args(debug_train_only=True, colocate=False)
+        _validate_rematerialize_param_from_master_weight(args)
+        assert args.rematerialize_param_from_master_weight is False
+        assert args.disable_param_buffers_cpu_backup is False
+
+    def test_noop_when_disabled(self):
+        args = self._make_args(rematerialize_param_from_master_weight=False, colocate=False)
+        _validate_rematerialize_param_from_master_weight(args)
+        assert args.disable_param_buffers_cpu_backup is False
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"train_backend": "fsdp"},
+            {"lora_rank": 8},
+            {"lora_adapter_path": "/path/to/adapter"},
+            {"debug_disable_optimizer": True},
+            {"indep_dp": True},
+            {"colocate": False},
+            {"offload_train": False},
+            {"offload_train_target": "disk"},
+            {"use_distributed_optimizer": False},
+            {"keep_old_actor": True},
+            {"use_precision_aware_optimizer": True},
+            {"overlap_param_gather": True},
+            {"compute_advantages_and_returns": False},
+            {"num_critic_only_steps": 2},
+        ],
+    )
+    def test_rejects_unsupported_config(self, overrides):
+        with pytest.raises(AssertionError):
+            _validate_rematerialize_param_from_master_weight(self._make_args(**overrides))
+
+    def test_backend_is_checked_before_megatron_only_args(self):
+        # An fsdp Namespace has none of the megatron args the later asserts read.
+        args = SimpleNamespace(
+            rematerialize_param_from_master_weight=True,
+            train_backend="fsdp",
+            debug_train_only=False,
+        )
+        with pytest.raises(AssertionError, match="Megatron"):
+            _validate_rematerialize_param_from_master_weight(args)
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "expected"),
+    [
+        ([], False),
+        (["--skip-actor-forward-only"], True),
+    ],
+)
+def test_skip_actor_forward_only_flag_is_parsed(extra_args, expected):
+    parser = argparse.ArgumentParser()
+    get_miles_extra_args_provider()(parser)
+
+    args = parser.parse_args(extra_args + REQUIRED_ARGS)
+
+    assert args.skip_actor_forward_only is expected
+
+
+def test_skip_actor_forward_only_is_gated_during_miles_validation():
+    parser = argparse.ArgumentParser()
+    get_miles_extra_args_provider()(parser)
+    args = parser.parse_args(
+        ["--skip-actor-forward-only", "--global-batch-size", "32", "--num-rollout", "1"] + REQUIRED_ARGS
+    )
+    vars(args).update(
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        lora_dropout=0.0,
+        moe_input_jitter_eps=None,
+        moe_router_force_biased=None,
+        moe_router_force_load_balancing=False,
+        moe_router_load_balancing_type="aux_loss",
+    )
+
+    with pytest.raises(AssertionError, match="--skip-actor-forward-only"):
+        miles_validate_args(args)
+
+
+def _make_skip_actor_forward_only_args(**overrides) -> SimpleNamespace:
+    defaults = dict(
+        compute_advantages_and_returns=True,
+        custom_megatron_before_log_prob_hook_path=None,
+        custom_megatron_before_train_step_hook_path=None,
+        custom_model_provider_path=None,
+        dumper_enable=False,
+        dumper_fwd_only=None,
+        dumper_source_patcher_config_train=None,
+        dump_details=None,
+        get_mismatch_metrics=False,
+        global_batch_size=64,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        keep_old_actor=False,
+        kl_coef=0.0,
+        lora_dropout=0.0,
+        log_correct_samples=False,
+        loss_type="policy_loss",
+        moe_input_jitter_eps=None,
+        moe_router_force_biased=None,
+        moe_router_force_load_balancing=False,
+        moe_router_load_balancing_type="aux_loss",
+        multi_lora=False,
+        n_samples_per_prompt=8,
+        num_steps_per_rollout=None,
+        rollout_batch_size=8,
+        rollout_data_postprocess_path=None,
+        save_debug_train_data=None,
+        train_backend="megatron",
+        true_on_policy_mode=False,
+        use_dynamic_global_batch_size=False,
+        use_indexer_replay=False,
+        use_opd=False,
+        use_rollout_entropy=False,
+        use_rollout_indexer_replay=False,
+        use_rollout_logprobs=False,
+        use_rollout_routing_replay=False,
+        use_routing_replay=False,
+        use_tis=False,
+    )
+    defaults.update(overrides)
+    return SimpleNamespace(**defaults)
+
+
+class TestValidateSkipActorForwardOnly:
+    def test_valid_single_step_configuration_passes(self):
+        validate_skip_actor_forward_only(_make_skip_actor_forward_only_args())
+
+    def test_zero_moe_input_jitter_passes(self):
+        validate_skip_actor_forward_only(_make_skip_actor_forward_only_args(moe_input_jitter_eps=0.0))
+
+    def test_tis_configuration_passes(self):
+        validate_skip_actor_forward_only(_make_skip_actor_forward_only_args(use_tis=True))
+
+    def test_rollout_logprobs_configuration_passes(self):
+        validate_skip_actor_forward_only(_make_skip_actor_forward_only_args(use_rollout_logprobs=True))
+
+    def test_rollout_logprobs_with_mismatch_metrics_passes(self):
+        validate_skip_actor_forward_only(
+            _make_skip_actor_forward_only_args(
+                get_mismatch_metrics=True,
+                use_rollout_logprobs=True,
+            )
+        )
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"dumper_enable": True},
+            {"dumper_fwd_only": ["enable=true"]},
+            {"dumper_enable": True, "dumper_fwd_only": ["enable=false"]},
+            {"dump_details": "/tmp/details"},
+            {
+                "dump_details": "/tmp/details",
+                "save_debug_train_data": "/tmp/details/train_data/{rollout_id}_{rank}.pt",
+            },
+        ],
+    )
+    def test_dumper_configuration_passes(self, overrides):
+        validate_skip_actor_forward_only(_make_skip_actor_forward_only_args(**overrides))
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"train_backend": "fsdp"},
+            {"loss_type": "custom_loss"},
+            {"compute_advantages_and_returns": False},
+            {"keep_old_actor": True},
+            {"kl_coef": 0.1},
+            {"use_opd": True},
+            {"hidden_dropout": 0.1},
+            {"attention_dropout": 0.1},
+            {"lora_dropout": 0.1},
+            {"moe_input_jitter_eps": 0.1},
+            {"moe_router_force_load_balancing": True},
+            {"moe_router_force_biased": 0.0},
+            {"moe_router_load_balancing_type": ["sinkhorn"]},
+            {"use_rollout_entropy": True},
+            {"true_on_policy_mode": True},
+            {"log_correct_samples": True},
+            {"rollout_data_postprocess_path": "pkg.hook"},
+            {"custom_megatron_before_log_prob_hook_path": "pkg.hook"},
+            {"custom_megatron_before_train_step_hook_path": "pkg.hook"},
+            {"custom_model_provider_path": "pkg.model_provider"},
+            {"dumper_source_patcher_config_train": "patcher.yaml"},
+            {"save_debug_train_data": "train-{rollout_id}.pt"},
+            {"use_routing_replay": True},
+            {"use_indexer_replay": True},
+            {"num_steps_per_rollout": 2},
+            {"global_batch_size": 32},
+        ],
+    )
+    def test_incompatible_configuration_is_rejected(self, overrides):
+        with pytest.raises(AssertionError, match="--skip-actor-forward-only"):
+            validate_skip_actor_forward_only(_make_skip_actor_forward_only_args(**overrides))
+
+    @pytest.mark.parametrize(
+        ("base_flag", "rollout_flag"),
+        [
+            ("use_routing_replay", "use_rollout_routing_replay"),
+            ("use_indexer_replay", "use_rollout_indexer_replay"),
+        ],
+    )
+    def test_rollout_replay_is_compatible(self, base_flag, rollout_flag):
+        validate_skip_actor_forward_only(
+            _make_skip_actor_forward_only_args(
+                **{
+                    base_flag: True,
+                    rollout_flag: True,
+                }
+            )
+        )
+
+    def test_dynamic_global_batch_size_defers_step_count_to_runtime(self):
+        validate_skip_actor_forward_only(
+            _make_skip_actor_forward_only_args(
+                global_batch_size=32,
+                use_dynamic_global_batch_size=True,
+            )
+        )

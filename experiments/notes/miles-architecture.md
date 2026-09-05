@@ -87,7 +87,7 @@ run.sbatch
        └─ mpirun -map-by ppr:1:node -bind-to none
             └─ one Singularity task per PBS node
                  └─ train.sh
-                      ├─ source scripts/models/<type>.sh
+                      ├─ expand scripts/models/<type>.py with model_args_utils.py
                       ├─ source experiments/common/ray_cluster.sh
                       │    ├─ node 0: start Ray head
                       │    └─ other nodes: join and wait

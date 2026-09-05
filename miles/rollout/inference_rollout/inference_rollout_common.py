@@ -32,6 +32,7 @@ from miles.rollout.recycle_compute_metrics import (
     stamp_sample_lifecycle_boundary,
 )
 from miles.rollout.rm_hub import async_rm, batched_async_rm
+from miles.utils.lifecycle import TrajectoryLifecycle
 from miles.utils.processing_utils import load_processor, load_tokenizer
 from miles.utils.types import Sample
 
@@ -132,30 +133,41 @@ async def generate_and_rm(
         finish_generation(sample, start_version, start_time)
         return sample
 
+    # dashboard lifecycle probe: the semaphore wait is the queue; attempt_end fires before reward
+    sink = None if evaluation else TrajectoryLifecycle().sink
+    if sink is not None:
+        sink.attempt_start(sample)
+
     # generate
     log_prefix = f"[sample={getattr(sample, 'index', '?')}]"
     logger.debug(f"{log_prefix} Waiting for semaphore...")
-    async with state.generate_fn_semaphore:
-        if state.aborted:
-            sample.status = Sample.Status.ABORTED
+    try:
+        async with state.generate_fn_semaphore:
             start_version = lifecycle_version_provider() if lifecycle_version_provider is not None else None
             start_time = time.time() if lifecycle_version_provider is not None else None
-            finish_generation(sample, start_version, start_time)
-            return sample
+            if state.aborted:
+                sample.status = Sample.Status.ABORTED
+                finish_generation(sample, start_version, start_time)
+                return sample
 
-        logger.debug(f"{log_prefix} Acquired semaphore, calling generate_function")
-        start_version = lifecycle_version_provider() if lifecycle_version_provider is not None else None
-        start_time = time.time() if lifecycle_version_provider is not None else None
-        output = await state.generate_function(
-            GenerateFnInput(
-                state=state,
-                sample=sample,
-                sampling_params=deepcopy(sampling_params),
-                evaluation=evaluation,
+            logger.debug(f"{log_prefix} Acquired semaphore, calling generate_function")
+            if sink is not None:
+                sink.gen_start(sample)
+            # per-sample override, e.g. an eval dataset naming its own generate function
+            generate_fn = load_generate_function(sample.generate_function_path) or state.generate_function
+            output = await generate_fn(
+                GenerateFnInput(
+                    state=state,
+                    sample=sample,
+                    sampling_params=deepcopy(sampling_params),
+                    evaluation=evaluation,
+                )
             )
-        )
-        sample = output.samples
-        logger.debug(f"{log_prefix} generate_function returned")
+            sample = output.samples
+            logger.debug(f"{log_prefix} generate_function returned")
+    finally:
+        if sink is not None:
+            sink.attempt_end(sample)
 
     finish_generation(sample, start_version, start_time)
 
@@ -196,6 +208,7 @@ async def generate_and_rm_group(
     group: list[Sample],
     sampling_params: dict[str, Any],
     evaluation: bool = False,
+    sample_done_callback: Callable[[], None] | None = None,
     *,
     lifecycle_version_provider: Callable[[], int] | None = None,
     on_group_generation_complete: Callable[[list[Sample]], None] | None = None,
@@ -233,20 +246,30 @@ async def generate_and_rm_group(
         current_sampling_params = sampling_params.copy()
         if getattr(args, "sglang_enable_deterministic_inference", False):
             current_sampling_params["sampling_seed"] = args.rollout_seed + idx
-        tasks.append(
-            asyncio.create_task(
-                generate_and_rm(
-                    state,
-                    sample,
-                    current_sampling_params,
-                    evaluation=evaluation,
-                    on_generation_complete=record_generation_completion,
-                    lifecycle_version_provider=lifecycle_version_provider,
-                )
+        task = asyncio.create_task(
+            generate_and_rm(
+                state,
+                sample,
+                current_sampling_params,
+                evaluation=evaluation,
+                on_generation_complete=record_generation_completion,
+                lifecycle_version_provider=lifecycle_version_provider,
             )
         )
+        if sample_done_callback is not None:
+            # fires on success, exception, and cancellation, so in-flight accounting is conserved
+            task.add_done_callback(lambda _task: sample_done_callback())
+        tasks.append(task)
 
-    group = await asyncio.gather(*tasks)
+    try:
+        group = await asyncio.gather(*tasks)
+    except BaseException:
+        # cancel siblings and let them settle: the group returns only after every
+        # sample task is done, so no orphan generation or in-flight credit outlives it
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
     logger.debug(f"{log_prefix} [group] All {len(group)} samples completed")
     if lifecycle_version_provider is not None:
         exact = group_completion_version is not None and group_completion_time is not None
@@ -315,16 +338,16 @@ class InferenceRolloutFn:
             self.state, input.rollout_id, self.data_source.get_samples
         )
         self.data_source.add_samples(aborted_samples)
+        if self.state.args.partial_rollout:
+            output.metrics["rollout/partial_rollout/buffer_depth_after_abort"] = float(
+                self.data_source.get_buffer_length()
+            )
         return output
 
     async def _call_eval(self, input: RolloutFnEvalInput) -> RolloutFnEvalOutput:
-        from miles.rollout.inference_rollout.inference_rollout_eval import eval_rollout_single_dataset
+        # Local: inference_rollout_eval imports GenerateState from this module.
+        from miles.rollout.inference_rollout.inference_rollout_eval import run_eval_datasets
 
-        assert not self.state.args.group_rm, "Group RM is not supported for eval rollout"
-
-        coros = []
-        for dataset_cfg in getattr(self.state.args, "eval_datasets", []) or []:
-            coros.append(eval_rollout_single_dataset(self.state, dataset_cfg, self.eval_prompt_dataset_cache))
-        results_list = await asyncio.gather(*coros)
-        results = {k: v for r in results_list for k, v in r.items()}
+        state = input.generate_state or self.state
+        results = await run_eval_datasets(state, self.eval_prompt_dataset_cache)
         return RolloutFnEvalOutput(data=results)

@@ -28,13 +28,13 @@ Agent function contract:
 """
 
 import argparse
-import asyncio
 import logging
 import time
 from collections.abc import Callable, Mapping
 from copy import deepcopy
 from typing import Any
 
+import httpx
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 
 from miles.rollout.base_types import GenerateFnInput, GenerateFnOutput
@@ -66,6 +66,7 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
         "agentic_tool_call.generate requires session_server_ip/session_server_ports. "
         "Pass --use-session-server to start the session server."
     )
+    use_v2 = getattr(input.args, "use_session_server", None) == "v2"
     tracer = await OpenAIEndpointTracer.create(input.args)
 
     custom_agent_function: Callable = load_function(input.args.custom_agent_function_path)
@@ -88,7 +89,7 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
 
     agent_metadata: dict[str, Any] = {}
     agent_aborted = False
-    collect_timed_out = False
+    collect_failed = False
     t_start = time.monotonic()
     try:
         logger.debug(f"{log_prefix} Starting agent function call")
@@ -107,24 +108,25 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
     finally:
         # Collect even if the agent failed.
         logger.debug(f"{log_prefix} Calling collect_samples...")
+        collect_kwargs = {"max_seq_len": max_seq_len}
+        if use_v2:
+            collect_kwargs["agent_metadata"] = agent_metadata
         try:
-            result = await tracer.collect_samples(
-                input.sample,
-                max_seq_len=max_seq_len,
-            )
-        except asyncio.TimeoutError:
-            collect_timed_out = True
-            logger.warning(f"{log_prefix} Timed out collecting samples", exc_info=True)
+            result = await tracer.collect_samples(input.sample, **collect_kwargs)
+        # Costs this sample, not the run; a non-2xx still raises RuntimeError.
+        except (TimeoutError, httpx.TransportError) as e:
+            collect_failed = True
+            logger.warning(f"{log_prefix} Failed collecting samples: {e!r}", exc_info=True)
         else:
             logger.debug(
                 f"{log_prefix} collect_samples done: {len(result.samples)} samples, "
                 f"total_time={time.monotonic()-t_start:.1f}s"
             )
 
-    if collect_timed_out:
+    if collect_failed:
         sample = deepcopy(input.sample)
         sample.status = Sample.Status.ABORTED
-        return GenerateFnOutput(samples=sample)
+        return GenerateFnOutput(samples=[sample] if use_v2 else sample)
 
     if not result.samples:
         if result.empty_reason == "all_truncated":
@@ -133,12 +135,24 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
             logger.warning("No model calls recorded for sample")
         sample = deepcopy(input.sample)
         sample.status = Sample.Status.ABORTED
-        return GenerateFnOutput(samples=sample)
+        return GenerateFnOutput(samples=[sample] if use_v2 else sample)
 
     samples = result.samples
-    for s in samples:
-        s.metadata.update(agent_metadata)
-        if agent_aborted:
+    if use_v2 and len(samples) > 1:
+        # FIXME: handle sample index issues.
+        rollout_id = input.sample.rollout_id if input.sample.rollout_id is not None else input.sample.index
+        assert rollout_id is not None, "v2 agentic samples require input Sample.rollout_id or Sample.index"
+        for sample in samples:
+            sample.rollout_id = rollout_id
+    if not use_v2:
+        # v1: the agent's metadata is applied driver-side. Under v2 it traveled
+        # through collect_samples and came back applied by the server-side
+        # merge (per-sample metadata/reward on the wire) — no overlay here.
+        for s in samples:
+            s.metadata.update(agent_metadata or {})
+
+    if agent_aborted:
+        for s in samples:
             s.status = Sample.Status.ABORTED
 
     # If the agent function reports wall-clock time spent outside policy generation
@@ -148,6 +162,9 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
     if ngt is not None:
         for s in samples:
             s.non_generation_time = ngt
+
+    if use_v2:
+        return GenerateFnOutput(samples=samples)
 
     (sample,) = samples
     sample.metadata.update(result.session_metadata)

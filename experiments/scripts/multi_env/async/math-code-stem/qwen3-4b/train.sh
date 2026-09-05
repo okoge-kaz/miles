@@ -17,12 +17,19 @@ cd /root/miles
     echo "invalid MODEL_PROFILE=${MODEL_PROFILE}" >&2
     exit 1
 }
-MODEL_PROFILE_PATH="/root/miles/scripts/models/${MODEL_PROFILE}.sh"
-[[ -r "${MODEL_PROFILE_PATH}" ]] || {
-    echo "model profile is not readable: ${MODEL_PROFILE_PATH}" >&2
-    exit 1
+MODEL_ARGS_LINE="$(
+    python3 miles/utils/external_utils/model_args_utils.py "${MODEL_PROFILE}"
+)" || exit 1
+read -ra MODEL_ARGS <<< "${MODEL_ARGS_LINE}"
+# ABCI exposes the full-node GPU allocation as UUIDs in
+# CUDA_VISIBLE_DEVICES. Ray preserves those values in ray.get_gpu_ids(), while
+# the current rollout launcher expects numeric IDs. This recipe uses every GPU
+# on each exclusive node, so normalize the in-container view before Ray starts.
+[[ "${GPUS_PER_NODE}" =~ ^[1-9][0-9]*$ ]] || {
+   echo "GPUS_PER_NODE must be a positive integer: ${GPUS_PER_NODE}" >&2
+   exit 1
 }
-source "${MODEL_PROFILE_PATH}"
+export CUDA_VISIBLE_DEVICES="$(seq -s, 0 "$(( GPUS_PER_NODE - 1 ))")"
 source /root/miles/experiments/common/ray_cluster.sh
 
 CKPT_ARGS=(

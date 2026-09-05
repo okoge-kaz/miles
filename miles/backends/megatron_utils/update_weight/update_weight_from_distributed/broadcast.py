@@ -105,8 +105,7 @@ class UpdateWeightFromDistributed(DistBucketedWeightUpdateMixin):
     def _update_weight_implementation(
         self, converted_named_tensors: list[tuple[str, torch.Tensor]], pbar: tqdm | None = None
     ) -> None:
-        """Lock → broadcast → clear → unlock. Lock prevents NCCL deadlock."""
-        # lock the rollout engines to prevent dead lock on broadcast.
+        """Serialize NCCL broadcasts and always release the rollout lock."""
         while not ray.get(self.rollout_engine_lock.acquire.remote()):
             time.sleep(0.1)
         try:
@@ -121,6 +120,8 @@ class UpdateWeightFromDistributed(DistBucketedWeightUpdateMixin):
             _check_weight_sync_results(ray.get(refs), is_lora=False)
             converted_named_tensors.clear()
         finally:
+            # Leaking this lock makes the next weight sync poll forever, so the
+            # release must run after both successful and failed broadcasts.
             ray.get(self.rollout_engine_lock.release.remote())
         if pbar:
             pbar.update(1)

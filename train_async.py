@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 from miles.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
+from miles.ray.rollout.eval_dispatch import EvalDispatcher
 from miles.rollout.queue_policy import should_prefetch_rollout_batches
 from miles.utils import object_store
 from miles.utils.arguments import parse_args, validate_async_off_policy_correction
@@ -187,8 +188,10 @@ async def train(args):
             skip_list=args.check_weight_update_skip_list,
         )
 
+    eval_dispatcher = EvalDispatcher(args, actor_model, rollout_manager)
+
     if args.eval_interval is not None and args.start_rollout_id == 0 and not args.skip_eval_before_train:
-        await rollout_manager.eval.remote(0)
+        await eval_dispatcher.dispatch(0, hf_dir=args.hf_checkpoint)
 
     async def save_training_model(model, rollout_id, force_sync, *, write_dist=True, write_hf=True):
         if args.use_critic and args.offload_train:
@@ -306,8 +309,8 @@ async def train(args):
                 rollout_data_next_future = None
             await actor_model.update_weights(rollout_id=rollout_id)
 
-        if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
-            await rollout_manager.eval.remote(rollout_id)
+        if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch, args.num_rollout):
+            await eval_dispatcher.dispatch(rollout_id, force=rollout_id == args.num_rollout - 1)
 
         if (
             args.debug_exit_after_rollout is not None
@@ -329,6 +332,7 @@ async def train(args):
                 updates_before_train=0,
             )
 
+    await eval_dispatcher.drain()
     await rollout_manager.dispose.remote()
 
 

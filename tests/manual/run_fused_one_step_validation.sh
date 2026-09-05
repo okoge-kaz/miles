@@ -23,7 +23,10 @@ set -euo pipefail
 : "${VALIDATION_CODE_ROOT:=/root/miles}"
 
 cd "${VALIDATION_CODE_ROOT}"
-source "${VALIDATION_CODE_ROOT}/scripts/models/qwen3-4B-Instruct-2507.sh"
+MODEL_ARGS_LINE="$(
+    python3 "${VALIDATION_CODE_ROOT}/miles/utils/external_utils/model_args_utils.py" qwen3-4B-Instruct-2507
+)" || exit 1
+read -ra MODEL_ARGS <<< "${MODEL_ARGS_LINE}"
 
 mkdir -p "${VALIDATION_OUTPUT}"
 

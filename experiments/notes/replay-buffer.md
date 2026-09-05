@@ -8,6 +8,12 @@ Replay-buffer persistence is opt-in:
 --replay-buffer-type inflight
 ```
 
+It is available only with an explicit built-in `--fully-async-queue-type`, not
+the v0.1-compatible or custom `DataBuffer` path. Its primary training purpose is
+to restore the queued and already-prepared rollout population across a restart,
+preventing the artificial change in realized training-staleness distribution
+that an empty rollout pipeline would introduce.
+
 Without `--use-replay-buffer`, resume keeps the existing cursor-only behavior
 and does not persist rollout data. The Qwen3-4B math-async recipe exposes the
 same settings as `USE_REPLAY_BUFFER=1` and `REPLAY_BUFFER_TYPE=rollout|inflight`.

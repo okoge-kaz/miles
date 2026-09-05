@@ -11,6 +11,7 @@ from miles.rollout.base_types import (
     RolloutFnEvalOutput,
     RolloutFnTrainInput,
     RolloutFnTrainOutput,
+    call_rollout_fn,
 )
 from miles.rollout.inference_rollout.compatibility import (
     LegacyGenerateFnAdapter,
@@ -44,6 +45,24 @@ def make_generate_fn_input():
     return _make
 
 
+def test_production_legacy_call_preserves_typed_rollout_metrics():
+    expected_metrics = {"staleness/total/mean": 1.0}
+
+    def legacy_rollout_fn(args, rollout_id, data_source, evaluation=False):
+        assert not evaluation
+        return RolloutFnTrainOutput(samples=[[{"text": "typed"}]], metrics=expected_metrics)
+
+    result = call_rollout_fn(
+        legacy_rollout_fn,
+        "dummy_args",
+        7,
+        "dummy_data_source",
+        evaluation=False,
+    )
+
+    assert result.metrics is expected_metrics
+
+
 class TestSupportedRolloutFormats:
     """
     Documentation test to show various supported rollout function formats
@@ -75,7 +94,10 @@ class TestSupportedRolloutFormats:
         def legacy_rollout_fn(args, rollout_id, data_source, evaluation=False):
             if evaluation:
                 return RolloutFnEvalOutput(data={"ds": {"acc": 0.95}})
-            return RolloutFnTrainOutput(samples=[[{"text": "typed"}]])
+            return RolloutFnTrainOutput(
+                samples=[[{"text": "typed"}]],
+                metrics={"staleness/total/mean": 1.0},
+            )
 
         with function_registry.temporary("test:legacy_typed", legacy_rollout_fn):
             fn = load_rollout_function(constructor_input, "test:legacy_typed")
@@ -89,6 +111,7 @@ class TestSupportedRolloutFormats:
             else:
                 assert isinstance(result, RolloutFnTrainOutput)
                 assert result.samples == [[{"text": "typed"}]]
+                assert result.metrics == {"staleness/total/mean": 1.0}
 
     @pytest.mark.parametrize("evaluation", [False, True])
     def test_format_3_sync_class(self, constructor_input, evaluation):

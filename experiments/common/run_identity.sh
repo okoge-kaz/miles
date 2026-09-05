@@ -4,7 +4,8 @@
 # TIS_CLIP_LOW, MIS_PROFILE, USE_OPSM, OPSM_DELTA, KL_LOSS_COEF, LR,
 # MAX_RESPONSE_LEN, NUM_STEPS_PER_ROLLOUT, ROLLOUT_BATCH_SIZE,
 # GLOBAL_BATCH_SIZE, N_SAMPLES_PER_PROMPT, TRAIN_SEED, ROLLOUT_SEED, and for PLACEMENT=async also
-# QUEUE_TYPE and, except for queue-drop, MAX_WEIGHT_STALENESS.
+# QUEUE_TYPE, TRAINING_BUFFER_QUEUE_SIZE, and, except for queue-drop,
+# MAX_WEIGHT_STALENESS.
 # Optionally accepts TASK_FAMILY (default: math). Sets RL_ALGORITHM,
 # POLICY_REGIME, CONFIG_TAG, RUN_NAME, CKPT_PATH.
 # Sourced by both run.sbatch and train.sh so the two cannot disagree.
@@ -31,13 +32,47 @@
 : "${N_SAMPLES_PER_PROMPT:?}"
 : "${TRAIN_SEED:?}"
 : "${ROLLOUT_SEED:?}"
+: "${PARTIAL_ROLLOUT:=0}"
+: "${OVER_SAMPLING_BATCH_SIZE:=${ROLLOUT_BATCH_SIZE}}"
+: "${MASK_OFFPOLICY_IN_PARTIAL_ROLLOUT:=0}"
+: "${ASYNC_MAX_CONCURRENT_SAMPLES:=}"
+: "${TRAINING_BUFFER_QUEUE_SIZE:=1000}"
+: "${USE_STALENESS_AWARE_LOSS:=0}"
+: "${SAFE_TRAINING_STALENESS:=2}"
+
+if [[ "${ZERO_REWARD_ON_TRUNCATED:-0}" != "0" && "${ZERO_LOSS_ON_TRUNCATED:-0}" != "0" ]]; then
+    echo "ZERO_REWARD_ON_TRUNCATED and ZERO_LOSS_ON_TRUNCATED are mutually exclusive" >&2
+    exit 2
+fi
+[[ "${USE_STALENESS_AWARE_LOSS}" =~ ^[01]$ ]] ||
+    { echo "USE_STALENESS_AWARE_LOSS must be 0 or 1" >&2; exit 1; }
+[[ "${SAFE_TRAINING_STALENESS}" =~ ^[0-9]+$ ]] ||
+    { echo "SAFE_TRAINING_STALENESS must be a non-negative integer" >&2; exit 1; }
+if [[ "${USE_STALENESS_AWARE_LOSS}" == 1 ]]; then
+    [[ "${PLACEMENT}" == async ]] ||
+        { echo "USE_STALENESS_AWARE_LOSS requires PLACEMENT=async" >&2; exit 1; }
+    [[ "${ZERO_REWARD_ON_TRUNCATED:-0}" != 0 && "${ZERO_LOSS_ON_TRUNCATED:-0}" == 0 ]] ||
+        { echo "USE_STALENESS_AWARE_LOSS requires zero-reward truncation feedback without zero-loss filtering" >&2; exit 1; }
+fi
+
+[[ "${PARTIAL_ROLLOUT}" =~ ^[01]$ ]] ||
+    { echo "PARTIAL_ROLLOUT must be 0 or 1" >&2; exit 1; }
+[[ "${MASK_OFFPOLICY_IN_PARTIAL_ROLLOUT}" =~ ^[01]$ ]] ||
+    { echo "MASK_OFFPOLICY_IN_PARTIAL_ROLLOUT must be 0 or 1" >&2; exit 1; }
+[[ "${OVER_SAMPLING_BATCH_SIZE}" =~ ^[1-9][0-9]*$ \
+   && "${OVER_SAMPLING_BATCH_SIZE}" -ge "${ROLLOUT_BATCH_SIZE}" ]] ||
+    { echo "OVER_SAMPLING_BATCH_SIZE must be an integer >= ROLLOUT_BATCH_SIZE" >&2; exit 1; }
+[[ "${MASK_OFFPOLICY_IN_PARTIAL_ROLLOUT}" == 0 || "${PARTIAL_ROLLOUT}" == 1 ]] ||
+    { echo "MASK_OFFPOLICY_IN_PARTIAL_ROLLOUT requires PARTIAL_ROLLOUT=1" >&2; exit 1; }
 
 case "${PLACEMENT}" in
     colocated)
         # None of these flags exist on this path; a non-default value would be silently dropped.
         [[ "${MAX_WEIGHT_STALENESS:-0}" == 0 && "${PAUSE_GENERATION_MODE:-none}" == none \
-           && "${STALENESS_REFERENCE:-completion}" == completion ]] ||
-            { echo "PLACEMENT=colocated cannot carry MAX_WEIGHT_STALENESS/PAUSE_GENERATION_MODE/STALENESS_REFERENCE" >&2; exit 1; }
+           && "${STALENESS_REFERENCE:-completion}" == completion \
+           && -z "${ASYNC_MAX_CONCURRENT_SAMPLES}" \
+           && "${TRAINING_BUFFER_QUEUE_SIZE}" == 1000 ]] ||
+            { echo "PLACEMENT=colocated cannot carry async-only staleness/concurrency settings" >&2; exit 1; }
         MAX_WEIGHT_STALENESS=0
         QUEUE_TYPE=none
         QUEUE_FACTOR=1
@@ -45,9 +80,14 @@ case "${PLACEMENT}" in
         STALENESS_REFERENCE=completion
         ;;
     async)
+        [[ "${PARTIAL_ROLLOUT}" == 0 && "${MASK_OFFPOLICY_IN_PARTIAL_ROLLOUT}" == 0 \
+           && "${OVER_SAMPLING_BATCH_SIZE}" -eq "${ROLLOUT_BATCH_SIZE}" ]] ||
+            { echo "PLACEMENT=async cannot use colocated partial/oversampling settings" >&2; exit 1; }
         : "${QUEUE_TYPE:=queue-recycle}"
         : "${QUEUE_FACTOR:=1}"
         : "${STALENESS_REFERENCE:=completion}"
+        [[ "${TRAINING_BUFFER_QUEUE_SIZE}" =~ ^[1-9][0-9]*$ ]] ||
+            { echo "TRAINING_BUFFER_QUEUE_SIZE must be an integer >= 1" >&2; exit 1; }
         [[ "${STALENESS_REFERENCE}" == completion || "${STALENESS_REFERENCE}" == submission \
            || "${STALENESS_REFERENCE}" == prefill ]] ||
             { echo "STALENESS_REFERENCE must be completion, submission, or prefill, got '${STALENESS_REFERENCE}'" >&2; exit 1; }
@@ -71,6 +111,8 @@ case "${PLACEMENT}" in
                     { echo "queue-drop cannot use MAX_WEIGHT_STALENESS" >&2; exit 1; }
                 [[ "${QUEUE_FACTOR}" =~ ^[1-9][0-9]*$ ]] ||
                     { echo "QUEUE_FACTOR must be an integer >= 1" >&2; exit 1; }
+                [[ "${TRAINING_BUFFER_QUEUE_SIZE}" == 1000 ]] ||
+                    { echo "TRAINING_BUFFER_QUEUE_SIZE is only used by queue-recycle and queue-max" >&2; exit 1; }
                 ;;
             *)
                 echo "QUEUE_TYPE must be queue-recycle, queue-max, or queue-drop, got '${QUEUE_TYPE}'" >&2
@@ -93,7 +135,7 @@ TASK_FAMILY="${TASK_FAMILY:-math}"
 # queue-max selects after the preceding update, so a zero prefill bound is also
 # categorized on-policy.
 if [[ "${NUM_STEPS_PER_ROLLOUT}" -eq 1 \
-      && ( "${PLACEMENT}" == colocated \
+      && ( ( "${PLACEMENT}" == colocated && "${PARTIAL_ROLLOUT}" == 0 ) \
            || ( "${QUEUE_TYPE}" == queue-max && "${MAX_WEIGHT_STALENESS}" -eq 0 ) ) ]]; then
     POLICY_REGIME=on-policy
 else
@@ -142,6 +184,9 @@ fi
 if [[ "${ZERO_LOSS_ON_TRUNCATED:-0}" != "0" ]]; then
     CONFIG_TAG="${CONFIG_TAG}-zero-loss-trunc"
 fi
+if [[ "${USE_STALENESS_AWARE_LOSS}" == 1 ]]; then
+    CONFIG_TAG="${CONFIG_TAG}-staleness-aware-loss-safe${SAFE_TRAINING_STALENESS}"
+fi
 # Replay-buffer formats have different resume semantics and reject one another
 # at load time. Recipes that opt into this identity axis therefore cannot
 # accidentally share a checkpoint directory when only the buffer type changes.
@@ -152,6 +197,22 @@ if [[ "${REPLAY_BUFFER_IDENTITY_TAG:-0}" != "0" ]]; then
     else
         CONFIG_TAG="${CONFIG_TAG}-no-rb"
     fi
+fi
+if [[ "${PLACEMENT}" == colocated && "${PARTIAL_ROLLOUT}" == 1 ]]; then
+    CONFIG_TAG="${CONFIG_TAG}-partial-o${OVER_SAMPLING_BATCH_SIZE}"
+    if [[ "${MASK_OFFPOLICY_IN_PARTIAL_ROLLOUT}" == 1 ]]; then
+        CONFIG_TAG="${CONFIG_TAG}-mask-old-prefix"
+    fi
+elif [[ "${PLACEMENT}" == colocated \
+        && "${OVER_SAMPLING_BATCH_SIZE}" -ne "${ROLLOUT_BATCH_SIZE}" ]]; then
+    CONFIG_TAG="${CONFIG_TAG}-oversample-o${OVER_SAMPLING_BATCH_SIZE}"
+fi
+if [[ "${PLACEMENT}" == async && -n "${ASYNC_MAX_CONCURRENT_SAMPLES}" ]]; then
+    CONFIG_TAG="${CONFIG_TAG}-concurrency-${ASYNC_MAX_CONCURRENT_SAMPLES}"
+fi
+if [[ "${PLACEMENT}" == async && "${QUEUE_TYPE}" != queue-drop \
+      && "${TRAINING_BUFFER_QUEUE_SIZE}" -ne 1000 ]]; then
+    CONFIG_TAG="${CONFIG_TAG}-tbq${TRAINING_BUFFER_QUEUE_SIZE}"
 fi
 if [[ "${TASK_FAMILY}" == search_r1 ]]; then
     : "${SEARCH_MAX_TURNS:?}"
@@ -165,22 +226,27 @@ fi
 # Suffixed only away from the default, so paths written before the option existed
 # keep their spelling. The reference changes the age decision, so two runs that
 # differ only here are different runs and must not share a directory.
-case "${QUEUE_TYPE}" in
-    none|queue-recycle)
-        STALENESS_TAG="max-weight-staleness-${MAX_WEIGHT_STALENESS}"
-        [[ "${STALENESS_REFERENCE:-completion}" == completion ]] ||
-            STALENESS_TAG="${STALENESS_TAG}-from-${STALENESS_REFERENCE}"
-        QUEUE_RUN_TAG="s${MAX_WEIGHT_STALENESS}"
-        ;;
-    queue-max)
-        STALENESS_TAG="queue-max/max-weight-staleness-${MAX_WEIGHT_STALENESS}-from-prefill"
-        QUEUE_RUN_TAG="qmax-s${MAX_WEIGHT_STALENESS}"
-        ;;
-    queue-drop)
-        STALENESS_TAG="queue-drop/q${QUEUE_FACTOR}"
-        QUEUE_RUN_TAG="qdrop-q${QUEUE_FACTOR}"
-        ;;
-esac
+if [[ "${PLACEMENT}" == colocated && "${PARTIAL_ROLLOUT}" == 1 ]]; then
+    STALENESS_TAG="partial-rollout/unbounded"
+    QUEUE_RUN_TAG="partial"
+else
+    case "${QUEUE_TYPE}" in
+        none|queue-recycle)
+            STALENESS_TAG="max-weight-staleness-${MAX_WEIGHT_STALENESS}"
+            [[ "${STALENESS_REFERENCE:-completion}" == completion ]] ||
+                STALENESS_TAG="${STALENESS_TAG}-from-${STALENESS_REFERENCE}"
+            QUEUE_RUN_TAG="s${MAX_WEIGHT_STALENESS}"
+            ;;
+        queue-max)
+            STALENESS_TAG="queue-max/max-weight-staleness-${MAX_WEIGHT_STALENESS}-from-prefill"
+            QUEUE_RUN_TAG="qmax-s${MAX_WEIGHT_STALENESS}"
+            ;;
+        queue-drop)
+            STALENESS_TAG="queue-drop/q${QUEUE_FACTOR}"
+            QUEUE_RUN_TAG="qdrop-q${QUEUE_FACTOR}"
+            ;;
+    esac
+fi
 
 # RUN_NAME is the wandb group and the log directory, not a path. It shows the
 # axes this study varies and closes over the rest with a hash; the full identity

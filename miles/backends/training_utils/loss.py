@@ -1,9 +1,8 @@
 from argparse import Namespace
-
 import torch
 from torch.utils.checkpoint import checkpoint
 
-from miles.backends.training_utils.cp_utils import get_sum_of_sample_mean
+from miles.backends.training_utils.cp_utils import get_local_response_loss_masks, get_sum_of_sample_mean
 from miles.backends.training_utils.loss_hub.advantages import compute_advantages, normalize_advantages
 from miles.backends.training_utils.loss_hub.logit_processors import get_log_probs_and_entropy, get_values  # noqa: F401
 from miles.backends.training_utils.loss_hub.losses import get_loss_function
@@ -55,7 +54,20 @@ def _pack_logging_values(
     return packed
 
 
-def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) -> None:
+def _detach_rollout_tensor_list(rollout_data: RolloutBatch, key: str) -> list[torch.Tensor] | None:
+    tensors = rollout_data.get(key)
+    if tensors is None:
+        return None
+
+    detached_tensors = [tensor.detach() for tensor in tensors]
+    rollout_data[key] = detached_tensors
+    return detached_tensors
+
+
+def compute_advantages_and_returns(
+    args: Namespace,
+    rollout_data: RolloutBatch,
+) -> None:
     """Compute advantages and returns in-place based on `args.advantage_estimator`.
 
     This function extracts rewards, log-probs, values, and masks from
@@ -67,7 +79,8 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
     data-parallel group using masked statistics.
 
     Early returns if both `log_probs` and `values` are None (intermediate
-    pipeline stages).
+    pipeline stages), unless the last stage is explicitly allowed to derive
+    zero-KL shapes without the standalone actor pass.
 
     Args:
         args: Configuration specifying estimator type, KL coefficient,
@@ -78,6 +91,8 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
             "advantages" and "returns" keys, each mapping to lists of tensors
             per sample.
     """
+    allow_missing_log_probs = args.skip_actor_forward_only and not args.use_rollout_logprobs
+    log_probs_key = "rollout_log_probs" if args.use_rollout_logprobs else "log_probs"
     fused_logprobs = getattr(args, "fuse_one_step_actor_logprobs", False)
     if fused_logprobs:
         # GRPO with reward-level KL disabled needs only a response-aligned tensor
@@ -90,7 +105,7 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
         kl_template: list[torch.Tensor] | None = rollout_data.get("rollout_log_probs")
     else:
         log_probs: list[torch.Tensor] | None = rollout_data.get(
-            "rollout_log_probs" if args.use_rollout_logprobs else "log_probs"
+            log_probs_key
         )
         kl_template = log_probs
     ref_log_probs: list[torch.Tensor] = rollout_data.get("ref_log_probs")
@@ -103,9 +118,25 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
 
     # return when not the last pp stage.
     if kl_template is None and values is None:
-        return
+        if not (allow_missing_log_probs and get_parallel_state().is_pp_last_stage):
+            return
 
-    if args.kl_coef == 0 or not log_probs:
+    # This is the authoritative persistence boundary: scores produced before
+    # the policy update are fixed training data and must not retain a graph.
+    _detach_rollout_tensor_list(rollout_data, "log_probs")
+    _detach_rollout_tensor_list(rollout_data, "rollout_log_probs")
+    _detach_rollout_tensor_list(rollout_data, "ref_log_probs")
+    _detach_rollout_tensor_list(rollout_data, "teacher_log_probs")
+    if not fused_logprobs:
+        log_probs = rollout_data.get(log_probs_key)
+    ref_log_probs = rollout_data.get("ref_log_probs")
+
+    if log_probs is None and values is None:
+        local_masks = get_local_response_loss_masks(
+            total_lengths, response_lengths, loss_masks, args.qkv_format, max_seq_lens
+        )
+        kl = [torch.zeros_like(mask, dtype=torch.float32) for mask in local_masks]
+    elif args.kl_coef == 0 or not log_probs:
         # when kl_coef is 0, we won't compute ref_log_prob
         xs = kl_template if kl_template is not None else values
         assert xs is not None
@@ -154,6 +185,7 @@ def loss_function(
     num_microbatches: int,
     logits: torch.Tensor,
     apply_megatron_loss_scaling: bool = False,
+    num_rollouts: int | None = None,
 ) -> tuple[torch.Tensor, int | torch.Tensor, dict[str, list[str] | torch.Tensor]]:
     """Dispatch to the configured loss and rescale for Megatron integration.
 
@@ -169,6 +201,8 @@ def loss_function(
             keys required by the selected loss function.
         num_microbatches: Number of gradient accumulation steps.
         logits: Model outputs (policy or value head).
+        num_rollouts: This step's rollout count (total across DP), used as
+            the loss normalizer; None falls back to the legacy batch/args value.
 
     Returns:
         Tuple of `(scaled_loss, normalizer, logging_dict)` where:
@@ -189,6 +223,7 @@ def loss_function(
         args.calculate_per_token_loss,
         args.qkv_format,
         batch.get("max_seq_lens", None),
+        denominators=batch.get("rollout_mask_sums", None),
     )
 
     func = get_loss_function(args)
@@ -209,8 +244,11 @@ def loss_function(
         loss = loss + 0 * logits.sum()
 
     # Here we need to divide by cp_size because to cancel the multiply in Megatron.
-    assert args.use_dynamic_global_batch_size == ("dynamic_global_batch_size" in batch)
-    global_batch_size = batch.get("dynamic_global_batch_size", args.global_batch_size)
+    if num_rollouts is not None:
+        global_batch_size = num_rollouts
+    else:
+        assert args.use_dynamic_global_batch_size == ("dynamic_global_batch_size" in batch)
+        global_batch_size = batch.get("dynamic_global_batch_size", args.global_batch_size)
     # Multi-LoRA: samples enter the gradient buffers with weight 1; per-adapter
     # normalization (1/adapter_global_batch_size, a constant known in advance)
     # is applied to the accumulated slot gradient at optimizer-step time.
