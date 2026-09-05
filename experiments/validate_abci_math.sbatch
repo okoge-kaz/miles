@@ -10,6 +10,8 @@
 # allocation to two nodes for bring-up; the maintained validation uses eight.
 set -euo pipefail
 cd "${PBS_O_WORKDIR:?submit from the Miles checkout}"
+mkdir -p experiments/outputs/abci-validation
+exec > >(tee -a "experiments/outputs/abci-validation/${PBS_JOBID}.live.log") 2>&1
 export WANDB_MODE=offline
 export MODEL_NAME=Qwen3-4B HF_MODEL_NAME=Qwen3-4B MODEL_PROFILE=qwen3-4B
 export DATASET_TAG=dapo-math-17k
@@ -21,13 +23,13 @@ source experiments/env.sh
 export ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-$((MILES_JOB_NUM_NODES / 2))}"
 export ACTOR_GPUS_PER_NODE=8
 export ROLLOUT_NUM_GPUS="$(((MILES_JOB_NUM_NODES - ACTOR_NUM_NODES) * GPUS_PER_NODE))"
-export ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-32}"
-export N_SAMPLES_PER_PROMPT=8
+export ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-192}"
+export N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-16}"
 export GLOBAL_BATCH_SIZE="$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT))"
 export NUM_STEPS_PER_ROLLOUT=1
 export MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-16384}"
 export NUM_ROLLOUT="${NUM_ROLLOUT:-30}"
-export ASYNC_MAX_CONCURRENT_SAMPLES="${ASYNC_MAX_CONCURRENT_SAMPLES:-512}"
+export ASYNC_MAX_CONCURRENT_SAMPLES="${ASYNC_MAX_CONCURRENT_SAMPLES:-${GLOBAL_BATCH_SIZE}}"
 export SAVE_INTERVAL="${SAVE_INTERVAL:-2}" SAVE_RETAIN_INTERVAL=2
 export SAVE_HF="${SAVE_HF:-1}" HF_SAVE_INTERVAL=2
 export USE_REPLAY_BUFFER=1 REPLAY_BUFFER_TYPE=inflight

@@ -24,7 +24,8 @@ def test_refill_maintains_pbs_inflight_target(tmp_path: Path) -> None:
 set -euo pipefail
 printf '%s|%s\n' "$WALL" "$*" >> "$LANE_LOG"
 if [[ " $* " != *" --submit "* ]]; then
-    printf 'status: available=1 complete=0 pending=1\n'
+    printf 'status: available=1 complete=0 active=0 pending=1 missing=0 incomplete=0 unreadable=0\n'
+    printf 'active job ids: \n'
 fi
 """,
     )

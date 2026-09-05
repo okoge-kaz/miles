@@ -36,9 +36,9 @@ CONCURRENCY = int(os.environ.get("CODE_EXEC_CONCURRENCY", "4"))
 # only that single call and allow every sample to launch a subprocess at once.
 # Keep one limiter per event loop so both reward contracts share the same
 # rollout-manager execution budget without binding a semaphore across test loops.
-_LOOP_SEMAPHORES: weakref.WeakKeyDictionary[
-    asyncio.AbstractEventLoop, tuple[int, asyncio.Semaphore]
-] = weakref.WeakKeyDictionary()
+_LOOP_SEMAPHORES: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, tuple[int, asyncio.Semaphore]] = (
+    weakref.WeakKeyDictionary()
+)
 
 _FENCE = re.compile(r"```(?:python|py)?\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
 
@@ -78,9 +78,10 @@ def _limited_command(command: list[str], *, memory_gb: float, timeout: float) ->
 def _bubblewrap_command(workdir: Path, script: Path) -> list[str]:
     executable = shutil.which("bwrap")
     unshare = shutil.which("unshare")
-    if executable is None or unshare is None:
+    mount = shutil.which("mount")
+    if executable is None or unshare is None or mount is None:
         raise RuntimeError(
-            "code execution requires Bubblewrap and util-linux unshare; install both or explicitly "
+            "code execution requires Bubblewrap and util-linux unshare/mount; install both or explicitly "
             "run a disposable isolated worker with CODE_EXEC_SANDBOX=process"
         )
     # The cluster seccomp profile permits creating a network namespace but denies
@@ -92,8 +93,17 @@ def _bubblewrap_command(workdir: Path, script: Path) -> list[str]:
         unshare,
         "--user",
         "--map-root-user",
+        "--mount",
         "--net",
         "--fork",
+        # Singularity marks its root mount unbindable. Make it bindable only
+        # inside this new mount namespace before constructing the read-only
+        # sandbox; the training process and host mounts remain untouched.
+        "/bin/sh",
+        "-c",
+        '"$1" --make-rprivate / && shift && exec "$@"',
+        "miles-code-sandbox",
+        mount,
         executable,
         "--die-with-parent",
         "--new-session",

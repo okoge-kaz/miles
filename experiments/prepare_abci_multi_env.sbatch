@@ -31,5 +31,6 @@ python3 -m experiments.src.datasets.nemotron.convert --dataset skywork-or1-code 
 '
 bash experiments/setup/datasets/prepare_performance_transfer_blends.sbatch
 export MATH_PROMPT_DATA=/data/dapo-math-17k/dapo-math-17k.jsonl
+export MATH_DEFAULT_SOURCE=dapo-math-17k
 bash experiments/setup/datasets/prepare_math_code_stem_blend.sbatch
 bash experiments/setup/environments/prepare_reasoning_gym_dependencies.sbatch

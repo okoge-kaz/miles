@@ -14,6 +14,7 @@ set -euo pipefail
 REPO_ROOT="${PBS_O_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)}"
 source "${REPO_ROOT}/experiments/env.sh"
 export MATH_PROMPT_DATA="${MATH_PROMPT_DATA:-/data/dapo-math-p10-90-qwen3-4b-base-lr2e-5-step4000/dapo-math-p10-90-qwen3-4b-base-lr2e-5-step4000.jsonl}"
+export MATH_DEFAULT_SOURCE="${MATH_DEFAULT_SOURCE:-dapo-math-filtered}"
 
 miles_srun \
     --image="${CONTAINER_IMAGE}" \
@@ -36,7 +37,7 @@ python3 -m experiments.src.datasets.common.merge \
     --rows-per-input 10891 \
     --seed 42 \
     --default-verifier math \
-    --default-source dapo-math-filtered \
+    --default-source "${MATH_DEFAULT_SOURCE}" \
     --require-verifiers math python_code mcqa_regex reasoning_gym \
     --summary "${OUT}/math-code-stem-balanced-summary.json"
 

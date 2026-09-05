@@ -22,7 +22,7 @@ def test_public_qwen3_4b_has_canonical_staging_identity() -> None:
     row = _active_manifest_rows()["Qwen3-4B"]
 
     assert row == ("Qwen3-4B", "Qwen/Qwen3-4B", "qwen3-4B")
-    assert (REPO_ROOT / "scripts/models/qwen3-4B.sh").is_file()
+    assert (REPO_ROOT / "scripts/models/qwen3-4B.py").is_file()
 
 
 def test_public_qwen3_4b_staging_paths_and_command_are_documented() -> None:

@@ -132,7 +132,7 @@ experiments/scripts/reasoning_eval/submit-truncation-ablation-sweeps.sh \
   --submit --max-submissions 0
 ```
 
-The scanner defaults to hiso's checkpoint root and the two fixed 2026-08-27
+The scanner defaults to the configured checkpoint root and the two historical 2026-08-27
 training namespaces. Use `--cohort reward-off` or `--cohort zero-loss` to scan
 one cohort. As with the legacy launcher, unreadable or incompletely published
 checkpoints are reported but never submitted.
@@ -183,27 +183,23 @@ Submit `refill-snapshot.sbatch` through `pbs_submit --profile=cpu`. Set
 `REFILL_ONCE=1` to execute one controller iteration, which is useful for a
 controlled validation of queue routing.
 
-For a sweep that is still producing or publishing checkpoints, the refill
-controller can continuously validate all 510 candidates and submit newly ready
-ones. It also keeps an interactive queue populated by moving only pending jobs;
-running evaluations are never canceled or migrated:
+For a sweep that is still publishing checkpoints, the PBS refill controller
+rescans the requested grid and submits newly complete exports up to
+`INFLIGHT_TARGET` (default four jobs in the configured GPU queue). It never
+moves or cancels existing evaluations.
 
 ```bash
-sbatch \
-  --export=ALL,TRAINING_ROOT=/path/to/checkpoints/training,RUN_NAMESPACE=sr-20260819-212906,POLL_SECONDS=300,DYNAMIC_QUIESCENT_SCANS=12,BATCH_INFLIGHT_TARGET=0,REGULAR_INFLIGHT_TARGET=490,INTERACTIVE_INFLIGHT_TARGET=20,REGULAR_WALL=04:00:00,INTERACTIVE_WALL=04:00:00,SLURM_JOB_USER="$USER",TRUST_PINNED_SNAPSHOT=0 \
+source experiments/env.sh
+pbs_submit --profile=cpu \
+  --export=RUN_NAMESPACE,TRAINING_ROOT,INFLIGHT_TARGET=4,TRUST_PINNED_SNAPSHOT=0 \
   experiments/scripts/reasoning_eval/refill-snapshot.sbatch
 ```
 
-With no `SNAPSHOT_ARM_MAX_STEPS`, the controller operates dynamically and does
-not require all checkpoints to exist at startup. Once every currently available
-checkpoint is evaluated, it waits for 12 unchanged scans by default before
-declaring the accessible set complete; a newly completed export resets that
-window. Supplying an arm-max-step snapshot retains the fixed-snapshot
-availability check. Queue targets accept zero, which is useful when
-the short-QoS lane is unavailable or node-limited. The controller requeues itself
-five minutes before its two-day wall limit when work remains. Set
-`CONTROLLER_DRY_RUN=1` to perform exactly one read-only scan without canceling,
-reassigning, or submitting any evaluation job.
+Without `SNAPSHOT_ARM_MAX_STEPS`, the controller waits for
+`DYNAMIC_QUIESCENT_SCANS` unchanged complete scans (default 12). Incomplete or
+unreadable exports keep it waiting. `CONTROLLER_DRY_RUN=1` performs one scan
+without submission; `REFILL_ONCE=1` permits one submission wave. PBS walltime
+ends the controller; relaunching it uses the persisted result markers.
 
 ## Results and figures
 

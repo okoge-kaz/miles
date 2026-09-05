@@ -6,11 +6,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 BASE_LAUNCHER="${SCRIPT_DIR}/submit-staleness-sweep.sh"
-DEFAULT_HISO_TRAINING_ROOT="/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/hiso/async-rl/checkpoints/training"
+DEFAULT_TRAINING_ROOT="${TRAIN_CKPT_DIR:-${MILES_WORKSPACE_ROOT:-/groups/gai51740/kazuki_fujii}/checkpoints/training}"
 
 REWARD_OFF_RUN_NAMESPACE="${REWARD_OFF_RUN_NAMESPACE:-hiso-reward-off-trunc-coloc-s8-16-r12-20260827-v1}"
 ZERO_LOSS_RUN_NAMESPACE="${ZERO_LOSS_RUN_NAMESPACE:-hiso-zero-loss-trunc-s8-16-20-r12-20260827-v1}"
-TRAINING_ROOT="${TRAINING_ROOT:-${DEFAULT_HISO_TRAINING_ROOT}}"
+TRAINING_ROOT="${TRAINING_ROOT:-${DEFAULT_TRAINING_ROOT}}"
 COHORT=all
 declare -a FORWARD_ARGS=()
 
@@ -30,7 +30,7 @@ Options:
 
 The reward-off cohort contains one colocated arm and staleness 8/16 crossed
 with trainer:rollout ratios 1:7/2:6. The zero-loss cohort contains staleness
-8/16/20 crossed with the same two ratios. TRAINING_ROOT, PARTITION, QOS, WALL,
+8/16/20 crossed with the same two ratios. TRAINING_ROOT, WALL,
 and the two *_RUN_NAMESPACE variables may be overridden through the environment.
 EOF
 }
