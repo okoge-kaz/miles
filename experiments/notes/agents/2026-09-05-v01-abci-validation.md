@@ -172,12 +172,31 @@ updates. The artifact auditor now rejects any retained distributed model
 without a verified replay pair, and detected the known orphan in the original
 bring-up. It still passes for the multi-environment run.
 
-Real archival validation is running as `2226244.pbs1` (two nodes, four updates,
-save interval 1, retain interval 2). Its dependent restart `2226246.pbs1`
-explicitly selects archived checkpoint 0 with `CKPT_STEP=0` and trains three
-updates. The Math train entrypoint now exposes this existing Megatron option.
-These jobs use namespace `v01-abci-retention-20260905` and the original
-8-group x 8-response bring-up settings.
+Real archival validation `2226244.pbs1` finished with exit 0 in 8m26s (two
+nodes, four updates, save interval 1, retain interval 2). Model and replay
+iterations both correctly retained 0, 2, and 3. Update 2 had zero GRPO loss and
+gradient: its actual eight groups all had constant rewards (two all-zero,
+six all-one groups). The original dump is preserved as
+`retention-fresh-step2.pt`; `--allow-zero-gradients` permits this documented
+small-batch case in the resume auditor while retaining finite-value checks,
+requiring some nonzero gradients, and reporting every zero-gradient step.
+
+The first archive restart, `2226246.pbs1`, exposed another existing runtime
+issue: Megatron's two checkpoint path resolvers use a truthiness check for
+`ckpt_step`, so explicit `CKPT_STEP=0` incorrectly loaded latest iteration 3.
+That job was cancelled. `cc29ff40` adds a scoped integer adapter that keeps
+zero explicit only during Megatron loading, then restores ordinary integer
+arguments and loaded-iteration state, including on exceptions. This avoids
+modifying the SIF or checkpoint trackers. The retry `2226274.pbs1` passed all
+24 checkpoint-selection/LoRA/in-memory tests on a GPU compute node before
+starting its three-update archive restart. The same tests require the CUDA
+driver library for this image's Transformer Engine import and cannot collect
+on the login node without it.
+
+The Math train entrypoint exposes Megatron's `CKPT_STEP` option. These jobs
+use namespace `v01-abci-retention-20260905` and the original 8-group x
+8-response bring-up settings. Actual restart from archived model 0 remains
+to be accepted after the retry finishes.
 
 The eight-node production batch (192 x 16 = 3072, 16K responses) and its replay
 restart have not yet been accepted. `2226149.pbs1` is running from `28a3303e`;
