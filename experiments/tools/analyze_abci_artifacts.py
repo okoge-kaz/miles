@@ -117,12 +117,20 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     latest = int((args.checkpoint / "latest_checkpointed_iteration.txt").read_text())
-    assert (args.checkpoint / f"iter_{latest:07d}").is_dir()
+    model_iterations = sorted(
+        int(path.name.removeprefix("iter_"))
+        for path in args.checkpoint.glob("iter_*")
+        if (path / ".metadata").is_file()
+    )
+    assert latest in model_iterations, "Latest distributed model metadata is missing"
     replay = verify_replay(args.checkpoint)
-    assert latest in {entry["iteration"] for entry in replay}, "Latest model lacks a verified replay snapshot"
+    missing_replay = set(model_iterations) - {entry["iteration"] for entry in replay}
+    assert not missing_replay, f"Retained model iterations lack verified replay snapshots: {sorted(missing_replay)}"
     report = {
         "checkpoint": str(args.checkpoint),
         "latest_iteration": latest,
+        "model_iterations": model_iterations,
+        "model_replay_pairs_verified": True,
         "replay": replay,
         "hf_exports": verify_hf_exports(args.checkpoint),
     }

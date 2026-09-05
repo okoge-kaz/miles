@@ -161,6 +161,24 @@ The first invocation used `DEBUG_EXIT_AFTER_ROLLOUT=1`, then the restart used 3.
 
 ## Remaining acceptance checks
 
+An additional archival audit found a pre-existing retention mismatch, also
+present in the starting ABCI branch: Megatron archives checkpoint iteration
+`N` when `N % save_retain_interval == 0`, but replay used `(N + 1) % interval`.
+The initial bring-up consequently retained model 0 after pruning replay 0.
+Its latest-checkpoint restart passed, but that historical archive is unusable.
+Commit `911438a3` aligns replay archival IDs with Megatron; 65 replay/resume
+tests passed, including preservation and loading of archive 0 after newer
+updates. The artifact auditor now rejects any retained distributed model
+without a verified replay pair, and detected the known orphan in the original
+bring-up. It still passes for the multi-environment run.
+
+Real archival validation is running as `2226244.pbs1` (two nodes, four updates,
+save interval 1, retain interval 2). Its dependent restart `2226246.pbs1`
+explicitly selects archived checkpoint 0 with `CKPT_STEP=0` and trains three
+updates. The Math train entrypoint now exposes this existing Megatron option.
+These jobs use namespace `v01-abci-retention-20260905` and the original
+8-group x 8-response bring-up settings.
+
 The eight-node production batch (192 x 16 = 3072, 16K responses) and its replay
 restart have not yet been accepted. `2226149.pbs1` is running from `28a3303e`;
 `2226167.pbs1` is an eight-node, four-update restart that depends on its PBS
