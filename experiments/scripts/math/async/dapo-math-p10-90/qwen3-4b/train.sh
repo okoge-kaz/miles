@@ -45,6 +45,7 @@ CKPT_ARGS=(
    --save-interval "${SAVE_INTERVAL}"
    --save-retain-interval "${SAVE_RETAIN_INTERVAL}"
 )
+[[ -z "${CKPT_STEP:-}" ]] || CKPT_ARGS+=(--ckpt-step "${CKPT_STEP}")
 if [[ "${SAVE_HF}" != "0" ]]; then
    CKPT_ARGS+=(--save-hf "${CKPT_PATH}/hf/{rollout_id}")
    if [[ -n "${HF_SAVE_INTERVAL:-}" ]]; then

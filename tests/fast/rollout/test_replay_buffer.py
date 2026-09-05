@@ -374,7 +374,9 @@ async def test_prepared_batch_is_a_warm_resume_hit_and_active_prompt_is_regenera
     original_staleness = {key: value for key, value in output.metrics.items() if key.startswith("staleness/")}
     resumed_staleness = {key: value for key, value in warm_output.metrics.items() if key.startswith("staleness/")}
     assert resumed_staleness == original_staleness
-    assert warm_output.metrics["fully_async/train_weight_version"] == output.metrics["fully_async/train_weight_version"]
+    assert (
+        warm_output.metrics["fully_async/train_weight_version"] == output.metrics["fully_async/train_weight_version"]
+    )
     assert warm_output.metrics["resume/replay_buffer/warm_prepared_batch_hit"] == 1
     assert restored._worker is None
     assert [group[0].group_index for group in restored_source.buffer] == [2]
@@ -1086,11 +1088,35 @@ def test_replay_buffer_checksum_fingerprint_and_retention(tmp_path: Path):
     for rollout_id in range(5, 9):
         save_replay_buffer(tmp_path, rollout_id, {**state, "value": rollout_id})
     prune_replay_buffers(tmp_path, current_rollout_id=8, keep_last=2, archive_interval=5)
-    assert (tmp_path / "rollout" / "replay_buffer_4.pt").is_file()
-    assert not (tmp_path / "rollout" / "replay_buffer_5.pt").exists()
+    assert not (tmp_path / "rollout" / "replay_buffer_4.pt").exists()
+    assert (tmp_path / "rollout" / "replay_buffer_5.pt").is_file()
     assert not (tmp_path / "rollout" / "replay_buffer_6.pt").exists()
     assert (tmp_path / "rollout" / "replay_buffer_7.pt").is_file()
     assert (tmp_path / "rollout" / "replay_buffer_8.pt").is_file()
+
+
+def test_replay_buffer_retention_preserves_zero_based_model_archives(tmp_path: Path):
+    state = {
+        "dataset_fingerprint": "dataset-a",
+        "data_source": {},
+        "applied_weight_version": 0,
+        "pending_prompts": [],
+        "ready_items": [],
+        "drain_progress": [],
+        "prepared_batches": [],
+        "regeneration_group_ids": [],
+    }
+    for rollout_id in range(4):
+        save_replay_buffer(tmp_path, rollout_id, state)
+
+    # ABCI's Megatron keeps model iterations 0 and 2 plus latest iteration 3.
+    prune_replay_buffers(tmp_path, current_rollout_id=3, keep_last=2, archive_interval=2)
+
+    remaining = {int(path.stem.rsplit("_", 1)[1]) for path in (tmp_path / "rollout").glob("*.pt")}
+    assert remaining == {0, 2, 3}
+    for rollout_id in (0, 2, 3):
+        loaded = load_replay_buffer(tmp_path, rollout_id, expected_fingerprint="dataset-a")
+        assert loaded["rollout_id"] == rollout_id
 
 
 def test_rollout_replay_buffer_rejects_inflight_payload(tmp_path: Path):

@@ -356,7 +356,9 @@ def prune_replay_buffers(
     for rollout_id, path in buffers:
         if rollout_id in recent_ids:
             continue
-        if archive_interval is not None and archive_interval > 0 and (rollout_id + 1) % archive_interval == 0:
+        # Megatron archives by the checkpoint iteration itself. The +1 used
+        # for scheduling saves would retain a different set of model/replay ids.
+        if archive_interval is not None and archive_interval > 0 and rollout_id % archive_interval == 0:
             continue
         path.unlink(missing_ok=True)
         Path(f"{path}{CHECKSUM_SUFFIX}").unlink(missing_ok=True)

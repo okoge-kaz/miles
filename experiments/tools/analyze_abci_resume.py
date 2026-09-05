@@ -59,7 +59,7 @@ def main() -> None:
     parser.add_argument(
         "--checkpoint-rollout-id",
         type=int,
-        help="Last saved optimizer update, when a clean debug exit leaves later updates unsaved",
+        help="Selected checkpoint update, when resuming an archive or discarding later unsaved updates",
     )
     parser.add_argument("--max-staleness", type=int, default=8)
     parser.add_argument("--output", type=Path, required=True)
@@ -93,7 +93,7 @@ def main() -> None:
         "fresh_updates": _summarize(fresh),
         "resumed_updates": _summarize(resumed),
         "checkpoint_rollout_id": saved_step,
-        "unsaved_fresh_steps_replayed": sorted(step for step in fresh["train"] if step > saved_step),
+        "fresh_steps_replayed": sorted(step for step in fresh["train"] if step > saved_step),
         "prepared_step": first_resume,
         "identical_staleness_metrics": len(prepared),
         "resume": resume,
