@@ -158,3 +158,15 @@ restart have not yet been accepted. `2226149.pbs1` is running from `28a3303e`;
 `2226167.pbs1` is an eight-node, four-update restart that depends on its PBS
 success (`afterok`). Both request two-hour walltimes. Their entrypoint is
 `experiments/validate_abci_math.sbatch`.
+
+The first eight-node snapshot, at update 1, contains 318 inflight groups and
+40,277,569 generated prefix tokens, totaling 1,682,249,411 bytes. Capture took
+382.348s and publication 1.159s; this capture overhead is material at batch
+3072. CPU audit `2226185.pbs1` passed with exit 0 in 43s, using about 11GB
+peak memory. It verified the complete replay payload and 16 HF shards;
+`math-8node-first-artifacts.json` records the result. Large deserialization can
+be run with `experiments/validate_abci_artifacts.sbatch`, setting
+`VALIDATION_CHECKPOINT_RELATIVE` beneath the validation checkpoint root and
+`ARTIFACT_REPORT_NAME` beneath the validation output root. Final CPU audit
+`2226187.pbs1` depends on successful completion of the eight-node restart and
+will produce `math-8node-artifacts.json`.
