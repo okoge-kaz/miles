@@ -10,7 +10,7 @@ from pathlib import Path
 from experiments.tools.replay_buffer_validation.log_parser import merge_step_records, parse_log
 
 
-def _read_segment(path: Path, max_staleness: int) -> dict:
+def _read_segment(path: Path, max_staleness: int, *, allow_zero_gradients: bool = False) -> dict:
     text = path.read_text(errors="replace")
     assert "succeeded" in text, f"No successful Ray job termination in {path}"
     records = merge_step_records(parse_log(path))
@@ -20,7 +20,8 @@ def _read_segment(path: Path, max_staleness: int) -> dict:
     for step, metrics in train.items():
         for key in ("train/loss", "train/grad_norm"):
             assert math.isfinite(metrics[key]), (path, step, key, metrics[key])
-        assert metrics["train/grad_norm"] > 0, (path, step, "zero gradient")
+        assert metrics["train/grad_norm"] >= 0, (path, step, "negative gradient norm")
+        assert allow_zero_gradients or metrics["train/grad_norm"] > 0, (path, step, "zero gradient")
         sample_metrics = rollout[step]
         assert 0 <= sample_metrics["staleness/total/max"] <= max_staleness, (path, step)
         assert sample_metrics["staleness/token_lag/exact/covered_response_token_frac"] == 1, (path, step)
@@ -30,6 +31,7 @@ def _read_segment(path: Path, max_staleness: int) -> dict:
             "staleness/token_lag/exact/loss_token/invalid_loss_masks",
         ):
             assert sample_metrics[key] == 0, (path, step, key)
+    assert any(metrics["train/grad_norm"] > 0 for metrics in train.values()), (path, "no nonzero gradients")
     return {"path": str(path), "train": train, "rollout": rollout}
 
 
@@ -62,10 +64,13 @@ def main() -> None:
         help="Selected checkpoint update, when resuming an archive or discarding later unsaved updates",
     )
     parser.add_argument("--max-staleness", type=int, default=8)
+    parser.add_argument(
+        "--allow-zero-gradients", action="store_true", help="Allow finite zero gradients in small GRPO batches"
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    fresh = _read_segment(args.fresh_log, args.max_staleness)
-    resumed = _read_segment(args.resume_log, args.max_staleness)
+    fresh = _read_segment(args.fresh_log, args.max_staleness, allow_zero_gradients=args.allow_zero_gradients)
+    resumed = _read_segment(args.resume_log, args.max_staleness, allow_zero_gradients=args.allow_zero_gradients)
     first_resume = min(resumed["train"])
     saved_step = args.checkpoint_rollout_id
     if saved_step is None:
@@ -94,6 +99,10 @@ def main() -> None:
         "resumed_updates": _summarize(resumed),
         "checkpoint_rollout_id": saved_step,
         "fresh_steps_replayed": sorted(step for step in fresh["train"] if step > saved_step),
+        "zero_gradient_steps": {
+            "fresh": [step for step, metrics in fresh["train"].items() if metrics["train/grad_norm"] == 0],
+            "resumed": [step for step, metrics in resumed["train"].items() if metrics["train/grad_norm"] == 0],
+        },
         "prepared_step": first_resume,
         "identical_staleness_metrics": len(prepared),
         "resume": resume,

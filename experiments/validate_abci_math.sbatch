@@ -41,6 +41,16 @@ export CLEAN_CHECKPOINT=0
 test -r "${HF_CKPT_DIR}/${HF_MODEL_NAME}/config.json"
 test -r "${MEGATRON_CKPT_DIR}/${MODEL_NAME}_torch_dist/latest_checkpointed_iteration.txt"
 test -r "${DATASET_DIR}/${PROMPT_DATA#/data/}"
+if [[ "${CHECKPOINT_SELECTION_PREFLIGHT:-0}" == 1 ]]; then
+    miles_srun --nodes=1 --image="${CONTAINER_IMAGE}" --bind="${CONTAINER_MOUNTS}" \
+        --no-home --export=ALL bash -lc '
+        cd /root/miles
+        PYTHONPATH=/root/miles python3 -m pytest -q \
+            tests/fast/backends/megatron_utils/test_checkpoint_step_selection.py \
+            tests/fast/backends/megatron_utils/test_lora_checkpoint_helpers.py \
+            tests/fast/backends/megatron_utils/test_in_memory_checkpoint.py
+        '
+fi
 printf 'ABCI validation: revision=%s nodes=%s namespace=%s\n' \
     "$(git rev-parse HEAD)" "${MILES_JOB_NUM_NODES}" "${VALIDATION_NAMESPACE}"
 exec bash experiments/scripts/math/async/dapo-math-p10-90/qwen3-4b/run.sbatch

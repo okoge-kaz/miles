@@ -1,13 +1,14 @@
 import logging
 import os
 import re
+from contextlib import contextmanager
 from pathlib import Path
 
 import torch.distributed as dist
 
 # TODO: may need to copy those 2 functions and do refactoring.
 from megatron.training.checkpointing import load_checkpoint as _load_checkpoint_megatron
-from megatron.training.checkpointing import save_checkpoint
+from megatron.training.checkpointing import get_loaded_iteration, save_checkpoint, set_loaded_iteration
 from megatron.training.global_vars import get_args
 
 from miles.utils import megatron_bridge_utils
@@ -97,6 +98,32 @@ logger = logging.getLogger(__name__)
 __all__ = ["save_checkpoint", "save_checkpoint_with_lora", "load_checkpoint"]
 
 
+class _ExplicitCheckpointStep(int):
+    """Keep zero explicit for Megatron versions that test ckpt_step truthiness."""
+
+    def __bool__(self) -> bool:
+        return True
+
+
+@contextmanager
+def _zero_checkpoint_step_compatibility(args):
+    step = getattr(args, "ckpt_step", None)
+    if step != 0:
+        yield
+        return
+    # The pinned Megatron tests `if args.ckpt_step` in two path resolvers.
+    # Keep integer arithmetic/formatting while preserving an explicit zero;
+    # restore ordinary ints before training or checkpoint serialization.
+    args.ckpt_step = _ExplicitCheckpointStep(0)
+    try:
+        yield
+    finally:
+        args.ckpt_step = step
+        loaded_step = get_loaded_iteration()
+        if isinstance(loaded_step, _ExplicitCheckpointStep):
+            set_loaded_iteration(int(loaded_step))
+
+
 def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_context, skip_load_to_model_and_opt):
     # ref: how megatron `load_checkpoint` gets directory
     args = get_args()
@@ -112,13 +139,15 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
         ), f"{args.load=} does not exist or is an empty directory. Did you specify the wrong folder?"
 
     if has_local_checkpoint_manager or _is_megatron_checkpoint(load_path):
-        result = _load_checkpoint_megatron(
-            ddp_model=ddp_model,
-            optimizer=optimizer,
-            opt_param_scheduler=opt_param_scheduler,
-            checkpointing_context=checkpointing_context,
-            skip_load_to_model_and_opt=skip_load_to_model_and_opt,
-        )
+        with _zero_checkpoint_step_compatibility(args):
+            result = _load_checkpoint_megatron(
+                ddp_model=ddp_model,
+                optimizer=optimizer,
+                opt_param_scheduler=opt_param_scheduler,
+                checkpointing_context=checkpointing_context,
+                skip_load_to_model_and_opt=skip_load_to_model_and_opt,
+            )
+        result = (int(result[0]), result[1])
     else:
         result = _load_checkpoint_hf(
             ddp_model=ddp_model,
