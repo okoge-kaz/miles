@@ -54,8 +54,8 @@ exit 0. It used 8 actor + 8 rollout GPUs, 8 groups x 8 responses, global batch
 queue-recycle, prefill reference, maximum staleness 8, and exact token-version
 segments were enabled. Replay publication preceded the model save.
 
-`2226139.pbs1` resumed this checkpoint and trained rollouts 1--3. The Ray job
-reported success. Prepared rollout 1's 363 staleness values matched exactly
+`2226139.pbs1` resumed this checkpoint and trained rollouts 1--3, completing
+with PBS exit 0 in 6m36s. Prepared rollout 1's 363 staleness values matched exactly
 before/after restart. It restored 16 pending groups, one prepared batch,
 eight inflight groups, and 180,503 generated prefix tokens; it regenerated no
 active group. `warm_prepared_batch_hit=1`. All four optimizer losses/gradients
@@ -76,9 +76,85 @@ manifests, HF exports, and rollout/dashboard dumps. Reproduce the audit with
 `python -m experiments.tools.analyze_abci_resume --fresh-log ... --resume-log ...
 --baseline-log ... --output ...`.
 
+## Four-node multi-environment training and restart
+
+`2226150.pbs1` completed with PBS exit 0 in 8m12s, training updates 0--2.
+It used 8 actor + 24 rollout GPUs, 32 groups x 8 responses, 8K responses,
+maximum staleness 4, and sandboxed Python rewards. With save interval 2, the
+last committed model was update 1, with prepared batch 2. The validation
+wrapper now defaults to four updates to finish on a checkpoint boundary.
+
+`2226156.pbs1` resumed model 1 and completed with PBS exit 0 in 9m29s,
+training updates 2--7. Replaying unsaved update 2 is expected. All 365
+staleness values for prepared batch 2 matched, as did its optimizer loss.
+The restart restored 69 pending groups, one ready group, one prepared batch,
+36 inflight groups, and 998,453 generated prefix tokens, with no active-group
+regeneration. Exact token coverage stayed 1; invalid token segments/samples
+and loss masks stayed 0. Observed maximum sample staleness was 4.
+
+The eight unique trained batches contain 2,048 samples:
+
+| Verifier | Samples | Positive rewards | Mean reward | Truncated |
+| --- | ---: | ---: | ---: | ---: |
+| Math | 656 | 330 | 0.5030 | 315 |
+| Python code | 528 | 140 | 0.2652 | 318 |
+| MCQA | 840 | 574 | 0.6833 | 36 |
+| Reasoning Gym | 24 | 9 | 0.3333 | 4 |
+
+Both competitive-coding and Skywork code sources were trained. Gym covered
+`rotten_oranges`, `decimal_chain_sum`, and `bitwise_arithmetic`; all eight
+decimal-chain answers earned 1, and the official scorer assigned partial
+credit to one rotten-oranges answer. The 8K validation cap accounts for the
+substantial Math/Code truncation. The balanced input mixture does not force
+equal domain counts in each asynchronous, completion-ordered batch.
+
+Replay snapshots 1, 3, 5, and 7 passed the core loader's main and external
+tensor checksum validation. Each corresponding HF export contains all 16
+nonempty indexed shards. Evidence is in `multi-env-resume-report.json`,
+`multi-env-samples-report.json`, and `multi-env-artifacts.json` under the
+validation output directory. The auditors are
+`experiments.tools.analyze_abci_resume` (use `--max-staleness 4
+--checkpoint-rollout-id 1` for these logs),
+`experiments.tools.analyze_abci_multi_env`, and
+`experiments.tools.analyze_abci_artifacts`.
+
+## Reproduction
+
+Submit from this checkout after sourcing `experiments/env.sh`. The validators
+use the existing public Qwen3-4B, isolated validation checkpoint directories,
+offline W&B, and inflight replay. Keep the namespace and all batch/placement
+settings identical for a restart; use a new namespace for a fresh experiment.
+`DEBUG_EXIT_AFTER_ROLLOUT` counts updates in the current invocation.
+
+```bash
+qsub -P gai51740 -q R9920261300 -N v01-math8-fresh \
+  -l select=8:ncpus=192:ngpus=8:mpiprocs=1 -l walltime=02:00:00 \
+  -v RTYPE=rt_HF,VALIDATION_NAMESPACE=my-math8-validation,DEBUG_EXIT_AFTER_ROLLOUT=12 \
+  -o "$PWD/experiments/outputs/abci-validation/" experiments/validate_abci_math.sbatch
+
+# After successful completion, resume the same namespace for four more updates.
+qsub -P gai51740 -q R9920261300 -N v01-math8-resume \
+  -l select=8:ncpus=192:ngpus=8:mpiprocs=1 -l walltime=02:00:00 \
+  -v RTYPE=rt_HF,VALIDATION_NAMESPACE=my-math8-validation,DEBUG_EXIT_AFTER_ROLLOUT=4 \
+  -o "$PWD/experiments/outputs/abci-validation/" experiments/validate_abci_math.sbatch
+
+# Run preparation once; wait for its successful completion before training.
+qsub -P gai51740 -q R9920261300 -v RTYPE=rt_HC \
+  experiments/prepare_abci_multi_env.sbatch
+qsub -P gai51740 -q R9920261300 -N v01-multi-fresh \
+  -l select=4:ncpus=192:ngpus=8:mpiprocs=1 -l walltime=02:00:00 \
+  -v RTYPE=rt_HF,VALIDATION_NAMESPACE=my-multi-validation \
+  -o "$PWD/experiments/outputs/abci-validation/" experiments/validate_abci_multi_env.sbatch
+```
+
+For the two-node bring-up use `select=2` and explicitly set
+`ROLLOUT_BATCH_SIZE=8,N_SAMPLES_PER_PROMPT=8,ASYNC_MAX_CONCURRENT_SAMPLES=64,MAX_RESPONSE_LEN=8192,SAVE_INTERVAL=1`.
+The first invocation used `DEBUG_EXIT_AFTER_ROLLOUT=1`, then the restart used 3.
+
 ## Remaining acceptance checks
 
-The eight-node production batch (192 x 16 = 3072, 16K responses), its replay
-restart, and the actual multi-environment training have not yet been accepted.
-Their entrypoints are `experiments/validate_abci_math.sbatch` and
-`experiments/validate_abci_multi_env.sbatch`, both with a two-hour PBS walltime.
+The eight-node production batch (192 x 16 = 3072, 16K responses) and its replay
+restart have not yet been accepted. `2226149.pbs1` is running from `28a3303e`;
+`2226167.pbs1` is an eight-node, four-update restart that depends on its PBS
+success (`afterok`). Both request two-hour walltimes. Their entrypoint is
+`experiments/validate_abci_math.sbatch`.

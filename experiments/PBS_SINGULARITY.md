@@ -10,7 +10,7 @@ All persistent paths derive from one setting. Export it before sourcing the
 shared environment:
 
 ```bash
-cd /groups/gai51740/kazuki_fujii/src/miles-v0.0
+cd /groups/gai51740/kazuki_fujii/src/miles-v0.1
 export MILES_WORKSPACE_ROOT=/groups/gai51740/kazuki_fujii
 source experiments/env.sh
 ```

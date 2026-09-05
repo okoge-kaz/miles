@@ -56,13 +56,22 @@ def main() -> None:
     parser.add_argument("--fresh-log", type=Path, required=True)
     parser.add_argument("--resume-log", type=Path, required=True)
     parser.add_argument("--baseline-log", type=Path)
+    parser.add_argument(
+        "--checkpoint-rollout-id",
+        type=int,
+        help="Last saved optimizer update, when a clean debug exit leaves later updates unsaved",
+    )
     parser.add_argument("--max-staleness", type=int, default=8)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     fresh = _read_segment(args.fresh_log, args.max_staleness)
     resumed = _read_segment(args.resume_log, args.max_staleness)
     first_resume = min(resumed["train"])
-    assert first_resume == max(fresh["train"]) + 1, "Optimizer iterations are not consecutive"
+    saved_step = args.checkpoint_rollout_id
+    if saved_step is None:
+        saved_step = max(fresh["train"])
+    assert saved_step in fresh["train"], "The saved optimizer update is absent from the fresh log"
+    assert first_resume == saved_step + 1, "Resume did not start after the saved optimizer update"
     assert len(resumed["train"]) >= 2, "Need a prepared batch and a newly produced batch after resume"
     prepared = _staleness_metrics(fresh["rollout"][first_resume])
     restored = _staleness_metrics(resumed["rollout"][first_resume])
@@ -83,6 +92,8 @@ def main() -> None:
         "resume_log": resumed["path"],
         "fresh_updates": _summarize(fresh),
         "resumed_updates": _summarize(resumed),
+        "checkpoint_rollout_id": saved_step,
+        "unsaved_fresh_steps_replayed": sorted(step for step in fresh["train"] if step > saved_step),
         "prepared_step": first_resume,
         "identical_staleness_metrics": len(prepared),
         "resume": resume,
