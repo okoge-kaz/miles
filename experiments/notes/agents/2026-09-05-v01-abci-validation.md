@@ -118,6 +118,14 @@ validation output directory. The auditors are
 `experiments.tools.analyze_abci_multi_env`, and
 `experiments.tools.analyze_abci_artifacts`.
 
+The artifact auditor also compares every retained prepared batch against its
+rollout dump: 18 fields, including sample/group IDs, prompts, labels, tokens,
+responses, rewards, log probabilities, and weight-version provenance, match
+exactly. Loss masks match after expanding the dump's omitted masks to the
+all-one masks created by train-data conversion. This passed for the two-node
+prepared batches 2--4 and multi-environment batches 2, 4, 6, and 8; batch 2
+includes the actual multi-environment restart.
+
 ## Reproduction
 
 Submit from this checkout after sourcing `experiments/env.sh`. The validators
