@@ -411,6 +411,33 @@ one-sided c=2.0, and that fires on 4e-06 of tokens at the start. With
 the clip has something to bite on — 0.02-0.08% of tokens, which is small but is
 exactly the tail that drives length growth.
 
+In the fused one-step path this is an **exact algebraic identity**, not merely a
+small-drift approximation. Let `sg` denote stop-gradient and let the actor
+forward at the sole optimizer step be `pi_theta`. miles sets the PPO anchor to
+that same forward, so
+
+```
+r_ppo = exp(log pi_theta - sg(log pi_theta)) = 1
+clip(r_ppo, 0.8, 1.28) = 1
+pg_clipfrac = 0
+```
+
+The derivative of the unclipped ratio at one is still the ordinary policy
+gradient; what disappears is the PPO trust-region action. The separate TIS
+factor is instead
+
+```
+r_tis = exp(log pi_theta - log mu_rollout)
+w_tis = sg(clamp(r_tis, 0, 2))
+```
+
+Thus the one-step actor-denominator objective is TIS-weighted REINFORCE, not a
+PPO-clipped objective. At `num_steps_per_rollout > 1`, the actor anchor is made
+before the optimizer substeps and later substeps have
+`pi_theta_k / pi_theta_0 != 1`; only then can the PPO clip act. Increasing the
+number of steps also changes the global-batch partition and optimizer path, so
+it is not a free way to add clipping while holding the experiment fixed.
+
 **This is a hypothesis with one cell missing.** `actor` and the correction
 family are confounded: every arm that collapsed also used TIS or ICEPOP, and
 every survivor also used M2PO/none/OPSM. One control run separates them —
@@ -418,6 +445,130 @@ every survivor also used M2PO/none/OPSM. One control run separates them —
 four node-hours before any conclusion about the corrections is written down.
 Note that k=1 makes the identity `ratio == 1` unavoidable for any
 actor-denominator arm; it is a property of the schedule, not a miles defect.
+
+## One-sided TIS at high staleness: do not narrow `[0, 2]` blindly (2026-09-06)
+
+The current TIS interval is often described as `[0, 2]`, but the lower endpoint
+does no clipping in exact arithmetic: `r_tis = exp(delta) > 0`. It is therefore
+a **one-sided upper cap**. Adding a floor such as 0.5 would not reject low-ratio
+tokens. It would *increase* their weights from `r_tis` to 0.5. This distinction
+matters most for negative-advantage, reward-zero samples: a positive floor can
+strengthen an already negative update rather than make it safer.
+
+### What the current runs say
+
+The following audit uses the last 20 updates for the healthy s=1/2/4/8 arms.
+For s=16/20/24/28 it uses the 20 updates immediately before response length
+first fell below 2,000 tokens. Values are medians over those windows. `up dev`
+and `down dev` are reconstructed without assuming a distribution:
+
+```
+up dev   = E[(r-1)+] = (E|r-1| + E[r] - 1) / 2
+down dev = E[(1-r)+] = (E|r-1| - E[r] + 1) / 2
+```
+
+| arm | realized staleness | response length | reward | `E[r]` | `E|r-1|` | up dev | down dev | `r>2` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| s1-t1r7 | 1.00 | 6,790 | .838 | 1.000 | .0134 | .0067 | .0067 | .000% |
+| s2-t1r7 | 1.89 | 6,584 | .863 | 1.000 | .0128 | .0064 | .0064 | .000% |
+| s4-t1r7 | 3.80 | 6,924 | .866 | 1.000 | .0140 | .0070 | .0070 | .001% |
+| s8-t1r7 | 7.20 | 6,811 | .857 | 1.000 | .0158 | .0079 | .0079 | .001% |
+| s16-t1r7 | 16.00 | 3,684 | .747 | .999 | .1154 | .0568 | .0586 | .955% |
+| s20-t1r7 | 20.00 | 3,611 | .706 | .995 | .1761 | .0914 | .0918 | 1.401% |
+| s24-t1r7 | 23.98 | 3,873 | .804 | .435 | .9010 | .1991 | .7766 | .432% |
+| s28-t1r7 | 27.26 | 3,864 | .718 | .928 | .4289 | .1602 | .2643 | 1.742% |
+
+Sources:
+
+- low-staleness history:
+  `experiments/outputs/reasoning_eval/staleness-ratio-sweep/sr-20260819-212906/analysis/partial-424-20260825-1009/staleness/training-history.csv`
+- high-staleness history:
+  `experiments/outputs/reasoning_eval/wandb-collapse-20260901/sr-20260826-141753-p1497131.csv`
+
+The separation is real: `E|r-1|` is only .013-.016 through s=8, but .115-.901
+before the short-response transition at s=16/20/24/28. The upper tail also rises
+from about .001% to .4-1.7%. But the table does **not** support the stronger
+claim that `r>2` alone causes the collapse. It is not monotone in staleness, and
+s24 is dominated by the *lower* side of the distribution despite having the
+smallest high-staleness upper-clip fraction.
+
+Nor does `tis_clipfrac` spike consistently at the onset of short answers. After
+the model rebounds into near-max-length repetitive generations, rollout becomes
+slow, realized staleness falls to roughly 3-6 in several arms, and TIS returns
+to a mean near one; the upper-clip fraction also largely disappears for
+s20/s24/s28 even though the behavioral collapse persists. TIS drift is
+therefore a credible upstream instability and useful early warning, but the
+aggregate logs do not show that a narrower scalar interval is sufficient to
+prevent or reverse the learned attractor.
+
+The present telemetry also cannot evaluate candidate lower bounds. It logs
+`E[r]`, `E|r-1|`, and the fraction above 2, but no lower-tail counts, quantiles,
+advantage sign, reward/truncation class, or response position. Before choosing a
+new interval, log at least:
+
+- fractions below 0.1/0.2/0.5 and above 1.28/1.5/2/4;
+- the four cells `(A>0 or A<0) x (r<1 or r>1)`;
+- signed and absolute objective mass in each cell, split by truncated/non-
+  truncated and by response-position bucket.
+
+### Prior work is actively revisiting this clipping rule
+
+This is not an untouched hyperparameter in the literature. The important trend
+is away from one universal symmetric window, not toward a consensus that the
+window should simply be narrower:
+
+- **CISPO / MiniMax-M1** clips the detached IS weight rather than dropping the
+  gradient outside a PPO trust region. It explicitly uses no effective lower
+  bound and reports tuning only the upper side; the exact released bound was not
+  specified. This is the closest objective family to one-step miles TIS.
+- **DISPO** splits the weight bounds by correctness and by whether `r` is above
+  or below one. Its ablations report two distinct failures for incorrect
+  responses: restricting the `r>1` contribution too much produces repetition
+  and a length spike, while removing the natural attenuation when `r<1`
+  produces a length collapse. Its final bounds are much looser for incorrect
+  responses than for correct ones. This directly argues against a global
+  `[0.5, 1.5]`-style change for our zero-reward samples.
+- **M2PO** replaces a fixed per-token interval with a batch-level second-moment
+  constraint on log ratios, masking only the most extreme tokens until the
+  remaining moment is below a threshold. It reports stable training with
+  staleness 256 while clipping fewer tokens, so uniform extra clipping is not
+  necessarily the robust direction.
+- **ACPO** adapts clip boundaries across token-probability groups using their
+  empirical ratio variance. **CTPO** changes the ratio to a cumulative-prefix
+  correction and grows log-space bounds with `sqrt(position)`. **ASPO** reverses
+  the positive-advantage weighting and adds dual clipping. **SIS** uses a
+  rejection test and assigns accepted off-policy tokens unit weight.
+
+Primary references:
+
+- MiniMax-M1 / CISPO: <https://arxiv.org/abs/2506.13585>
+- DISPO: <https://arxiv.org/abs/2602.00983>
+- M2PO: <https://arxiv.org/abs/2510.01161>
+- ACPO: <https://arxiv.org/abs/2606.22570>
+- CTPO: <https://arxiv.org/abs/2605.07331>
+- ASPO: <https://arxiv.org/abs/2510.06062>
+- SIS: <https://arxiv.org/abs/2607.04728>
+
+### Decision for the next ablation
+
+Do not make a global floor-plus-cap tightening the primary intervention. The
+clean controls are:
+
+1. restore a real one-step trust region with `rollout-logprobs` as the PPO
+   denominator and no separate TIS, versus the current actor-denominator TIS;
+2. after adding quadrant telemetry, decouple bounds by advantage sign; keep the
+   negative-advantage lower endpoint at zero while testing upper caps/relaxation,
+   and separately test tighter positive-advantage bounds;
+3. compare that with a distribution-aware mask such as M2PO rather than only a
+   scalar TIS sweep.
+
+A narrow global cap remains a valid falsification arm, but DISPO predicts that
+making the negative `r>1` cap smaller can worsen repetition. A positive global
+floor is especially unsafe as a first change because it magnifies low-ratio
+negative updates, precisely the direction associated with vanishing response
+length in that study. These predictions must be checked in miles: DISPO used
+different models, reward coding, many optimizer substeps per batch, and no
+max-weight-staleness queue, so its numerical bounds should not be copied.
 
 ### What this means for the learning-rate axis
 
