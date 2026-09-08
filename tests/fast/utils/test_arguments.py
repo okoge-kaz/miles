@@ -182,14 +182,14 @@ def test_training_buffer_queue_size_cli_defaults_to_legacy_capacity_and_accepts_
     assert configured.training_buffer_queue_size == 6000
 
 
-def test_sample_staleness_histogram_defaults_to_32_and_accepts_override():
+def test_sample_staleness_histogram_defaults_to_40_and_accepts_override():
     parser = argparse.ArgumentParser()
     get_miles_extra_args_provider()(parser)
 
     defaults = parser.parse_args(REQUIRED_ARGS)
     configured = parser.parse_args(["--sample-staleness-max-bin", "48"] + REQUIRED_ARGS)
 
-    assert defaults.sample_staleness_max_bin == 32
+    assert defaults.sample_staleness_max_bin == 40
     assert configured.sample_staleness_max_bin == 48
 
 

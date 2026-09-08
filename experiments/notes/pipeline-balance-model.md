@@ -151,7 +151,8 @@ token-rate proxy and the `1:7` point is marked as backpressure-censored.
 This historical `s8` cohort is quarantined for controlled algorithm comparison
 because its 1000-group queue binds below the intended weight-staleness bound;
 it remains useful here precisely as an exploratory check of the queue-cap
-branch. Corrected `s8+` experiments use a 6000-group queue.
+branch. Corrected `s8` through `s28` experiments use a 6000-group queue; the
+`s32`/`s40` extension uses 8000 groups to satisfy the same capacity invariant.
 
 | T:R | train compute s | effective groups/s | capacity censored | observed total staleness | model |
 |---|---:|---:|:---:|---:|---:|

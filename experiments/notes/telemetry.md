@@ -638,7 +638,7 @@ pull mid-chain without noting the rollout index where it happened.
 
 Both distributions contain `mean`, `variance`, `std`, `max`, `p50`, `p90`,
 `p99`, `frac_zero`, `num_groups`, and the fixed histogram `count_0` through
-`count_32` plus `count_ge_33`. There is no `frac_at_bound`: the admission check
+`count_40` plus `count_ge_41`. There is no `frac_at_bound`: the admission check
 uses dequeue staleness while these distributions use scheduled train
 staleness, and the exact boundary also depends on queue policy. Rejection is
 therefore recorded directly rather than inferred from a histogram bin.
@@ -753,8 +753,8 @@ deadlocking. While drain waits, training cannot publish a new version, so fresh
 groups eventually pass under the frozen version. The signatures are a high
 `wasted_token_frac`, many bound-exceeded groups, and rising retry counts.
 
-The staleness histograms resolve `count_0` through `count_32` plus
-`count_ge_33`. Dumps carry all four forward-provenance arrays, completion
+The staleness histograms resolve `count_0` through `count_40` plus
+`count_ge_41`. Dumps carry all four forward-provenance arrays, completion
 versions, and the queue lifecycle's ready/enqueue/dequeue/decision fields for
 offline reconstruction.
 

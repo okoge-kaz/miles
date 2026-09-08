@@ -12,8 +12,10 @@ usage() {
 usage: experiments/zero_reward_truncation_staleness_aware_loss_sweep.sh [--submit]
                                                                          [--resume-chain]
                                                                          [--clean-checkpoint]
+                                                                         [--point M:T:R ...]
 
-Without --submit, print the exact five-arm grid. This launcher fixes:
+Without --submit, print the exact five-arm grid. --point can select one existing
+arm for a partial resume. This launcher fixes:
 
   max weight staleness:          12, 16, 20, 24, 28
   trainer:rollout node ratio:    1:7
@@ -26,6 +28,7 @@ Without --submit, print the exact five-arm grid. This launcher fixes:
   staleness-aware loss:          on
   safe training staleness:       4
   post-TIS objective diagnostics: on
+  exact staleness logging:       0 through 40, then one >=41 bin
 
 The diagnostics report absolute post-TIS policy-gradient objective mass before
 and after staleness-aware scaling. The logging flag is opt-in and remains off
@@ -52,6 +55,15 @@ while (( $# > 0 )); do
             FORWARD_ARGS+=("$1")
             [[ -v CHAIN_JOBS ]] || export CHAIN_JOBS=9
             shift
+            ;;
+        --point)
+            [[ $# -ge 2 ]] || { echo "--point needs M:T:R" >&2; exit 2; }
+            [[ "$2" =~ ^(12|16|20|24|28):1:7$ ]] || {
+                echo "this launcher accepts only S=12/16/20/24/28 with T:R=1:7" >&2
+                exit 2
+            }
+            FORWARD_ARGS+=("$1" "$2")
+            shift 2
             ;;
         --help|-h)
             usage
@@ -92,6 +104,7 @@ export RATIO_DENOMINATOR=actor
 export USE_STALENESS_AWARE_LOSS=1
 export SAFE_TRAINING_STALENESS=4
 export LOG_STALENESS_AWARE_LOSS_DETAILS=1
+export SAMPLE_STALENESS_MAX_BIN=40
 if [[ ! -v RUN_NAMESPACE ]]; then
     export RUN_NAMESPACE="staleness-aware-loss-safe4-s12-16-20-24-28-t1r7-$(date +%Y%m%d-%H%M%S)-p$$"
 fi

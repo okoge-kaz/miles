@@ -371,21 +371,23 @@ terminal arms.
 
 #### 2026-08-31 high-staleness queue-capacity correction
 
-All async arms with `MAX_WEIGHT_STALENESS >= 8` must use
+All async arms with `MAX_WEIGHT_STALENESS >= 8` must use at least
 `TRAINING_BUFFER_QUEUE_SIZE=6000`. A 1000-group queue can constrain producer
 admission before the configured weight-staleness bound becomes the active
 limit, so it is not a controlled setting for the intended `s8+` comparisons.
-The sweep launcher derives this value per arm, including mixed grids, and the
-async DAPO math recipe rejects any `s8+` job that reaches runtime with another
-value.
+The sweep launcher applies the 6000-group floor per arm, including mixed grids,
+while preserving a larger requested value. The async DAPO math recipe rejects
+an `s8+` job below the floor or below the capacity invariant.
 
 The queue argument counts completed prompt groups, not trajectories. For a
 global batch of `G` trajectories, `n` samples per prompt, and bound `S`, the
 minimum capacity enforced by this experiment is
 `ceil(G * S / n)` groups. With `G=3072` and `n=16`, the requirements for
 `S={8,16,20,24,28}` are `{1536,3072,3840,4608,5376}` groups, respectively, so
-6000 covers the current grid. `S=32` would require 6144 groups and therefore
-fails before submission instead of silently running queue-bound.
+6000 covers that grid. `S={32,40}` requires `{6144,7680}` groups; the extension
+uses 8000 groups and receives a distinct `-tbq8000` checkpoint identity. The
+older `-tbq6000` checkpoints must retain 6000 on resume because the replay
+buffer validates its saved queue configuration.
 
 Fourteen earlier async checkpoints are quarantined by this correction: the
 four `s8` ratio arms in `sr-20260819-212906`, all six arms in

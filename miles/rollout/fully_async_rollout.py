@@ -124,9 +124,9 @@ WEIGHT_VERSION_QUERY_TIMEOUT_SECS = 2.0
 # Realized lag is a small integer; anything past this goes in one overflow bucket
 # so the metric count stays bounded no matter how far behind a run drifts.
 #
-# 32, not 16: the high-staleness cohort sweeps bounds through 28 and needs
-# enough resolution in the tail to map realized staleness to downstream score.
-STALENESS_HISTOGRAM_MAX = 32
+# The high-staleness cohort sweeps bounds through 40 and needs enough resolution
+# in the tail to map realized staleness to downstream score.
+STALENESS_HISTOGRAM_MAX = 40
 QueueItem = tuple[list[Sample], Group]
 _CONTINUATION_METADATA_KEYS = (
     SUBMISSION_VERSION_KEY,

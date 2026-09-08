@@ -17,7 +17,8 @@ staleness_training_buffer_queue_size() {
         return 1
     }
 
-    if (( max_weight_staleness >= MILES_HIGH_STALENESS_THRESHOLD )); then
+    if (( max_weight_staleness >= MILES_HIGH_STALENESS_THRESHOLD \
+          && default_queue_size < MILES_HIGH_STALENESS_TRAINING_BUFFER_QUEUE_SIZE )); then
         printf '%s\n' "${MILES_HIGH_STALENESS_TRAINING_BUFFER_QUEUE_SIZE}"
     else
         printf '%s\n' "${default_queue_size}"

@@ -158,7 +158,7 @@ fi
 : "${FUSE_ONE_STEP_ACTOR_LOGPROBS:=1}"
 : "${VERIFY_FUSED_ONE_STEP_ACTOR_LOGPROBS:=0}"  # debug only; retains legacy forward
 : "${LOG_SAMPLE_STALENESS_METRICS:=1}"
-: "${SAMPLE_STALENESS_MAX_BIN:=32}"
+: "${SAMPLE_STALENESS_MAX_BIN:=40}"
 : "${LOG_SAMPLE_STALENESS_RATIO_HISTOGRAM:=0}"  # high-cardinality, debug only
 : "${LOG_UPDATE_DIAGNOSTICS:=1}"                 # no parameter/update tensor scan
 : "${SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS:=1}"  # compact exact token/version boundaries

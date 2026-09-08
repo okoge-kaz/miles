@@ -1,4 +1,7 @@
 #!/bin/bash
+# Extend the 16K zero-loss-on-truncation study to staleness 32 and 40 with a
+# completed-group queue large enough for the default GBS=3072, n=16 batch shape.
+
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." &>/dev/null && pwd)"
@@ -6,33 +9,34 @@ SWEEP_PATH="${REPO_ROOT}/experiments/staleness_ratio_sweep.sh"
 
 usage() {
     cat <<'EOF'
-usage: experiments/zero_loss_truncation_high_staleness_step300_sweep.sh [--submit]
-                                                                         [--resume-chain]
-                                                                         [--clean-checkpoint]
-                                                                         [--point M:T:R ...]
+usage: experiments/zero_loss_truncation_staleness_s32_40_sweep.sh [--submit]
+                                                                   [--resume-chain]
+                                                                   [--clean-checkpoint]
+                                                                   [--point M:T:R ...]
 
-Without --submit, print the exact two-arm grid. --point can select one existing
-arm for a partial resume. This launcher fixes:
+Without --submit, print the exact two-arm grid. --point can select one arm for
+a partial resume. This launcher fixes:
 
   optimizer updates:              300
-  max weight staleness:           24, 28
+  max weight staleness:           32, 40
   trainer:rollout node ratio:     1:7
   response-only ceiling:          16384 tokens
   total prompt+response limit:    32768 tokens
-  completed-group buffer:         6000 groups
+  completed-group buffer:         8000 groups
+  required buffer at S=32/S=40:   6144/7680 groups
   async in-flight samples:        4096
   zero reward on truncated:       off
   zero loss on truncated:         on
   staleness-aware loss:           off
   importance-sampling correction: token TIS clipped to [0, 2]
+  exact staleness logging:        0 through 40, then one >=41 bin
 
-The two arms isolate whether fully removing the direct policy-gradient loss
-from truncated samples extends the stable boundary beyond the completed S=20
-run. SAMPLE_STALENESS_MAX_BIN=40 preserves the expanded logging contract.
+The tbq8000 checkpoint identity is intentionally incompatible with the earlier
+S=24/28 tbq6000 study. Never resume those checkpoints through this launcher.
 
 Useful environment overrides: CHAIN_JOBS, PARTITION, WALL, and RUN_NAMESPACE.
-With --resume-chain, RUN_NAMESPACE must name the existing study and CHAIN_JOBS
-defaults to nine new allocations per arm. Existing checkpoints are preserved.
+With --resume-chain, RUN_NAMESPACE must name an existing tbq8000 study and
+CHAIN_JOBS defaults to nine new allocations per selected arm.
 EOF
 }
 
@@ -52,8 +56,8 @@ while (( $# > 0 )); do
             ;;
         --point)
             [[ $# -ge 2 ]] || { echo "--point needs M:T:R" >&2; exit 2; }
-            [[ "$2" == 24:1:7 || "$2" == 28:1:7 ]] || {
-                echo "this launcher accepts only --point 24:1:7 or 28:1:7" >&2
+            [[ "$2" == 32:1:7 || "$2" == 40:1:7 ]] || {
+                echo "this launcher accepts only --point 32:1:7 or 40:1:7" >&2
                 exit 2
             }
             FORWARD_ARGS+=("$1" "$2")
@@ -78,14 +82,14 @@ fi
 
 export MILES_REPO="${REPO_ROOT}"
 export TOTAL_NODES=8
-export STALENESS_LEVELS="24 28"
+export STALENESS_LEVELS="32 40"
 export RATIOS="1:7"
 export NUM_ROLLOUT=300
 export MAX_RESPONSE_LEN=16384
 export ROLLOUT_MAX_CONTEXT_LEN=32768
 export CONTEXT_PARALLEL_SIZE=1
 export MAX_TOKENS_PER_GPU=32768
-export TRAINING_BUFFER_QUEUE_SIZE=6000
+export TRAINING_BUFFER_QUEUE_SIZE=8000
 export ASYNC_MAX_CONCURRENT_SAMPLES=4096
 export ZERO_REWARD_ON_TRUNCATED=0
 export ZERO_LOSS_ON_TRUNCATED=1
@@ -97,7 +101,7 @@ export USE_STALENESS_AWARE_LOSS=0
 export LOG_STALENESS_AWARE_LOSS_DETAILS=0
 export SAMPLE_STALENESS_MAX_BIN=40
 if [[ ! -v RUN_NAMESPACE ]]; then
-    export RUN_NAMESPACE="zero-loss-trunc-s24-28-t1r7-step300-$(date +%Y%m%d-%H%M%S)-p$$"
+    export RUN_NAMESPACE="zero-loss-trunc-s32-40-t1r7-step300-tbq8000-$(date +%Y%m%d-%H%M%S)-p$$"
 fi
 
 exec "${SWEEP_PATH}" --zero-loss-on-truncated "${FORWARD_ARGS[@]}"

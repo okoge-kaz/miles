@@ -128,8 +128,9 @@ truncation ablation, 32K mode, colocated/matched mode, or --point.
 
 Useful environment overrides: TOTAL_NODES, STALENESS_LEVELS, RATIOS,
 TRAINING_BUFFER_QUEUE_SIZE, CHAIN_JOBS, PARTITION, WALL, and RUN_NAMESPACE.
-TRAINING_BUFFER_QUEUE_SIZE controls arms below max weight staleness 8. Arms at
-max weight staleness 8 or above always use 6000 completed groups.
+TRAINING_BUFFER_QUEUE_SIZE controls every arm. Arms at max weight staleness 8
+or above enforce a floor of 6000 completed groups while preserving larger
+values, which are required by bounds above 31 with the default batch shape.
 Every async arm also requires at least
 ceil(GLOBAL_BATCH_SIZE * max_weight_staleness / N_SAMPLES_PER_PROMPT)
 completed groups and fails before submission when that capacity is unavailable.
@@ -589,7 +590,7 @@ require_setting USE_REPLAY_BUFFER 1
 require_setting REPLAY_BUFFER_TYPE inflight
 require_setting FUSE_ONE_STEP_ACTOR_LOGPROBS 1
 require_setting SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS 1
-require_setting SAMPLE_STALENESS_MAX_BIN 32
+require_setting SAMPLE_STALENESS_MAX_BIN 40
 require_setting SAVE_HF 1
 require_setting HF_SAVE_INTERVAL 10
 if (( MATCH_PARTIAL_CONCURRENCY == 1 )); then
@@ -787,10 +788,11 @@ printf 'fixed by recipe: queue=%s, reference=%s, rollouts=%s, steps/rollout=%s, 
     "${QUEUE_POLICY}" "${STALENESS_REFERENCE_VALUE}" "${NUM_ROLLOUT_VALUE}" \
     "${NUM_STEPS_PER_ROLLOUT_VALUE}" \
     "${GLOBAL_BATCH}" "${TENSOR_PARALLEL}" "${CONTEXT_PARALLEL}" "${MAX_TOKENS_PER_GPU_VALUE}"
-printf 'completed-group buffer policy: below s%s=%s groups; s%s and above=%s groups\n' \
+printf 'completed-group buffer policy: below s%s=%s groups; s%s and above=max(%s, %s) groups\n' \
     "${MILES_HIGH_STALENESS_THRESHOLD}" \
     "${TRAINING_BUFFER_QUEUE_SIZE_VALUE}" \
     "${MILES_HIGH_STALENESS_THRESHOLD}" \
+    "${TRAINING_BUFFER_QUEUE_SIZE_VALUE}" \
     "${MILES_HIGH_STALENESS_TRAINING_BUFFER_QUEUE_SIZE}"
 printf 'capacity invariant: buffer >= ceil(gbs * max-staleness / samples-per-prompt) groups\n'
 printf 'fixed safety: response=%s, total-context=%s, zero-reward-trunc=%s, zero-loss-trunc=%s, replay=%s/%s, fused-logprobs=%s, exact-segments=%s, staleness-bin=%s\n' \

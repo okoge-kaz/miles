@@ -1505,7 +1505,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 "--sample-staleness-max-bin",
                 dest="sample_staleness_max_bin",
                 type=int,
-                default=32,
+                default=40,
                 help=(
                     "Largest exact staleness bin for --log-sample-staleness-metrics; "
                     "larger values share one overflow bin."
@@ -3563,7 +3563,7 @@ def miles_validate_args(args):
             f"so one group already puts n_samples_per_prompt trajectories in flight"
         )
 
-    assert getattr(args, "sample_staleness_max_bin", 32) >= 0, "--sample-staleness-max-bin must be non-negative"
+    assert getattr(args, "sample_staleness_max_bin", 40) >= 0, "--sample-staleness-max-bin must be non-negative"
     if getattr(args, "log_sample_staleness_ratio_histogram", False):
         assert getattr(
             args, "log_sample_staleness_metrics", False
