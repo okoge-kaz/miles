@@ -522,7 +522,7 @@ def scaling_fits(points: list[dict[str, Any]], fit_staleness: int) -> dict[str, 
         "fit_staleness": fit_staleness,
         "training_model": "train_seconds(T) = slope / T + intercept",
         "training_fit": asdict(linear_fit(train_pairs)),
-        "rollout_model": "1 / groups_per_second(R) = slope / R + intercept",
+        "rollout_model": "tau_R(R) = 1 / groups_per_second(R) = slope / R + intercept",
         "rollout_fit": asdict(linear_fit(rollout_pairs)),
         "rollout_fit_excludes_capacity_censored_points": True,
     }
@@ -595,7 +595,33 @@ def ratio_candidates(
     return candidates
 
 
-def _svg_header(*, title: str, subtitle: str) -> list[str]:
+def _svg_header(
+    *,
+    title: str,
+    subtitle: str,
+    subtitle_markup: str | None = None,
+    publication_style: bool = False,
+) -> list[str]:
+    if publication_style:
+        elements = [
+            '<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="680" viewBox="0 0 1280 680">',
+            "<style>text{font-family:Arial,Helvetica,sans-serif;fill:#222}"
+            ".title{font-size:27px;font-weight:700}.subtitle{font-size:22px;fill:#222}"
+            ".axis-label{font-size:24px;font-weight:600}.tick{font-size:20px;fill:#333}"
+            ".legend{font-size:20px}.grid{stroke:#d8d8d8;stroke-width:1.2}"
+            ".axis{stroke:#333;stroke-width:2}.series{fill:none;stroke-width:4}"
+            "</style>",
+            '<rect width="100%" height="100%" fill="white"/>',
+        ]
+        if title:
+            elements.append(
+                f'<text class="title" x="640" y="33" text-anchor="middle">{html.escape(title)}</text>'
+            )
+        subtitle_content = subtitle_markup or html.escape(subtitle)
+        elements.append(
+            f'<text class="subtitle" x="640" y="42" text-anchor="middle">{subtitle_content}</text>'
+        )
+        return elements
     return [
         '<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="620" viewBox="0 0 1280 620">',
         "<style>text{font-family:Arial,sans-serif;fill:#222}.title{font-size:24px;font-weight:700}"
@@ -627,6 +653,7 @@ def _series_elements(
     *,
     x_map: Any,
     y_map: Any,
+    marker_radius: float = 4.0,
 ) -> list[str]:
     points = " ".join(f"{x_map(x):.2f},{y_map(y):.2f}" for x, y in series.points)
     dash = ' stroke-dasharray="8 6"' if series.dashed else ""
@@ -639,15 +666,40 @@ def _series_elements(
             continue
         if series.marker == "square":
             elements.append(
-                f'<rect x="{center_x - 4:.2f}" y="{center_y - 4:.2f}" width="8" height="8" '
+                f'<rect x="{center_x - marker_radius:.2f}" y="{center_y - marker_radius:.2f}" '
+                f'width="{2 * marker_radius:.2f}" height="{2 * marker_radius:.2f}" '
                 f'fill="white" stroke="{series.color}" stroke-width="2"/>'
             )
         else:
             elements.append(
-                f'<circle cx="{center_x:.2f}" cy="{center_y:.2f}" r="4" '
+                f'<circle cx="{center_x:.2f}" cy="{center_y:.2f}" r="{marker_radius:.2f}" '
                 f'fill="white" stroke="{series.color}" stroke-width="2"/>'
             )
     return elements
+
+
+def _publication_y_axis(series: tuple[_PlotSeries, ...]) -> tuple[float, tuple[float, ...], int]:
+    maximum = max(y for item in series for _, y in item.points)
+    raw_step = maximum / 5
+    exponent = math.floor(math.log10(raw_step))
+    magnitude = 10**exponent
+    candidates = tuple(multiplier * magnitude for multiplier in (1, 2, 2.5, 5, 10))
+    step = min(candidates, key=lambda candidate: abs(math.log(candidate / raw_step)))
+    upper = math.ceil(maximum / step) * step
+    tick_count = int(round(upper / step))
+    decimals = max(0, -math.floor(math.log10(step)))
+    return upper, tuple(index * step for index in range(tick_count + 1)), decimals
+
+
+def _math_variable(symbol: str, subscript: str | None = None) -> str:
+    base = f'<tspan font-style="italic">{html.escape(symbol)}</tspan>'
+    if subscript is None:
+        return base
+    return (
+        base
+        + f'<tspan baseline-shift="sub" font-size="70%" '
+        f'font-style="italic">{html.escape(subscript)}</tspan>'
+    )
 
 
 def _render_xy_chart(
@@ -658,21 +710,43 @@ def _render_xy_chart(
     y_label: str,
     series: tuple[_PlotSeries, ...],
     x_ticks: tuple[tuple[float, str], ...],
+    subtitle_markup: str | None = None,
+    x_label_markup: str | None = None,
+    y_label_markup: str | None = None,
+    publication_style: bool = False,
 ) -> str:
-    plot_x, plot_y, plot_width, plot_height = 105.0, 95.0, 850.0, 425.0
-    x_min, x_max, y_max = _plot_bounds(series)
+    x_min, x_max, default_y_max = _plot_bounds(series)
+    if publication_style:
+        plot_x, plot_y, plot_width, plot_height = 125.0, 82.0, 835.0, 500.0
+        x_label_y, y_label_x = 657.0, 28.0
+        x_tick_offset, y_tick_offset = 31.0, 7.0
+        legend_x, legend_y, legend_step = 992.0, 135.0, 48.0
+        y_max, y_ticks, y_tick_decimals = _publication_y_axis(series)
+    else:
+        plot_x, plot_y, plot_width, plot_height = 105.0, 95.0, 850.0, 425.0
+        x_label_y, y_label_x = 578.0, 23.0
+        x_tick_offset, y_tick_offset = 21.0, 4.0
+        legend_x, legend_y, legend_step = 1000.0, 120.0, 30.0
+        y_max = default_y_max
+        y_ticks = tuple(y_max * index / 5 for index in range(6))
+        y_tick_decimals = 2
     x_padding = 0.04 * (x_max - x_min)
     x_min, x_max = x_min - x_padding, x_max + x_padding
     x_map = lambda value: plot_x + plot_width * (value - x_min) / (x_max - x_min)
     y_map = lambda value: plot_y + plot_height * (y_max - value) / y_max
-    elements = _svg_header(title=title, subtitle=subtitle)
-    for index in range(6):
-        value = y_max * index / 5
+    elements = _svg_header(
+        title=title,
+        subtitle=subtitle,
+        subtitle_markup=subtitle_markup,
+        publication_style=publication_style,
+    )
+    for value in y_ticks:
         y = y_map(value)
         elements.extend(
             [
                 f'<line class="grid" x1="{plot_x:.2f}" y1="{y:.2f}" x2="{plot_x + plot_width:.2f}" y2="{y:.2f}"/>',
-                f'<text class="tick" x="{plot_x - 10:.2f}" y="{y + 4:.2f}" text-anchor="end">{value:.2f}</text>',
+                f'<text class="tick" x="{plot_x - 12:.2f}" y="{y + y_tick_offset:.2f}" '
+                f'text-anchor="end">{value:.{y_tick_decimals}f}</text>',
             ]
         )
     for value, label in x_ticks:
@@ -680,34 +754,61 @@ def _render_xy_chart(
         elements.extend(
             [
                 f'<line class="grid" x1="{x:.2f}" y1="{plot_y:.2f}" x2="{x:.2f}" y2="{plot_y + plot_height:.2f}"/>',
-                f'<text class="tick" x="{x:.2f}" y="{plot_y + plot_height + 21:.2f}" text-anchor="middle">{html.escape(label)}</text>',
+                f'<text class="tick" x="{x:.2f}" y="{plot_y + plot_height + x_tick_offset:.2f}" '
+                f'text-anchor="middle">{html.escape(label)}</text>',
             ]
         )
+    x_label_content = x_label_markup or html.escape(x_label)
+    y_label_content = y_label_markup or html.escape(y_label)
     elements.extend(
         [
             f'<line class="axis" x1="{plot_x:.2f}" y1="{plot_y:.2f}" x2="{plot_x:.2f}" y2="{plot_y + plot_height:.2f}"/>',
             f'<line class="axis" x1="{plot_x:.2f}" y1="{plot_y + plot_height:.2f}" x2="{plot_x + plot_width:.2f}" y2="{plot_y + plot_height:.2f}"/>',
-            f'<text class="axis-label" x="{plot_x + plot_width / 2:.2f}" y="578" text-anchor="middle">{html.escape(x_label)}</text>',
-            f'<text class="axis-label" x="23" y="{plot_y + plot_height / 2:.2f}" text-anchor="middle" transform="rotate(-90 23 {plot_y + plot_height / 2:.2f})">{html.escape(y_label)}</text>',
+            f'<text class="axis-label" x="{plot_x + plot_width / 2:.2f}" y="{x_label_y:.2f}" '
+            f'text-anchor="middle">{x_label_content}</text>',
+            f'<text class="axis-label" x="{y_label_x:.2f}" y="{plot_y + plot_height / 2:.2f}" '
+            f'text-anchor="middle" transform="rotate(-90 {y_label_x:.2f} '
+            f'{plot_y + plot_height / 2:.2f})">{y_label_content}</text>',
         ]
     )
     for item in series:
-        elements.extend(_series_elements(item, x_map=x_map, y_map=y_map))
+        elements.extend(
+            _series_elements(
+                item,
+                x_map=x_map,
+                y_map=y_map,
+                marker_radius=6.0 if publication_style else 4.0,
+            )
+        )
     for index, item in enumerate(series):
-        y = 120 + index * 30
+        y = legend_y + index * legend_step
         dash = ' stroke-dasharray="8 6"' if item.dashed else ""
+        legend_sample = (
+            f'<line x1="{legend_x:.1f}" y1="{y:.1f}" x2="{legend_x + 38:.1f}" y2="{y:.1f}" '
+            f'stroke="{item.color}" stroke-width="{4 if publication_style else 2.8}"{dash}/>'
+        )
+        if not item.connected and item.marker != "none":
+            legend_sample = (
+                f'<circle cx="{legend_x + 19:.1f}" cy="{y:.1f}" r="{6 if publication_style else 4}" '
+                f'fill="white" stroke="{item.color}" stroke-width="2"/>'
+            )
         elements.extend(
             [
-                f'<line x1="1000" y1="{y}" x2="1033" y2="{y}" stroke="{item.color}" stroke-width="2.8"{dash}/>',
-                f'<text class="legend" x="1042" y="{y + 4}">{html.escape(item.label)}</text>',
+                legend_sample,
+                f'<text class="legend" x="{legend_x + 50:.1f}" y="{y + 7:.1f}">'
+                f'{html.escape(item.label)}</text>',
             ]
         )
     elements.append("</svg>")
     return "\n".join(elements) + "\n"
 
 
-def _fit_curve(fit: Fit, nodes: list[int], function: Any) -> tuple[tuple[float, float], ...]:
-    minimum, maximum = min(nodes), max(nodes)
+def _fit_curve(
+    fit: Fit,
+    minimum: float,
+    maximum: float,
+    function: Any,
+) -> tuple[tuple[float, float], ...]:
     return tuple(
         (minimum + (maximum - minimum) * index / 60, function(fit, minimum + (maximum - minimum) * index / 60))
         for index in range(61)
@@ -716,58 +817,67 @@ def _fit_curve(fit: Fit, nodes: list[int], function: Any) -> tuple[tuple[float, 
 
 def _training_scaling_figure(selected: list[dict[str, Any]], fit: Fit, nodes: list[int]) -> str:
     observed = tuple((point["trainer_nodes"], point["train_compute_seconds"]) for point in selected)
-    fitted = _fit_curve(fit, nodes, _fit_train_seconds)
+    prediction_end = max(nodes) + 1
+    fitted = _fit_curve(fit, min(nodes), prediction_end, _fit_train_seconds)
+    tau_t = _math_variable("τ", "T")
+    a_t = _math_variable("a", "T")
+    b_t = _math_variable("b", "T")
     return _render_xy_chart(
-        title="Trainer strong scaling",
-        subtitle=f"tau_T(T) = {fit.slope:.2f}/T + {fit.intercept:.2f} seconds; R²={fit.r_squared:.4f}",
-        x_label="trainer nodes T",
-        y_label="training compute seconds / update",
-        series=(
-            _PlotSeries("late-window median", "#0072B2", observed, connected=False),
-            _PlotSeries("inverse-node fit", "#D55E00", fitted, marker="none"),
+        title="",
+        subtitle="",
+        subtitle_markup=(
+            f"{tau_t}(T) = {a_t} / T + {b_t};   "
+            f"{a_t} = {fit.slope:.2f} s·node, {b_t} = {fit.intercept:.2f} s; "
+            f"R² = {fit.r_squared:.4f}"
         ),
-        x_ticks=tuple((node, str(node)) for node in nodes),
+        x_label="Number of training nodes, T",
+        y_label="",
+        y_label_markup=f"Training time, {tau_t}(T) [s / update]",
+        series=(
+            _PlotSeries("Measured median", "#0072B2", observed, connected=False),
+            _PlotSeries("Fit / extrapolation", "#D55E00", fitted, dashed=True, marker="none"),
+        ),
+        x_ticks=tuple((node, str(node)) for node in range(min(nodes), prediction_end + 1)),
+        publication_style=True,
     )
 
 
 def _rollout_scaling_figure(selected: list[dict[str, Any]], fit: Fit, nodes: list[int]) -> str:
     uncensored = tuple(
-        (point["rollout_nodes"], point["rollout_groups_per_second"])
+        (point["rollout_nodes"], 1 / point["rollout_groups_per_second"])
         for point in selected
         if not point["rollout_rate_capacity_censored"]
     )
-    censored = tuple(
-        (point["rollout_nodes"], point["rollout_groups_per_second"])
-        for point in selected
-        if point["rollout_rate_capacity_censored"]
+    uncensored_nodes = sorted(int(node) for node, _ in uncensored)
+    prediction_start = 1.0
+    prediction_end = max(uncensored_nodes) + 0.5
+    fitted = _fit_curve(
+        fit,
+        prediction_start,
+        prediction_end,
+        lambda rollout_fit, node: rollout_fit.slope / node + rollout_fit.intercept,
     )
-    series = [
-        _PlotSeries("uncensored median", "#0072B2", uncensored, connected=False),
-        _PlotSeries("reciprocal-rate fit", "#D55E00", _fit_curve(fit, nodes, _fit_rollout_rate), marker="none"),
-    ]
-    if censored:
-        series.append(_PlotSeries("backpressure-censored", "#777777", censored, connected=False, marker="square"))
-    if fit.intercept > 0:
-        asymptote = 1 / fit.intercept
-        series.append(
-            _PlotSeries(
-                f"asymptote {asymptote:.3f} groups/s",
-                "#009E73",
-                ((min(nodes), asymptote), (max(nodes), asymptote)),
-                dashed=True,
-                marker="none",
-            )
-        )
+    tau_r = _math_variable("τ", "R")
+    lambda_r = _math_variable("λ", "R")
+    a_r = _math_variable("a", "R")
+    b_r = _math_variable("b", "R")
     return _render_xy_chart(
-        title="Rollout engine scaling and saturation",
-        subtitle=(
-            f"1/lambda_R(R) = {fit.slope:.3f}/R + {fit.intercept:.3f}; "
-            f"R²={fit.r_squared:.4f}; {selected[0]['rollout_group_rate_source']}"
+        title="",
+        subtitle="",
+        subtitle_markup=(
+            f"{tau_r}(R) = 1 / {lambda_r}(R) = {a_r} / R + {b_r};   "
+            f"{a_r} = {fit.slope:.3f} s·node/group, "
+            f"{b_r} = {fit.intercept:.3f} s/group; R² = {fit.r_squared:.3f}"
         ),
-        x_label="rollout nodes / engines R",
-        y_label="completed prompt groups / second",
-        series=tuple(series),
-        x_ticks=tuple((node, str(node)) for node in nodes),
+        x_label="Number of rollout nodes / engines, R",
+        y_label="",
+        y_label_markup=f"Rollout time, {tau_r}(R) [s / prompt group]",
+        series=(
+            _PlotSeries("Measured median", "#0072B2", uncensored, connected=False),
+            _PlotSeries("Fit / extrapolation", "#D55E00", fitted, dashed=True, marker="none"),
+        ),
+        x_ticks=tuple((node, str(node)) for node in range(1, max(uncensored_nodes) + 1)),
+        publication_style=True,
     )
 
 
@@ -879,7 +989,11 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     if not rows:
         return
     with path.open("w", encoding="utf-8", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+        writer = csv.DictWriter(
+            stream,
+            fieldnames=list(rows[0]),
+            lineterminator="\n",
+        )
         writer.writeheader()
         writer.writerows(rows)
 

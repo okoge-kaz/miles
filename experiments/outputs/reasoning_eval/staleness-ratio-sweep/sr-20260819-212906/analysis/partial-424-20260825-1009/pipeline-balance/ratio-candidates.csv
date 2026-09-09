@@ -1,0 +1,5 @@
+trainer_nodes,rollout_nodes,ratio,predicted_train_compute_seconds,predicted_rollout_groups_per_second,rho,predicted_optimizer_updates_per_hour,predicted_training_staleness_or_cap,predicted_natural_staleness,predicted_linear_growth_per_training_step,predicted_effective_staleness_cap,staleness_regime,recommended_for_throughput
+1,7,1:7,228.85776979739848,0.9305755460818836,1.1092158547098754,15.730293986465835,7.10987111405822,1.901537780724887,0.09846221927511278,7.10987111405822,cap-limited,0
+2,6,2:6,118.23926306504468,0.8968833966790728,0.5523272493677485,16.816563687732614,2.0,2.0,0.0,7.208333333333333,rollout-limited stationary,1
+3,5,3:5,81.36642748759341,0.8536153458063166,0.36174807883774285,16.005287733868435,2.0,2.0,0.0,7.208333333333333,rollout-limited stationary,0
+4,4,4:4,62.930009698867785,0.7960126788206727,0.26090148749274306,14.925237727887614,2.0,2.0,0.0,7.208333333333333,rollout-limited stationary,0

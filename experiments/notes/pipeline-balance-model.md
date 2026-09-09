@@ -11,6 +11,7 @@ Let:
 - `B` be prompt groups consumed by one training update;
 - `tau_T` be trainer compute seconds per update, excluding rollout starvation;
 - `lambda_R` be completed rollout groups per second before queue backpressure;
+- `tau_R = 1/lambda_R` be effective seconds per completed rollout group;
 - `K` be completed-group queue capacity;
 - `C` be the time-mean number of active rollout groups.
 
@@ -106,8 +107,8 @@ so `L_cap` is an envelope rather than an exact distributional mean.
 The analysis fits two intentionally small models:
 
 ```text
-tau_T(T)       = a_T/T + b_T
-1/lambda_R(R)  = a_R/R + b_R.
+tau_T(T) = a_T/T + b_T
+tau_R(R) = 1/lambda_R(R) = a_R/R + b_R.
 ```
 
 The first is the fixed-work inverse-DP model plus a non-scaling floor. Perfect
@@ -182,7 +183,7 @@ extrapolation.
 The uncensored rollout fit is
 
 ```text
-1/lambda_R(R) = 1.695/R + 0.832 seconds/group, R^2 = 0.874.
+tau_R(R) = 1/lambda_R(R) = 1.695/R + 0.832 seconds/group, R^2 = 0.874.
 ```
 
 It predicts an asymptote of 1.20 groups/s and, at `C=192`, an effective
@@ -230,9 +231,10 @@ python experiments/tools/pipeline_balance_model.py history \
 The `history` command also writes five dependency-free SVG figures under
 `OUTPUT_DIR/figures/`:
 
-- `training-node-scaling.svg`: observed trainer time and the inverse-DP fit;
-- `rollout-node-scaling.svg`: uncensored rollout rate, fit, censored points,
-  and the fitted saturation asymptote;
+- `training-node-scaling.svg`: observed trainer time and the inverse-DP fit,
+  extrapolated one node beyond the observations;
+- `rollout-node-scaling.svg`: reciprocal uncensored rollout rate as effective
+  time per completed group, with the fit extrapolated from one rollout node;
 - `node-ratio-throughput.svg`: measured-rate and fitted updates/hour;
 - `staleness-prediction-vs-observed.svg`: the late-window validation;
 - `predicted-staleness-trajectories.svg`: stationary lines or linear growth to

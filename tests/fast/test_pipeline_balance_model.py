@@ -158,3 +158,61 @@ def test_history_figures_are_dependency_free_valid_svg(tmp_path):
     assert len(figures) == 5
     for figure in figures:
         ET.parse(figure)
+
+
+def test_publication_scaling_figures_show_equations_and_exclude_bound_rollout_point():
+    selected = [
+        {
+            "trainer_nodes": 1,
+            "rollout_nodes": 7,
+            "train_compute_seconds": 228.0,
+            "rollout_groups_per_second": 0.81,
+            "rollout_rate_capacity_censored": 1,
+        },
+        {
+            "trainer_nodes": 2,
+            "rollout_nodes": 6,
+            "train_compute_seconds": 118.0,
+            "rollout_groups_per_second": 0.90,
+            "rollout_rate_capacity_censored": 0,
+        },
+        {
+            "trainer_nodes": 3,
+            "rollout_nodes": 5,
+            "train_compute_seconds": 82.0,
+            "rollout_groups_per_second": 0.85,
+            "rollout_rate_capacity_censored": 0,
+        },
+        {
+            "trainer_nodes": 4,
+            "rollout_nodes": 4,
+            "train_compute_seconds": 63.0,
+            "rollout_groups_per_second": 0.80,
+            "rollout_rate_capacity_censored": 0,
+        },
+    ]
+    training_fit = MODEL.Fit(observations=4, slope=221.24, intercept=7.62, r_squared=0.9991)
+    rollout_fit = MODEL.Fit(observations=3, slope=1.695, intercept=0.832, r_squared=0.874)
+
+    training_svg = MODEL._training_scaling_figure(selected, training_fit, [1, 2, 3, 4])
+    rollout_svg = MODEL._rollout_scaling_figure(selected, rollout_fit, [4, 5, 6, 7])
+
+    ET.fromstring(training_svg)
+    ET.fromstring(rollout_svg)
+    assert '<text class="title"' not in training_svg
+    assert '<text class="title"' not in rollout_svg
+    assert "τ" in training_svg
+    assert "a</tspan><tspan" in training_svg
+    assert "221.24" in training_svg
+    assert "Measured median" in training_svg
+    assert "Fit / extrapolation" in training_svg
+    assert 'stroke-dasharray="8 6"' in training_svg
+    assert ">5</text>" in training_svg
+    assert "τ" in rollout_svg
+    assert "λ" in rollout_svg
+    assert "Rollout time" in rollout_svg
+    assert "completed prompt groups / second" not in rollout_svg
+    assert "backpressure-censored" not in rollout_svg
+    assert ">1</text>" in rollout_svg
+    assert ">7</text>" not in rollout_svg
+    assert rollout_svg.count("<circle") == 4
