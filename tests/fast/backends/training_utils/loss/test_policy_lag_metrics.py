@@ -199,6 +199,19 @@ def test_nonfinite_response_inputs_are_counted_and_invalidate_dependencies() -> 
     assert metrics[f"{nontruncated_prefix}loss_sensitivity_weighted_metrics_valid_pre"] == 1.0
 
 
+def test_finite_fp32_delta_does_not_overflow_during_square() -> None:
+    metrics = _collect(
+        delta=torch.tensor([1.0e30], dtype=torch.float32),
+        sensitivity=torch.ones(1),
+        lengths=[1],
+        truncated=[0],
+    )
+
+    assert math.isfinite(metrics["policy_lag/all_response/delta_rms"])
+    assert metrics["policy_lag/all_response/delta_rms"] == pytest.approx(1.0e30)
+    assert math.isfinite(metrics["policy_lag/all_response/loss_sensitivity_delta_sq_sum_pre"])
+
+
 def test_unsupported_surrogate_emits_delta_only() -> None:
     metrics = _collect(
         delta=torch.tensor([0.25, -0.5]),
