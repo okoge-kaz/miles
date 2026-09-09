@@ -60,3 +60,43 @@ def test_true_on_policy_log_checker_passes_when_values_and_dtype_match(monkeypat
     )
 
     assert captured["log_dict"]["log_probs"] == captured["log_dict"]["rollout_log_probs"]
+
+
+def test_rollout_logger_skips_policy_lag_reference_mask_and_accepts_bool_metrics(monkeypatch):
+    captured = {}
+    parallel_state = SimpleNamespace(
+        tp=SimpleNamespace(rank=0),
+        cp=SimpleNamespace(size=1),
+        is_pp_last_stage=True,
+    )
+
+    monkeypatch.setattr(log_utils, "get_parallel_state", lambda: parallel_state)
+    monkeypatch.setattr(
+        log_utils,
+        "gather_log_data",
+        lambda metric_name, args, rollout_id, log_dict: captured.setdefault("log_dict", log_dict),
+    )
+
+    rollout_data = {
+        "tokens": [torch.tensor([1, 2, 3])],
+        "total_lengths": [3],
+        "response_lengths": [2],
+        "loss_masks": [torch.tensor([1, 0], dtype=torch.int32)],
+        "policy_lag_initial_loss_masks": [torch.tensor([True, True])],
+        "bool_metric": [torch.tensor([True, False])],
+    }
+
+    log_utils.log_rollout_data(
+        1,
+        Namespace(
+            ci_test=False,
+            qkv_format="thd",
+            log_multi_turn=False,
+            log_passrate=False,
+            log_correct_samples=False,
+        ),
+        rollout_data,
+    )
+
+    assert "policy_lag_initial_loss_masks" not in captured["log_dict"]
+    assert captured["log_dict"]["bool_metric"] == 0.5

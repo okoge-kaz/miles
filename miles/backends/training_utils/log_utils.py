@@ -166,6 +166,9 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
                 "step_adapter_names",
                 "step_adapter_batch_sizes",
                 "prompt_group_sizes",
+                # Training-only reference mask consumed by policy-lag metrics.
+                # Its fraction is logged under policy_lag/* by the loss collector.
+                "policy_lag_initial_loss_masks",
                 # Debug-only fused shadow input. It is compared against the
                 # gradient-enabled anchor under train/verify_* metrics; logging it
                 # here would imply a production rollout-phase actor forward.
@@ -202,6 +205,8 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
                         )
                         val = cp_size * sum_of_sample_mean(val) / len(loss_masks)
                     else:
+                        if not val.is_floating_point() and not val.is_complex():
+                            val = val.float()
                         val = val.mean() * cp_size
                 else:
                     # Flatten nested lists (e.g. list of lists from async rollout)
