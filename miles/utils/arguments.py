@@ -1532,6 +1532,22 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--log-policy-lag-metrics",
+                action="store_true",
+                default=False,
+                help=(
+                    "Log current/rollout selected-token policy lag and pre/post target-weighting "
+                    "diagnostics based on abs(d reference policy-surrogate loss / d selected logprob). "
+                    "This performs detached additive reductions but no extra model forward or backward pass."
+                ),
+            )
+            parser.add_argument(
+                "--log-effective-staleness-metrics",
+                dest="log_policy_lag_metrics",
+                action="store_true",
+                help=argparse.SUPPRESS,
+            )
+            parser.add_argument(
                 "--disable-grpo-std-normalization",
                 action="store_false",
                 dest="grpo_std_normalization",
@@ -3034,8 +3050,7 @@ def _validate_truncation_behavior(args: argparse.Namespace) -> None:
         return
     if zero_loss:
         raise ValueError(
-            "--use-staleness-aware-loss cannot be combined with --zero-loss-on-truncated "
-            "(overlong filtering)"
+            "--use-staleness-aware-loss cannot be combined with --zero-loss-on-truncated " "(overlong filtering)"
         )
     if not zero_reward:
         raise ValueError("--use-staleness-aware-loss requires --zero-reward-on-truncated")
@@ -3047,6 +3062,64 @@ def _validate_truncation_behavior(args: argparse.Namespace) -> None:
         raise ValueError("--use-staleness-aware-loss requires built-in reward post-processing")
     if getattr(args, "custom_convert_samples_to_train_data_path", None) is not None:
         raise ValueError("--use-staleness-aware-loss requires built-in sample-to-train-data conversion")
+
+
+def _configure_policy_lag_metadata(args: argparse.Namespace) -> None:
+    """Attach the diagnostic contract to the tracker run configuration."""
+    if not getattr(args, "log_policy_lag_metrics", False):
+        return
+
+    target_modes = []
+    if getattr(args, "zero_loss_on_truncated", False):
+        target_modes.append("zero_loss")
+    if getattr(args, "use_staleness_aware_loss", False):
+        target_modes.append("staleness_aware")
+    target_weighting = "composed" if len(target_modes) > 1 else (target_modes[0] if target_modes else "none")
+
+    uses_is = getattr(args, "get_mismatch_metrics", False) or getattr(args, "use_tis", False)
+    custom_tis = getattr(args, "custom_tis_function_path", None)
+    if not uses_is:
+        is_weight_source = "none"
+        is_weight_detached = True
+    elif custom_tis is not None:
+        is_weight_source = f"custom:{custom_tis}"
+        is_weight_detached = None
+    elif getattr(args, "fuse_one_step_actor_logprobs", False):
+        is_weight_source = "detached_current_actor_over_rollout_policy"
+        is_weight_detached = True
+    else:
+        is_weight_source = "actor_scoring_policy_over_rollout_policy"
+        is_weight_detached = True
+
+    if getattr(args, "advantage_estimator", None) == "gspo":
+        loss_variant = "gspo_unsupported"
+    else:
+        loss_variant = "ppo_dual_clip" if getattr(args, "eps_clip_c", None) is not None else "ppo_clip"
+        if getattr(args, "use_m2po", False):
+            loss_variant += "_m2po"
+
+    post_matches_actual = not (
+        getattr(args, "calculate_per_token_loss", False)
+        and getattr(args, "zero_loss_on_truncated", False)
+    )
+    if getattr(args, "custom_pg_loss_reducer_function_path", None) is not None:
+        post_matches_actual = False
+
+    metadata = {
+        "policy_lag_schema_version": 1,
+        "policy_lag_scope": "policy_surrogate_only",
+        "policy_lag_coefficient_semantics": "abs_d_reference_loss_d_selected_logprob",
+        "policy_lag_normalization": "fixed_pre_filter_global_reducer",
+        "policy_lag_post_matches_actual_loss": post_matches_actual,
+        "policy_lag_loss_variant": loss_variant,
+        "policy_lag_is_weight_source": is_weight_source,
+        "policy_lag_is_weight_detached": is_weight_detached,
+        "policy_lag_is_granularity": "token",
+        "policy_lag_target_weighting": target_weighting,
+        "policy_lag_version_unit": "weight_distribution_version",
+    }
+    for name, value in metadata.items():
+        setattr(args, name, value)
 
 
 def miles_validate_args(args):
@@ -3581,6 +3654,14 @@ def miles_validate_args(args):
             "--log-sample-staleness-metrics requires the built-in sample-to-train-data "
             "converter to carry sample staleness"
         )
+    if getattr(args, "log_policy_lag_metrics", False):
+        assert (
+            args.loss_type == "policy_loss"
+        ), "--log-policy-lag-metrics currently instruments the policy-loss path"
+        assert getattr(args, "custom_convert_samples_to_train_data_path", None) is None, (
+            "--log-policy-lag-metrics requires the built-in sample-to-train-data converter "
+            "to preserve pre-target loss masks"
+        )
 
     _resolve_rollout_functions(args)
 
@@ -3685,6 +3766,7 @@ def miles_validate_args(args):
             args.use_dynamic_batch_size is False
         ), "Dynamic batch size is not supported for bshd format. Please specify --micro-batch-size instead."
 
+    _configure_policy_lag_metadata(args)
     _maybe_apply_dumper_overrides(args)
 
 

@@ -73,6 +73,9 @@ TELEMETRY_ARGS=(
 if [[ "${OBSERVE_TRAINING_ENTROPY}" != "0" ]]; then
    TELEMETRY_ARGS+=(--observe-training-entropy)
 fi
+if [[ "${LOG_POLICY_LAG_METRICS:-0}" != "0" ]]; then
+   TELEMETRY_ARGS+=(--log-policy-lag-metrics)
+fi
 if [[ "${DUMP_TRAIN_DATA}" == "0" ]]; then
    TELEMETRY_ARGS+=(--no-dump-train-data)
 else

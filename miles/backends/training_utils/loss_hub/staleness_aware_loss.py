@@ -94,21 +94,24 @@ def _additive_logging_parts(
     return {f"{STALENESS_AWARE_LOSS_PART_PREFIX}{name}": value.detach() for name, value in parts.items()}
 
 
-def apply_staleness_aware_loss(
+def apply_staleness_aware_loss_with_weights(
     *,
     args: Namespace,
     batch: RolloutBatch,
     pg_loss_tokens: torch.Tensor,
     final_masks: list[torch.Tensor],
-) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Attenuate truncated zero-reward samples and return additive log parts.
+) -> tuple[torch.Tensor, dict[str, torch.Tensor], torch.Tensor]:
+    """Attenuate truncated zero-reward samples and return the applied weights.
 
     Non-truncated samples retain unit weight regardless of their staleness. Log
     parts use the final post-correction loss mask and piggyback on the existing
-    training-metric reduction.
+    training-metric reduction. The returned token weights are the exact tensor
+    applied to the policy surrogate; diagnostic callers must reuse this tensor
+    rather than recomputing the decay independently.
     """
     if not getattr(args, "use_staleness_aware_loss", False):
-        return pg_loss_tokens, {}
+        weights = torch.ones_like(pg_loss_tokens, dtype=torch.float32).detach()
+        return pg_loss_tokens, {}, weights
     if not getattr(args, "zero_reward_on_truncated", False):
         raise RuntimeError("--use-staleness-aware-loss requires --zero-reward-on-truncated")
     if getattr(args, "log_staleness_aware_loss_details", False) and not getattr(args, "use_tis", False):
@@ -148,7 +151,26 @@ def apply_staleness_aware_loss(
         pg_loss_tokens=pg_loss_tokens,
         log_details=getattr(args, "log_staleness_aware_loss_details", False),
     )
-    return weighted_pg_loss_tokens, parts
+    return weighted_pg_loss_tokens, parts, token_decay.detach()
+
+
+def apply_staleness_aware_loss(
+    *,
+    args: Namespace,
+    batch: RolloutBatch,
+    pg_loss_tokens: torch.Tensor,
+    final_masks: list[torch.Tensor],
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Backward-compatible wrapper that omits the applied token weights."""
+    if not getattr(args, "use_staleness_aware_loss", False):
+        return pg_loss_tokens, {}
+    weighted_loss, parts, _weights = apply_staleness_aware_loss_with_weights(
+        args=args,
+        batch=batch,
+        pg_loss_tokens=pg_loss_tokens,
+        final_masks=final_masks,
+    )
+    return weighted_loss, parts
 
 
 def _safe_ratio(numerator: float, denominator: float) -> float:
@@ -176,13 +198,9 @@ def finalize_staleness_aware_loss_parts(metric_sums: dict[str, float]) -> dict[s
     if pre_scaling_objective is None:
         return metrics
 
-    truncated_pre_scaling_objective = metric_sums[
-        f"{prefix}truncated_zero_post_tis_pre_scaling_abs_pg_objective"
-    ]
+    truncated_pre_scaling_objective = metric_sums[f"{prefix}truncated_zero_post_tis_pre_scaling_abs_pg_objective"]
     post_scaling_objective = metric_sums[f"{prefix}post_tis_post_scaling_abs_pg_objective"]
-    truncated_post_scaling_objective = metric_sums[
-        f"{prefix}truncated_zero_post_tis_post_scaling_abs_pg_objective"
-    ]
+    truncated_post_scaling_objective = metric_sums[f"{prefix}truncated_zero_post_tis_post_scaling_abs_pg_objective"]
     metrics |= {
         "staleness_aware_loss/post_tis_pre_scaling_abs_pg_objective_per_loss_token": _safe_ratio(
             pre_scaling_objective, loss_tokens

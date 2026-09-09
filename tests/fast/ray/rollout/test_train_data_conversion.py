@@ -130,6 +130,46 @@ class TestConvertSamplesToTrainData:
         assert out["rewards"] == pytest.approx([-0.5, 0.5])
         assert out["loss_masks"] == [[1, 1, 1, 1], [0, 0, 0, 0]]
 
+    def test_policy_lag_preserves_pre_zero_loss_mask(self):
+        args = make_args(
+            rewards_normalization=False,
+            zero_loss_on_truncated=True,
+            log_policy_lag_metrics=True,
+        )
+        completed = make_sample(response_length=3, status=Sample.Status.COMPLETED)
+        completed.loss_mask = [1, 0, 1]
+        truncated = make_sample(response_length=3, status=Sample.Status.TRUNCATED)
+        truncated.loss_mask = [1, 0, 1]
+
+        out = convert_samples_to_train_data(
+            args,
+            [completed, truncated],
+            metadata={},
+            custom_convert_samples_to_train_data_func=None,
+            custom_reward_post_process_func=None,
+        )
+
+        assert out["loss_masks"] == [[1, 0, 1], [0, 0, 0]]
+        assert out["policy_lag_initial_loss_masks"] == [[1, 0, 1], [1, 0, 1]]
+
+    def test_policy_lag_without_zero_loss_adds_no_rollout_payload(self):
+        args = make_args(
+            rewards_normalization=False,
+            zero_loss_on_truncated=False,
+            log_policy_lag_metrics=True,
+        )
+        sample = make_sample(response_length=3, status=Sample.Status.TRUNCATED)
+
+        out = convert_samples_to_train_data(
+            args,
+            [sample],
+            metadata={},
+            custom_convert_samples_to_train_data_func=None,
+            custom_reward_post_process_func=None,
+        )
+
+        assert "policy_lag_initial_loss_masks" not in out
+
     def test_optional_field_rollout_log_probs_passed_through(self):
         args = make_args(rewards_normalization=False)
         s = make_sample()
@@ -617,6 +657,7 @@ class TestSplitTrainDataRaw:
             "tokens": [[1, 2], [3, 4], [5, 6], [7, 8]],
             "response_lengths": [1, 1, 1, 1],
             "loss_masks": [[0, 1], [0, 1], [0, 1], [0, 1]],
+            "policy_lag_initial_loss_masks": [[1], [1], [1], [1]],
             "rollout_indexer_topk": [torch.tensor([i]) for i in range(4)],
             "opd_reverse_kl": [[float(i)] for i in range(4)],
         }
@@ -630,6 +671,7 @@ class TestSplitTrainDataRaw:
         for part in result:
             assert len(part["rollout_indexer_topk"]) == 2
             assert len(part["opd_reverse_kl"]) == 2
+            assert len(part["policy_lag_initial_loss_masks"]) == 2
 
     def test_no_witness_ids_when_absent(self) -> None:
         tokens = [[1, 2], [3, 4]]

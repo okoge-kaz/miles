@@ -118,6 +118,9 @@ fi
 if [[ "${LOG_UPDATE_DIAGNOSTICS:-0}" != "0" ]]; then
    TELEMETRY_ARGS+=(--log-update-diagnostics)
 fi
+if [[ "${LOG_POLICY_LAG_METRICS:-0}" != "0" ]]; then
+   TELEMETRY_ARGS+=(--log-policy-lag-metrics)
+fi
 
 # EVAL_INTERVAL=0 passes no --eval-interval at all, which is what leaves
 # args.eval_interval None and turns both eval sites off (train.py:98,144).

@@ -9,6 +9,7 @@ import pytest
 from miles.backends.sglang_utils.arguments import add_sglang_arguments
 from miles.backends.sglang_utils.arguments import validate_args as validate_sglang_args
 from miles.utils.arguments import (
+    _configure_policy_lag_metadata,
     _maybe_apply_dumper_overrides,
     _resolve_ft_components,
     _resolve_rollout_functions,
@@ -193,6 +194,46 @@ def test_sample_staleness_histogram_defaults_to_40_and_accepts_override():
     assert configured.sample_staleness_max_bin == 48
 
 
+def test_policy_lag_metrics_are_opt_in_with_compatibility_alias():
+    parser = argparse.ArgumentParser()
+    get_miles_extra_args_provider()(parser)
+
+    defaults = parser.parse_args(REQUIRED_ARGS)
+    enabled = parser.parse_args(["--log-policy-lag-metrics"] + REQUIRED_ARGS)
+    aliased = parser.parse_args(["--log-effective-staleness-metrics"] + REQUIRED_ARGS)
+
+    assert not defaults.log_policy_lag_metrics
+    assert enabled.log_policy_lag_metrics
+    assert aliased.log_policy_lag_metrics
+
+
+def test_policy_lag_run_config_records_semantics_and_actual_normalization() -> None:
+    args = SimpleNamespace(
+        log_policy_lag_metrics=True,
+        zero_loss_on_truncated=True,
+        use_staleness_aware_loss=False,
+        use_tis=True,
+        get_mismatch_metrics=False,
+        custom_tis_function_path=None,
+        fuse_one_step_actor_logprobs=True,
+        advantage_estimator="grpo",
+        eps_clip_c=None,
+        use_m2po=False,
+        calculate_per_token_loss=True,
+        custom_pg_loss_reducer_function_path=None,
+    )
+
+    _configure_policy_lag_metadata(args)
+
+    assert args.policy_lag_schema_version == 1
+    assert args.policy_lag_scope == "policy_surrogate_only"
+    assert args.policy_lag_coefficient_semantics == "abs_d_reference_loss_d_selected_logprob"
+    assert args.policy_lag_normalization == "fixed_pre_filter_global_reducer"
+    assert args.policy_lag_post_matches_actual_loss is False
+    assert args.policy_lag_target_weighting == "zero_loss"
+    assert args.policy_lag_is_weight_detached is True
+
+
 def test_zero_reward_on_truncated_cli_is_opt_in():
     parser = argparse.ArgumentParser()
     get_miles_extra_args_provider()(parser)
@@ -270,9 +311,7 @@ def test_truncation_behavior_cli_flags_are_mutually_exclusive():
     get_miles_extra_args_provider()(parser)
 
     with pytest.raises(SystemExit):
-        parser.parse_args(
-            ["--zero-reward-on-truncated", "--zero-loss-on-truncated"] + REQUIRED_ARGS
-        )
+        parser.parse_args(["--zero-reward-on-truncated", "--zero-loss-on-truncated"] + REQUIRED_ARGS)
 
 
 @pytest.mark.parametrize(

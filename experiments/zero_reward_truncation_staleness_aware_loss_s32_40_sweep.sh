@@ -31,6 +31,7 @@ a partial resume. This launcher fixes:
   safe training staleness:          4
   post-TIS objective diagnostics:   on
   exact staleness logging:          0 through 40, then one >=41 bin
+  policy_lag diagnostics:           always on
 
 The tbq8000 checkpoint identity is intentionally incompatible with the earlier
 S=12/16/20/24/28 tbq6000 study. Never resume those checkpoints through this
@@ -102,6 +103,7 @@ export RATIO_DENOMINATOR=actor
 export USE_STALENESS_AWARE_LOSS=1
 export SAFE_TRAINING_STALENESS=4
 export LOG_STALENESS_AWARE_LOSS_DETAILS=1
+export LOG_POLICY_LAG_METRICS=1
 export SAMPLE_STALENESS_MAX_BIN=40
 if [[ ! -v RUN_NAMESPACE ]]; then
     export RUN_NAMESPACE="staleness-aware-loss-safe4-s32-40-t1r7-step300-tbq8000-$(date +%Y%m%d-%H%M%S)-p$$"

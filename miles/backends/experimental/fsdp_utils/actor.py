@@ -497,6 +497,7 @@ class FSDPTrainRayActor(TrainRayActor):
                         [
                             "tokens",
                             "loss_masks",
+                            "policy_lag_initial_loss_masks",
                             "multimodal_train_inputs",
                             "total_lengths",
                             "response_lengths",

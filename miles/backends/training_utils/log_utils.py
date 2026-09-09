@@ -7,11 +7,19 @@ import psutil
 import torch
 import torch.distributed as dist
 
+from miles.backends.training_utils.loss_hub.policy_lag_metrics import (
+    POLICY_LAG_PART_PREFIX,
+    finalize_policy_lag_parts,
+)
 from miles.backends.training_utils.loss_hub.staleness_aware_loss import (
     STALENESS_AWARE_LOSS_PART_PREFIX,
     finalize_staleness_aware_loss_parts,
 )
 from miles.backends.training_utils.loss_hub.staleness_metrics import finalize_sample_staleness_metrics
+from miles.backends.training_utils.loss_hub.tis_population_metrics import (
+    TIS_POPULATION_PART_PREFIX,
+    finalize_tis_abs_population_parts,
+)
 from miles.backends.training_utils.update_diagnostics import (
     UPDATE_PART_PREFIX,
     finalize_update_diagnostic_parts,
@@ -31,6 +39,7 @@ from .parallel import get_parallel_state
 logger = logging.getLogger(__name__)
 
 _SAMPLE_STALENESS_PREFIX = "sample_staleness/"
+_POLICY_LAG_PREFIX = "policy_lag/"
 
 
 def gather_log_data(
@@ -440,13 +449,19 @@ def aggregate_train_losses(
     values = values.tolist()
     num_samples_or_tokens = values[0]
     metric_sums = dict(zip(keys, values[1:], strict=True))
+    diagnostic_metric_sums = {}
 
     for key, value in metric_sums.items():
-        if key.startswith((UPDATE_PART_PREFIX, STALENESS_AWARE_LOSS_PART_PREFIX)):
+        if key.startswith(
+            (UPDATE_PART_PREFIX, STALENESS_AWARE_LOSS_PART_PREFIX, TIS_POPULATION_PART_PREFIX, POLICY_LAG_PART_PREFIX)
+        ):
             continue
         loss_reduced[key] = value * parallel_state.cp.size / num_samples_or_tokens
     if diagnostic_values is not None:
-        for key, value in zip(diagnostic_keys, diagnostic_values.tolist(), strict=True):
+        diagnostic_metric_sums = dict(zip(diagnostic_keys, diagnostic_values.tolist(), strict=True))
+        for key, value in diagnostic_metric_sums.items():
+            if key.startswith((TIS_POPULATION_PART_PREFIX, POLICY_LAG_PART_PREFIX)):
+                continue
             loss_reduced[key] = value * parallel_state.cp.size / num_samples_or_tokens
 
     # Sequence-level ESS: rho = (sum w)^2 / (B * sum w^2), which is a ratio of
@@ -464,14 +479,16 @@ def aggregate_train_losses(
 
     loss_reduced.update(finalize_update_diagnostic_parts(metric_sums))
     loss_reduced.update(finalize_staleness_aware_loss_parts(metric_sums))
+    loss_reduced.update(finalize_tis_abs_population_parts(diagnostic_metric_sums))
+    loss_reduced.update(finalize_policy_lag_parts(diagnostic_metric_sums))
     finalize_sample_staleness_metrics(loss_reduced)
 
     return loss_reduced
 
 
 def _format_train_metric_key(key: str, role_tag: str) -> str:
-    """Keep actor sample-staleness diagnostics in their own root section."""
-    if not role_tag and key.startswith(_SAMPLE_STALENESS_PREFIX):
+    """Keep actor diagnostics with dedicated schemas in their root sections."""
+    if not role_tag and key.startswith((_SAMPLE_STALENESS_PREFIX, _POLICY_LAG_PREFIX)):
         return key
     return f"train/{role_tag}{key}"
 

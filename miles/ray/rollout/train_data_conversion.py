@@ -12,6 +12,7 @@ from miles.utils.types import Sample
 ROLLOUT_DATA_TENSOR_DTYPES = {
     "tokens": "int32",
     "loss_masks": "int32",
+    "policy_lag_initial_loss_masks": "uint8",
     "rollout_log_probs": "float32",
     "teacher_log_probs": "float32",
     "opd_reverse_kl": "float32",
@@ -21,6 +22,7 @@ ROLLOUT_DATA_TENSOR_DTYPES = {
 
 ROLLOUT_DATA_VALUE_SPEC: dict[str, ValueSpec] = {
     **{field: ValueSpec(codec="typed_ragged") for field in ROLLOUT_DATA_TENSOR_DTYPES},
+    "policy_lag_initial_loss_masks": ValueSpec(codec="typed_ragged", dtype="uint8"),
     "partition": ValueSpec(codec="ndarray", dtype="int64"),
     "seq_witness_ids": ValueSpec(codec="ndarray", dtype="int64"),
     "response_lengths": ValueSpec(codec="ndarray", dtype="int64"),
@@ -117,6 +119,10 @@ def convert_samples_to_train_data(
     # loss mask
     # TODO: compress the loss mask
     loss_masks = []
+    policy_lag_initial_loss_masks = []
+    preserve_policy_lag_zero_loss_inputs = getattr(args, "log_policy_lag_metrics", False) and getattr(
+        args, "zero_loss_on_truncated", False
+    )
     for sample in samples:
         # always instantiate loss_mask if not provided
         if sample.loss_mask is None:
@@ -125,13 +131,20 @@ def convert_samples_to_train_data(
         assert (
             len(sample.loss_mask) == sample.response_length
         ), f"loss mask length {len(sample.loss_mask)} != response length {sample.response_length}"
+        initial_loss_mask = list(sample.loss_mask)
+        if sample.remove_sample:
+            initial_loss_mask = [0] * sample.response_length
         zero_truncated_loss = (
             getattr(args, "zero_loss_on_truncated", False) and sample.status == Sample.Status.TRUNCATED
         )
         if sample.remove_sample or zero_truncated_loss:
             sample.loss_mask = [0] * sample.response_length
         loss_masks.append(sample.loss_mask)
+        if preserve_policy_lag_zero_loss_inputs:
+            policy_lag_initial_loss_masks.append(initial_loss_mask)
     train_data["loss_masks"] = loss_masks
+    if preserve_policy_lag_zero_loss_inputs:
+        train_data["policy_lag_initial_loss_masks"] = policy_lag_initial_loss_masks
 
     # overwriting the raw reward
     if samples[0].metadata and "raw_reward" in samples[0].metadata:
@@ -284,6 +297,7 @@ def split_train_data_by_dp_raw(args, data: dict[str, Any], *, dp_size: int) -> l
             "rewards",
             "truncated",
             "loss_masks",
+            "policy_lag_initial_loss_masks",
             "round_number",
             "sample_indices",
             "sample_group_indices",

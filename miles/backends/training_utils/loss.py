@@ -9,6 +9,8 @@ from miles.backends.training_utils.loss_hub.logit_processors import get_log_prob
 from miles.backends.training_utils.loss_hub.losses import get_loss_function
 from miles.backends.training_utils.loss_hub.math_utils import compute_approx_kl
 from miles.backends.training_utils.loss_hub.opd import apply_opd_kl_to_advantages
+from miles.backends.training_utils.loss_hub.policy_lag_metrics import POLICY_LAG_PART_PREFIX
+from miles.backends.training_utils.loss_hub.tis_population_metrics import TIS_POPULATION_PART_PREFIX
 from miles.backends.training_utils.parallel import get_parallel_state
 from miles.utils.audit_utils.event_logger.logger import get_event_logger, is_event_logger_initialized
 from miles.utils.audit_utils.event_logger.models import TrainAdvantageComputationEvent
@@ -16,6 +18,11 @@ from miles.utils.multi_lora import is_multi_lora_enabled
 from miles.utils.types import RolloutBatch
 
 _SAMPLE_STALENESS_PART_PREFIX = "_sample_staleness_part/"
+_DIAGNOSTIC_PART_PREFIXES = (
+    _SAMPLE_STALENESS_PART_PREFIX,
+    TIS_POPULATION_PART_PREFIX,
+    POLICY_LAG_PART_PREFIX,
+)
 
 
 def _pack_logging_values(
@@ -26,12 +33,8 @@ def _pack_logging_values(
 ) -> dict[str, list[str] | torch.Tensor]:
     """Keep the historical vector unchanged and isolate opt-in diagnostics."""
 
-    standard_metrics = {
-        key: value for key, value in metrics.items() if not key.startswith(_SAMPLE_STALENESS_PART_PREFIX)
-    }
-    diagnostic_metrics = {
-        key: value for key, value in metrics.items() if key.startswith(_SAMPLE_STALENESS_PART_PREFIX)
-    }
+    standard_metrics = {key: value for key, value in metrics.items() if not key.startswith(_DIAGNOSTIC_PART_PREFIXES)}
+    diagnostic_metrics = {key: value for key, value in metrics.items() if key.startswith(_DIAGNOSTIC_PART_PREFIXES)}
     detached_values = [
         value.detach() if isinstance(value, torch.Tensor) else value for value in (count, *standard_metrics.values())
     ]

@@ -93,6 +93,7 @@ _ARGS_DEFAULTS = dict(
     use_unbiased_kl=False,
     use_tis=False,
     get_mismatch_metrics=False,
+    log_policy_lag_metrics=False,
     tis_clip=1.5,
     tis_clip_low=0.5,
     custom_tis_function_path=None,

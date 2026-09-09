@@ -30,6 +30,7 @@ a partial resume. This launcher fixes:
   staleness-aware loss:           off
   importance-sampling correction: token TIS clipped to [0, 2]
   exact staleness logging:        0 through 40, then one >=41 bin
+  policy_lag diagnostics:         always on
 
 The tbq8000 checkpoint identity is intentionally incompatible with the earlier
 S=24/28 tbq6000 study. Never resume those checkpoints through this launcher.
@@ -99,6 +100,7 @@ export TIS_CLIP_LOW=0
 export RATIO_DENOMINATOR=actor
 export USE_STALENESS_AWARE_LOSS=0
 export LOG_STALENESS_AWARE_LOSS_DETAILS=0
+export LOG_POLICY_LAG_METRICS=1
 export SAMPLE_STALENESS_MAX_BIN=40
 if [[ ! -v RUN_NAMESPACE ]]; then
     export RUN_NAMESPACE="zero-loss-trunc-s32-40-t1r7-step300-tbq8000-$(date +%Y%m%d-%H%M%S)-p$$"

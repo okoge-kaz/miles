@@ -468,6 +468,7 @@ def train_one_step(
                 "total_lengths",
                 "response_lengths",
                 "loss_masks",
+                "policy_lag_initial_loss_masks",
                 "log_probs",
                 "legacy_actor_log_probs",
                 "ref_log_probs",

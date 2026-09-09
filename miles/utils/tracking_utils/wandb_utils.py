@@ -9,7 +9,7 @@ from miles.utils.env_report import decode_env_report
 logger = logging.getLogger(__name__)
 
 _STEP_METRIC_PREFIXES = {
-    "train/step": ("train", "sample_staleness"),
+    "train/step": ("train", "sample_staleness", "policy_lag"),
     "rollout/step": (
         "rollout",
         "fully_async",

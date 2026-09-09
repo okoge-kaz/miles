@@ -27,6 +27,7 @@ def vanilla_tis_function(
         "tis": tis.clone().detach(),
         "tis_clipfrac": tis_clipfrac.clone().detach(),
         "tis_abs": tis_abs.clone().detach(),
+        "_tis_applied_weight": tis_weights.detach(),
     }
     pg_loss = pg_loss * tis_weights
     return pg_loss, loss_masks, metrics
@@ -57,6 +58,7 @@ def icepop_function(
         "tis": ice_ratio.clone().detach(),
         "tis_clipfrac": ice_clipfrac.clone().detach(),
         "tis_abs": ice_abs.clone().detach(),
+        "_tis_applied_weight": ice_weight.detach(),
     }
     pg_loss = pg_loss * ice_weight
     return pg_loss, loss_masks, metrics

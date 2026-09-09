@@ -30,10 +30,9 @@ arm for a partial resume. This launcher fixes:
   post-TIS objective diagnostics: on
   exact staleness logging:       0 through 40, then one >=41 bin
 
-The diagnostics report absolute post-TIS policy-gradient objective mass before
-and after staleness-aware scaling. The logging flag is opt-in and remains off
-in the base recipe. To launch the unscaled S=12 control from the existing
-launcher, use:
+The objective diagnostics report absolute post-TIS policy-surrogate mass before
+and after staleness-aware scaling. Policy-lag diagnostics are also forced on.
+To launch the unscaled S=12 control from the existing launcher, use:
 
   experiments/staleness_ratio_sweep.sh --s12-t1r7-baseline
 
@@ -104,6 +103,7 @@ export RATIO_DENOMINATOR=actor
 export USE_STALENESS_AWARE_LOSS=1
 export SAFE_TRAINING_STALENESS=4
 export LOG_STALENESS_AWARE_LOSS_DETAILS=1
+export LOG_POLICY_LAG_METRICS=1
 export SAMPLE_STALENESS_MAX_BIN=40
 if [[ ! -v RUN_NAMESPACE ]]; then
     export RUN_NAMESPACE="staleness-aware-loss-safe4-s12-16-20-24-28-t1r7-$(date +%Y%m%d-%H%M%S)-p$$"

@@ -53,6 +53,11 @@ def get_rollout_data(
     rollout_data["loss_masks"] = [
         torch.tensor(t, dtype=torch.int, device=torch.cuda.current_device()) for t in rollout_data["loss_masks"]
     ]
+    if "policy_lag_initial_loss_masks" in rollout_data:
+        rollout_data["policy_lag_initial_loss_masks"] = [
+            torch.tensor(t, dtype=torch.bool, device=torch.cuda.current_device())
+            for t in rollout_data["policy_lag_initial_loss_masks"]
+        ]
     if args.enable_witness:
         seq_witness_ids = rollout_data.pop("seq_witness_ids")
         rollout_data["witness_ids"] = [

@@ -110,6 +110,7 @@ def test_wandb_backend_preserves_partial_metric_keys(monkeypatch):
     assert captured[0] is metrics
     assert "staleness" in _STEP_METRIC_PREFIXES["rollout/step"]
     assert "rollout" in _STEP_METRIC_PREFIXES["rollout/step"]
+    assert "policy_lag" in _STEP_METRIC_PREFIXES["train/step"]
 
 
 class TestTitoMismatchMetrics:

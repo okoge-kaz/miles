@@ -22,6 +22,9 @@ set -euo pipefail
 cd /workspace/miles
 export PYTHONPATH=/workspace/miles
 python -m pytest -q \
+    tests/fast/backends/training_utils/loss/test_policy_lag_metrics.py \
+    tests/fast/backends/training_utils/loss/test_staleness_aware_loss.py \
+    tests/fast/backends/training_utils/loss/test_tis_population_metrics.py \
     tests/fast/backends/training_utils/loss/test_staleness_metrics.py \
     tests/fast/backends/training_utils/test_debug_dump.py \
     tests/fast/test_analyze_staleness_telemetry.py \
@@ -49,7 +52,10 @@ python_files=(
     miles/backends/training_utils/log_utils.py
     miles/backends/training_utils/loss.py
     miles/backends/training_utils/loss_hub/losses.py
+    miles/backends/training_utils/loss_hub/policy_lag_metrics.py
+    miles/backends/training_utils/loss_hub/staleness_aware_loss.py
     miles/backends/training_utils/loss_hub/staleness_metrics.py
+    miles/backends/training_utils/loss_hub/tis_population_metrics.py
     miles/ray/rollout/metrics.py
     miles/ray/rollout/rollout_manager.py
     miles/ray/rollout/train_data_conversion.py
@@ -68,6 +74,9 @@ python_files=(
     miles/utils/types.py
     miles/utils/test_wandb_utils.py
     tests/fast/backends/training_utils/loss/test_staleness_metrics.py
+    tests/fast/backends/training_utils/loss/test_policy_lag_metrics.py
+    tests/fast/backends/training_utils/loss/test_staleness_aware_loss.py
+    tests/fast/backends/training_utils/loss/test_tis_population_metrics.py
     tests/fast/backends/training_utils/test_debug_dump.py
     tests/fast/ray/rollout/real_ray/test_rollout_manager.py
     tests/fast/ray/rollout/test_train_data_conversion.py

@@ -62,6 +62,13 @@ exist alongside it.
 
     train/train_rollout_kl, train/train_rollout_logprob_abs_diff, train/ppo_kl
     train/tis, train/tis_abs, train/tis_clipfrac
+    train/tis_abs/{active,all_response,truncated,non_truncated}
+    train/tis_abs_approx_{p95,p99}_capped_1e3/{active,all_response,truncated,non_truncated}
+    policy_lag/{all_response,truncated,non_truncated}/delta_{abs_mean,rms}
+    policy_lag/{all_response,truncated,non_truncated}/loss_sensitivity_sum_{pre,post}
+    policy_lag/{all_response,truncated,non_truncated}/loss_sensitivity_weighted_delta_rms_{pre,post}
+    policy_lag/{all_response,truncated,non_truncated}/loss_sensitivity_delta_sq_sum_{pre,post}
+    policy_lag/{all_response,truncated,non_truncated}/loss_sensitivity_{,delta_sq_}retained_fraction
     train/ess_ratio, train/rollout_token_level_ess,
     train/rollout_sequence_level_ess, train/ois
     train/policy_rollout_abs_diff, train/policy_rollout_kl,
@@ -80,6 +87,57 @@ therefore neither response truncation nor a discarded-sample fraction.  A
 custom rejection-style correction such as IcePop can instead turn out-of-range
 weights into zero, so the correction mode must accompany this metric when runs
 are compared.  `pg_clipfrac` separately measures PPO objective clipping.
+
+The population-specific `tis_abs` metrics remove the zero-loss measurement
+censoring without changing the training objective. `active` follows the same
+loss mask and reducer as the compatibility `train/tis_abs`; `all_response`
+ignores the loss mask, while `truncated` and `non_truncated` split that full
+response-token population using the rollout termination status. Their p95/p99
+metrics are distributed fixed-bin approximations capped at a TIS absolute
+deviation of 1,000; the means are not capped. Empty populations report zero.
+
+`--log-policy-lag-metrics` adds the flat `policy_lag/` namespace on the same
+`train/step` axis. For each response token it uses
+`Delta = log pi_policy(a|s) - log pi_rollout(a|s)`. The three populations are
+the exact trainer-visible response-token population and its termination-status
+split; prompt and padding tokens are absent, while zero-loss truncated tokens
+remain measurable.
+
+`loss_sensitivity` means the absolute derivative of the fixed-reference
+policy-surrogate loss with respect to the selected current-policy log
+probability. It is not a parameter-gradient norm. Pre and post reuse the same
+forward, PPO branch, advantage, applied TIS weight, and global reference
+normalizer; post alone multiplies the actual zero-loss or staleness-aware target
+weight. Subpopulations never receive a new normalizer. The collector emits
+float64 additive sums per microbatch and forms RMS and retention ratios only
+after global DP/CP aggregation.
+
+An empty or zero-sensitivity population has a zero count/sum but an undefined
+weighted RMS, logged as NaN with a zero validity flag. Nonfinite values on real
+response tokens are counted and invalidate dependent metrics. For token-mean
+zero-loss training, the training normalizer changes after filtering; in that
+case the fixed-normalization post series is accompanied by the three
+`*_actual` values and run config records
+`policy_lag_post_matches_actual_loss=false`.
+
+The earlier experimental names are intentionally not emitted as aliases because
+their masking, normalization, and undefined-value rules differ:
+
+| earlier name | schema-v1 replacement |
+|---|---|
+| `train/policy_rollout_log_ratio_rms_all_response` | `policy_lag/all_response/delta_rms` |
+| `train/policy_gradient_weighted_log_ratio_rms_{pre_filter,post_filter}` | `policy_lag/all_response/loss_sensitivity_weighted_delta_rms_{pre,post}` |
+| `train/policy_gradient_coefficient_mass_retained_fraction` | `policy_lag/all_response/loss_sensitivity_retained_fraction` |
+
+The collector performs detached elementwise reductions only: it adds no model
+forward, model backward, parameter scan, or retained autograd graph. It is not
+free: each training microbatch still pays response-token arithmetic plus a
+small scalar reduction/all-reduce, and zero-loss runs transport one additional
+`uint8` pre-filter mask. The async and sync math recipes enable it by default;
+`LOG_POLICY_LAG_METRICS=0` remains available for a short end-to-end overhead
+A/B or for an unsupported custom training path. Unsupported
+surrogate/reducer/TIS variants still log Delta and set
+`policy_lag/loss_sensitivity_supported=0` instead of borrowing the PPO formula.
 
 The historical token-level ESS is Kish's ratio over tokens *within each
 response*, averaged with the training reducer. It remains for compatibility but

@@ -25,6 +25,7 @@ arm for a partial resume. This launcher fixes:
   zero loss on truncated:         on
   staleness-aware loss:           off
   importance-sampling correction: token TIS clipped to [0, 2]
+  policy-lag diagnostics: on (Delta and pre/post loss-sensitivity-weighted)
 
 The two arms isolate whether fully removing the direct policy-gradient loss
 from truncated samples extends the stable boundary beyond the completed S=20
@@ -95,6 +96,7 @@ export TIS_CLIP_LOW=0
 export RATIO_DENOMINATOR=actor
 export USE_STALENESS_AWARE_LOSS=0
 export LOG_STALENESS_AWARE_LOSS_DETAILS=0
+export LOG_POLICY_LAG_METRICS=1
 export SAMPLE_STALENESS_MAX_BIN=40
 if [[ ! -v RUN_NAMESPACE ]]; then
     export RUN_NAMESPACE="zero-loss-trunc-s24-28-t1r7-step300-$(date +%Y%m%d-%H%M%S)-p$$"
