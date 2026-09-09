@@ -2,8 +2,10 @@
 
 The job measures colocated partial-rollout transitions. The training CLI keeps
 all switching-cost telemetry opt-in. This recipe enables the low-overhead phase
-timers and byte counters, but keeps hot-path memory logging, the Miles dashboard,
-event dumps, and full Ray log forwarding disabled by default. A separate
+timers, byte counters, and policy-lag diagnostics, but keeps hot-path memory
+logging, the Miles dashboard, event dumps, and full Ray log forwarding disabled
+by default. Policy-lag collection reuses the training forward and runs outside
+the measured switch timer spans. A separate
 host/device bandwidth benchmark runs per node before Ray starts. The job does not
 save checkpoints or run evaluation.
 
@@ -12,6 +14,7 @@ The relevant controls are:
 ```text
 LOG_COLOCATE_SWITCH_METRICS=1  # driver block timers and rank-local snapshot timer
 LOG_COLOCATE_TRANSFER_BYTES=1  # exact snapshot/payload bytes plus physical HBM delta
+--log-policy-lag-metrics       # always-on detached trainer-side diagnostics
 LOG_MEMORY_USAGE=0             # hot-path HBM/CPU snapshots; diagnostic-only
 ENABLE_MILES_DASHBOARD=0       # per-rank Timer event RPCs; diagnostic-only
 ENABLE_DUMP_DETAILS=0          # synchronous event JSONL writes; diagnostic-only

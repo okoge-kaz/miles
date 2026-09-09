@@ -102,7 +102,9 @@ MISC_ARGS=(
     --attention-backend flash
 )
 
-TELEMETRY_ARGS=()
+# Keep policy-lag diagnostics enabled for every production measurement. The
+# collector reuses the training forward and is outside the switch timer spans.
+TELEMETRY_ARGS=(--log-policy-lag-metrics)
 if [[ "${LOG_COLOCATE_SWITCH_METRICS}" != 0 ]]; then
     TELEMETRY_ARGS+=(--log-colocate-switch-metrics)
 fi
