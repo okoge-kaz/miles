@@ -29,6 +29,21 @@ STALENESS_COLORS = {
 METRIC = "staleness/total/mean"
 SENSITIVE_METRIC_THRESHOLD = 0.25
 SENSITIVE_METRIC_CANDIDATES = (
+    "policy_lag/all_response/delta_rms",
+    "policy_lag/truncated/delta_rms",
+    "policy_lag/non_truncated/delta_rms",
+    "policy_lag/all_response/loss_sensitivity_weighted_delta_rms_pre",
+    "policy_lag/all_response/loss_sensitivity_weighted_delta_rms_post",
+    "policy_lag/all_response/loss_sensitivity_retained_fraction",
+    "policy_lag/all_response/loss_sensitivity_delta_sq_retained_fraction",
+    "train/tis_abs/all_response",
+    "train/tis_abs/truncated",
+    "train/tis_abs/non_truncated",
+    "train/tis_abs/active",
+    "train/policy_rollout_log_ratio_rms_all_response",
+    "train/policy_gradient_weighted_log_ratio_rms_pre_filter",
+    "train/policy_gradient_weighted_log_ratio_rms_post_filter",
+    "train/policy_gradient_coefficient_mass_retained_fraction",
     "train/tis_abs",
     "train/tis_clipfrac",
     "train/policy_rollout_abs_diff",
@@ -42,8 +57,31 @@ SENSITIVE_METRIC_CANDIDATES = (
     "train/grad_norm_pre_clip",
 )
 SENSITIVE_METRIC_LABELS = {
+    "policy_lag/all_response/delta_rms": "policy lag RMS (all response tokens)",
+    "policy_lag/truncated/delta_rms": "policy lag RMS (truncated responses)",
+    "policy_lag/non_truncated/delta_rms": "policy lag RMS (non-truncated responses)",
+    "policy_lag/all_response/loss_sensitivity_weighted_delta_rms_pre": (
+        "loss-sensitivity-weighted policy lag RMS (pre)"
+    ),
+    "policy_lag/all_response/loss_sensitivity_weighted_delta_rms_post": (
+        "loss-sensitivity-weighted policy lag RMS (post)"
+    ),
+    "policy_lag/all_response/loss_sensitivity_retained_fraction": (
+        "loss sensitivity retained"
+    ),
+    "policy_lag/all_response/loss_sensitivity_delta_sq_retained_fraction": (
+        "loss sensitivity × policy lag² retained"
+    ),
     "train/tis": "TIS signed mean (reference)",
     "train/tis_abs": "TIS absolute deviation",
+    "train/tis_abs/active": "TIS absolute deviation (active loss tokens)",
+    "train/tis_abs/all_response": "TIS absolute deviation (all response tokens)",
+    "train/tis_abs/truncated": "TIS absolute deviation (truncated responses)",
+    "train/tis_abs/non_truncated": "TIS absolute deviation (non-truncated responses)",
+    "train/policy_rollout_log_ratio_rms_all_response": "policy–rollout log-ratio RMS (all responses)",
+    "train/policy_gradient_weighted_log_ratio_rms_pre_filter": "gradient-weighted log-ratio RMS (pre-filter)",
+    "train/policy_gradient_weighted_log_ratio_rms_post_filter": "gradient-weighted log-ratio RMS (post-filter)",
+    "train/policy_gradient_coefficient_mass_retained_fraction": "gradient coefficient mass retained",
     "train/tis_clipfrac": "TIS clipped-token fraction",
     "train/policy_rollout_kl": "policy–rollout KL",
     "train/policy_rollout_abs_diff": "policy–rollout |logprob diff|",

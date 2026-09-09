@@ -71,14 +71,64 @@ ROLLOUT_METRICS = (
     "rollout/truncated_ratio",
     "rollout/response_len/mean",
 )
+POLICY_LAG_POPULATIONS = ("all_response", "truncated", "non_truncated")
+POLICY_LAG_POPULATION_METRICS = (
+    "response_token_count",
+    "delta_abs_mean",
+    "delta_rms",
+    "loss_sensitivity_sum_pre",
+    "loss_sensitivity_sum_post",
+    "loss_sensitivity_weighted_delta_rms_pre",
+    "loss_sensitivity_weighted_delta_rms_post",
+    "loss_sensitivity_delta_sq_sum_pre",
+    "loss_sensitivity_delta_sq_sum_post",
+    "loss_sensitivity_retained_fraction",
+    "loss_sensitivity_delta_sq_retained_fraction",
+    "initial_loss_mask_fraction",
+    "final_loss_mask_nonzero_fraction",
+    "final_loss_mask_weight_mean",
+    "loss_sensitivity_weighted_metrics_valid_pre",
+    "loss_sensitivity_weighted_metrics_valid_post",
+    "nonfinite_delta_count",
+    "nonfinite_loss_sensitivity_count_pre",
+    "nonfinite_loss_sensitivity_count_post",
+)
+POLICY_LAG_METRICS = (
+    "policy_lag/loss_sensitivity_supported",
+    *(
+        f"policy_lag/{population}/{metric}"
+        for population in POLICY_LAG_POPULATIONS
+        for metric in POLICY_LAG_POPULATION_METRICS
+    ),
+)
 TRAIN_METRICS = (
     "train/policy_rollout_kl",
     "train/policy_rollout_abs_diff",
+    *POLICY_LAG_METRICS,
+    # Pre-schema aliases retained so the exporter can still stitch older runs.
+    "train/policy_rollout_log_ratio_rms_all_response",
+    "train/policy_gradient_weighted_log_ratio_rms_pre_filter",
+    "train/policy_gradient_weighted_log_ratio_rms_post_filter",
+    "train/policy_gradient_weighted_abs_log_ratio_mean_pre_filter",
+    "train/policy_gradient_weighted_abs_log_ratio_mean_post_filter",
+    "train/policy_gradient_coefficient_mass_retained_fraction",
     "train/policy_rollout_token_ess",
     "train/policy_rollout_sequence_ess",
     "train/train_rollout_kl",
     "train/tis",
     "train/tis_abs",
+    "train/tis_abs/active",
+    "train/tis_abs/all_response",
+    "train/tis_abs/truncated",
+    "train/tis_abs/non_truncated",
+    "train/tis_abs_approx_p95_capped_1e3/active",
+    "train/tis_abs_approx_p95_capped_1e3/all_response",
+    "train/tis_abs_approx_p95_capped_1e3/truncated",
+    "train/tis_abs_approx_p95_capped_1e3/non_truncated",
+    "train/tis_abs_approx_p99_capped_1e3/active",
+    "train/tis_abs_approx_p99_capped_1e3/all_response",
+    "train/tis_abs_approx_p99_capped_1e3/truncated",
+    "train/tis_abs_approx_p99_capped_1e3/non_truncated",
     "train/tis_clipfrac",
     "train/ppo_kl",
     "train/final_loss_tokens",

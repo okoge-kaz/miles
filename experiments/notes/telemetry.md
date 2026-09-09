@@ -142,12 +142,18 @@ surrogate/reducer/TIS variants still log Delta and set
 The historical token-level ESS is Kish's ratio over tokens *within each
 response*, averaged with the training reducer. It remains for compatibility but
 is not the population ESS normally meant by an off-policy sequence diagnostic.
-`rollout_sequence_level_ess` is the standard
-`(sum_i w_i)^2 / (B sum_i w_i^2)` over response weights. The `policy_rollout_*`
-family always uses the current actor forward, independently of the PPO ratio
+`rollout_sequence_level_ess` is algebraically the standard
+`(sum_i w_i)^2 / (B sum_i w_i^2)` over response weights. However, the raw
+sequence metric is not a usable staleness-health diagnostic for the 16K/32K
+long-CoT study: its log weight sums every token, so response length and the
+Megatron/SGLang scoring floor dominate it before policy lag does. The
+2026-09-06 W&B audit below gives the counterexamples and records the decision not
+to use it as evidence for or against collapse. The `policy_rollout_*` family
+always uses the current actor forward, independently of the PPO ratio
 denominator; use it when `--use-rollout-logprobs` would otherwise make the
-historical family identically zero/one. Both ESS families reuse tensors already
-computed by the loss and require no additional model forward.
+historical family identically zero/one. Token ESS remains useful specifically
+for token-weight concentration, but a high value is not evidence that the run
+is stable.
 
 **Waste accounting**, which is how the pause modes get compared:
 
@@ -1495,6 +1501,107 @@ The result bundle is under
 a nominal `clean_head` arm, but this invocation pointed that arm at the same
 working tree; only the telemetry-off versus enabled deltas above are used as a
 code-path comparison.
+
+### Long-CoT sequence ESS audit (2026-09-06)
+
+The raw sequence-level ESS in these runs must not be interpreted as a measure
+of harmful staleness.  This conclusion comes from a direct audit of the W&B
+lineages used by
+`experiments/outputs/reasoning_eval/wandb-collapse-20260901/`, not from the
+configured max-staleness labels.
+
+The metric constructs one response weight
+
+```
+log w_i = sum_t (log pi_train(a_it | s_it) - log pi_rollout(a_it | s_it))
+rho_seq = (sum_i w_i)^2 / (B * sum_i w_i^2)
+```
+
+and is therefore the normalized ESS of a full-trajectory importance-sampling
+estimator.  It is algebraically valid for that estimator, but this experiment
+uses token-level TIS and token-level DAPO loss rather than a product of ratios
+over the response.  More importantly, summing the train/inference scoring floor
+over a variable-length response makes `log w_i` depend strongly on length even
+at zero staleness.  The measured approximately `5.4e-4` per-token systematic
+difference can contribute about 1.1 nat over 2K tokens, 8.6 nat over 16K tokens,
+and a 17.6-nat spread over the observed 347--32677-token length range.  Thus a
+fixed prefix near 2K can still be diagnostically useful, but 2K is not a
+universal validity threshold.
+
+The decisive W&B counterexamples are below.  Each number is the mean of the
+last 20 logged training steps in the stitched lineage.  The source namespaces
+are `hiso-zero-loss-trunc-s8-16-20-r12-tbq6000-20260831-v1`,
+`sr-20260826-141753-p1497131`, and
+`hiso-no-trunc-treatment-s8-16-r12-tbq6000-20260831-v1`, respectively.
+
+| condition | realized staleness | raw reward | truncated | response length | sequence ESS | token ESS |
+|---|---:|---:|---:|---:|---:|---:|
+| zero-loss, S20 T:R=1:7, stable through step 300 | 19.72 | 0.795 | 15.1% | 8,312 | 0.0159 | 0.9972 |
+| zero-reward, S20 T:R=1:7, collapsed by step 220 | 10.03 | 0.000017 | 99.99% | 16,383 | 0.1076 | 0.9991 |
+| no truncation treatment, S16 T:R=1:7, collapsed by step 249 | 15.56 | 0.000017 | 99.96% | 16,378 | 0.5882 | 0.99995 |
+
+The collapsed runs can therefore look *healthier* than the stable run under
+both global ESS summaries.  Once almost every response has exactly the maximum
+length, a systematic per-token offset contributes nearly the same common shift
+to every `log w_i`; normalized ESS cancels that shift and rises.  Conversely,
+in the six zero-loss arms at training step one, where realized staleness is
+zero, `policy_rollout_sequence_ess` was already only 0.036--0.101.  Over the
+late zero-loss window it was 0.0141, 0.0110, and 0.0159 at realized T:R=1:7
+staleness 7.77, 15.78, and 19.72 respectively, with no monotone dose response.
+
+The staleness-conditioned W&B summaries expose the confounding directly.  The
+audit covered 99 zero-loss and staleness-aware W&B run segments, containing 229
+non-empty staleness-bin summaries.  Eighty summaries contained at least two
+non-empty age bins; in all 80, the highest-age bin had the longer reconstructed
+mean response than the lowest-age bin.  This is expected under the prefill
+reference because longer responses spend more policy updates in generation.
+Across the run-bin summaries, correlation between `log(sequence ESS)` and
+staleness-bin index was only +0.033 for zero-loss and -0.126 for
+staleness-aware loss.
+
+For a concrete same-update example, W&B run `x3aihhue` at train step 221 had:
+
+| sample staleness | reconstructed mean response length | sequence ESS | token ESS |
+|---:|---:|---:|---:|
+| 27 | 5,297 | 0.0265 | 0.9958 |
+| 28 | 7,969 | 0.00465 | 0.9954 |
+
+The mean lengths are reconstructed as the whole-batch mean multiplied by
+`consumed_response_token_mass / consumed_sequence_mass`.  The raw sequence ESS
+drop cannot be assigned to the one-version age difference because the older
+population is also 51% longer.
+
+There are two additional implementation caveats in the top-level
+`train/policy_rollout_sequence_ess` path at commit `cb1c041f`:
+
+- `compute_sequence_level_ess_parts` sets `B = len(loss_masks)` and maps an
+  all-zero loss mask to `log w_i = 0`, hence `w_i = 1`.  A truncated sample
+  removed by `--zero-loss-on-truncated` is therefore counted as a unit-weight
+  sequence instead of being excluded.  The newer staleness-bin implementation
+  does exclude samples with zero active tokens.
+- The sequence sufficient statistics are computed in float64 but explicitly
+  cast to float32 before the ordinary cross-rank metric reduction.  This adds a
+  separate long-horizon overflow/underflow risk; it is not needed to explain the
+  empirical length confounding above.
+
+Decisions for this study:
+
+- Do not use raw global or per-age sequence ESS as causal evidence for or
+  against staleness-induced collapse at 16K or 32K.
+- Treat token ESS only as a diagnostic of token importance-weight
+  concentration.  A value near one does not establish training stability; the
+  two collapsed counterexamples above have token ESS above 0.999.
+- Diagnose the observed failure with reward, truncation fraction, response
+  length, downstream AIME, TIS clipping, and the post-mask objective
+  contribution attributed to each staleness bin.  The evidence is compatible
+  with stale truncated-sample feedback causing collapse without an ESS
+  collapse.
+- If an ESS-like diagnostic is needed, log fixed-prefix `ESS@K` for
+  `K in {512, 1024, 2048}`, compare only samples that contain that prefix, and
+  add length-bin-conditioned or length-residualized sequence log-ratio
+  summaries.  Also retain per-sequence mean log-ratio quantiles; these are
+  length-comparable diagnostics, although they are not true trajectory
+  importance weights.
 
 ### What can be causal
 

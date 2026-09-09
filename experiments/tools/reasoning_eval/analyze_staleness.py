@@ -41,12 +41,36 @@ STALENESS_CORRELATION_FEATURES = (
     *STALENESS_AUXILIARY_FEATURES,
 )
 REALIZED_STALENESS_FEATURES = (*STALENESS_FEATURES, *STALENESS_AUXILIARY_FEATURES)
+POLICY_LAG_MEDIATOR_METRICS = tuple(
+    f"policy_lag/{population}/{metric}"
+    for population in ("all_response", "truncated", "non_truncated")
+    for metric in (
+        "delta_abs_mean",
+        "delta_rms",
+        "loss_sensitivity_weighted_delta_rms_pre",
+        "loss_sensitivity_weighted_delta_rms_post",
+        "loss_sensitivity_retained_fraction",
+        "loss_sensitivity_delta_sq_retained_fraction",
+    )
+)
 STEP_MEDIATOR_METRICS = (
     "train/policy_rollout_kl",
     "train/policy_rollout_abs_diff",
+    *POLICY_LAG_MEDIATOR_METRICS,
+    # Pre-schema aliases retained for historical exports.
+    "train/policy_rollout_log_ratio_rms_all_response",
+    "train/policy_gradient_weighted_log_ratio_rms_pre_filter",
+    "train/policy_gradient_weighted_log_ratio_rms_post_filter",
+    "train/policy_gradient_weighted_abs_log_ratio_mean_pre_filter",
+    "train/policy_gradient_weighted_abs_log_ratio_mean_post_filter",
+    "train/policy_gradient_coefficient_mass_retained_fraction",
     "train/policy_rollout_token_ess",
     "train/policy_rollout_sequence_ess",
     "train/tis_abs",
+    "train/tis_abs/active",
+    "train/tis_abs/all_response",
+    "train/tis_abs/truncated",
+    "train/tis_abs/non_truncated",
     "train/tis_clipfrac",
     "train/grad_norm_pre_clip",
     "train/grad_clip_coefficient",
