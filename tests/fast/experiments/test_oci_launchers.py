@@ -14,6 +14,8 @@ SCRIPTS = sorted(
 )
 SCRIPTS.append(REPO / "tests/manual/run_oci_validation.sbatch")
 SCRIPTS.append(REPO / "tests/manual/run_oci_step4000_smoke.sbatch")
+SCRIPTS.append(REPO / "tests/manual/run_oci_async_smoke.sbatch")
+SCRIPTS.append(REPO / "tests/manual/run_oci_prefill_smoke.sh")
 
 
 @pytest.mark.parametrize("path", SCRIPTS, ids=lambda path: str(path.relative_to(REPO)))
