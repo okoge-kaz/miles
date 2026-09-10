@@ -28,6 +28,44 @@ def _make_probe_slow(engine: MagicMock, *, delay_seconds: float) -> None:
 
 
 class TestPortAllocator:
+    async def test_cluster_port_range_is_read_at_construction(self, monkeypatch):
+        monkeypatch.setenv("MILES_WORKER_PORT_START", "2000")
+        monkeypatch.setenv("MILES_WORKER_PORT_END", "8999")
+        allocator = PortAllocator()
+        engine = fake_engine(host="10.0.0.1", port_seed=0)
+
+        assert await allocator.alloc(engine, node_ip="10.0.0.1", consecutive=35) == 2000
+        assert allocator._next_port_of_ip["10.0.0.1"] == 2035
+
+    async def test_custom_range_wraps_before_ephemeral_ports(self):
+        allocator = PortAllocator(port_start=2000, port_end=8999)
+        allocator._next_port_of_ip["10.0.0.1"] = 8990
+        engine = fake_engine(host="10.0.0.1", port_seed=0)
+
+        assert await allocator.alloc(engine, node_ip="10.0.0.1", consecutive=35) == 2000
+
+    async def test_probe_cannot_escape_the_configured_range(self):
+        allocator = PortAllocator(port_start=2000, port_end=8999)
+        engine = fake_engine(host="10.0.0.1", port_seed=8995)
+
+        with pytest.raises(RuntimeError, match="outside the configured worker range"):
+            await allocator.alloc(engine, node_ip="10.0.0.1", consecutive=10)
+        assert allocator._next_port_of_ip == {}
+
+    @pytest.mark.parametrize("start,end", [(0, 8999), (9000, 8999), (2000, 65536)])
+    def test_invalid_ranges_are_rejected(self, start, end):
+        with pytest.raises(ValueError, match="Invalid worker port range"):
+            PortAllocator(port_start=start, port_end=end)
+
+    @pytest.mark.parametrize("count", [0, -1, 7001])
+    async def test_invalid_block_sizes_are_rejected(self, count):
+        allocator = PortAllocator(port_start=2000, port_end=8999)
+        engine = fake_engine(host="10.0.0.1", port_seed=0)
+
+        with pytest.raises(ValueError, match="does not fit"):
+            await allocator.alloc(engine, node_ip="10.0.0.1", consecutive=count)
+        engine._get_free_port_block.remote.assert_not_called()
+
     def test_a_fresh_allocator_has_no_cursors(self):
         """A brand new allocator starts with no per-node cursors."""
         c = PortAllocator()

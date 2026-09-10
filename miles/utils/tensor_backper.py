@@ -21,13 +21,16 @@ class MainCastContext:
 
 class TensorBackuper(ABC):
     @staticmethod
-    def create(source_getter, main_cast_ctx: "MainCastContext | None" = None):
+    def create(source_getter, main_cast_ctx: "MainCastContext | None" = None, *, track_transfer_nbytes: bool = False):
         if main_cast_ctx is not None:
-            return _TensorBackuperMainCast(source_getter=source_getter, ctx=main_cast_ctx)
-        return _TensorBackuperNormal(source_getter=source_getter)
+            return _TensorBackuperMainCast(
+                source_getter=source_getter, ctx=main_cast_ctx, track_transfer_nbytes=track_transfer_nbytes
+            )
+        return _TensorBackuperNormal(source_getter=source_getter, track_transfer_nbytes=track_transfer_nbytes)
 
-    def __init__(self, source_getter: _SourceGetter):
+    def __init__(self, source_getter: _SourceGetter, *, track_transfer_nbytes: bool = False):
         self._source_getter = source_getter
+        self._track_transfer_nbytes = track_transfer_nbytes
 
     @property
     @abstractmethod
@@ -42,6 +45,11 @@ class TensorBackuper(ABC):
     def backup(self, tag: str):
         raise NotImplementedError
 
+    @abstractmethod
+    def backup_transfer_nbytes(self, tag: str) -> int:
+        """Return bytes copied from the source tensors by one ``backup`` call."""
+        raise NotImplementedError
+
     def copy(self, *, src_tag: str, dst_tag: str):
         raise NotImplementedError
 
@@ -51,9 +59,10 @@ class TensorBackuper(ABC):
 
 
 class _TensorBackuperNormal(TensorBackuper):
-    def __init__(self, source_getter):
-        super().__init__(source_getter=source_getter)
+    def __init__(self, source_getter, *, track_transfer_nbytes: bool = False):
+        super().__init__(source_getter=source_getter, track_transfer_nbytes=track_transfer_nbytes)
         self._backups: dict[str, dict[str, torch.Tensor]] = defaultdict(dict)
+        self._backup_transfer_nbytes: dict[str, int] = {}
 
     @property
     def backup_tags(self):
@@ -66,11 +75,20 @@ class _TensorBackuperNormal(TensorBackuper):
     @torch.no_grad()
     def backup(self, tag: str) -> None:
         backup_dict = self._backups[tag]
+        should_measure = self._track_transfer_nbytes and tag not in self._backup_transfer_nbytes
+        transfer_nbytes = 0
         for name, param in self._source_getter():
             if name not in backup_dict:
                 backup_dict[name] = torch.empty_like(param, device=torch.device("cpu"), pin_memory=True)
             backup_dict[name].copy_(param.detach(), non_blocking=True)
+            if should_measure:
+                transfer_nbytes += param.numel() * param.element_size()
         torch.cuda.synchronize()
+        if should_measure:
+            self._backup_transfer_nbytes[tag] = transfer_nbytes
+
+    def backup_transfer_nbytes(self, tag: str) -> int:
+        return self._backup_transfer_nbytes.get(tag, 0)
 
     @torch.no_grad()
     def copy(self, *, src_tag: str, dst_tag: str):
@@ -97,10 +115,10 @@ class _TensorBackuperMainCast(TensorBackuper):
 
     _check_num_cycles = 2
 
-    def __init__(self, source_getter, ctx: MainCastContext):
-        super().__init__(source_getter=source_getter)
+    def __init__(self, source_getter, ctx: MainCastContext, *, track_transfer_nbytes: bool = False):
+        super().__init__(source_getter=source_getter, track_transfer_nbytes=track_transfer_nbytes)
         self._ctx = ctx
-        self._others = _TensorBackuperNormal(source_getter=source_getter)
+        self._others = _TensorBackuperNormal(source_getter=source_getter, track_transfer_nbytes=track_transfer_nbytes)
         self._extras_backup: dict[str, torch.Tensor] = {}
         self._extras_backup_by_id: dict[int, torch.Tensor] = {}
         self._backup_count = 0
@@ -173,6 +191,15 @@ class _TensorBackuperMainCast(TensorBackuper):
                 f"backup time for {len(mismatches)}/{len(expected)} tensors "
                 f"(cycle {self._backup_count}): {mismatches[:20]}"
             )
+
+    def backup_transfer_nbytes(self, tag: str) -> int:
+        if tag != "actor":
+            return self._others.backup_transfer_nbytes(tag)
+        return (
+            sum(t.numel() * t.element_size() for t in self._extras_backup.values())
+            if self._track_transfer_nbytes
+            else 0
+        )
 
 
 def _hash_tensor_sha256(x: torch.Tensor) -> str:

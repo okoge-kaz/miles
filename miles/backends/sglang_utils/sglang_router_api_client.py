@@ -1,3 +1,4 @@
+import asyncio
 import dataclasses
 import logging
 from urllib.parse import quote
@@ -6,11 +7,13 @@ import httpx
 import sglang_router
 from packaging.version import parse
 
-from miles.utils.http_utils import GeneralHttpClientProvider
+from miles.utils.http_utils import GeneralHttpClientProvider, router_worker_base_urls
 
 logger = logging.getLogger(__name__)
 
 ROUTER_REQUEST_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
+ROUTER_REGISTRATION_TIMEOUT_SECONDS = 120.0
+ROUTER_REGISTRATION_POLL_INTERVAL_SECONDS = 1.0
 
 
 def use_legacy_router_api(args) -> bool:
@@ -47,6 +50,30 @@ class SGLangRouterApiClient:
                 timeout=ROUTER_REQUEST_TIMEOUT,
             )
         response.raise_for_status()
+        if not use_legacy_api and response.status_code == 202:
+            await self._wait_for_worker_registration(worker_url)
+
+    async def _wait_for_worker_registration(self, worker_url: str) -> None:
+        # A 202 only queues registration. Starting weight checksums/offload now
+        # can block SGLang's metadata RPC long enough for that workflow to fail.
+        try:
+            async with asyncio.timeout(ROUTER_REGISTRATION_TIMEOUT_SECONDS):
+                while True:
+                    response = await GeneralHttpClientProvider.client().get(
+                        f"{self.router_url}/workers", timeout=ROUTER_REQUEST_TIMEOUT
+                    )
+                    response.raise_for_status()
+                    ready_urls = router_worker_base_urls(
+                        [worker["url"] for worker in response.json()["workers"] if worker.get("is_healthy", True)]
+                    )
+                    if worker_url in ready_urls:
+                        return
+                    await asyncio.sleep(ROUTER_REGISTRATION_POLL_INTERVAL_SECONDS)
+        except TimeoutError as error:
+            raise TimeoutError(
+                f"Worker {worker_url} was accepted but did not become ready in router {self.router_url} "
+                f"within {ROUTER_REGISTRATION_TIMEOUT_SECONDS}s"
+            ) from error
 
     async def remove_worker(self, worker_url: str, use_legacy_api: bool):
         response = None

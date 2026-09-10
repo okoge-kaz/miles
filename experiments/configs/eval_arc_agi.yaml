@@ -1,0 +1,19 @@
+# ARC-AGI eval, for the arc-agi and reasoning-gym recipes.
+#
+# The validation split of nvidia/Nemotron-RL-ARC-AGI-v1 (transductive): the model
+# prints the output grid in \boxed{} and it is compared cell for cell. No judge,
+# no partial credit, no sandbox.
+#
+# 514 problems. avg@4 rather than avg@1 because the reward is extremely sparse --
+# a single grid either matches or does not, and at these pass rates one flip on
+# 514 problems is 0.2 points.
+
+eval:
+  defaults:
+    n_samples_per_eval_prompt: 4
+    max_response_len: 16384
+    top_p: 1.0
+
+  datasets:
+    - name: arc_agi_val
+      path: /data/nemotron-rl-arc-agi/arc-agi-val-miles.jsonl

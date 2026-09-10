@@ -62,7 +62,7 @@ def test_true_on_policy_log_checker_passes_when_values_and_dtype_match(monkeypat
     assert captured["log_dict"]["log_probs"] == captured["log_dict"]["rollout_log_probs"]
 
 
-def test_sampling_mask_csr_payload_is_not_averaged_as_a_metric(monkeypatch):
+def test_rollout_logger_skips_sampling_and_policy_masks_and_accepts_bool_metrics(monkeypatch):
     captured = {}
     parallel_state = SimpleNamespace(
         tp=SimpleNamespace(rank=0),
@@ -77,12 +77,14 @@ def test_sampling_mask_csr_payload_is_not_averaged_as_a_metric(monkeypatch):
         lambda _metric_name, _args, _rollout_id, log_dict: captured.setdefault("log_dict", log_dict),
     )
     rollout_data = {
-        "tokens": [torch.tensor([1, 2])],
-        "total_lengths": [2],
-        "response_lengths": [1],
-        "loss_masks": [torch.tensor([1], dtype=torch.int32)],
+        "tokens": [torch.tensor([1, 2, 3])],
+        "total_lengths": [3],
+        "response_lengths": [2],
+        "loss_masks": [torch.tensor([1, 0], dtype=torch.int32)],
         "rollout_sampling_mask_ids": [[1, 7]],
         "rollout_sampling_mask_offsets": [[0, 2]],
+        "policy_lag_initial_loss_masks": [torch.tensor([True, True])],
+        "bool_metric": [torch.tensor([True, False])],
     }
 
     log_utils.log_rollout_data(
@@ -100,3 +102,5 @@ def test_sampling_mask_csr_payload_is_not_averaged_as_a_metric(monkeypatch):
 
     assert "rollout_sampling_mask_ids" not in captured["log_dict"]
     assert "rollout_sampling_mask_offsets" not in captured["log_dict"]
+    assert "policy_lag_initial_loss_masks" not in captured["log_dict"]
+    assert captured["log_dict"]["bool_metric"] == (0.5, 1)

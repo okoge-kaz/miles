@@ -16,6 +16,7 @@ FROM lmsysorg/sglang:${SGLANG_IMAGE_TAG} AS sglang
 
 # ======================================== Arguments =============================================
 
+ARG SGLANG_REPO=sgl-project/sglang
 ARG SGLANG_BRANCH=sglang-miles
 ARG SGLANG_COMMIT=""
 
@@ -201,7 +202,7 @@ RUN rm -rf /root/.cache/pip /root/flash-attention
 # re-installing must not rebuild them, which needs the torch link path only the upstream
 # build stage has.
 RUN cd /sgl-workspace/sglang && \
-    git fetch origin ${SGLANG_BRANCH} && \
+    git fetch https://github.com/${SGLANG_REPO}.git ${SGLANG_BRANCH} && \
     if [ -n "${SGLANG_COMMIT}" ]; then \
       git checkout -f ${SGLANG_COMMIT}; \
     else \

@@ -20,6 +20,9 @@ import typer
 
 CACHE_DIR = "/tmp/miles-docker-cache"
 REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_SGLANG_REPO = ""
+DEFAULT_SGLANG_BRANCH = ""
+DEFAULT_SGLANG_COMMIT = ""
 
 VARIANTS = {
     "cu13": {
@@ -97,6 +100,9 @@ def build_and_push(
     push: bool = False,
     custom_tag: str = "",
     extra_build_args: list[str] | None = None,
+    sglang_repo: str = "",
+    sglang_branch: str = "",
+    sglang_commit: str = "",
 ) -> None:
     extra_build_args = extra_build_args or []
     config = VARIANTS[variant]
@@ -145,6 +151,14 @@ def build_and_push(
     for key, value in config.get("build_args", {}).items():
         cmd += ["--build-arg", f"{key}={value}"]
 
+    for key, value in (
+        ("SGLANG_REPO", sglang_repo),
+        ("SGLANG_BRANCH", sglang_branch),
+        ("SGLANG_COMMIT", sglang_commit),
+    ):
+        if value:
+            cmd += ["--build-arg", f"{key}={value}"]
+
     # Caller overrides (e.g. release builds pinning SGLANG_COMMIT / MILES_COMMIT
     # from release-lock.json) come last so they win over variant defaults.
     for spec in extra_build_args:
@@ -187,6 +201,18 @@ def main(
     push: bool = typer.Option(False, help="Push images to registry after building."),  # noqa: B008
     custom_tag: str = typer.Option("", help="Custom tag name (required when --image-tag is custom)."),  # noqa: B008
     build_arg: list[str] = typer.Option([], help="Extra KEY=VALUE build-arg (repeatable)."),  # noqa: B008
+    sglang_repo: str = typer.Option(  # noqa: B008
+        DEFAULT_SGLANG_REPO,
+        help="GitHub owner/repo for the SGLang fork.",
+    ),
+    sglang_branch: str = typer.Option(  # noqa: B008
+        DEFAULT_SGLANG_BRANCH,
+        help="SGLang branch to fetch.",
+    ),
+    sglang_commit: str = typer.Option(  # noqa: B008
+        DEFAULT_SGLANG_COMMIT,
+        help="Exact SGLang commit to install.",
+    ),
 ) -> None:
     build_and_push(
         variant.value,
@@ -196,6 +222,9 @@ def main(
         push=push,
         custom_tag=custom_tag,
         extra_build_args=build_arg,
+        sglang_repo=sglang_repo,
+        sglang_branch=sglang_branch,
+        sglang_commit=sglang_commit,
     )
 
 

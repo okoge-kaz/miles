@@ -1,0 +1,25 @@
+# Tool-use eval, for the fncall-pivot / conv-tooluse / swe-pivot recipes.
+#
+# BFCL is the benchmark both Qwen3 and Nemotron report. Only its AST categories
+# are here: `exec_*` calls live APIs and `multi_turn_*` needs a stateful
+# environment, so neither is gradable without leaving the node. Including them
+# would depress the score by the fraction of rows the harness cannot judge
+# rather than by anything the policy did -- see build_bfcl.py for the split.
+#
+# The irrelevance/relevance rows carry an empty ground truth: the correct
+# behaviour is to call nothing. They are kept because spurious tool use is a real
+# failure mode and these are the only rows that measure it.
+#
+# tool_key matters: BFCL ships a different function set per row, so the tools
+# have to come off the row rather than from a global --generate-tool-specs-path.
+
+eval:
+  defaults:
+    n_samples_per_eval_prompt: 1
+    max_response_len: 2048
+    top_p: 1.0
+    tool_key: tools
+
+  datasets:
+    - name: bfcl_ast
+      path: /data/bfcl/bfcl-ast-miles.jsonl

@@ -367,3 +367,27 @@ forwards metrics elsewhere should return `False` and leave the built-in logging 
 place. To change which numbers the buffer reports in the first place, override
 `get_metrics()` on a custom buffer instead, as described in
 [Arguments: Buffer options](#arguments-buffer-options).
+
+## Opt-in math RL experiment queues
+
+The migrated `experiments/cw-dfw-math-rl` recipes explicitly select
+`--fully-async-queue-type queue-recycle|queue-max|queue-drop`. This selects
+`miles.rollout.experimental_fully_async_rollout.FullyAsyncRolloutFn`; plain
+`--fully-async` retains the standard DataBuffer and sample-level scheduler above.
+The experiment implementation submits whole groups and cannot be combined with
+`--custom-async-data-buffer-path` or sample-level submission.
+
+`--training-buffer-queue-size` bounds completed groups for queue-recycle and
+queue-max (default 1000). queue-drop uses `--fully-async-queue-factor`.
+Replay-buffer persistence is opt-in with `--use-replay-buffer`; see
+[replay-buffer notes](../../experiments/notes/replay-buffer.md).
+
+For prefill provenance, let F be first-prefill version, Q group-ready version,
+D dequeue version, and T scheduled training version. Telemetry reports
+pre_queue = Q - F, in_queue = T - Q, total = T - F. queue-recycle enforces
+D - F < max; the usual prefetched schedule T = D + 1 then ensures T - F <= max.
+Prefill mode requires a separately qualified SGLang provenance implementation;
+an upstream image must not be assumed to supply those fields. See the
+[OCI migration notes](../../experiments/notes/cluster-migration.md) for resources,
+image qualification, and verification status. Historical cw-dfw results do not
+measure this cluster's throughput.

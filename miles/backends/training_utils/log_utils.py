@@ -7,6 +7,23 @@ import psutil
 import torch
 import torch.distributed as dist
 
+from miles.backends.training_utils.loss_hub.policy_lag_metrics import (
+    POLICY_LAG_PART_PREFIX,
+    finalize_policy_lag_parts,
+)
+from miles.backends.training_utils.loss_hub.staleness_aware_loss import (
+    STALENESS_AWARE_LOSS_PART_PREFIX,
+    finalize_staleness_aware_loss_parts,
+)
+from miles.backends.training_utils.loss_hub.staleness_metrics import finalize_sample_staleness_metrics
+from miles.backends.training_utils.loss_hub.tis_population_metrics import (
+    TIS_POPULATION_PART_PREFIX,
+    finalize_tis_abs_population_parts,
+)
+from miles.backends.training_utils.update_diagnostics import (
+    UPDATE_PART_PREFIX,
+    finalize_update_diagnostic_parts,
+)
 from miles.utils import train_metric_utils
 from miles.utils.flops_utils import fwd_tflops_per_gpu
 from miles.utils.ft_utils.process_group_utils import MultiPGUtil
@@ -20,6 +37,9 @@ from .data import DataIterator
 from .parallel import get_parallel_state
 
 logger = logging.getLogger(__name__)
+
+_SAMPLE_STALENESS_PREFIX = "sample_staleness/"
+_POLICY_LAG_PREFIX = "policy_lag/"
 
 _MULTI_TURN_REDUCTION_BY_KEY = {
     "raw_response_length/response_length_max": "max",
@@ -196,6 +216,9 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
                 "sample_indices",
                 "rollout_ids",
                 "rollout_mask_sums",
+                "sample_group_indices",
+                "generation_attempt_numbers",
+                "training_steps",
                 "rollout_routed_experts",
                 "rollout_indexer_topk",
                 "rollout_sampling_mask_ids",
@@ -214,6 +237,13 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
                 "step_adapter_names",
                 "step_adapter_batch_sizes",
                 "prompt_group_sizes",
+                # Training-only reference mask consumed by policy-lag metrics.
+                # Its fraction is logged under policy_lag/* by the loss collector.
+                "policy_lag_initial_loss_masks",
+                # Debug-only fused shadow input. It is compared against the
+                # gradient-enabled anchor under train/verify_* metrics; logging it
+                # here would imply a production rollout-phase actor forward.
+                "legacy_actor_log_probs",
             ]:
                 continue
             if isinstance(val, (list, tuple)):
@@ -247,6 +277,8 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
                         if rollout_count_share is not None:
                             count = rollout_count_share
                     else:
+                        if not tensor.is_floating_point() and not tensor.is_complex():
+                            tensor = tensor.float()
                         per_rank_sum = tensor.mean() * cp_size * count
                     log_dict[key] = (per_rank_sum.item(), count)
                 else:
@@ -294,7 +326,12 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
             if "rollout/entropy" in reduced_log_dict:
                 assert 0 < reduced_log_dict["rollout/entropy"] < 0.7
 
-        if args.ci_test and args.true_on_policy_mode and not args.ci_disable_logprobs_checker:
+        if (
+            args.ci_test
+            and args.true_on_policy_mode
+            and not args.ci_disable_logprobs_checker
+            and not getattr(args, "fuse_one_step_actor_logprobs", False)
+        ):
             assert log_dict["log_probs"] == log_dict["rollout_log_probs"], (
                 f"CI check failed: true_on_policy_mode is enabled, but log_probs "
                 f"({log_dict['log_probs']}) != rollout_log_probs "
@@ -340,12 +377,14 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
             correct_total_lengths = []
             correct_loss_masks = []
             correct_entropy = []
+            actor_log_probs = rollout_data.get("log_probs")
             for i, raw_reward in enumerate(raw_rewards):
                 if raw_reward == 1:
                     correct_response_lengths.append(response_lengths[i])
                     correct_total_lengths.append(total_lengths[i])
                     correct_loss_masks.append(loss_masks[i])
-                    correct_entropy.append(-rollout_data["log_probs"][i])
+                    if actor_log_probs is not None:
+                        correct_entropy.append(-actor_log_probs[i])
             num_correct_responses = len(correct_total_lengths)
             rollout_data["correct_response_lengths"] = correct_response_lengths
             correct_response_length_percentile = quantile(
@@ -353,15 +392,16 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
             )
             for p, val in correct_response_length_percentile.items():
                 rollout_data[f"correct_length/{p}"] = [val] * num_correct_responses
-            if len(correct_entropy) > 0:
-                # per-sample mean over the correct subset, not per-rollout
-                sum_of_sample_mean = get_sum_of_sample_mean(
-                    correct_total_lengths, correct_response_lengths, correct_loss_masks, denominators=None
-                )
-                correct_entropy = sum_of_sample_mean(torch.cat(correct_entropy, dim=0))
-                rollout_data["correct_entropy"] = [correct_entropy.item()] * num_correct_responses
-            else:
-                rollout_data["correct_entropy"] = [0] * num_correct_responses
+            if actor_log_probs is not None:
+                if len(correct_entropy) > 0:
+                    # per-sample mean over the correct subset, not per-rollout
+                    sum_of_sample_mean = get_sum_of_sample_mean(
+                        correct_total_lengths, correct_response_lengths, correct_loss_masks, denominators=None
+                    )
+                    correct_entropy = sum_of_sample_mean(torch.cat(correct_entropy, dim=0))
+                    rollout_data["correct_entropy"] = [correct_entropy.item()] * num_correct_responses
+                else:
+                    rollout_data["correct_entropy"] = [0] * num_correct_responses
 
 
 def log_multi_turn_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatch) -> None:
@@ -458,6 +498,9 @@ def aggregate_train_losses(
             exactly once under the DP*CP all-reduce). None keeps the legacy
             reduction: divide by the all-reduced ``values[0]`` count, cancelled
             by ``cp_size``.
+            Each log_dict has the historical ``keys``/``values`` vector and may
+            also carry isolated ``diagnostic_keys``/``diagnostic_values`` additive
+            parts for high-dynamic-range diagnostics.
 
     Returns:
         Dictionary mapping metric names to averaged values.
@@ -467,18 +510,29 @@ def aggregate_train_losses(
         return {}
 
     keys = losses_reduced[0]["keys"]
+    diagnostic_keys = losses_reduced[0].get("diagnostic_keys", [])
 
     values = None
+    diagnostic_values = None
     for log_dict in losses_reduced:
+        if log_dict.get("diagnostic_keys", []) != diagnostic_keys:
+            raise ValueError("Diagnostic metric keys changed across micro-batches")
         if values is None:
             values = log_dict["values"].clone()
         else:
             values += log_dict["values"]
+        if diagnostic_keys:
+            if diagnostic_values is None:
+                diagnostic_values = log_dict["diagnostic_values"].clone()
+            else:
+                diagnostic_values += log_dict["diagnostic_values"]
 
     assert len(keys) + 1 == values.numel(), f"Expected {len(keys) + 1} values, got {values.numel()}"
 
     for group in parallel_state.effective_dp_cp.groups_inner_to_outer:
         MultiPGUtil.all_reduce(values, [group], op=dist.ReduceOp.SUM)
+        if diagnostic_values is not None:
+            MultiPGUtil.all_reduce(diagnostic_values, [group], op=dist.ReduceOp.SUM)
 
     loss_reduced = {}
     values = values.tolist()
@@ -489,10 +543,49 @@ def aggregate_train_losses(
         num_samples_or_tokens = values[0]
         cp_factor = parallel_state.cp.size
 
-    for key, value in zip(keys, values[1:], strict=False):
+    metric_sums = dict(zip(keys, values[1:], strict=True))
+    diagnostic_metric_sums = {}
+
+    for key, value in metric_sums.items():
+        if key.startswith(
+            (UPDATE_PART_PREFIX, STALENESS_AWARE_LOSS_PART_PREFIX, TIS_POPULATION_PART_PREFIX, POLICY_LAG_PART_PREFIX)
+        ):
+            continue
         loss_reduced[key] = value * cp_factor / num_samples_or_tokens
+    if diagnostic_values is not None:
+        diagnostic_metric_sums = dict(zip(diagnostic_keys, diagnostic_values.tolist(), strict=True))
+        for key, value in diagnostic_metric_sums.items():
+            if key.startswith((TIS_POPULATION_PART_PREFIX, POLICY_LAG_PART_PREFIX)):
+                continue
+            loss_reduced[key] = value * cp_factor / num_samples_or_tokens
+
+    # Sequence-level ESS: rho = (sum w)^2 / (B * sum w^2), which is a ratio of
+    # sums and so cannot be averaged the way every other metric here can. The
+    # loss emits the three sums instead; each has just been divided by the same
+    # normaliser N, and rho = a^2 / (b * c) with a=S1/N, b=S2/N, c=B/N leaves N
+    # cancelling exactly. The parts are dropped once consumed -- they are an
+    # implementation detail and mean nothing on their own.
+    for src, dst in (("_seq_ess", "rollout_sequence_level_ess"), ("_policy_seq_ess", "policy_rollout_sequence_ess")):
+        a = loss_reduced.pop(f"{src}_sum_w", None)
+        b = loss_reduced.pop(f"{src}_sum_w2", None)
+        c = loss_reduced.pop(f"{src}_n", None)
+        if a is not None and b is not None and c is not None and b > 0.0 and c > 0.0:
+            loss_reduced[dst] = (a * a) / (b * c)
+
+    loss_reduced.update(finalize_update_diagnostic_parts(metric_sums))
+    loss_reduced.update(finalize_staleness_aware_loss_parts(metric_sums))
+    loss_reduced.update(finalize_tis_abs_population_parts(diagnostic_metric_sums))
+    loss_reduced.update(finalize_policy_lag_parts(diagnostic_metric_sums))
+    finalize_sample_staleness_metrics(loss_reduced)
 
     return loss_reduced
+
+
+def _format_train_metric_key(key: str, role_tag: str) -> str:
+    """Keep actor diagnostics with dedicated schemas in their root sections."""
+    if not role_tag and key.startswith((_SAMPLE_STALENESS_PREFIX, _POLICY_LAG_PREFIX)):
+        return key
+    return f"train/{role_tag}{key}"
 
 
 def log_train_step(
@@ -528,14 +621,14 @@ def log_train_step(
     role_tag = "" if role == "actor" else f"{role}-"
 
     log_dict_out = {
-        f"train/{role_tag}{key}": val.mean().item() if isinstance(val, torch.Tensor) else val
+        _format_train_metric_key(key, role_tag): val.mean().item() if isinstance(val, torch.Tensor) else val
         for key, val in loss_dict.items()
     }
     log_dict_out[f"train/{role_tag}grad_norm"] = float(grad_norm)
 
     if extra_metrics:
         for key, val in extra_metrics.items():
-            log_dict_out[f"train/{role_tag}{key}"] = val
+            log_dict_out[_format_train_metric_key(key, role_tag)] = val
 
     log_dict_out["train/step"] = accumulated_step_id
 

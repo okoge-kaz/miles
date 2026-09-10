@@ -54,3 +54,19 @@ def test_secondary_wandb_init_uses_extended_init_timeout(monkeypatch):
     assert settings.x_primary is False
     assert settings.x_update_finish_state is False
     assert settings.init_timeout == 300.0
+
+
+def test_metric_namespaces_use_their_declared_step_axes(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        wandb_utils.wandb,
+        "define_metric",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    wandb_utils._init_wandb_common()
+
+    for step_metric, prefixes in wandb_utils._STEP_METRIC_PREFIXES.items():
+        assert ((step_metric,), {}) in calls
+        for prefix in prefixes:
+            assert ((f"{prefix}/*",), {"step_metric": step_metric}) in calls

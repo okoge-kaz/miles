@@ -17,6 +17,8 @@ from miles.ray.rollout.train_data_conversion import (
     split_train_data_by_dp_raw,
     split_train_data_by_dp_scheduled_raw,
 )
+from miles.rollout.partial_rollout_telemetry import START_ROLLOUT_ID_KEY, collect_partial_rollout_staleness_metrics
+from miles.rollout.recycle_compute_metrics import SAMPLE_REFERENCE_VERSION_KEY, TRAIN_VERSION_KEY
 from miles.utils import object_store
 from miles.utils.sampling_mask import RolloutSamplingMask
 from miles.utils.types import Sample, WeightVersionSpan, WeightVersionsPerCall
@@ -105,6 +107,69 @@ class TestConvertSamplesToTrainData:
             custom_reward_post_process_func=None,
         )
         assert out["truncated"][0] == 1
+        assert out["loss_masks"][0] == [1, 1, 1, 1]
+
+    def test_zero_loss_on_truncated_keeps_reward_in_group_baseline(self):
+        args = make_args(
+            n_samples_per_prompt=2,
+            rollout_batch_size=1,
+            rewards_normalization=True,
+            zero_loss_on_truncated=True,
+        )
+        samples = make_samples_grouped(n_groups=1, group_size=2, rewards=[0.0, 1.0])
+        samples[1].status = Sample.Status.TRUNCATED
+
+        out = convert_samples_to_train_data(
+            args,
+            samples,
+            metadata={},
+            custom_convert_samples_to_train_data_func=None,
+            custom_reward_post_process_func=None,
+        )
+
+        assert out["raw_reward"] == [0.0, 1.0]
+        assert out["rewards"] == pytest.approx([-0.5, 0.5])
+        assert out["loss_masks"] == [[1, 1, 1, 1], [0, 0, 0, 0]]
+
+    def test_policy_lag_preserves_pre_zero_loss_mask(self):
+        args = make_args(
+            rewards_normalization=False,
+            zero_loss_on_truncated=True,
+            log_policy_lag_metrics=True,
+        )
+        completed = make_sample(response_length=3, status=Sample.Status.COMPLETED)
+        completed.loss_mask = [1, 0, 1]
+        truncated = make_sample(response_length=3, status=Sample.Status.TRUNCATED)
+        truncated.loss_mask = [1, 0, 1]
+
+        out = convert_samples_to_train_data(
+            args,
+            [completed, truncated],
+            metadata={},
+            custom_convert_samples_to_train_data_func=None,
+            custom_reward_post_process_func=None,
+        )
+
+        assert out["loss_masks"] == [[1, 0, 1], [0, 0, 0]]
+        assert out["policy_lag_initial_loss_masks"] == [[1, 0, 1], [1, 0, 1]]
+
+    def test_policy_lag_without_zero_loss_adds_no_rollout_payload(self):
+        args = make_args(
+            rewards_normalization=False,
+            zero_loss_on_truncated=False,
+            log_policy_lag_metrics=True,
+        )
+        sample = make_sample(response_length=3, status=Sample.Status.TRUNCATED)
+
+        out = convert_samples_to_train_data(
+            args,
+            [sample],
+            metadata={},
+            custom_convert_samples_to_train_data_func=None,
+            custom_reward_post_process_func=None,
+        )
+
+        assert "policy_lag_initial_loss_masks" not in out
 
     def test_optional_field_rollout_log_probs_passed_through(self):
         args = make_args(rewards_normalization=False)
@@ -168,6 +233,80 @@ class TestConvertSamplesToTrainData:
             custom_reward_post_process_func=None,
         )
         assert out["round_number"][0] == 7
+
+    def test_sample_staleness_is_derived_from_lifecycle_versions(self):
+        args = make_args(
+            rewards_normalization=False,
+            log_sample_staleness_metrics=True,
+        )
+        samples = [make_sample(), make_sample()]
+        for sample, reference in zip(samples, (3, 5), strict=True):
+            sample.metadata[SAMPLE_REFERENCE_VERSION_KEY] = reference
+            sample.metadata[TRAIN_VERSION_KEY] = 8
+        out = convert_samples_to_train_data(
+            args,
+            samples,
+            metadata={},
+            custom_convert_samples_to_train_data_func=None,
+            custom_reward_post_process_func=None,
+        )
+        assert out["sample_staleness"] == [5, 3]
+
+    def test_partial_rollout_boundary_age_reaches_trainer_data(self):
+        args = make_args(
+            rewards_normalization=False,
+            log_sample_staleness_metrics=True,
+        )
+        fresh = make_sample()
+        retained = make_sample()
+        retained.metadata[START_ROLLOUT_ID_KEY] = 3
+        collect_partial_rollout_staleness_metrics([[fresh], [retained]], rollout_id=5)
+
+        out = convert_samples_to_train_data(
+            args,
+            [fresh, retained],
+            metadata={},
+            custom_convert_samples_to_train_data_func=None,
+            custom_reward_post_process_func=None,
+        )
+
+        assert out["sample_staleness"] == [0, 2]
+
+    def test_sample_staleness_is_not_sent_to_trainer_when_diagnostics_are_off(self):
+        args = make_args(
+            rewards_normalization=False,
+            log_sample_staleness_metrics=False,
+            dump_details=None,
+        )
+        sample = make_sample()
+        sample.metadata[SAMPLE_REFERENCE_VERSION_KEY] = 3
+        sample.metadata[TRAIN_VERSION_KEY] = 8
+
+        out = convert_samples_to_train_data(
+            args,
+            [sample],
+            metadata={},
+            custom_convert_samples_to_train_data_func=None,
+            custom_reward_post_process_func=None,
+        )
+
+        assert "sample_staleness" not in out
+
+    def test_sample_staleness_is_omitted_when_provenance_is_incomplete(self):
+        args = make_args(
+            rewards_normalization=False,
+            log_sample_staleness_metrics=True,
+        )
+        sample = make_sample()
+        sample.metadata[TRAIN_VERSION_KEY] = 8
+        out = convert_samples_to_train_data(
+            args,
+            [sample],
+            metadata={},
+            custom_convert_samples_to_train_data_func=None,
+            custom_reward_post_process_func=None,
+        )
+        assert "sample_staleness" not in out
 
     def test_optional_field_raw_reward_overridden_from_metadata(self):
         args = make_args(rewards_normalization=False)
@@ -806,6 +945,7 @@ class TestSplitTrainDataRaw:
             "tokens": [[1, 2], [3, 4], [5, 6], [7, 8]],
             "response_lengths": [1, 1, 1, 1],
             "loss_masks": [[0, 1], [0, 1], [0, 1], [0, 1]],
+            "policy_lag_initial_loss_masks": [[1], [1], [1], [1]],
             "rollout_indexer_topk": [torch.tensor([i]) for i in range(4)],
             "opd_reverse_kl": [[float(i)] for i in range(4)],
         }
@@ -819,6 +959,7 @@ class TestSplitTrainDataRaw:
         for part in result:
             assert len(part["rollout_indexer_topk"]) == 2
             assert len(part["opd_reverse_kl"]) == 2
+            assert len(part["policy_lag_initial_loss_masks"]) == 2
 
     def test_no_witness_ids_when_absent(self) -> None:
         tokens = [[1, 2], [3, 4]]

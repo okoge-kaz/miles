@@ -254,6 +254,42 @@ def run_all(args, parallel_state, inputs):
 # ---------------------------------------------------------------------------
 
 
+_ADDED_DIAGNOSTIC_KEYS = {
+    "policy_rollout_kl",
+    "policy_rollout_abs_diff",
+    "policy_rollout_token_ess",
+    "rollout_token_level_ess",
+    "_policy_seq_ess_sum_w",
+    "_policy_seq_ess_sum_w2",
+    "_policy_seq_ess_n",
+    "_seq_ess_sum_w",
+    "_seq_ess_sum_w2",
+    "_seq_ess_n",
+}
+
+
+def _project_legacy_diagnostics(outputs, saved_outputs):
+    """Keep frozen loss/gradient coverage when explicitly named metrics are added.
+
+    New ESS/lag values have their own tests. Do not regenerate the old numeric
+    snapshots or weaken their tolerance on architectures with different math.
+    Unexpected extra metrics still fail the strict comparison below.
+    """
+    outputs = deep_clone(outputs)
+    metrics = outputs["loss_fn"]["metrics"]
+    saved_metrics = saved_outputs["loss_fn"]["metrics"]
+    for key in _ADDED_DIAGNOSTIC_KEYS - saved_metrics.keys():
+        metrics.pop(key, None)
+    dispatcher = outputs["loss_function_dispatcher"]
+    saved_keys = saved_outputs["loss_function_dispatcher"]["log_dict_keys"]
+    excluded = _ADDED_DIAGNOSTIC_KEYS - set(saved_keys)
+    keys = dispatcher["log_dict_keys"]
+    keep = [i for i, key in enumerate(keys) if key not in excluded]
+    dispatcher["log_dict_keys"] = [keys[i] for i in keep]
+    dispatcher["log_dict_values"] = dispatcher["log_dict_values"][[0, *[i + 1 for i in keep]]]
+    return outputs
+
+
 @pytest.mark.parametrize("config", CONFIGS, ids=[c[0] for c in CONFIGS])
 class TestLossSnapshot:
 
@@ -289,4 +325,4 @@ class TestLossSnapshot:
             saved_inputs, saved_outputs = load_snapshot(path)
             saved_args = args_from_dict(saved_inputs["args_dict"])
             outputs = run_all(saved_args, parallel_state, saved_inputs)
-            assert_outputs_equal(outputs, saved_outputs)
+            assert_outputs_equal(_project_legacy_diagnostics(outputs, saved_outputs), saved_outputs)

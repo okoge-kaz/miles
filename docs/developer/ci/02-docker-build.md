@@ -35,7 +35,7 @@ The Dockerfile is the build recipe: it provides the cu13 defaults and emits one 
 
 ## Build script
 
-`docker/build.py` builds and pushes the images. Select a build with `--variant` and a tag mode with `--image-tag {dev,latest,custom}`. The `VARIANTS` table is the source of truth for each variant's image, target platforms, Dockerfile, and default build-args. Repeatable `--build-arg KEY=VALUE` options are appended after those defaults, so an explicit caller override wins.
+`docker/build.py` builds and pushes the images. Select a build with `--variant` and a tag mode with `--image-tag {dev,latest,custom}`. The `VARIANTS` table is the source of truth for each variant's image, target platforms, Dockerfile, and default build-args. Optional `--sglang-repo`, `--sglang-branch`, and `--sglang-commit` select an experiment's SGLang source; leaving them empty preserves the Dockerfile defaults. Repeatable `--build-arg KEY=VALUE` options are appended after those defaults and source options, so an explicit caller override wins.
 
 
 | `--variant`    | Tag (`--image-tag dev`)            | Platforms                     | Notes                                          |

@@ -379,10 +379,15 @@ class SGLangApiClient:
         response.raise_for_status()
         return response
 
-    async def begin_weight_update(self, selector: str = "all", sync_base: bool = True):
+    async def begin_weight_update(
+        self, selector: str = "all", sync_base: bool = True, weight_version: str | None = None
+    ):
         """Open a weight-update session on the engine. sync_base=False declares an
         adapter-only session (no quant unpack; base tensors rejected)."""
-        return await self._make_request("begin_weight_update", {"selector": selector, "sync_base": sync_base})
+        payload = {"selector": selector, "sync_base": sync_base}
+        if weight_version is not None:
+            payload["weight_version"] = weight_version
+        return await self._make_request("begin_weight_update", payload)
 
     async def end_weight_update(self, expected_lora_checksums=None):
         """Close the weight-update session: re-finalize base weights (sync_base

@@ -17,7 +17,7 @@ def compute_advantages(
     args: Namespace,
     kl: list[torch.Tensor],
     rewards: list[float],
-    log_probs: list[torch.Tensor],
+    log_probs: list[torch.Tensor] | None,
     loss_masks: list[torch.Tensor],
     total_lengths: list[int],
     response_lengths: list[int],

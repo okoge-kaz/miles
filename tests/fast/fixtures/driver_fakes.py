@@ -23,7 +23,7 @@ class FakeRolloutExecutor:
         self.dispose = FakeRemoteMethod(self._dispose)
         self.report_eval_skip = FakeRemoteMethod(self._report_eval_skip)
 
-    async def _get(self, rollout_id: int) -> dict[str, Any]:
+    async def _get(self, rollout_id: int, *, updates_before_train: int = 0) -> dict[str, Any]:
         self.events.append(f"generate_start:{rollout_id}")
         if (gate := self.generation_gates.get(rollout_id)) is not None:
             await gate.wait()
@@ -88,7 +88,9 @@ class FakeTrainingModel:
         self.train_started[rollout_id].set()
         return f"{self.role}-values-{rollout_id}"
 
-    async def save_model(self, rollout_id: int, force_sync: bool = False) -> None:
+    async def save_model(
+        self, rollout_id: int, force_sync: bool = False, *, write_dist: bool = True, write_hf: bool = True
+    ) -> None:
         self.events.append(f"{self.role}_save:{rollout_id}")
         self.saved.append(rollout_id)
 

@@ -90,6 +90,45 @@ async def test_add_worker_posts_the_worker_payload_on_the_modern_api(client, rec
     assert kwargs["json"] == {"url": WORKER_URL, "worker_type": "regular"}
 
 
+@pytest.mark.parametrize("ready_url", [WORKER_URL, f"{WORKER_URL}@0"])
+async def test_accepted_registration_waits_for_the_correct_healthy_worker(client, recorder, monkeypatch, ready_url):
+    from miles.backends.sglang_utils import sglang_router_api_client as api
+
+    monkeypatch.setattr(api, "ROUTER_REGISTRATION_POLL_INTERVAL_SECONDS", 0)
+    recorder.install(
+        monkeypatch,
+        responses=[
+            _FakeResponse(status_code=202),
+            _FakeResponse({"workers": []}),
+            _FakeResponse({"workers": [{"url": "http://another-worker:1234", "is_healthy": True}]}),
+            _FakeResponse({"workers": [{"url": WORKER_URL, "is_healthy": False}]}),
+            _FakeResponse({"workers": [{"url": ready_url, "is_healthy": True}]}),
+        ],
+    )
+
+    await client.add_worker(worker_url=WORKER_URL, worker_type="regular", use_legacy_api=False)
+
+    assert [verb for verb, _url, _kwargs in recorder.calls] == ["post", "get", "get", "get", "get"]
+    assert all(kwargs["timeout"] == ROUTER_REQUEST_TIMEOUT for _verb, _url, kwargs in recorder.calls)
+
+
+async def test_accepted_registration_has_a_total_deadline(client, recorder, monkeypatch):
+    from miles.backends.sglang_utils import sglang_router_api_client as api
+
+    monkeypatch.setattr(api, "ROUTER_REGISTRATION_TIMEOUT_SECONDS", 0.01)
+    recorder.install(monkeypatch, responses=[_FakeResponse(status_code=202), _FakeResponse({"workers": []})])
+
+    with pytest.raises(TimeoutError, match="accepted but did not become ready"):
+        await client.add_worker(worker_url=WORKER_URL, worker_type="regular", use_legacy_api=False)
+
+
+async def test_accepted_registration_propagates_lookup_errors(client, recorder, monkeypatch):
+    recorder.install(monkeypatch, responses=[_FakeResponse(status_code=202), _FakeResponse(status_code=503)])
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.add_worker(worker_url=WORKER_URL, worker_type="regular", use_legacy_api=False)
+
+
 async def test_add_worker_includes_the_bootstrap_port_for_prefill_workers(client, recorder):
     """PD disaggregation needs the prefill worker's bootstrap port registered with the router."""
     await client.add_worker(worker_url=WORKER_URL, worker_type="prefill", use_legacy_api=False, bootstrap_port=8998)

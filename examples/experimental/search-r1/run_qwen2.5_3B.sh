@@ -37,6 +37,7 @@ ROLLOUT_ARGS=(
    --rollout-batch-size 32
    --n-samples-per-prompt 8
    --rollout-max-response-len 512
+   --rollout-stop '</search>' '</answer>'
    --rollout-temperature 1
 
    # eval args

@@ -17,8 +17,8 @@ def vanilla_tis_function(
     `[tis_clip_low, tis_clip]` and multiply into `pg_loss`. `loss_masks` is
     passed through unchanged; metrics report the pre-clamp ratio.
     """
-    rollout_log_probs = torch.cat(rollout_log_probs, dim=0)
-    old_log_probs = torch.cat(train_log_probs, dim=0)
+    rollout_log_probs = torch.cat(rollout_log_probs, dim=0).detach()
+    old_log_probs = torch.cat(train_log_probs, dim=0).detach()
     tis = torch.exp(old_log_probs - rollout_log_probs)
     tis_abs = (torch.exp(old_log_probs - rollout_log_probs) - 1).abs()
     tis_weights = torch.clamp(tis, min=args.tis_clip_low, max=args.tis_clip)
@@ -28,6 +28,8 @@ def vanilla_tis_function(
         "tis_clipfrac": tis_clipfrac.clone().detach(),
         "tis_abs": tis_abs.clone().detach(),
     }
+    if getattr(args, "log_policy_lag_metrics", False):
+        metrics["_tis_applied_weight"] = tis_weights.detach()
     pg_loss = pg_loss * tis_weights
     return pg_loss, loss_masks, metrics
 
@@ -45,8 +47,8 @@ def icepop_function(
     `[tis_clip_low, tis_clip]` and pass the in-range ratio through unweighted.
     Same return shape as `vanilla_tis_function`.
     """
-    rollout_log_probs = torch.cat(rollout_log_probs, dim=0)
-    old_log_probs = torch.cat(train_log_probs, dim=0)
+    rollout_log_probs = torch.cat(rollout_log_probs, dim=0).detach()
+    old_log_probs = torch.cat(train_log_probs, dim=0).detach()
     ice_ratio = torch.exp(old_log_probs - rollout_log_probs)
     ice_abs = (torch.exp(old_log_probs - rollout_log_probs) - 1).abs()
     ice_weight = torch.where(
@@ -58,5 +60,7 @@ def icepop_function(
         "tis_clipfrac": ice_clipfrac.clone().detach(),
         "tis_abs": ice_abs.clone().detach(),
     }
+    if getattr(args, "log_policy_lag_metrics", False):
+        metrics["_tis_applied_weight"] = ice_weight.detach()
     pg_loss = pg_loss * ice_weight
     return pg_loss, loss_masks, metrics

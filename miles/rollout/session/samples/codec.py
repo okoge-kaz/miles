@@ -42,6 +42,12 @@ SAMPLES_VALUE_SPEC: dict[str, ValueSpec] = {
     "rollout_indexer_topk": ValueSpec("tensor", np.dtype(np.int32), strict=True),
     "status": ValueSpec("json"),
     "weight_versions": ValueSpec("json"),
+    "first_prefill_weight_versions": ValueSpec("json"),
+    "min_forward_weight_versions": ValueSpec("json"),
+    "max_forward_weight_versions": ValueSpec("json"),
+    "last_forward_weight_versions": ValueSpec("json"),
+    "response_weight_versions": ValueSpec("json"),
+    "response_weight_version_segments": ValueSpec("json"),
     "prefix_cache_info": ValueSpec("json"),
     "metadata": ValueSpec("json"),
 }
@@ -67,6 +73,16 @@ assert _TENSOR_FIELDS <= set(COMPUTED_FIELDS + ROLLOUT_SAMPLING_MASK_FIELDS)
 
 _SAMPLES_META_KEY = "_samples_meta"
 _OPD_STUDENT_TOP_LOGPROBS_KEY = "opd_student_top_logprobs"
+_BACKWARD_COMPAT_VERSION_FIELDS = frozenset(
+    {
+        "first_prefill_weight_versions",
+        "min_forward_weight_versions",
+        "max_forward_weight_versions",
+        "last_forward_weight_versions",
+        "response_weight_versions",
+        "response_weight_version_segments",
+    }
+)
 
 
 @dataclasses.dataclass
@@ -175,11 +191,16 @@ def decode_samples_and_merge_input_sample(
         for field in fields:
             spec = SAMPLES_VALUE_SPEC_V2[field]
             if spec.codec == "json":
-                value = sample_meta[field]
+                if field in _BACKWARD_COMPAT_VERSION_FIELDS and field not in sample_meta:
+                    value = []
+                else:
+                    value = sample_meta[field]
                 if field == "status":
                     value = Sample.Status(value)
                 elif field == "weight_versions":
                     value = [WeightVersionsPerCall.from_dicts(call) for call in value]
+                elif field in _BACKWARD_COMPAT_VERSION_FIELDS:
+                    value = list(value)
                 elif field == "prefix_cache_info":
                     value = Sample.PrefixCacheInfo.from_dict(value)
                 elif field == "reward":
@@ -226,6 +247,10 @@ def assert_input_sample_defaults(input_sample: Sample) -> None:
         f"input sample must not carry weight_versions (got {input_sample.weight_versions}); "
         "the legacy pipeline appended to it, the samples-wire overlay replaces it"
     )
+    for field in _BACKWARD_COMPAT_VERSION_FIELDS:
+        assert (
+            getattr(input_sample, field) == []
+        ), f"input sample must not carry {field} (got {getattr(input_sample, field)})"
     assert (
         input_sample.prefix_cache_info.to_dict() == Sample.PrefixCacheInfo().to_dict()
     ), f"input sample must carry a default prefix_cache_info (got {input_sample.prefix_cache_info.to_dict()})"

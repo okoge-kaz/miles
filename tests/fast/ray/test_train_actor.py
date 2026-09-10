@@ -56,6 +56,19 @@ class TestKillSelf:
 
 
 class TestSetRolloutExecutor:
+    @pytest.mark.parametrize("rank", [0, 1])
+    def test_weight_updater_wiring_keeps_parallel_config_publication(self, monkeypatch, rank):
+        monkeypatch.setattr(train_actor, "ray", SimpleNamespace(get=lambda ref: ref))
+        actor = _make_actor(rank=rank)
+        actor.weight_updater = SimpleNamespace(rollout_executor=None)
+        executor = FakeRolloutExecutor()
+
+        actor.set_rollout_executor(executor)
+
+        assert actor.weight_updater.rollout_executor is executor
+        assert executor.set_train_parallel_config.calls == ([(_TRAIN_PARALLEL_CONFIG,)] if rank == 0 else [])
+        assert actor.pop_colocate_switch_metrics() == {}
+
     def _make_executor(self, published: list[object]) -> SimpleNamespace:
         return SimpleNamespace(
             set_train_parallel_config=SimpleNamespace(remote=lambda config: published.append(config))

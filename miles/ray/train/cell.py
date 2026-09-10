@@ -91,6 +91,7 @@ class TrainerCell:
         witness_info,
         attempt: int,
         external_data: list | None = None,
+        collect_wake_up_time: bool = False,
     ) -> list:
         if external_data is not None and len(external_data) != len(self._get_worker_handles()):
             raise NonRetryableError("external_data must contain one payload per train worker")
@@ -103,6 +104,7 @@ class TrainerCell:
                 witness_info=witness_info,
                 attempt=attempt,
                 **({} if external_data is None else dict(external_data=external_data[i])),
+                **({"collect_wake_up_time": True} if collect_wake_up_time else {}),
             ),
         )
 

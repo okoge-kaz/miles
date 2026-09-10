@@ -8,6 +8,7 @@ from miles.backends.megatron_utils.ft.types import TrainStepOutcome
 from miles.ray.specs.train import compute_trainer_num_cells, compute_trainer_pool_id
 from miles.ray.train.cell import TrainerCell
 from miles.ray.train.cell_monitor import create_trainer_cell_health_checker
+from miles.ray.train.types import TrainResultWithTiming, unwrap_train_results_with_timing
 from miles.utils.async_utils import AsyncioGatherUtils
 from miles.utils.audit_utils.checksum_utils import flatten_inference_engine_checksums
 from miles.utils.audit_utils.event_analyzer import analyzer as event_analyzer
@@ -34,6 +35,21 @@ logger = logging.getLogger(__name__)
 
 _RETRY_MAX_ATTEMPTS = 30
 _CELLS_READY_TIMEOUT_SECONDS = 3600.0
+
+
+def _unwrap_cell_train_results_with_timing(results: list) -> tuple[list, float]:
+    """Unwrap worker payloads and return the maximum local timer from surviving cells."""
+    local_wake_up_times = []
+    unwrapped_results = []
+    for cell_results in results:
+        if isinstance(cell_results, BaseException):
+            unwrapped_results.append(cell_results)
+            continue
+        cell_results, cell_wake_up_time = unwrap_train_results_with_timing(cell_results)
+        unwrapped_results.append(cell_results)
+        local_wake_up_times.append(cell_wake_up_time)
+
+    return unwrapped_results, max(local_wake_up_times, default=0.0)
 
 
 class TrainerController:
@@ -159,7 +175,9 @@ class TrainerController:
 
     # ------------------------ API :: train ------------------------
 
-    async def train(self, rollout_id: int, rollout_data_pack, external_data: list | None = None) -> list:
+    async def train(
+        self, rollout_id: int, rollout_data_pack, external_data: list | None = None, collect_wake_up_time: bool = False
+    ):
         """Do one rollout training"""
 
         assert (
@@ -167,8 +185,10 @@ class TrainerController:
         ), "external_data is only supported for a single cell, i.e. without independent DP"
 
         event_analyzer.run_analysis_from_args(self.args)
+        local_wake_up_time = 0.0
 
-        async def _fn(attempt: int) -> list:
+        async def _fn(attempt: int):
+            nonlocal local_wake_up_time
             witness_info = self._allocate_witness_info(
                 rollout_id=rollout_id,
                 attempt=attempt,
@@ -177,18 +197,25 @@ class TrainerController:
 
             log_structured(logger.info, tag="ft", op="train", phase="start", rollout=rollout_id, attempt=attempt)
             await self._refresh_cells(rollout_id=rollout_id)
+            train_kwargs = dict(
+                rollout_id=rollout_id,
+                rollout_data_ref=rollout_data_pack["data_ref"],
+                witness_info=witness_info,
+                attempt=attempt,
+                external_data=external_data,
+            )
+            if collect_wake_up_time:
+                train_kwargs["collect_wake_up_time"] = True
             snapshot_alive_cells, results = await self._gather_all_alive_and_catch(
-                lambda cell: cell.train(
-                    rollout_id=rollout_id,
-                    rollout_data_ref=rollout_data_pack["data_ref"],
-                    witness_info=witness_info,
-                    attempt=attempt,
-                    external_data=external_data,
-                ),
+                lambda cell: cell.train(**train_kwargs),
                 debug_name="execute_all_alive_and_catch#train",
                 check_recoverable=False,
             )
+            if collect_wake_up_time:
+                results, attempt_wake_up_time = _unwrap_cell_train_results_with_timing(results)
             self._check_train_one_attempt(snapshot_alive_cells, results)
+            if collect_wake_up_time:
+                local_wake_up_time = attempt_wake_up_time
 
             self._log_step_end_event(
                 rollout_id=rollout_id,
@@ -207,6 +234,8 @@ class TrainerController:
 
         await self._test_action_executor.run_after_step(rollout_id=rollout_id)
 
+        if collect_wake_up_time:
+            return TrainResultWithTiming(result=worker_results, local_wake_up_time=local_wake_up_time)
         return worker_results
 
     def _allocate_witness_info(self, *, rollout_id: int, attempt: int, sample_indices):
@@ -316,11 +345,15 @@ class TrainerController:
         )
         return [item for sublist in cell_results for item in sublist]
 
-    async def save_model(self, rollout_id: int, force_sync: bool = False):
+    async def save_model(
+        self, rollout_id: int, force_sync: bool = False, *, write_dist: bool = True, write_hf: bool = True
+    ):
         """Save actor model. Only cell 0 saves to avoid file write conflicts."""
         # Catch with vanilla retry: cells w/ exceptions are auto marked errored, thus retry will find the next one
         await retry(
-            lambda _: self._execute_first_alive("save_model", rollout_id=rollout_id, force_sync=force_sync),
+            lambda _: self._execute_first_alive(
+                "save_model", rollout_id=rollout_id, force_sync=force_sync, write_dist=write_dist, write_hf=write_hf
+            ),
             max_attempts=_RETRY_MAX_ATTEMPTS,
         )
 
@@ -334,6 +367,9 @@ class TrainerController:
     async def update_weights(self, rollout_id: int | None = None) -> int | None:
         """Broadcast weights to rollout engines and answer the version they now serve."""
         log_structured(logger.info, tag="ft", op="update_weights", phase="start", rollout=rollout_id)
+        if getattr(self.args, "use_replay_buffer", False):
+            current_version = await self._rollout_executor.get_current_applied_weight_version.remote()
+            await self.restore_weight_version(current_version)
         # TODO: allow using all cells to update weights (instead of first alive cell)
         # Fetch the updatable engines once (like V1 RayActorGroup) so all
         # ranks observe a consistent engine set.
@@ -346,8 +382,17 @@ class TrainerController:
         await self._inference_controller.end_update_weights(snapshot_cell_id_to_hashes=info.snapshot_cell_id_to_hashes)
 
         await self._maybe_log_inference_engine_weight_checksums(rollout_id=rollout_id)
-
         return weight_versions[0]
+
+    async def pop_colocate_switch_metrics(self):
+        return await self._execute_first_alive("pop_colocate_switch_metrics")
+
+    async def restore_weight_version(self, version: int) -> None:
+        """Align every failover cell before the next versioned weight push."""
+        _, results = await self._execute_all_alive_and_catch("restore_weight_version", version=version)
+        errors = [result for result in results if isinstance(result, BaseException)]
+        if errors:
+            raise RuntimeError(f"Failed to restore weight version {version} on trainer cells") from errors[0]
 
     async def _maybe_log_inference_engine_weight_checksums(self, *, rollout_id: int | None) -> None:
         if not is_event_logger_initialized():
@@ -378,7 +423,9 @@ class TrainerController:
     async def offload(self):
         self._health_checker_activeness.bump_active(False)
         # Catch *without* retry: cells w/ exceptions are auto marked errored, and will not be used
-        await self._execute_all_alive_and_catch("sleep")
+        _cells, results = await self._execute_all_alive_and_catch("sleep")
+        if getattr(self.args, "log_colocate_switch_metrics", False):
+            return results
 
     async def clear_memory(self):
         # Catch *without* retry: cells w/ exceptions are auto marked errored, and will not be used

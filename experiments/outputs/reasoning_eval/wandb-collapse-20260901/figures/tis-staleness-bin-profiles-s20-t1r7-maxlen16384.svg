@@ -1,0 +1,383 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1612" height="1045" viewBox="0 0 1612 1045">
+<style>text{font-family:Arial,Helvetica,sans-serif;fill:#202020}.axis-label{font-size:13px}.tick{font-size:11px}.column-label{font-size:15px;font-weight:700}.metric-label{font-size:13px;font-weight:700}.grid{stroke:#e2e2e2;stroke-width:.8}.axis{stroke:#303030;stroke-width:1}.raw{fill:none;stroke-width:.9;opacity:.15}.smooth{fill:none;stroke-width:2.2}.reference{fill:none;stroke:#111;stroke-width:1.8;stroke-dasharray:7 4}.quantile-band{stroke:none;opacity:.04}.quantile-low{fill:none;stroke-width:1;opacity:.20}.quantile-high{fill:none;stroke-width:2.2}.reference-band{fill:#111;stroke:none;opacity:.05}.maxlen{stroke:#555;stroke-width:1.1;stroke-dasharray:4 4}.onset{stroke:#555;stroke-width:1;stroke-dasharray:3 3}.annotation{font-size:10px;fill:#8b0000;font-weight:600}.response-overlay{fill:none;stroke:#111;stroke-width:1.8;stroke-dasharray:7 3}.legend{font-size:11px}.endpoint{font-size:10px;font-weight:600}</style>
+<rect width="100%" height="100%" fill="white"/>
+<style>.token-mass{fill:none;stroke:#0072B2;stroke-width:2.1}.response-mass{fill:none;stroke:#56B4E9;stroke-width:1.8;stroke-dasharray:6 3}.contribution-mass{fill:none;stroke:#D55E00;stroke-width:2.2}.profile{fill:none;stroke:#222;stroke-width:2.2}.point{stroke:white;stroke-width:.7}.note{font-size:10px;fill:#555}</style>
+<text class="column-label" x="79.0" y="20">S=20 staleness-bin profiles: healthy, collapse transition, and stabilized treatments</text>
+<line class="token-mass" x1="79.0" y1="47" x2="106.0" y2="47"/>
+<text class="legend" x="113.0" y="51">pre-loss token mass</text>
+<line class="response-mass" x1="244.0" y1="47" x2="271.0" y2="47"/>
+<text class="legend" x="278.0" y="51">response-token mass</text>
+<line class="contribution-mass" x1="429.0" y1="47" x2="456.0" y2="47"/>
+<text class="legend" x="463.0" y="51">post-mask/TIS objective mass</text>
+<text class="note" x="79.0" y="70">Zero-loss mismatch and clip statistics condition on unmasked tokens; its mask panel shows the censored token share.</text>
+<text class="column-label" x="214.0" y="89" text-anchor="middle">zero-reward healthy · steps 91-110</text>
+<defs><clipPath id="age-0-0"><rect x="89.0" y="124.0" width="296.0" height="149.0"/></clipPath></defs>
+<line class="grid" x1="89.0" y1="273.0" x2="385.0" y2="273.0"/>
+<text class="tick" x="83.0" y="277.0" text-anchor="end">0</text>
+<line class="grid" x1="89.0" y1="235.8" x2="385.0" y2="235.8"/>
+<text class="tick" x="83.0" y="239.8" text-anchor="end">25%</text>
+<line class="grid" x1="89.0" y1="198.5" x2="385.0" y2="198.5"/>
+<text class="tick" x="83.0" y="202.5" text-anchor="end">50%</text>
+<line class="grid" x1="89.0" y1="161.2" x2="385.0" y2="161.2"/>
+<text class="tick" x="83.0" y="165.2" text-anchor="end">75%</text>
+<line class="grid" x1="89.0" y1="124.0" x2="385.0" y2="124.0"/>
+<text class="tick" x="83.0" y="128.0" text-anchor="end">100%</text>
+<line class="axis" x1="89.0" y1="124.0" x2="89.0" y2="273.0"/>
+<line class="axis" x1="89.0" y1="273.0" x2="385.0" y2="273.0"/>
+<text class="metric-label" x="237.0" y="110.0" text-anchor="middle">Age mass / objective share</text>
+<polyline class="token-mass" clip-path="url(#age-0-0)" points="89.00,271.90 138.33,248.58 187.67,252.29 237.00,242.43 286.33,236.45 335.67,247.42 385.00,262.92"/>
+<circle class="point" cx="89.00" cy="271.90" r="2.7" fill="#0072B2"/>
+<circle class="point" cx="138.33" cy="248.58" r="2.7" fill="#0072B2"/>
+<circle class="point" cx="187.67" cy="252.29" r="2.7" fill="#0072B2"/>
+<circle class="point" cx="237.00" cy="242.43" r="2.7" fill="#0072B2"/>
+<circle class="point" cx="286.33" cy="236.45" r="2.7" fill="#0072B2"/>
+<circle class="point" cx="335.67" cy="247.42" r="2.7" fill="#0072B2"/>
+<circle class="point" cx="385.00" cy="262.92" r="2.7" fill="#0072B2"/>
+<polyline class="response-mass" clip-path="url(#age-0-0)" points="89.00,271.90 138.33,248.58 187.67,252.29 237.00,242.43 286.33,236.45 335.67,247.42 385.00,262.92"/>
+<circle class="point" cx="89.00" cy="271.90" r="2.7" fill="#56B4E9"/>
+<circle class="point" cx="138.33" cy="248.58" r="2.7" fill="#56B4E9"/>
+<circle class="point" cx="187.67" cy="252.29" r="2.7" fill="#56B4E9"/>
+<circle class="point" cx="237.00" cy="242.43" r="2.7" fill="#56B4E9"/>
+<circle class="point" cx="286.33" cy="236.45" r="2.7" fill="#56B4E9"/>
+<circle class="point" cx="335.67" cy="247.42" r="2.7" fill="#56B4E9"/>
+<circle class="point" cx="385.00" cy="262.92" r="2.7" fill="#56B4E9"/>
+<polyline class="contribution-mass" clip-path="url(#age-0-0)" points="89.00,272.26 138.33,250.24 187.67,251.78 237.00,243.67 286.33,235.65 335.67,246.01 385.00,262.39"/>
+<circle class="point" cx="89.00" cy="272.26" r="2.7" fill="#D55E00"/>
+<circle class="point" cx="138.33" cy="250.24" r="2.7" fill="#D55E00"/>
+<circle class="point" cx="187.67" cy="251.78" r="2.7" fill="#D55E00"/>
+<circle class="point" cx="237.00" cy="243.67" r="2.7" fill="#D55E00"/>
+<circle class="point" cx="286.33" cy="235.65" r="2.7" fill="#D55E00"/>
+<circle class="point" cx="335.67" cy="246.01" r="2.7" fill="#D55E00"/>
+<circle class="point" cx="385.00" cy="262.39" r="2.7" fill="#D55E00"/>
+<defs><clipPath id="age-0-1"><rect x="89.0" y="357.0" width="296.0" height="149.0"/></clipPath></defs>
+<line class="grid" x1="89.0" y1="506.0" x2="385.0" y2="506.0"/>
+<text class="tick" x="83.0" y="510.0" text-anchor="end">.001</text>
+<line class="grid" x1="89.0" y1="468.8" x2="385.0" y2="468.8"/>
+<text class="tick" x="83.0" y="472.8" text-anchor="end">.01</text>
+<line class="grid" x1="89.0" y1="431.5" x2="385.0" y2="431.5"/>
+<text class="tick" x="83.0" y="435.5" text-anchor="end">.1</text>
+<line class="grid" x1="89.0" y1="394.2" x2="385.0" y2="394.2"/>
+<text class="tick" x="83.0" y="398.2" text-anchor="end">1</text>
+<line class="grid" x1="89.0" y1="357.0" x2="385.0" y2="357.0"/>
+<text class="tick" x="83.0" y="361.0" text-anchor="end">10</text>
+<line class="axis" x1="89.0" y1="357.0" x2="89.0" y2="506.0"/>
+<line class="axis" x1="89.0" y1="506.0" x2="385.0" y2="506.0"/>
+<text class="metric-label" x="237.0" y="343.0" text-anchor="middle">Mean |log pi_train - log pi_rollout|</text>
+<polyline class="profile" clip-path="url(#age-0-1)" points="89.00,487.76 138.33,477.47 187.67,465.04 237.00,458.50 286.33,459.07 335.67,460.55 385.00,470.83"/>
+<circle class="point" cx="89.00" cy="487.76" r="2.7" fill="#222222"/>
+<circle class="point" cx="138.33" cy="477.47" r="2.7" fill="#222222"/>
+<circle class="point" cx="187.67" cy="465.04" r="2.7" fill="#222222"/>
+<circle class="point" cx="237.00" cy="458.50" r="2.7" fill="#222222"/>
+<circle class="point" cx="286.33" cy="459.07" r="2.7" fill="#222222"/>
+<circle class="point" cx="335.67" cy="460.55" r="2.7" fill="#222222"/>
+<circle class="point" cx="385.00" cy="470.83" r="2.7" fill="#222222"/>
+<defs><clipPath id="age-0-2"><rect x="89.0" y="590.0" width="296.0" height="149.0"/></clipPath></defs>
+<line class="grid" x1="89.0" y1="739.0" x2="385.0" y2="739.0"/>
+<text class="tick" x="83.0" y="743.0" text-anchor="end">.0001%</text>
+<line class="grid" x1="89.0" y1="709.2" x2="385.0" y2="709.2"/>
+<text class="tick" x="83.0" y="713.2" text-anchor="end">.001%</text>
+<line class="grid" x1="89.0" y1="679.4" x2="385.0" y2="679.4"/>
+<text class="tick" x="83.0" y="683.4" text-anchor="end">.01%</text>
+<line class="grid" x1="89.0" y1="649.6" x2="385.0" y2="649.6"/>
+<text class="tick" x="83.0" y="653.6" text-anchor="end">.1%</text>
+<line class="grid" x1="89.0" y1="619.8" x2="385.0" y2="619.8"/>
+<text class="tick" x="83.0" y="623.8" text-anchor="end">1%</text>
+<line class="grid" x1="89.0" y1="590.0" x2="385.0" y2="590.0"/>
+<text class="tick" x="83.0" y="594.0" text-anchor="end">10%</text>
+<line class="axis" x1="89.0" y1="590.0" x2="89.0" y2="739.0"/>
+<line class="axis" x1="89.0" y1="739.0" x2="385.0" y2="739.0"/>
+<text class="metric-label" x="237.0" y="576.0" text-anchor="middle">TIS upper-clip fraction</text>
+<polyline class="profile" clip-path="url(#age-0-2)" points="89.00,706.58 138.33,692.62 187.67,679.26 237.00,671.03 286.33,664.74 335.67,662.33 385.00,667.13"/>
+<circle class="point" cx="89.00" cy="706.58" r="2.7" fill="#222222"/>
+<circle class="point" cx="138.33" cy="692.62" r="2.7" fill="#222222"/>
+<circle class="point" cx="187.67" cy="679.26" r="2.7" fill="#222222"/>
+<circle class="point" cx="237.00" cy="671.03" r="2.7" fill="#222222"/>
+<circle class="point" cx="286.33" cy="664.74" r="2.7" fill="#222222"/>
+<circle class="point" cx="335.67" cy="662.33" r="2.7" fill="#222222"/>
+<circle class="point" cx="385.00" cy="667.13" r="2.7" fill="#222222"/>
+<defs><clipPath id="age-0-3"><rect x="89.0" y="823.0" width="296.0" height="149.0"/></clipPath></defs>
+<line class="grid" x1="89.0" y1="972.0" x2="385.0" y2="972.0"/>
+<text class="tick" x="83.0" y="976.0" text-anchor="end">0</text>
+<line class="grid" x1="89.0" y1="934.8" x2="385.0" y2="934.8"/>
+<text class="tick" x="83.0" y="938.8" text-anchor="end">25%</text>
+<line class="grid" x1="89.0" y1="897.5" x2="385.0" y2="897.5"/>
+<text class="tick" x="83.0" y="901.5" text-anchor="end">50%</text>
+<line class="grid" x1="89.0" y1="860.2" x2="385.0" y2="860.2"/>
+<text class="tick" x="83.0" y="864.2" text-anchor="end">75%</text>
+<line class="grid" x1="89.0" y1="823.0" x2="385.0" y2="823.0"/>
+<text class="tick" x="83.0" y="827.0" text-anchor="end">100%</text>
+<text class="tick" x="89.0" y="989.0" text-anchor="middle">14</text>
+<text class="tick" x="187.7" y="989.0" text-anchor="middle">16</text>
+<text class="tick" x="286.3" y="989.0" text-anchor="middle">18</text>
+<text class="tick" x="385.0" y="989.0" text-anchor="middle">20</text>
+<line class="axis" x1="89.0" y1="823.0" x2="89.0" y2="972.0"/>
+<line class="axis" x1="89.0" y1="972.0" x2="385.0" y2="972.0"/>
+<text class="metric-label" x="237.0" y="809.0" text-anchor="middle">Initially masked response tokens in age bin</text>
+<text class="axis-label" x="237.0" y="1007.0" text-anchor="middle">sample training staleness</text>
+<polyline class="profile" clip-path="url(#age-0-3)" points="89.00,972.00 138.33,972.00 187.67,972.00 237.00,972.00 286.33,972.00 335.67,972.00 385.00,972.00"/>
+<circle class="point" cx="89.00" cy="972.00" r="2.7" fill="#222222"/>
+<circle class="point" cx="138.33" cy="972.00" r="2.7" fill="#222222"/>
+<circle class="point" cx="187.67" cy="972.00" r="2.7" fill="#222222"/>
+<circle class="point" cx="237.00" cy="972.00" r="2.7" fill="#222222"/>
+<circle class="point" cx="286.33" cy="972.00" r="2.7" fill="#222222"/>
+<circle class="point" cx="335.67" cy="972.00" r="2.7" fill="#222222"/>
+<circle class="point" cx="385.00" cy="972.00" r="2.7" fill="#222222"/>
+<text class="column-label" x="606.0" y="89" text-anchor="middle">zero-reward transition · steps 128-147</text>
+<defs><clipPath id="age-1-0"><rect x="481.0" y="124.0" width="296.0" height="149.0"/></clipPath></defs>
+<line class="grid" x1="481.0" y1="273.0" x2="777.0" y2="273.0"/>
+<text class="tick" x="475.0" y="277.0" text-anchor="end">0</text>
+<line class="grid" x1="481.0" y1="235.8" x2="777.0" y2="235.8"/>
+<text class="tick" x="475.0" y="239.8" text-anchor="end">25%</text>
+<line class="grid" x1="481.0" y1="198.5" x2="777.0" y2="198.5"/>
+<text class="tick" x="475.0" y="202.5" text-anchor="end">50%</text>
+<line class="grid" x1="481.0" y1="161.2" x2="777.0" y2="161.2"/>
+<text class="tick" x="475.0" y="165.2" text-anchor="end">75%</text>
+<line class="grid" x1="481.0" y1="124.0" x2="777.0" y2="124.0"/>
+<text class="tick" x="475.0" y="128.0" text-anchor="end">100%</text>
+<line class="axis" x1="481.0" y1="124.0" x2="481.0" y2="273.0"/>
+<line class="axis" x1="481.0" y1="273.0" x2="777.0" y2="273.0"/>
+<text class="metric-label" x="629.0" y="110.0" text-anchor="middle">Age mass / objective share</text>
+<polyline class="token-mass" clip-path="url(#age-1-0)" points="481.00,272.41 629.00,259.31 777.00,138.28"/>
+<circle class="point" cx="481.00" cy="272.41" r="2.7" fill="#0072B2"/>
+<circle class="point" cx="629.00" cy="259.31" r="2.7" fill="#0072B2"/>
+<circle class="point" cx="777.00" cy="138.28" r="2.7" fill="#0072B2"/>
+<polyline class="response-mass" clip-path="url(#age-1-0)" points="481.00,272.41 629.00,259.31 777.00,138.28"/>
+<circle class="point" cx="481.00" cy="272.41" r="2.7" fill="#56B4E9"/>
+<circle class="point" cx="629.00" cy="259.31" r="2.7" fill="#56B4E9"/>
+<circle class="point" cx="777.00" cy="138.28" r="2.7" fill="#56B4E9"/>
+<polyline class="contribution-mass" clip-path="url(#age-1-0)" points="481.00,272.64 629.00,259.49 777.00,137.87"/>
+<circle class="point" cx="481.00" cy="272.64" r="2.7" fill="#D55E00"/>
+<circle class="point" cx="629.00" cy="259.49" r="2.7" fill="#D55E00"/>
+<circle class="point" cx="777.00" cy="137.87" r="2.7" fill="#D55E00"/>
+<defs><clipPath id="age-1-1"><rect x="481.0" y="357.0" width="296.0" height="149.0"/></clipPath></defs>
+<line class="grid" x1="481.0" y1="506.0" x2="777.0" y2="506.0"/>
+<text class="tick" x="475.0" y="510.0" text-anchor="end">.001</text>
+<line class="grid" x1="481.0" y1="468.8" x2="777.0" y2="468.8"/>
+<text class="tick" x="475.0" y="472.8" text-anchor="end">.01</text>
+<line class="grid" x1="481.0" y1="431.5" x2="777.0" y2="431.5"/>
+<text class="tick" x="475.0" y="435.5" text-anchor="end">.1</text>
+<line class="grid" x1="481.0" y1="394.2" x2="777.0" y2="394.2"/>
+<text class="tick" x="475.0" y="398.2" text-anchor="end">1</text>
+<line class="grid" x1="481.0" y1="357.0" x2="777.0" y2="357.0"/>
+<text class="tick" x="475.0" y="361.0" text-anchor="end">10</text>
+<line class="axis" x1="481.0" y1="357.0" x2="481.0" y2="506.0"/>
+<line class="axis" x1="481.0" y1="506.0" x2="777.0" y2="506.0"/>
+<text class="metric-label" x="629.0" y="343.0" text-anchor="middle">Mean |log pi_train - log pi_rollout|</text>
+<polyline class="profile" clip-path="url(#age-1-1)" points="481.00,469.92 629.00,423.58 777.00,405.03"/>
+<circle class="point" cx="481.00" cy="469.92" r="2.7" fill="#222222"/>
+<circle class="point" cx="629.00" cy="423.58" r="2.7" fill="#222222"/>
+<circle class="point" cx="777.00" cy="405.03" r="2.7" fill="#222222"/>
+<defs><clipPath id="age-1-2"><rect x="481.0" y="590.0" width="296.0" height="149.0"/></clipPath></defs>
+<line class="grid" x1="481.0" y1="739.0" x2="777.0" y2="739.0"/>
+<text class="tick" x="475.0" y="743.0" text-anchor="end">.0001%</text>
+<line class="grid" x1="481.0" y1="709.2" x2="777.0" y2="709.2"/>
+<text class="tick" x="475.0" y="713.2" text-anchor="end">.001%</text>
+<line class="grid" x1="481.0" y1="679.4" x2="777.0" y2="679.4"/>
+<text class="tick" x="475.0" y="683.4" text-anchor="end">.01%</text>
+<line class="grid" x1="481.0" y1="649.6" x2="777.0" y2="649.6"/>
+<text class="tick" x="475.0" y="653.6" text-anchor="end">.1%</text>
+<line class="grid" x1="481.0" y1="619.8" x2="777.0" y2="619.8"/>
+<text class="tick" x="475.0" y="623.8" text-anchor="end">1%</text>
+<line class="grid" x1="481.0" y1="590.0" x2="777.0" y2="590.0"/>
+<text class="tick" x="475.0" y="594.0" text-anchor="end">10%</text>
+<line class="axis" x1="481.0" y1="590.0" x2="481.0" y2="739.0"/>
+<line class="axis" x1="481.0" y1="739.0" x2="777.0" y2="739.0"/>
+<text class="metric-label" x="629.0" y="576.0" text-anchor="middle">TIS upper-clip fraction</text>
+<polyline class="profile" clip-path="url(#age-1-2)" points="481.00,657.95 629.00,629.88 777.00,614.82"/>
+<circle class="point" cx="481.00" cy="657.95" r="2.7" fill="#222222"/>
+<circle class="point" cx="629.00" cy="629.88" r="2.7" fill="#222222"/>
+<circle class="point" cx="777.00" cy="614.82" r="2.7" fill="#222222"/>
+<defs><clipPath id="age-1-3"><rect x="481.0" y="823.0" width="296.0" height="149.0"/></clipPath></defs>
+<line class="grid" x1="481.0" y1="972.0" x2="777.0" y2="972.0"/>
+<text class="tick" x="475.0" y="976.0" text-anchor="end">0</text>
+<line class="grid" x1="481.0" y1="934.8" x2="777.0" y2="934.8"/>
+<text class="tick" x="475.0" y="938.8" text-anchor="end">25%</text>
+<line class="grid" x1="481.0" y1="897.5" x2="777.0" y2="897.5"/>
+<text class="tick" x="475.0" y="901.5" text-anchor="end">50%</text>
+<line class="grid" x1="481.0" y1="860.2" x2="777.0" y2="860.2"/>
+<text class="tick" x="475.0" y="864.2" text-anchor="end">75%</text>
+<line class="grid" x1="481.0" y1="823.0" x2="777.0" y2="823.0"/>
+<text class="tick" x="475.0" y="827.0" text-anchor="end">100%</text>
+<text class="tick" x="481.0" y="989.0" text-anchor="middle">18</text>
+<text class="tick" x="777.0" y="989.0" text-anchor="middle">20</text>
+<line class="axis" x1="481.0" y1="823.0" x2="481.0" y2="972.0"/>
+<line class="axis" x1="481.0" y1="972.0" x2="777.0" y2="972.0"/>
+<text class="metric-label" x="629.0" y="809.0" text-anchor="middle">Initially masked response tokens in age bin</text>
+<text class="axis-label" x="629.0" y="1007.0" text-anchor="middle">sample training staleness</text>
+<polyline class="profile" clip-path="url(#age-1-3)" points="481.00,972.00 629.00,972.00 777.00,972.00"/>
+<circle class="point" cx="481.00" cy="972.00" r="2.7" fill="#222222"/>
+<circle class="point" cx="629.00" cy="972.00" r="2.7" fill="#222222"/>
+<circle class="point" cx="777.00" cy="972.00" r="2.7" fill="#222222"/>
+<text class="column-label" x="998.0" y="89" text-anchor="middle">zero-loss late · steps 281-300</text>
+<defs><clipPath id="age-2-0"><rect x="873.0" y="124.0" width="296.0" height="149.0"/></clipPath></defs>
+<line class="grid" x1="873.0" y1="273.0" x2="1169.0" y2="273.0"/>
+<text class="tick" x="867.0" y="277.0" text-anchor="end">0</text>
+<line class="grid" x1="873.0" y1="235.8" x2="1169.0" y2="235.8"/>
+<text class="tick" x="867.0" y="239.8" text-anchor="end">25%</text>
+<line class="grid" x1="873.0" y1="198.5" x2="1169.0" y2="198.5"/>
+<text class="tick" x="867.0" y="202.5" text-anchor="end">50%</text>
+<line class="grid" x1="873.0" y1="161.2" x2="1169.0" y2="161.2"/>
+<text class="tick" x="867.0" y="165.2" text-anchor="end">75%</text>
+<line class="grid" x1="873.0" y1="124.0" x2="1169.0" y2="124.0"/>
+<text class="tick" x="867.0" y="128.0" text-anchor="end">100%</text>
+<line class="axis" x1="873.0" y1="124.0" x2="873.0" y2="273.0"/>
+<line class="axis" x1="873.0" y1="273.0" x2="1169.0" y2="273.0"/>
+<text class="metric-label" x="1021.0" y="110.0" text-anchor="middle">Age mass / objective share</text>
+<polyline class="token-mass" clip-path="url(#age-2-0)" points="873.00,273.00 1021.00,222.52 1169.00,174.48"/>
+<circle class="point" cx="873.00" cy="273.00" r="2.7" fill="#0072B2"/>
+<circle class="point" cx="1021.00" cy="222.52" r="2.7" fill="#0072B2"/>
+<circle class="point" cx="1169.00" cy="174.48" r="2.7" fill="#0072B2"/>
+<polyline class="response-mass" clip-path="url(#age-2-0)" points="873.00,273.00 1021.00,230.35 1169.00,166.66"/>
+<circle class="point" cx="873.00" cy="273.00" r="2.7" fill="#56B4E9"/>
+<circle class="point" cx="1021.00" cy="230.35" r="2.7" fill="#56B4E9"/>
+<circle class="point" cx="1169.00" cy="166.66" r="2.7" fill="#56B4E9"/>
+<polyline class="contribution-mass" clip-path="url(#age-2-0)" points="873.00,273.00 1021.00,238.93 1169.00,158.07"/>
+<circle class="point" cx="873.00" cy="273.00" r="2.7" fill="#D55E00"/>
+<circle class="point" cx="1021.00" cy="238.93" r="2.7" fill="#D55E00"/>
+<circle class="point" cx="1169.00" cy="158.07" r="2.7" fill="#D55E00"/>
+<defs><clipPath id="age-2-1"><rect x="873.0" y="357.0" width="296.0" height="149.0"/></clipPath></defs>
+<line class="grid" x1="873.0" y1="506.0" x2="1169.0" y2="506.0"/>
+<text class="tick" x="867.0" y="510.0" text-anchor="end">.001</text>
+<line class="grid" x1="873.0" y1="468.8" x2="1169.0" y2="468.8"/>
+<text class="tick" x="867.0" y="472.8" text-anchor="end">.01</text>
+<line class="grid" x1="873.0" y1="431.5" x2="1169.0" y2="431.5"/>
+<text class="tick" x="867.0" y="435.5" text-anchor="end">.1</text>
+<line class="grid" x1="873.0" y1="394.2" x2="1169.0" y2="394.2"/>
+<text class="tick" x="867.0" y="398.2" text-anchor="end">1</text>
+<line class="grid" x1="873.0" y1="357.0" x2="1169.0" y2="357.0"/>
+<text class="tick" x="867.0" y="361.0" text-anchor="end">10</text>
+<line class="axis" x1="873.0" y1="357.0" x2="873.0" y2="506.0"/>
+<line class="axis" x1="873.0" y1="506.0" x2="1169.0" y2="506.0"/>
+<text class="metric-label" x="1021.0" y="343.0" text-anchor="middle">Mean |log pi_train - log pi_rollout|</text>
+<polyline class="profile" clip-path="url(#age-2-1)" points="873.00,506.00 1021.00,459.26 1169.00,457.91"/>
+<circle class="point" cx="873.00" cy="506.00" r="2.7" fill="#222222"/>
+<circle class="point" cx="1021.00" cy="459.26" r="2.7" fill="#222222"/>
+<circle class="point" cx="1169.00" cy="457.91" r="2.7" fill="#222222"/>
+<defs><clipPath id="age-2-2"><rect x="873.0" y="590.0" width="296.0" height="149.0"/></clipPath></defs>
+<line class="grid" x1="873.0" y1="739.0" x2="1169.0" y2="739.0"/>
+<text class="tick" x="867.0" y="743.0" text-anchor="end">.0001%</text>
+<line class="grid" x1="873.0" y1="709.2" x2="1169.0" y2="709.2"/>
+<text class="tick" x="867.0" y="713.2" text-anchor="end">.001%</text>
+<line class="grid" x1="873.0" y1="679.4" x2="1169.0" y2="679.4"/>
+<text class="tick" x="867.0" y="683.4" text-anchor="end">.01%</text>
+<line class="grid" x1="873.0" y1="649.6" x2="1169.0" y2="649.6"/>
+<text class="tick" x="867.0" y="653.6" text-anchor="end">.1%</text>
+<line class="grid" x1="873.0" y1="619.8" x2="1169.0" y2="619.8"/>
+<text class="tick" x="867.0" y="623.8" text-anchor="end">1%</text>
+<line class="grid" x1="873.0" y1="590.0" x2="1169.0" y2="590.0"/>
+<text class="tick" x="867.0" y="594.0" text-anchor="end">10%</text>
+<line class="axis" x1="873.0" y1="590.0" x2="873.0" y2="739.0"/>
+<line class="axis" x1="873.0" y1="739.0" x2="1169.0" y2="739.0"/>
+<text class="metric-label" x="1021.0" y="576.0" text-anchor="middle">TIS upper-clip fraction</text>
+<polyline class="profile" clip-path="url(#age-2-2)" points="873.00,715.56 1021.00,698.77 1169.00,699.24"/>
+<circle class="point" cx="873.00" cy="715.56" r="2.7" fill="#222222"/>
+<circle class="point" cx="1021.00" cy="698.77" r="2.7" fill="#222222"/>
+<circle class="point" cx="1169.00" cy="699.24" r="2.7" fill="#222222"/>
+<defs><clipPath id="age-2-3"><rect x="873.0" y="823.0" width="296.0" height="149.0"/></clipPath></defs>
+<line class="grid" x1="873.0" y1="972.0" x2="1169.0" y2="972.0"/>
+<text class="tick" x="867.0" y="976.0" text-anchor="end">0</text>
+<line class="grid" x1="873.0" y1="934.8" x2="1169.0" y2="934.8"/>
+<text class="tick" x="867.0" y="938.8" text-anchor="end">25%</text>
+<line class="grid" x1="873.0" y1="897.5" x2="1169.0" y2="897.5"/>
+<text class="tick" x="867.0" y="901.5" text-anchor="end">50%</text>
+<line class="grid" x1="873.0" y1="860.2" x2="1169.0" y2="860.2"/>
+<text class="tick" x="867.0" y="864.2" text-anchor="end">75%</text>
+<line class="grid" x1="873.0" y1="823.0" x2="1169.0" y2="823.0"/>
+<text class="tick" x="867.0" y="827.0" text-anchor="end">100%</text>
+<text class="tick" x="873.0" y="989.0" text-anchor="middle">18</text>
+<text class="tick" x="1169.0" y="989.0" text-anchor="middle">20</text>
+<line class="axis" x1="873.0" y1="823.0" x2="873.0" y2="972.0"/>
+<line class="axis" x1="873.0" y1="972.0" x2="1169.0" y2="972.0"/>
+<text class="metric-label" x="1021.0" y="809.0" text-anchor="middle">Initially masked response tokens in age bin</text>
+<text class="axis-label" x="1021.0" y="1007.0" text-anchor="middle">sample training staleness</text>
+<polyline class="profile" clip-path="url(#age-2-3)" points="873.00,972.00 1021.00,955.83 1169.00,919.10"/>
+<circle class="point" cx="873.00" cy="972.00" r="2.7" fill="#222222"/>
+<circle class="point" cx="1021.00" cy="955.83" r="2.7" fill="#222222"/>
+<circle class="point" cx="1169.00" cy="919.10" r="2.7" fill="#222222"/>
+<text class="column-label" x="1390.0" y="89" text-anchor="middle">staleness-aware late · steps 241-260</text>
+<defs><clipPath id="age-3-0"><rect x="1265.0" y="124.0" width="296.0" height="149.0"/></clipPath></defs>
+<line class="grid" x1="1265.0" y1="273.0" x2="1561.0" y2="273.0"/>
+<text class="tick" x="1259.0" y="277.0" text-anchor="end">0</text>
+<line class="grid" x1="1265.0" y1="235.8" x2="1561.0" y2="235.8"/>
+<text class="tick" x="1259.0" y="239.8" text-anchor="end">25%</text>
+<line class="grid" x1="1265.0" y1="198.5" x2="1561.0" y2="198.5"/>
+<text class="tick" x="1259.0" y="202.5" text-anchor="end">50%</text>
+<line class="grid" x1="1265.0" y1="161.2" x2="1561.0" y2="161.2"/>
+<text class="tick" x="1259.0" y="165.2" text-anchor="end">75%</text>
+<line class="grid" x1="1265.0" y1="124.0" x2="1561.0" y2="124.0"/>
+<text class="tick" x="1259.0" y="128.0" text-anchor="end">100%</text>
+<line class="axis" x1="1265.0" y1="124.0" x2="1265.0" y2="273.0"/>
+<line class="axis" x1="1265.0" y1="273.0" x2="1561.0" y2="273.0"/>
+<text class="metric-label" x="1413.0" y="110.0" text-anchor="middle">Age mass / objective share</text>
+<polyline class="token-mass" clip-path="url(#age-3-0)" points="1265.00,272.15 1413.00,216.32 1561.00,181.54"/>
+<circle class="point" cx="1265.00" cy="272.15" r="2.7" fill="#0072B2"/>
+<circle class="point" cx="1413.00" cy="216.32" r="2.7" fill="#0072B2"/>
+<circle class="point" cx="1561.00" cy="181.54" r="2.7" fill="#0072B2"/>
+<polyline class="response-mass" clip-path="url(#age-3-0)" points="1265.00,272.15 1413.00,216.32 1561.00,181.54"/>
+<circle class="point" cx="1265.00" cy="272.15" r="2.7" fill="#56B4E9"/>
+<circle class="point" cx="1413.00" cy="216.32" r="2.7" fill="#56B4E9"/>
+<circle class="point" cx="1561.00" cy="181.54" r="2.7" fill="#56B4E9"/>
+<polyline class="contribution-mass" clip-path="url(#age-3-0)" points="1265.00,272.58 1413.00,222.85 1561.00,174.58"/>
+<circle class="point" cx="1265.00" cy="272.58" r="2.7" fill="#D55E00"/>
+<circle class="point" cx="1413.00" cy="222.85" r="2.7" fill="#D55E00"/>
+<circle class="point" cx="1561.00" cy="174.58" r="2.7" fill="#D55E00"/>
+<defs><clipPath id="age-3-1"><rect x="1265.0" y="357.0" width="296.0" height="149.0"/></clipPath></defs>
+<line class="grid" x1="1265.0" y1="506.0" x2="1561.0" y2="506.0"/>
+<text class="tick" x="1259.0" y="510.0" text-anchor="end">.001</text>
+<line class="grid" x1="1265.0" y1="468.8" x2="1561.0" y2="468.8"/>
+<text class="tick" x="1259.0" y="472.8" text-anchor="end">.01</text>
+<line class="grid" x1="1265.0" y1="431.5" x2="1561.0" y2="431.5"/>
+<text class="tick" x="1259.0" y="435.5" text-anchor="end">.1</text>
+<line class="grid" x1="1265.0" y1="394.2" x2="1561.0" y2="394.2"/>
+<text class="tick" x="1259.0" y="398.2" text-anchor="end">1</text>
+<line class="grid" x1="1265.0" y1="357.0" x2="1561.0" y2="357.0"/>
+<text class="tick" x="1259.0" y="361.0" text-anchor="end">10</text>
+<line class="axis" x1="1265.0" y1="357.0" x2="1265.0" y2="506.0"/>
+<line class="axis" x1="1265.0" y1="506.0" x2="1561.0" y2="506.0"/>
+<text class="metric-label" x="1413.0" y="343.0" text-anchor="middle">Mean |log pi_train - log pi_rollout|</text>
+<polyline class="profile" clip-path="url(#age-3-1)" points="1265.00,480.22 1413.00,456.98 1561.00,455.80"/>
+<circle class="point" cx="1265.00" cy="480.22" r="2.7" fill="#222222"/>
+<circle class="point" cx="1413.00" cy="456.98" r="2.7" fill="#222222"/>
+<circle class="point" cx="1561.00" cy="455.80" r="2.7" fill="#222222"/>
+<defs><clipPath id="age-3-2"><rect x="1265.0" y="590.0" width="296.0" height="149.0"/></clipPath></defs>
+<line class="grid" x1="1265.0" y1="739.0" x2="1561.0" y2="739.0"/>
+<text class="tick" x="1259.0" y="743.0" text-anchor="end">.0001%</text>
+<line class="grid" x1="1265.0" y1="709.2" x2="1561.0" y2="709.2"/>
+<text class="tick" x="1259.0" y="713.2" text-anchor="end">.001%</text>
+<line class="grid" x1="1265.0" y1="679.4" x2="1561.0" y2="679.4"/>
+<text class="tick" x="1259.0" y="683.4" text-anchor="end">.01%</text>
+<line class="grid" x1="1265.0" y1="649.6" x2="1561.0" y2="649.6"/>
+<text class="tick" x="1259.0" y="653.6" text-anchor="end">.1%</text>
+<line class="grid" x1="1265.0" y1="619.8" x2="1561.0" y2="619.8"/>
+<text class="tick" x="1259.0" y="623.8" text-anchor="end">1%</text>
+<line class="grid" x1="1265.0" y1="590.0" x2="1561.0" y2="590.0"/>
+<text class="tick" x="1259.0" y="594.0" text-anchor="end">10%</text>
+<line class="axis" x1="1265.0" y1="590.0" x2="1265.0" y2="739.0"/>
+<line class="axis" x1="1265.0" y1="739.0" x2="1561.0" y2="739.0"/>
+<text class="metric-label" x="1413.0" y="576.0" text-anchor="middle">TIS upper-clip fraction</text>
+<polyline class="profile" clip-path="url(#age-3-2)" points="1265.00,709.06 1413.00,690.52 1561.00,694.36"/>
+<circle class="point" cx="1265.00" cy="709.06" r="2.7" fill="#222222"/>
+<circle class="point" cx="1413.00" cy="690.52" r="2.7" fill="#222222"/>
+<circle class="point" cx="1561.00" cy="694.36" r="2.7" fill="#222222"/>
+<defs><clipPath id="age-3-3"><rect x="1265.0" y="823.0" width="296.0" height="149.0"/></clipPath></defs>
+<line class="grid" x1="1265.0" y1="972.0" x2="1561.0" y2="972.0"/>
+<text class="tick" x="1259.0" y="976.0" text-anchor="end">0</text>
+<line class="grid" x1="1265.0" y1="934.8" x2="1561.0" y2="934.8"/>
+<text class="tick" x="1259.0" y="938.8" text-anchor="end">25%</text>
+<line class="grid" x1="1265.0" y1="897.5" x2="1561.0" y2="897.5"/>
+<text class="tick" x="1259.0" y="901.5" text-anchor="end">50%</text>
+<line class="grid" x1="1265.0" y1="860.2" x2="1561.0" y2="860.2"/>
+<text class="tick" x="1259.0" y="864.2" text-anchor="end">75%</text>
+<line class="grid" x1="1265.0" y1="823.0" x2="1561.0" y2="823.0"/>
+<text class="tick" x="1259.0" y="827.0" text-anchor="end">100%</text>
+<text class="tick" x="1265.0" y="989.0" text-anchor="middle">18</text>
+<text class="tick" x="1561.0" y="989.0" text-anchor="middle">20</text>
+<line class="axis" x1="1265.0" y1="823.0" x2="1265.0" y2="972.0"/>
+<line class="axis" x1="1265.0" y1="972.0" x2="1561.0" y2="972.0"/>
+<text class="metric-label" x="1413.0" y="809.0" text-anchor="middle">Initially masked response tokens in age bin</text>
+<text class="axis-label" x="1413.0" y="1007.0" text-anchor="middle">sample training staleness</text>
+<polyline class="profile" clip-path="url(#age-3-3)" points="1265.00,972.00 1413.00,972.00 1561.00,972.00"/>
+<circle class="point" cx="1265.00" cy="972.00" r="2.7" fill="#222222"/>
+<circle class="point" cx="1413.00" cy="972.00" r="2.7" fill="#222222"/>
+<circle class="point" cx="1561.00" cy="972.00" r="2.7" fill="#222222"/>
+</svg>

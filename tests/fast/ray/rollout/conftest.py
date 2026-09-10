@@ -36,6 +36,7 @@ def make_args(**overrides: Any) -> Namespace:
         over_sampling_batch_size=None,
         rollout_global_dataset=False,
         num_rollout=1,
+        fully_async=False,
         update_weights_interval=1,
         check_weight_update_equal=False,
         check_weight_update_skip_list=None,
@@ -58,6 +59,7 @@ def make_args(**overrides: Any) -> Namespace:
         log_reward_category=None,
         log_passrate=False,
         pin_rollout_manager_to_head=False,
+        zero_loss_on_truncated=False,
         # placement / colocation
         debug_train_only=False,
         debug_rollout_only=False,

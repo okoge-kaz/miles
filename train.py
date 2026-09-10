@@ -1,10 +1,12 @@
 import asyncio
 import logging
 import os
+import time
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 
 from miles.ray.placement_group import create_rollout_components, create_training_models, update_weights
+from miles.ray.train.types import TrainResultWithTiming
 from miles.ray.wiring import launch_worker_manager
 from miles.utils import object_store
 from miles.utils.arguments import parse_args
@@ -15,10 +17,94 @@ from miles.utils.ft_utils.api_server.server import start_api_server
 from miles.utils.ft_utils.mini_ft_controller import maybe_start_mini_ft_controller
 from miles.utils.logging_utils import configure_logger
 from miles.utils.lora import lora_rollout_enabled
-from miles.utils.misc import should_run_periodic_action
+from miles.utils.metric_utils import compute_rollout_step
+from miles.utils.misc import checkpoint_artifacts_due, should_run_periodic_action
 from miles.utils.tracking_utils.tracking import finish_tracking, init_tracking
+from miles.utils.tracking_utils.tracking import log as log_tracking
 
 logger = logging.getLogger(__name__)
+
+
+async def _train_model(
+    model,
+    rollout_id: int,
+    rollout_data_pack,
+    *,
+    external_data=None,
+    collect_wake_up_time: bool = False,
+) -> tuple[object, float]:
+    train_kwargs = {} if external_data is None else {"external_data": external_data}
+    if collect_wake_up_time:
+        train_kwargs["collect_wake_up_time"] = True
+    result = await model.train(rollout_id, rollout_data_pack, **train_kwargs)
+    if not collect_wake_up_time:
+        return result, 0.0
+    if not isinstance(result, TrainResultWithTiming):
+        raise TypeError("Timed train calls must return TrainResultWithTiming")
+    return result.result, result.local_wake_up_time
+
+
+def _log_colocate_switch_metrics(
+    args,
+    rollout_id: int,
+    *,
+    rollout_offload_block_time: float,
+    local_wake_up_time: float,
+    trainer_offload_block_time: float,
+    rollout_weight_onload_block_time: float,
+    weight_update_block_time: float,
+    rollout_kv_onload_block_time: float,
+    train_to_rollout_block_time: float,
+    worker_metrics: dict[str, int | float] | None = None,
+) -> None:
+    """Log colocated switch components on the rollout that incurred them.
+
+    ``rollout_to_train_active_time`` is a component sum, not an end-to-end
+    wall time: the wake-up component is the maximum worker-local duration and
+    excludes train-group refresh and Ray dispatch latency. With a critic, it
+    ends when the first trainer (the critic) is ready.
+    ``train_to_rollout_block_time`` starts after checkpoint saves, so any
+    earlier per-model offloads are excluded. Its four component timers use the
+    same driver clock and retain the existing control flow.
+    """
+    rollout_to_train_active_time = rollout_offload_block_time + local_wake_up_time
+    metrics = {
+        "perf/colocate/rollout_offload_block_time": rollout_offload_block_time,
+        "perf/colocate/rollout_to_train_active_time": rollout_to_train_active_time,
+        "perf/colocate/trainer_offload_block_time": trainer_offload_block_time,
+        "perf/colocate/rollout_weight_onload_block_time": rollout_weight_onload_block_time,
+        "perf/colocate/weight_update_block_time": weight_update_block_time,
+        "perf/colocate/rollout_kv_onload_block_time": rollout_kv_onload_block_time,
+        "perf/colocate/train_to_rollout_block_time": train_to_rollout_block_time,
+        "perf/colocate/switch_total_active_time": rollout_to_train_active_time + train_to_rollout_block_time,
+        "rollout/step": compute_rollout_step(args, rollout_id),
+    }
+    if worker_metrics:
+        metrics.update(worker_metrics)
+    logger.info("colocate switch %d: %s", rollout_id, metrics)
+    log_tracking(args, metrics, step_key="rollout/step")
+
+
+def _summarize_colocate_worker_metrics(*results) -> dict[str, int | float]:
+    """Summarize opt-in worker scalars already returned by blocking Ray calls."""
+    values_by_name: dict[str, list[int | float]] = {}
+    stack = list(results)
+    while stack:
+        value = stack.pop()
+        if isinstance(value, dict):
+            for name, metric_value in value.items():
+                if isinstance(metric_value, (int, float)) and not isinstance(metric_value, bool):
+                    values_by_name.setdefault(name, []).append(metric_value)
+        elif isinstance(value, (list, tuple)):
+            stack.extend(value)
+
+    metrics: dict[str, int | float] = {}
+    for name, values in values_by_name.items():
+        prefix = f"perf/colocate/{name}"
+        metrics[f"{prefix}_max"] = max(values)
+        if name.endswith("_bytes"):
+            metrics[f"{prefix}_sum"] = sum(values)
+    return metrics
 
 
 async def train(args):
@@ -28,6 +114,7 @@ async def train(args):
     _worker_manager = launch_worker_manager(args)
     object_store.init_instance(args, contribute_segment=False)
     init_tracking(args)
+    collect_switch_metrics = args.log_colocate_switch_metrics
 
     if args.colocate_memory_peak_device == "gpu":
         assert (
@@ -75,19 +162,19 @@ async def train(args):
 
     async def offload_train():
         if args.use_critic:
-            return
+            return []
         if args.offload_train:
-            await actor_model.offload()
+            return await actor_model.offload()
         else:
-            await actor_model.clear_memory()
+            return await actor_model.clear_memory()
 
-    async def save(rollout_id, force_sync=False):
+    async def save(rollout_id, force_sync=False, *, write_dist=True, write_hf=True):
         force_sync = force_sync or rollout_id == args.num_rollout - 1
 
         async def save_training_model(model):
             if args.use_critic and args.offload_train:
                 await model.onload()
-            await model.save_model(rollout_id, force_sync=force_sync)
+            await model.save_model(rollout_id, force_sync=force_sync, write_dist=write_dist, write_hf=write_hf)
             if args.use_critic and args.offload_train:
                 await model.offload()
 
@@ -95,7 +182,9 @@ async def train(args):
             await save_training_model(actor_model)
         if args.use_critic:
             await save_training_model(critic_model)
-        await rollout_executor.save.remote(rollout_id)
+        # Buffer state is only meaningful next to a resumable checkpoint.
+        if write_dist:
+            await rollout_executor.save.remote(rollout_id)
 
     # train loop.
     # note that for async training, one can change the position of the sync operation(ray.get).
@@ -107,6 +196,8 @@ async def train(args):
         await inference_controller.prepare_rollout(rollout_id)
         rollout_data_pack = await rollout_executor.get.remote(rollout_id)
 
+        rollout_offload_block_time = 0.0
+        rollout_offload_start = time.monotonic() if collect_switch_metrics else None
         if args.offload_rollout:
             if args.colocate_memory_peak_device == "gpu":
                 await inference_controller.offload_kv()
@@ -119,40 +210,110 @@ async def train(args):
                 if "weight" in args.offload_rollout_level:
                     offload_tags.append(GPU_MEMORY_TYPE_WEIGHTS)
                 await inference_controller.offload(tags=offload_tags)
+        if args.offload_rollout and rollout_offload_start is not None:
+            rollout_offload_block_time = time.monotonic() - rollout_offload_start
 
+        local_wake_up_time = 0.0
         if args.use_critic:
-            values = await critic_model.train(rollout_id, rollout_data_pack)
+            # The critic is the first trainer that blocks the rollout-to-train switch.
+            values, local_wake_up_time = await _train_model(
+                critic_model,
+                rollout_id,
+                rollout_data_pack,
+                collect_wake_up_time=collect_switch_metrics,
+            )
             if args.offload_train:
                 await critic_model.offload()
             if rollout_id >= args.num_critic_only_steps:
-                await actor_model.train(rollout_id, rollout_data_pack, external_data=values)
+                await _train_model(
+                    actor_model,
+                    rollout_id,
+                    rollout_data_pack,
+                    external_data=values,
+                )
                 if args.offload_train:
                     await actor_model.offload()
         else:
-            await actor_model.train(rollout_id, rollout_data_pack)
+            _, local_wake_up_time = await _train_model(
+                actor_model,
+                rollout_id,
+                rollout_data_pack,
+                collect_wake_up_time=collect_switch_metrics,
+            )
         remove_rollout_data_refs(args, rollout_data_pack)
 
         external_save = args.save_trigger_sentinel is not None and os.path.exists(args.save_trigger_sentinel)
-        if external_save or should_run_periodic_action(
-            rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout
-        ):
-            await save(rollout_id, force_sync=external_save)
+        write_dist, write_hf = checkpoint_artifacts_due(
+            rollout_id,
+            save_interval=args.save_interval,
+            hf_save_interval=args.hf_save_interval,
+            num_rollout_per_epoch=num_rollout_per_epoch,
+            num_rollout=args.num_rollout,
+            external_save=external_save,
+        )
+        if write_dist or write_hf:
+            await save(rollout_id, force_sync=external_save, write_dist=write_dist, write_hf=write_hf)
             if external_save:
                 os.remove(args.save_trigger_sentinel)
 
+        trainer_offload_block_time = 0.0
+        rollout_weight_onload_block_time = 0.0
+        weight_update_block_time = 0.0
+        rollout_kv_onload_block_time = 0.0
+
+        train_to_rollout_start = time.monotonic() if collect_switch_metrics else None
+        trainer_offload_worker_metrics = None
         if args.colocate_memory_peak_device == "gpu":
             await actor_model.clear_memory()
             if lora_rollout_enabled(args):
                 await actor_model.offload_grad_buffer()
+            phase_start = time.monotonic() if collect_switch_metrics else None
             await inference_controller.onload_weights()
-            await offload_train()
+            if phase_start is not None:
+                rollout_weight_onload_block_time = time.monotonic() - phase_start
+            phase_start = time.monotonic() if collect_switch_metrics else None
+            trainer_offload_worker_metrics = await offload_train()
+            if phase_start is not None:
+                trainer_offload_block_time = time.monotonic() - phase_start
         else:
-            await offload_train()
+            phase_start = time.monotonic() if collect_switch_metrics else None
+            trainer_offload_worker_metrics = await offload_train()
+            if phase_start is not None:
+                trainer_offload_block_time = time.monotonic() - phase_start
             if args.offload_rollout:
+                phase_start = time.monotonic() if collect_switch_metrics else None
                 await inference_controller.onload_weights()
+                if phase_start is not None:
+                    rollout_weight_onload_block_time = time.monotonic() - phase_start
+        phase_start = time.monotonic() if collect_switch_metrics else None
         await update_weights(actor_model, rollout_executor, rollout_id=rollout_id)
+        weight_update_worker_metrics = (
+            await actor_model.pop_colocate_switch_metrics() if collect_switch_metrics else None
+        )
+        if phase_start is not None:
+            weight_update_block_time = time.monotonic() - phase_start
         if args.offload_rollout:
+            phase_start = time.monotonic() if collect_switch_metrics else None
             await inference_controller.onload_kv()
+            if phase_start is not None:
+                rollout_kv_onload_block_time = time.monotonic() - phase_start
+        if train_to_rollout_start is not None:
+            train_to_rollout_block_time = time.monotonic() - train_to_rollout_start
+            _log_colocate_switch_metrics(
+                args,
+                rollout_id,
+                rollout_offload_block_time=rollout_offload_block_time,
+                local_wake_up_time=local_wake_up_time,
+                trainer_offload_block_time=trainer_offload_block_time,
+                rollout_weight_onload_block_time=rollout_weight_onload_block_time,
+                weight_update_block_time=weight_update_block_time,
+                rollout_kv_onload_block_time=rollout_kv_onload_block_time,
+                train_to_rollout_block_time=train_to_rollout_block_time,
+                worker_metrics=_summarize_colocate_worker_metrics(
+                    trainer_offload_worker_metrics,
+                    weight_update_worker_metrics,
+                ),
+            )
 
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
             await inference_controller.prepare_eval()

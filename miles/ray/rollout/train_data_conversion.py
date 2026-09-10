@@ -3,6 +3,7 @@ from typing import Any
 
 import torch
 
+from miles.rollout.recycle_compute_metrics import SAMPLE_REFERENCE_VERSION_KEY, TRAIN_VERSION_KEY
 from miles.utils import object_store
 from miles.utils.dp_schedule import build_dp_schedule, has_full_schedule_config
 from miles.utils.multi_lora import is_multi_lora_enabled
@@ -16,6 +17,7 @@ logger = logging.getLogger(__name__)
 ROLLOUT_DATA_TENSOR_DTYPES = {
     "tokens": "int32",
     "loss_masks": "int32",
+    "policy_lag_initial_loss_masks": "uint8",
     "rollout_log_probs": "float32",
     "rollout_sampling_mask_ids": "int32",
     "rollout_sampling_mask_offsets": "int64",
@@ -27,6 +29,7 @@ ROLLOUT_DATA_TENSOR_DTYPES = {
 
 ROLLOUT_DATA_VALUE_SPEC: dict[str, ValueSpec] = {
     **{field: ValueSpec(codec="typed_ragged") for field in ROLLOUT_DATA_TENSOR_DTYPES},
+    "policy_lag_initial_loss_masks": ValueSpec(codec="typed_ragged", dtype="uint8"),
     "partition": ValueSpec(codec="ndarray", dtype="int64"),
     "seq_witness_ids": ValueSpec(codec="ndarray", dtype="int64"),
     "response_lengths": ValueSpec(codec="ndarray", dtype="int64"),
@@ -36,10 +39,19 @@ ROLLOUT_DATA_VALUE_SPEC: dict[str, ValueSpec] = {
     "sample_indices": ValueSpec(codec="ndarray", dtype="int64"),
     "rollout_ids": ValueSpec(codec="ndarray", dtype="int64"),
     "rollout_mask_sums": ValueSpec(codec="ndarray", dtype="int64"),
+    "sample_group_indices": ValueSpec(codec="ndarray", dtype="int64"),
+    "generation_attempt_numbers": ValueSpec(codec="ndarray", dtype="int64"),
+    "training_steps": ValueSpec(codec="ndarray", dtype="int64"),
+    "sample_staleness": ValueSpec(codec="ndarray", dtype="int64"),
     "multimodal_train_inputs": ValueSpec(codec="ragged_tensor_dict"),
     "prompt": ValueSpec(codec="msgpack_ragged"),
     "metadata": ValueSpec(codec="msgpack_ragged"),
     "weight_versions": ValueSpec(codec="msgpack_ragged"),
+    "first_prefill_weight_versions": ValueSpec(codec="msgpack_ragged"),
+    "min_forward_weight_versions": ValueSpec(codec="msgpack_ragged"),
+    "max_forward_weight_versions": ValueSpec(codec="msgpack_ragged"),
+    "last_forward_weight_versions": ValueSpec(codec="msgpack_ragged"),
+    "response_weight_versions": ValueSpec(codec="msgpack_ragged"),
     "raw_reward": ValueSpec(codec="auto"),
     "total_lengths": ValueSpec(codec="auto"),
     "dynamic_global_batch_size": ValueSpec(codec="auto"),
@@ -83,10 +95,47 @@ def convert_samples_to_train_data(
         "sample_indices": [sample.index for sample in samples],
         "rollout_ids": [s.rollout_id if s.rollout_id is not None else s.index for s in samples],
     }
+    if getattr(args, "dump_details", None) is not None:
+        if all(sample.group_index is not None for sample in samples):
+            train_data["sample_group_indices"] = [sample.group_index for sample in samples]
+        train_data["generation_attempt_numbers"] = [sample.retry_count for sample in samples]
+        if (training_step := metadata.get("training_step")) is not None:
+            train_data["training_steps"] = [int(training_step)] * len(samples)
+
+    require_staleness = getattr(args, "use_staleness_aware_loss", False)
+    if (
+        getattr(args, "log_sample_staleness_metrics", False)
+        or getattr(args, "dump_details", None) is not None
+        or require_staleness
+    ):
+        staleness_rows = []
+        for sample in samples:
+            reference = sample.metadata.get(SAMPLE_REFERENCE_VERSION_KEY)
+            train_version = sample.metadata.get(TRAIN_VERSION_KEY)
+            if not isinstance(reference, int) or not isinstance(train_version, int):
+                if require_staleness:
+                    raise RuntimeError(
+                        "--use-staleness-aware-loss requires complete per-sample "
+                        f"training-staleness provenance; sample {sample.index} is missing a weight version"
+                    )
+                staleness_rows = []
+                break
+            if train_version < reference:
+                raise RuntimeError(
+                    f"Negative sample staleness for sample {sample.index}: "
+                    f"train={train_version}, reference={reference}"
+                )
+            staleness_rows.append(train_version - reference)
+        if staleness_rows:
+            train_data["sample_staleness"] = staleness_rows
 
     # loss mask
     # TODO: compress the loss mask
     loss_masks = []
+    policy_lag_initial_loss_masks = []
+    preserve_policy_lag_zero_loss_inputs = getattr(args, "log_policy_lag_metrics", False) and getattr(
+        args, "zero_loss_on_truncated", False
+    )
     for sample in samples:
         # always instantiate loss_mask if not provided
         if sample.loss_mask is None:
@@ -95,10 +144,20 @@ def convert_samples_to_train_data(
         assert (
             len(sample.loss_mask) == sample.response_length
         ), f"loss mask length {len(sample.loss_mask)} != response length {sample.response_length}"
+        initial_loss_mask = list(sample.loss_mask)
         if sample.remove_sample:
+            initial_loss_mask = [0] * sample.response_length
+        zero_truncated_loss = (
+            getattr(args, "zero_loss_on_truncated", False) and sample.status == Sample.Status.TRUNCATED
+        )
+        if sample.remove_sample or zero_truncated_loss:
             sample.loss_mask = [0] * sample.response_length
         loss_masks.append(sample.loss_mask)
+        if preserve_policy_lag_zero_loss_inputs:
+            policy_lag_initial_loss_masks.append(initial_loss_mask)
     train_data["loss_masks"] = loss_masks
+    if preserve_policy_lag_zero_loss_inputs:
+        train_data["policy_lag_initial_loss_masks"] = policy_lag_initial_loss_masks
 
     train_data["rollout_mask_sums"] = _compute_rollout_mask_sums(train_data["rollout_ids"], loss_masks)
 
@@ -147,6 +206,15 @@ def convert_samples_to_train_data(
 
     if any(sample.weight_versions for sample in samples):
         train_data["weight_versions"] = [[call.to_dicts() for call in sample.weight_versions] for sample in samples]
+    for field in (
+        "first_prefill_weight_versions",
+        "min_forward_weight_versions",
+        "max_forward_weight_versions",
+        "last_forward_weight_versions",
+        "response_weight_versions",
+    ):
+        if any(getattr(sample, field) for sample in samples):
+            train_data[field] = [getattr(sample, field) for sample in samples]
 
     if samples[0].teacher_log_probs is not None:
         train_data["teacher_log_probs"] = [sample.teacher_log_probs for sample in samples]
@@ -382,10 +450,15 @@ def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, An
             "rewards",
             "truncated",
             "loss_masks",
+            "policy_lag_initial_loss_masks",
             "round_number",
             "sample_indices",
             "rollout_ids",
             "rollout_mask_sums",
+            "sample_group_indices",
+            "generation_attempt_numbers",
+            "training_steps",
+            "sample_staleness",
             "rollout_log_probs",
             "rollout_sampling_mask_ids",
             "rollout_sampling_mask_offsets",
@@ -396,6 +469,11 @@ def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, An
             "opd_reverse_kl",
             "seq_witness_ids",
             "weight_versions",
+            "first_prefill_weight_versions",
+            "min_forward_weight_versions",
+            "max_forward_weight_versions",
+            "last_forward_weight_versions",
+            "response_weight_versions",
             "adapter_slots",
         ]:
             if key not in data:

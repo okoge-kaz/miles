@@ -4,7 +4,6 @@ from typing import Any, Literal
 
 import numpy as np
 
-
 REPETITION_WINDOW_SIZE_CHARS = 10_000
 REPETITION_WINDOW_STRIDE_CHARS = 5_000
 # has_repetition runs synchronously on the rollout executor's event loop, so
@@ -66,10 +65,20 @@ def _estimate_pass_at_k(num_samples, num_correct, k):
 
 
 def compute_statistics(values: list[float]) -> dict[str, float]:
+    """Summary of one per-sample quantity, as scalars the trackers can take.
+
+    Carries the upper tail, not just mean/median/max: for response length the tail
+    is what decides how many weight versions a single generation spans, and a
+    lone outlier moves ``max`` without saying whether the tail is heavy. ``max``
+    alone cannot distinguish a distribution with one long sample from one where a
+    tenth of the batch is long.
+    """
     values = np.array(values)
     return {
         "mean": np.mean(values).item(),
         "median": np.median(values).item(),
+        "p90": np.percentile(values, 90).item(),
+        "p99": np.percentile(values, 99).item(),
         "max": np.max(values).item(),
         "min": np.min(values).item(),
     }

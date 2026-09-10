@@ -1,0 +1,87 @@
+{
+  "exclude_after_resume": 10,
+  "figures_directory": "experiments/outputs/reasoning_eval/staleness-ratio-sweep/sr-20260819-212906/analysis/partial-424-20260825-1009/pipeline-balance/figures",
+  "fits": {
+    "fit_staleness": 8,
+    "rollout_fit": {
+      "intercept": 0.8323936253909154,
+      "observations": 3,
+      "r_squared": 0.8742229951312793,
+      "slope": 1.6954710868133636
+    },
+    "rollout_fit_excludes_capacity_censored_points": true,
+    "rollout_model": "tau_R(R) = 1 / groups_per_second(R) = slope / R + intercept",
+    "training_fit": {
+      "intercept": 7.620756332690888,
+      "observations": 4,
+      "r_squared": 0.9991200429753582,
+      "slope": 221.2370134647076
+    },
+    "training_model": "train_seconds(T) = slope / T + intercept"
+  },
+  "history_csv": "experiments/outputs/reasoning_eval/staleness-ratio-sweep/sr-20260819-212906/analysis/partial-424-20260825-1009/staleness/training-history.csv",
+  "rate_warning": "Rows without throughput/generated_groups_per_second use a token-rate proxy. That proxy is selection-sensitive when generated sample length is unavailable.",
+  "ratio_candidates": [
+    {
+      "predicted_effective_staleness_cap": 7.10987111405822,
+      "predicted_linear_growth_per_training_step": 0.09846221927511278,
+      "predicted_natural_staleness": 1.901537780724887,
+      "predicted_optimizer_updates_per_hour": 15.730293986465835,
+      "predicted_rollout_groups_per_second": 0.9305755460818836,
+      "predicted_train_compute_seconds": 228.85776979739848,
+      "predicted_training_staleness_or_cap": 7.10987111405822,
+      "ratio": "1:7",
+      "recommended_for_throughput": 0,
+      "rho": 1.1092158547098754,
+      "rollout_nodes": 7,
+      "staleness_regime": "cap-limited",
+      "trainer_nodes": 1
+    },
+    {
+      "predicted_effective_staleness_cap": 7.208333333333333,
+      "predicted_linear_growth_per_training_step": 0.0,
+      "predicted_natural_staleness": 2.0,
+      "predicted_optimizer_updates_per_hour": 16.816563687732614,
+      "predicted_rollout_groups_per_second": 0.8968833966790728,
+      "predicted_train_compute_seconds": 118.23926306504468,
+      "predicted_training_staleness_or_cap": 2.0,
+      "ratio": "2:6",
+      "recommended_for_throughput": 1,
+      "rho": 0.5523272493677485,
+      "rollout_nodes": 6,
+      "staleness_regime": "rollout-limited stationary",
+      "trainer_nodes": 2
+    },
+    {
+      "predicted_effective_staleness_cap": 7.208333333333333,
+      "predicted_linear_growth_per_training_step": 0.0,
+      "predicted_natural_staleness": 2.0,
+      "predicted_optimizer_updates_per_hour": 16.005287733868435,
+      "predicted_rollout_groups_per_second": 0.8536153458063166,
+      "predicted_train_compute_seconds": 81.36642748759341,
+      "predicted_training_staleness_or_cap": 2.0,
+      "ratio": "3:5",
+      "recommended_for_throughput": 0,
+      "rho": 0.36174807883774285,
+      "rollout_nodes": 5,
+      "staleness_regime": "rollout-limited stationary",
+      "trainer_nodes": 3
+    },
+    {
+      "predicted_effective_staleness_cap": 7.208333333333333,
+      "predicted_linear_growth_per_training_step": 0.0,
+      "predicted_natural_staleness": 2.0,
+      "predicted_optimizer_updates_per_hour": 14.925237727887614,
+      "predicted_rollout_groups_per_second": 0.7960126788206727,
+      "predicted_train_compute_seconds": 62.930009698867785,
+      "predicted_training_staleness_or_cap": 2.0,
+      "ratio": "4:4",
+      "recommended_for_throughput": 0,
+      "rho": 0.26090148749274306,
+      "rollout_nodes": 4,
+      "staleness_regime": "rollout-limited stationary",
+      "trainer_nodes": 4
+    }
+  ],
+  "window": 50
+}

@@ -154,9 +154,11 @@ class TrainRayActor(NodeProbeMixin):
         os._exit(1)
 
     def clear_memory(self):
-        print_memory("before TrainRayActor.clear_memory")
+        if getattr(self.args, "log_memory_usage", False):
+            print_memory("before TrainRayActor.clear_memory")
         clear_memory()
-        print_memory("after TrainRayActor.clear_memory")
+        if getattr(self.args, "log_memory_usage", False):
+            print_memory("after TrainRayActor.clear_memory")
 
     @abc.abstractmethod
     def sleep(self, tags):
@@ -167,11 +169,11 @@ class TrainRayActor(NodeProbeMixin):
         raise NotImplementedError
 
     @abc.abstractmethod
-    def train(self, rollout_id, rollout_data_ref, external_data=None):
+    def train(self, rollout_id, rollout_data_ref, external_data=None, collect_wake_up_time: bool = False):
         raise NotImplementedError
 
     @abc.abstractmethod
-    def save_model(self, rollout_id, force_sync=False):
+    def save_model(self, rollout_id, force_sync=False, *, write_dist=True, write_hf=True):
         raise NotImplementedError
 
     def export_hf(self, rollout_id: int, path: str) -> None:
@@ -188,5 +190,10 @@ class TrainRayActor(NodeProbeMixin):
 
     def set_rollout_executor(self, rollout_executor):
         self.rollout_executor = rollout_executor
+        if hasattr(self, "weight_updater"):
+            self.weight_updater.rollout_executor = rollout_executor
         if self.args.rank == 0:
             ray.get(self.rollout_executor.set_train_parallel_config.remote(self.train_parallel_config))
+
+    def pop_colocate_switch_metrics(self) -> dict[str, int | float]:
+        return {}

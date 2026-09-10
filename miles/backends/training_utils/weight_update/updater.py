@@ -10,6 +10,7 @@ import logging
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
 
+import ray
 import torch
 import torch.distributed as dist
 from tqdm import tqdm
@@ -65,6 +66,8 @@ class WeightUpdater:
         )
         self.weights_getter = weights_getter
         self.weight_version = 0
+        self.rollout_executor = None
+        self._colocate_transfer_metrics: dict[str, int] = {}
         self.is_lora = is_lora
         if is_lora:
             assert lora_sync_config is not None
@@ -98,6 +101,8 @@ class WeightUpdater:
     def update_weights(self) -> None:
         """Run one weight sync: session frame + base-bucket stream + adapter pushes for LoRA."""
         protocol = self.protocol
+        track_transfer_bytes = getattr(self.args, "log_colocate_transfer_bytes", False)
+        local_payload_bytes = 0
         if not protocol.begin_sync(self.weight_version + 1, self._iter_base_buckets):
             return
         self.weight_version += 1
@@ -110,7 +115,14 @@ class WeightUpdater:
             pause_engines(self.args, protocol.rollout_engines)
             self._register_new_lora_adapters(protocol.rollout_engines, adapters)
             begin_weight_update(
-                protocol.rollout_engines, self._hf_weight_iterator.weight_update_selector, sync_base=sync_base
+                protocol.rollout_engines,
+                self._hf_weight_iterator.weight_update_selector,
+                sync_base=sync_base,
+                **(
+                    {"weight_version": self.weight_version}
+                    if getattr(self.args, "staleness_reference", None) == "prefill"
+                    else {}
+                ),
             )
         dist.barrier(group=get_gloo_group())
 
@@ -128,6 +140,8 @@ class WeightUpdater:
                 materialize=protocol.is_sender,
             ):
                 if protocol.is_sender:
+                    if track_transfer_bytes:
+                        local_payload_bytes += sum(tensor.numel() * tensor.element_size() for _, tensor in bucket)
                     if driver and checksums is not None:
                         record_lora_checksums(bucket, checksums)
                     protocol.send_bucket(bucket)
@@ -140,9 +154,17 @@ class WeightUpdater:
             if protocol.use_weight_update_session and driver:
                 end_weight_update(protocol.rollout_engines, expected_lora_checksums=checksums)
                 set_weight_version(protocol.rollout_engines, self.weight_version)
+                if self.rollout_executor is not None and getattr(self.args, "fully_async", False):
+                    ray.get(self.rollout_executor.set_applied_weight_version.remote(self.weight_version))
                 resume_engines(protocol.rollout_engines)
             dist.barrier(group=get_gloo_group())
         protocol.after_engines_resumed()
+        if track_transfer_bytes:
+            self._colocate_transfer_metrics = {"weight_update_payload_bytes": local_payload_bytes}
+
+    def pop_colocate_transfer_metrics(self) -> dict[str, int]:
+        metrics, self._colocate_transfer_metrics = self._colocate_transfer_metrics, {}
+        return metrics
 
     def _iter_base_buckets(self, *, materialize: bool):
         return self._hf_weight_iterator.iter_hf_weights(self.weights_getter(), materialize=materialize)

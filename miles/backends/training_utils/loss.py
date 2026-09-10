@@ -8,11 +8,53 @@ from miles.backends.training_utils.loss_hub.logit_processors import get_log_prob
 from miles.backends.training_utils.loss_hub.losses import get_loss_function
 from miles.backends.training_utils.loss_hub.math_utils import compute_approx_kl
 from miles.backends.training_utils.loss_hub.opd import apply_opd_kl_to_advantages
+from miles.backends.training_utils.loss_hub.policy_lag_metrics import POLICY_LAG_PART_PREFIX
+from miles.backends.training_utils.loss_hub.tis_population_metrics import TIS_POPULATION_PART_PREFIX
 from miles.backends.training_utils.parallel import get_parallel_state
 from miles.utils.audit_utils.event_logger.logger import get_event_logger, is_event_logger_initialized
 from miles.utils.audit_utils.event_logger.models import TrainAdvantageComputationEvent
 from miles.utils.multi_lora import is_multi_lora_enabled
 from miles.utils.types import RolloutBatch
+
+_SAMPLE_STALENESS_PART_PREFIX = "_sample_staleness_part/"
+_DIAGNOSTIC_PART_PREFIXES = (
+    _SAMPLE_STALENESS_PART_PREFIX,
+    TIS_POPULATION_PART_PREFIX,
+    POLICY_LAG_PART_PREFIX,
+)
+
+
+def _pack_logging_values(
+    count: int | torch.Tensor,
+    metrics: dict[str, torch.Tensor],
+    *,
+    device: torch.device,
+) -> dict[str, list[str] | torch.Tensor]:
+    """Keep the historical vector unchanged and isolate opt-in diagnostics."""
+
+    standard_metrics = {key: value for key, value in metrics.items() if not key.startswith(_DIAGNOSTIC_PART_PREFIXES)}
+    diagnostic_metrics = {key: value for key, value in metrics.items() if key.startswith(_DIAGNOSTIC_PART_PREFIXES)}
+    detached_values = [
+        value.detach() if isinstance(value, torch.Tensor) else value for value in (count, *standard_metrics.values())
+    ]
+    packed: dict[str, list[str] | torch.Tensor] = {
+        "keys": list(standard_metrics),
+        # This is deliberately the historical packing path. Optional float64
+        # ESS parts must not change the reduction precision of existing logs.
+        "values": torch.tensor(detached_values, device=device),
+    }
+    if not diagnostic_metrics:
+        return packed
+
+    def as_scalar(value: int | float | torch.Tensor) -> torch.Tensor:
+        tensor = value.detach() if isinstance(value, torch.Tensor) else torch.as_tensor(value)
+        if tensor.numel() != 1:
+            raise ValueError(f"Training metric must be scalar, got shape {tuple(tensor.shape)}")
+        return tensor.to(device=device, dtype=torch.float64).reshape(())
+
+    packed["diagnostic_keys"] = list(diagnostic_metrics)
+    packed["diagnostic_values"] = torch.stack([as_scalar(value) for value in diagnostic_metrics.values()])
+    return packed
 
 
 def _detach_rollout_tensor_list(rollout_data: RolloutBatch, key: str) -> list[torch.Tensor] | None:
@@ -48,13 +90,28 @@ def compute_advantages_and_returns(
         args: Configuration specifying estimator type, KL coefficient,
             normalization settings, and other hyperparameters.
         rollout_data: Dict containing input lists ("log_probs", "ref_log_probs",
-            "rewards", "values", "response_lengths", "loss_masks",
-            "total_lengths"). Modified in-place to add "advantages" and
-            "returns" keys, each mapping to lists of tensors per sample.
+            "rollout_log_probs", "rewards", "values", "response_lengths",
+            "loss_masks", "total_lengths"). Modified in-place to add
+            "advantages" and "returns" keys, each mapping to lists of tensors
+            per sample.
     """
     allow_missing_log_probs = args.skip_actor_forward_only and not args.use_rollout_logprobs
     log_probs_key = "rollout_log_probs" if args.use_rollout_logprobs else "log_probs"
-    log_probs: list[torch.Tensor] = rollout_data.get(log_probs_key)
+    fused_logprobs = getattr(args, "fuse_one_step_actor_logprobs", False)
+    if fused_logprobs:
+        # GRPO with reward-level KL disabled needs only a response-aligned tensor
+        # template for zero KL. The actor anchor is created later from the
+        # gradient-enabled forward, so do not give rollout probabilities policy
+        # semantics here.
+        if not get_parallel_state().is_pp_last_stage:
+            return
+        log_probs = None
+        kl_template: list[torch.Tensor] | None = rollout_data.get("rollout_log_probs")
+    else:
+        log_probs: list[torch.Tensor] | None = rollout_data.get(
+            "rollout_log_probs" if args.use_rollout_logprobs else "log_probs"
+        )
+        kl_template = log_probs
     ref_log_probs: list[torch.Tensor] = rollout_data.get("ref_log_probs")
     rewards: list[float] = rollout_data.get("rewards")
     values: None | list[torch.Tensor] = rollout_data.get("values")
@@ -66,7 +123,7 @@ def compute_advantages_and_returns(
     # under --use-rollout-logprobs every stage holds log-probs, so ask the parallel state, not the tensors
     if not get_parallel_state().is_pp_last_stage:
         return
-    if log_probs is None and values is None and not allow_missing_log_probs:
+    if kl_template is None and values is None and not allow_missing_log_probs:
         return
 
     # This is the authoritative persistence boundary: scores produced before
@@ -75,17 +132,19 @@ def compute_advantages_and_returns(
     _detach_rollout_tensor_list(rollout_data, "rollout_log_probs")
     _detach_rollout_tensor_list(rollout_data, "ref_log_probs")
     _detach_rollout_tensor_list(rollout_data, "teacher_log_probs")
-    log_probs = rollout_data.get(log_probs_key)
+    log_probs = None if fused_logprobs else rollout_data.get(log_probs_key)
+    kl_template = rollout_data.get("rollout_log_probs") if fused_logprobs else log_probs
     ref_log_probs = rollout_data.get("ref_log_probs")
 
-    if log_probs is None and values is None:
+    if kl_template is None and values is None:
         local_masks = get_local_response_loss_masks(
             total_lengths, response_lengths, loss_masks, args.qkv_format, max_seq_lens
         )
         kl = [torch.zeros_like(mask, dtype=torch.float32) for mask in local_masks]
     elif args.kl_coef == 0 or not log_probs:
         # when kl_coef is 0, we won't compute ref_log_prob
-        xs = log_probs if log_probs is not None else values
+        xs = kl_template if kl_template is not None else values
+        assert xs is not None
         kl = [torch.zeros_like(x, dtype=torch.float32, device=x.device) for x in xs]
     else:
         kl = [
@@ -218,13 +277,11 @@ def loss_function(
     return (
         loss,
         torch.tensor(num_tokens if args.calculate_per_token_loss else 1, device=logits.device),
-        {
-            "keys": list(log.keys()),
-            "values": torch.tensor(
-                [num_samples if not args.calculate_per_token_loss else num_tokens] + list(log.values()),
-                device=logits.device,
-            ),
-        },
+        _pack_logging_values(
+            num_samples if not args.calculate_per_token_loss else num_tokens,
+            log,
+            device=logits.device,
+        ),
     )
 
 
