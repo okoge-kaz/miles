@@ -142,9 +142,21 @@ were transferred and no held-out benchmark score is claimed.
 
 The imported image contains Python 3.12.3, PyTorch 2.13.0+cu130, Ray 2.58.0 and
 SGLang `0.5.20.dev54+ga8e5c63` (`a8e5c632fe40555f720d4f2c69771ea8cf24f3c4`).
-It supports the basic weight-update request but lacks the experiment's
-`first_prefill_weight_version` provenance. Prefill-referenced staleness is
-**not qualified**. Use an explicitly compatible ARM fork/image and pass the
-prefill smoke before enabling that treatment; do not blindly install the old
-0.5.17 fork over this image. Optional evaluator images and fully-async training
-are also not yet qualified by the sync bring-up.
+Without an overlay it supports the basic weight-update request but lacks the
+experiment's `first_prefill_weight_version` provenance. Do not blindly install
+the old 0.5.17 fork over this image.
+
+On 2026-09-10, an exact-base, opt-in provenance overlay passed the real-GPU
+prefill/forward-token smoke and 336 focused tests. Four-node async jobs
+`7061490` and `7061593` then completed six updates with queue-recycle bound 2,
+prefill reference, MCore/HF saving and actual inflight replay resume. All six
+steps' raw group/sample/token lag and trainer staleness bins match their logs;
+provenance coverage is 100%, and W&B offline staleness history has no missing
+trained steps. The final eval points are present in dashboard/driver logs but
+missing from W&B offline history, an unresolved logging limit. See
+[the exact async configuration and evidence](oci-async-bringup.md).
+
+This qualifies the documented small-batch dense Qwen3 async smoke, not arbitrary
+SGLang modes or production-shape async training. The base image is unchanged,
+online W&B upload and optional evaluator images remain unqualified, and the
+remaining short/batch stages of the run ladder still apply.

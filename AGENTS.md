@@ -13,5 +13,9 @@ Use `tests/manual/run_oci_validation.sbatch` for disposable multi-node NCCL and
 regression checks. For the staged Step4000 assets, use the training/save/resume
 wrapper `tests/manual/run_oci_step4000_smoke.sbatch`; paths, commands, and results
 are in `experiments/notes/oci-step4000-bringup.md`.
+For four-node async prefill-staleness and inflight-replay qualification, use
+`tests/manual/run_oci_async_smoke.sbatch` and read
+`experiments/notes/oci-async-bringup.md`; this requires the documented opt-in
+SGLang overlay, and its W&B eval-persistence limit remains unresolved.
 See `experiments/notes/cluster-migration.md` for the exact
 qualification limits; infrastructure tests do not establish training readiness.

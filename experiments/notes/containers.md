@@ -52,7 +52,16 @@ base; it is **not** the default for current Docker builds or OCI recipes.
 SGLANG_COMMIT and starts from SQSH_IMAGE. Its output must pass the prefill
 weight-version smoke before using `STALENESS_REFERENCE=prefill`.
 
+On 2026-09-10, the pinned `a8e5c63` OCI image plus the opt-in
+`OCI_SGLANG_PROVENANCE_PATCH=1` overlay passed the real-GPU prefill/forward-token
+probe and four-node async training/save/inflight-resume checks. The helper
+`experiments/container/apply_oci_sglang_provenance.sh` verifies the exact base
+commit and applies the checked-in patch inside each writable container, before
+Ray starts. The base SQSH stays unchanged and still lacks this metadata without
+the overlay. See [async qualification](oci-async-bringup.md) for the patch digest,
+reproduction command, supported serving scope, and remaining logging limits.
+
 Do not substitute submission or completion versions while labelling results
 first-prefill. A functioning upstream GPU image alone does not establish the
 extra metadata contract. See [migration status](cluster-migration.md) for
-what was actually exercised and what still requires assets or image qualification.
+what was actually exercised and what still requires workload qualification.

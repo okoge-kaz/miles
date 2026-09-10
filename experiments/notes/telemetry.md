@@ -5,6 +5,14 @@
 > staged here. Use [cluster.md](cluster.md), [containers.md](containers.md), and
 > [cluster-migration.md](cluster-migration.md) for the current environment.
 
+> OCI async qualification (2026-09-10): the separate
+> [four-node training/save/inflight-resume check](oci-async-bringup.md) verified
+> all six trained steps' group/sample/exact-token staleness against raw dumps,
+> with 100% provenance coverage and complete W&B **offline staleness** history.
+> It does not replace the historical inventory below. Final eval points were
+> present in dashboard logs but missing from W&B offline history; online upload
+> and production-scale logging remain unqualified.
+
 The historical inventory was audited against a live async run
 (`v-3n-8t16r-r1`, job 15150858) plus an earlier job that reached an eval
 (15113756).  Later sections identify newer instrumentation and its validation
