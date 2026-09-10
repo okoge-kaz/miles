@@ -2,6 +2,10 @@
 
 set -ex
 
+if [[ "${OCI_SGLANG_PROVENANCE_PATCH:-0}" == 1 ]]; then
+   bash /root/miles/experiments/container/apply_oci_sglang_provenance.sh
+fi
+
 export PYTHONBUFFERED=16
 export HF_HOME=/root/.cache/huggingface
 export MILES_EXPERIMENTAL_ROLLOUT_REFACTOR=1

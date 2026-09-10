@@ -1,0 +1,275 @@
+diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
+index a2b4b2d..052c9d6 100644
+--- a/python/sglang/srt/managers/io_struct.py
++++ b/python/sglang/srt/managers/io_struct.py
+@@ -2034,6 +2034,7 @@ class BeginWeightUpdateReqInput(BaseReq, kw_only=True):
+     # sync), so the quant unpack/repack round-trip is skipped and a base-named
+     # tensor arriving in-session is an error.
+     sync_base: bool = True
++    weight_version: Optional[str] = None
+ 
+ 
+ class BeginWeightUpdateReqOutput(BaseReq, kw_only=True):
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index c565a06..46039fe 100755
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -2186,6 +2186,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+     dp_cooperation_info: Optional[DPCooperationInfo] = None
+     prefill_stats: Optional[PrefillStats] = None
+     forward_iter: Optional[int] = None
++    forward_weight_version: int = -1
+     launch_ts: Optional[float] = None
+     after_idle_gap: bool = False
+ 
+@@ -3572,6 +3573,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+             prefill_stats=self.prefill_stats,
+             fpm_start_time=self.fpm_start_time,
+             forward_iter=self.forward_iter,
++            forward_weight_version=self.forward_weight_version,
+             launch_ts=self.launch_ts,
+             after_idle_gap=self.after_idle_gap,
+             extend_num_tokens=self.extend_num_tokens,
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index edd55c2..b571460 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -4058,6 +4058,8 @@ class Scheduler(
+ 
+         # Run forward
+         if self.is_generation:
++            if self.server_args.enable_response_weight_version_segments:
++                self.stamp_forward_weight_version(batch)
+             if self.enable_overlap:
+                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
+                 # no-ops (ForwardBatch.init_new lazily computes the sum).
+@@ -4944,6 +4946,40 @@ class Scheduler(
+         barrier(group=self.tp_group.cpu_group)
+         return RpcReqOutput(success=success, message="" if not exec else str(exec))
+ 
++    def stamp_forward_weight_version(self, batch: ScheduleBatch) -> None:
++        """Stamp actual forwards from the scheduler's committed serving version."""
++        raw_version = get_serving().weight_version
++        version = 0 if raw_version == "default" else int(raw_version)
++        if version < 0:
++            raise ValueError("Policy provenance requires a non-negative weight version")
++        if not batch.spec_algorithm.is_none():
++            raise NotImplementedError(
++                "Policy provenance is qualified for non-speculative generation only"
++            )
++        batch.forward_weight_version = version
++        for req in batch.reqs:
++            if req.beam_group is not None:
++                raise NotImplementedError(
++                    "Policy provenance does not support beam search"
++                )
++            stats = req.time_stats
++            if (
++                batch.forward_mode.is_extend()
++                and stats.first_prefill_weight_version < 0
++            ):
++                stats.first_prefill_weight_version = version
++            if stats.min_forward_weight_version < 0:
++                stats.min_forward_weight_version = version
++                stats.max_forward_weight_version = version
++            else:
++                stats.min_forward_weight_version = min(
++                    stats.min_forward_weight_version, version
++                )
++                stats.max_forward_weight_version = max(
++                    stats.max_forward_weight_version, version
++                )
++            stats.last_forward_weight_version = version
++
+     def handle_update_weight_version(
+         self, recv_req: UpdateWeightVersionReqInput
+     ) -> UpdateWeightVersionReqOutput:
+diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+index 7e400e5..43be386 100644
+--- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
++++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+@@ -323,7 +323,14 @@ class SchedulerBatchResultProcessor:
+                         )
+                     else:
+                         # req output_ids are set here
++                        response_start = len(req.output_ids)
+                         req.output_ids.append(next_token_id)
++                        if batch.forward_weight_version >= 0:
++                            req.time_stats.record_response_weight_version_segment(
++                                response_start=response_start,
++                                response_end=len(req.output_ids),
++                                weight_version=batch.forward_weight_version,
++                            )
+ 
+                         self._maybe_update_reasoning_tokens(req, next_token_id)
+ 
+@@ -953,8 +960,15 @@ class SchedulerBatchResultProcessor:
+             next_token_id = next_token_ids[i]
+             is_spec = not batch.spec_algorithm.is_none()
+ 
++            response_start = len(req.output_ids)
+             req.output_ids.extend(next_token_id)
+             new_accept_len = len(next_token_id)
++            if batch.forward_weight_version >= 0:
++                req.time_stats.record_response_weight_version_segment(
++                    response_start=response_start,
++                    response_end=len(req.output_ids),
++                    weight_version=batch.forward_weight_version,
++                )
+ 
+             self._maybe_update_reasoning_tokens(req, next_token_id)
+             req.time_stats.set_last_decode_finish_time()
+diff --git a/python/sglang/srt/managers/scheduler_components/weight_updater.py b/python/sglang/srt/managers/scheduler_components/weight_updater.py
+index 2576ca6..064435d 100644
+--- a/python/sglang/srt/managers/scheduler_components/weight_updater.py
++++ b/python/sglang/srt/managers/scheduler_components/weight_updater.py
+@@ -403,7 +403,7 @@ class SchedulerWeightUpdaterManager:
+         self._weight_update_selector = recv_req.selector
+         self._weight_update_sync_base = recv_req.sync_base
+         self._lora_stash = {}
+-        self._weight_update_pending_version = None
++        self._weight_update_pending_version = recv_req.weight_version
+         if recv_req.sync_base:
+             for _, runner in self.get_model_runners(recv_req.selector):
+                 runner.begin_weight_update()
+diff --git a/python/sglang/srt/managers/tokenizer_control_mixin.py b/python/sglang/srt/managers/tokenizer_control_mixin.py
+index 18ee994..9a6d8df 100644
+--- a/python/sglang/srt/managers/tokenizer_control_mixin.py
++++ b/python/sglang/srt/managers/tokenizer_control_mixin.py
+@@ -482,7 +482,7 @@ class TokenizerControlMixin:
+         )
+         if success:
+             self._weight_update_session_open = True
+-            self._weight_update_pending_version = None
++            self._weight_update_pending_version = obj.weight_version
+         return success, message
+ 
+     async def end_weight_update(
+diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
+index 07cc6ed..f5a3a5f 100644
+--- a/python/sglang/srt/managers/tokenizer_manager.py
++++ b/python/sglang/srt/managers/tokenizer_manager.py
+@@ -2303,9 +2303,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                 "num_retractions": recv_obj.retraction_counts[i],
+             }
+ 
+-            if self.enable_metrics:
+-                if recv_obj.time_stats is not None:
+-                    scheduler_time_stats = recv_obj.time_stats[i]
++            if recv_obj.time_stats is not None:
++                scheduler_time_stats = recv_obj.time_stats[i]
++                if self.server_args.enable_response_weight_version_segments:
++                    meta_info.update(
++                        scheduler_time_stats.convert_to_policy_version_meta_info(
++                            recv_obj.completion_tokens[i]
++                        )
++                    )
++                    meta_info["response_weight_version"] = self.config_value(
++                        "weight_version"
++                    )
++                if self.enable_metrics:
+                     meta_info.update(scheduler_time_stats.convert_to_output_meta_info())
+ 
+             if getattr(state.obj, "return_logprob", False):
+diff --git a/python/sglang/srt/observability/req_time_stats.py b/python/sglang/srt/observability/req_time_stats.py
+index 6d32a25..0844ed6 100644
+--- a/python/sglang/srt/observability/req_time_stats.py
++++ b/python/sglang/srt/observability/req_time_stats.py
+@@ -642,18 +642,45 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
+ 
+     has_timing_data: bool = False
+ 
++    # Scheduler policy provenance is independent of optional timing metrics.
++    first_prefill_weight_version: int = -1
++    min_forward_weight_version: int = -1
++    max_forward_weight_version: int = -1
++    last_forward_weight_version: int = -1
++    response_weight_version_segments: Optional[List[List[int]]] = None
++
++    def record_response_weight_version_segment(
++        self, *, response_start: int, response_end: int, weight_version: int
++    ) -> None:
++        if response_start < 0 or response_end <= response_start or weight_version < 0:
++            raise ValueError("Invalid response policy-version boundary")
++        if self.response_weight_version_segments is None:
++            self.response_weight_version_segments = []
++        segments = self.response_weight_version_segments
++        if (
++            segments
++            and segments[-1][1] == response_start
++            and segments[-1][2] == weight_version
++        ):
++            segments[-1][1] = response_end
++        else:
++            segments.append([response_start, response_end, weight_version])
++
+     def __getstate__(self) -> object:
+         # send to detokenizer/tokenizer
+-        if not (self.enable_metrics or self.has_timing_data):
+-            return {}
+-
+-        state = {
+-            "has_timing_data": True,
+-            "wait_queue_entry_time": self.wait_queue_entry_time,
+-            "forward_entry_time": self.forward_entry_time,
+-            "prefill_finished_time": self.prefill_finished_time,
+-            "diff_realtime_monotonic": global_diff_realtime_monotonic,
+-        }
++        state = {}
++        if self.first_prefill_weight_version >= 0:
++            state.update(self.convert_to_policy_version_meta_info())
++        if self.enable_metrics or self.has_timing_data:
++            state.update(
++                {
++                    "has_timing_data": True,
++                    "wait_queue_entry_time": self.wait_queue_entry_time,
++                    "forward_entry_time": self.forward_entry_time,
++                    "prefill_finished_time": self.prefill_finished_time,
++                    "diff_realtime_monotonic": global_diff_realtime_monotonic,
++                }
++            )
+         return state
+ 
+     def set_scheduler_recv_time(self, ts=None):
+@@ -1181,6 +1208,26 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
+         )
+         return meta_data
+ 
++    def convert_to_policy_version_meta_info(
++        self, completion_tokens: Optional[int] = None
++    ):
++        meta_info = {
++            "first_prefill_weight_version": self.first_prefill_weight_version,
++            "min_forward_weight_version": self.min_forward_weight_version,
++            "max_forward_weight_version": self.max_forward_weight_version,
++            "last_forward_weight_version": self.last_forward_weight_version,
++        }
++        if self.response_weight_version_segments is not None:
++            response_end = (
++                completion_tokens if completion_tokens is not None else 1 << 63
++            )
++            meta_info["response_weight_version_segments"] = [
++                [start, min(end, response_end), version]
++                for start, end, version in self.response_weight_version_segments
++                if start < response_end and min(end, response_end) > start
++            ]
++        return meta_info
++
+     def format_duration(self, duration: float) -> str:
+         return f"{duration * 1e3:.2f}ms"
+ 
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 69bd191..db9a995 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -1332,6 +1332,10 @@ class ServerArgs:
+         "Version identifier for the model weights. Defaults to 'default' if not specified.",
+         NS("serving"),
+     ] = "default"
++    enable_response_weight_version_segments: A[
++        bool,
++        "Return scheduler first-prefill/forward provenance and exact response-token version segments (dense non-speculative generation).",
++    ] = False
+     chat_template: A[
+         Optional[str],
+         "The buliltin chat template name or the path of the chat template file. This is only used for OpenAI-compatible API server.",
