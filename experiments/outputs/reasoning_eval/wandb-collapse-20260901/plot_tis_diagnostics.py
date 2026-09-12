@@ -45,6 +45,7 @@ class Source:
     namespace: str
     treatment: str
     treatment_label: str
+    training_buffer_queue_size: int = 6000
 
 
 @dataclass(frozen=True)
@@ -55,6 +56,7 @@ class Arm:
     arm: str
     staleness: int
     dashboard_path: Path
+    training_buffer_queue_size: int = 6000
 
 
 @dataclass(frozen=True)
@@ -102,6 +104,23 @@ SOURCES = (
         "staleness-aware-safe4-t1r7-cb1c041f",
         "staleness-aware",
         "staleness-aware truncated loss",
+    ),
+    Source(
+        "zero-loss-trunc-s24-28-t1r7-step300-tbq6000-20260910-v1",
+        "zero-loss",
+        "zero loss on truncated",
+    ),
+    Source(
+        "zero-loss-trunc-s32-40-t1r7-step300-tbq8000-20260908-v1",
+        "zero-loss",
+        "zero loss on truncated",
+        training_buffer_queue_size=8000,
+    ),
+    Source(
+        "staleness-aware-loss-safe4-s32-40-t1r7-step300-tbq8000-20260908-v1",
+        "staleness-aware",
+        "staleness-aware truncated loss",
+        training_buffer_queue_size=8000,
     ),
 )
 TREATMENT_ORDER = ("zero-reward", "none", "zero-loss", "staleness-aware")
@@ -171,8 +190,10 @@ BASELINE_TRUNCATED_TOKEN_METRIC = "diagnostic/truncated_zero_loss_token_fraction
 
 
 def discover_arms() -> list[Arm]:
+    """Read the comparison cohorts, never splice independent policy-lag reruns."""
     arms: list[Arm] = []
     seen: set[tuple[str, str]] = set()
+    plotted_keys: set[tuple[str, int]] = set()
     for source in SOURCES:
         paths = TRAINING_ROOT.glob(
             f"max-weight-staleness-*-from-prefill/*-{source.namespace}-*/"
@@ -188,6 +209,10 @@ def discover_arms() -> list[Arm]:
             if key in seen:
                 raise ValueError(f"duplicate dashboard for {key}: {path}")
             seen.add(key)
+            plotted_key = (source.treatment, int(match["staleness"]))
+            if plotted_key in plotted_keys:
+                raise ValueError(f"independent runs share plot identity {plotted_key}: {path}")
+            plotted_keys.add(plotted_key)
             arms.append(
                 Arm(
                     namespace=source.namespace,
@@ -196,6 +221,7 @@ def discover_arms() -> list[Arm]:
                     arm=match["arm"],
                     staleness=int(match["staleness"]),
                     dashboard_path=path,
+                    training_buffer_queue_size=source.training_buffer_queue_size,
                 )
             )
     return sorted(arms, key=lambda arm: (TREATMENT_ORDER.index(arm.treatment), arm.staleness))
@@ -411,7 +437,9 @@ def summary_rows(
             "treatment": arm.treatment,
             "arm": arm.arm,
             "max_weight_staleness": arm.staleness,
+            "training_buffer_queue_size": arm.training_buffer_queue_size,
             "last_observed_step": last_step(metrics),
+            "last_tis_step": optional_number(max(metrics.get("train/tis_abs", {}), default=None)),
             "collapse_onset_reward_rolling5_lt_0p30": optional_number(collapse_step),
             "first_tis_abs_rolling5_ge_0p05": optional_number(tis_abs_step),
             "tis_abs_lead_to_collapse_steps": optional_number(
@@ -582,7 +610,9 @@ def scale_value(spec: MetricSpec, value: float) -> float:
     return (bounded - spec.lower) / (spec.upper - spec.lower)
 
 
-def metric_specs() -> tuple[MetricSpec, ...]:
+def metric_specs(max_staleness: int = 28) -> tuple[MetricSpec, ...]:
+    staleness_upper = 28 if max_staleness <= 28 else math.ceil(max_staleness / 10) * 10
+    staleness_ticks = tuple(staleness_upper * index / 4 for index in range(5))
     return (
         MetricSpec(
             "rollout/raw_reward",
@@ -611,10 +641,10 @@ def metric_specs() -> tuple[MetricSpec, ...]:
         MetricSpec(
             "staleness/total/mean",
             "Realized training staleness",
-            (0.0, 7.0, 14.0, 21.0, 28.0),
-            ("0", "7", "14", "21", "28"),
+            staleness_ticks,
+            tuple(f"{tick:g}" for tick in staleness_ticks),
             0.0,
-            28.0,
+            float(staleness_upper),
         ),
         MetricSpec(
             "train/tis_abs",
@@ -733,10 +763,11 @@ def append_series(
 def render_cross_treatment(
     histories: dict[tuple[str, int], dict[str, dict[int, float]]],
 ) -> str:
-    specs = metric_specs()
+    staleness_levels = sorted({staleness for _, staleness in histories})
+    specs = metric_specs(max(staleness_levels, default=28))
     panel_width, panel_height = 390.0, 170.0
     column_gap, row_gap = 10.0, 14.0
-    left, top = 18.0, 100.0
+    left, top = 18.0, 132.0
     width = int(left + len(TREATMENT_ORDER) * (panel_width + column_gap) + 18)
     height = int(top + len(specs) * (panel_height + row_gap) + 20)
     elements = svg_canvas(width, height)
@@ -753,20 +784,25 @@ def render_cross_treatment(
             f'<text class="note" x="{left + 64:.1f}" y="74">Zero-loss TIS metrics exclude initially masked truncated tokens; sequence ESS is omitted because full-response length confounds it.</text>',
         ]
     )
-    staleness_levels = sorted({staleness for _, staleness in histories})
-    legend_x = width - 88.0 * len(staleness_levels) - 22.0
+    legend_x = left + 64.0
     for index, staleness in enumerate(staleness_levels):
         item_x = legend_x + 88.0 * index
         elements.extend(
             [
-                f'<line x1="{item_x:.1f}" y1="48" x2="{item_x + 24:.1f}" y2="48" stroke="{color(staleness)}" stroke-width="2.5"/>',
-                f'<text class="legend" x="{item_x + 29:.1f}" y="52">S={staleness}</text>',
+                f'<line x1="{item_x:.1f}" y1="98" x2="{item_x + 24:.1f}" y2="98" stroke="{color(staleness)}" stroke-width="2.5"/>',
+                f'<text class="legend" x="{item_x + 29:.1f}" y="102">S={staleness}</text>',
             ]
+        )
+    if any(staleness >= 32 for staleness in staleness_levels):
+        queue_note_x = legend_x + 88.0 * len(staleness_levels) + 24.0
+        elements.append(
+            f'<text class="legend" x="{queue_note_x:.1f}" y="102">'
+            'S32/40: queue 8000; other curves: queue 6000</text>'
         )
     for column, treatment in enumerate(TREATMENT_ORDER):
         panel_x = left + column * (panel_width + column_gap)
         elements.append(
-            f'<text class="column-label" x="{panel_x + panel_width / 2:.1f}" y="93" '
+            f'<text class="column-label" x="{panel_x + panel_width / 2:.1f}" y="{top - 7:.1f}" '
             f'text-anchor="middle">{html.escape(TREATMENT_LABELS[treatment])}</text>'
         )
         treatment_keys = sorted(
@@ -799,6 +835,10 @@ def render_cross_treatment(
                 )
             for key in treatment_keys:
                 metrics = histories[key]
+                elements.append(
+                    f'<g data-treatment="{html.escape(treatment)}" data-staleness="{key[1]}" '
+                    f'data-metric="{html.escape(spec.name)}">'
+                )
                 append_series(
                     elements,
                     values=metrics.get(spec.name, {}),
@@ -816,6 +856,7 @@ def render_cross_treatment(
                         f'x2="{onset_x:.1f}" y2="{y_map(spec.lower):.1f}" '
                         f'stroke="{color(key[1])}"/>'
                     )
+                elements.append("</g>")
     elements.append("</svg>")
     return "\n".join(elements) + "\n"
 
@@ -1211,8 +1252,10 @@ def render_report(
     lines = [
         "# TIS・truncation・staleness 解析",
         "",
-        "Snapshot: 2026-09-06。ローカル `metrics.jsonl` を run 内の記録順で latest-write-wins にし、",
+        "解釈の初期snapshot: 2026-09-06。表と図は実行時点のローカル `metrics.jsonl` を run 内の記録順で latest-write-wins にし、",
         "Train:Rollout=1:7、max response length=16,384、step<=300 に限定した。太線は trailing-5 mean。",
+        "Zero-loss S24/28とzero-loss / staleness-aware S32/40も図とCSVへ含める。独立のpolicy-lag S8/12/16再実験とは接続しない。",
+        "S32/40のtraining buffer queueは8000、それ以外の本図の系列は6000。観測終了stepとqueue条件は同一ではない。",
         "",
         "## 結論",
         "",
@@ -1283,6 +1326,23 @@ def render_report(
                 )
             )
             + " |"
+        )
+    lines.extend([
+        "", "### 追加cohortの観測範囲", "",
+        "以下は未完走・評価待ちを含む学習側診断であり、downstreamの安定性を保証しない。",
+        "", "| treatment | S | queue | last logged step | last TIS step | realized stale | reward | TIS abs |",
+        "|:--|--:|--:|--:|--:|--:|--:|--:|",
+    ])
+    for row in summary:
+        if row["max_weight_staleness"] < 32 and not (
+            row["treatment"] == "zero-loss" and row["max_weight_staleness"] in (24, 28)
+        ):
+            continue
+        lines.append(
+            f"| {row['treatment']} | {row['max_weight_staleness']} | {row['training_buffer_queue_size']} "
+            f"| {row['last_observed_step']} | {row['last_tis_step']} "
+            f"| {format_optional(row['late20_realized_staleness'], 2)} "
+            f"| {format_optional(row['late20_raw_reward'])} | {format_optional(row['late20_tis_abs'])} |"
         )
     lines.extend(
         [
@@ -1423,11 +1483,17 @@ def main() -> None:
         ("zero-loss", 8),
         ("zero-loss", 16),
         ("zero-loss", 20),
+        ("zero-loss", 24),
+        ("zero-loss", 28),
+        ("zero-loss", 32),
+        ("zero-loss", 40),
         ("staleness-aware", 12),
         ("staleness-aware", 16),
         ("staleness-aware", 20),
         ("staleness-aware", 24),
         ("staleness-aware", 28),
+        ("staleness-aware", 32),
+        ("staleness-aware", 40),
     }
     missing = expected_keys - set(histories)
     if missing:

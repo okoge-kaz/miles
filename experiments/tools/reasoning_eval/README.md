@@ -167,6 +167,28 @@ reassigning, or submitting any evaluation job.
 
 ## Results and figures
 
+To refresh the schema-v1 policy-lag figures from the readable training dashboard
+logs (no W&B query or Slurm submission):
+
+```bash
+python3 experiments/tools/reasoning_eval/plot_policy_lag.py
+```
+
+Outputs are five SVG figures under
+`experiments/outputs/reasoning_eval/wandb-collapse-20260901/figures/`, plus
+`policy-lag-step-metrics.csv` and `policy-lag-coverage.json` in the parent
+directory. See `policy-lag-figures.md` there for metric definitions and coverage
+limitations. Override `--training-root` or `--output-dir` to use another location.
+`staleness-and-policy-lag-by-step-t1r7.svg` focuses on the two diagnostics versus
+training step, with realized staleness above policy-lag RMS on aligned axes.
+The renderer keeps independent reruns separate, does not smooth or interpolate
+missing steps, and does not reconstruct sensitivity from historical TIS logs.
+
+The cross-cohort refresh reads completed tasks from both Kfujii's and Hiso's
+result roots. `summarize_results.py --additional-result-study-root PATH` unions
+missing tasks; the primary root wins duplicate task identities, with no score
+averaging. A macro mean still requires all three tasks for the same checkpoint.
+
 ```bash
 experiments/scripts/reasoning_eval/show-results.sh sr-20260819-212906
 ```

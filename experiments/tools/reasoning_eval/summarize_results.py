@@ -139,22 +139,21 @@ def _collect_score(
 
 
 def _collect_records(
-    *, root: Path, protocol: str, mode: str, steps: Iterable[int]
+    *, root: Path, protocol: str, mode: str, steps: Iterable[int], additional_roots: Iterable[Path] = ()
 ) -> list[ScoreRecord]:
+    """Union completed tasks across owners; first root wins, never average reruns."""
     records: list[ScoreRecord] = []
+    roots = (root, *additional_roots)
     for arm in _expected_arms():
         for step in steps:
             for task in TASKS:
-                record = _collect_score(
-                    root=root,
-                    arm=arm,
-                    step=step,
-                    task=task,
-                    protocol=protocol,
-                    mode=mode,
-                )
-                if record is not None:
-                    records.append(record)
+                for candidate_root in roots:
+                    record = _collect_score(
+                        root=candidate_root, arm=arm, step=step, task=task, protocol=protocol, mode=mode,
+                    )
+                    if record is not None:
+                        records.append(record)
+                        break
     return records
 
 
@@ -258,6 +257,8 @@ def _render_markdown(
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--result-study-root", type=Path, required=True)
+    parser.add_argument("--additional-result-study-root", type=Path, action="append", default=[],
+                        help="Read missing completed tasks from another owner; may be repeated.")
     parser.add_argument("--protocol-name", default=DEFAULT_PROTOCOL)
     parser.add_argument("--eval-mode", choices=("smoke", "full"), default="full")
     parser.add_argument("--start-step", type=int, default=10)
@@ -275,7 +276,8 @@ def main() -> None:
     output_dir = args.output_dir or root / "analysis" / args.protocol_name / args.eval_mode
     output_dir.mkdir(parents=True, exist_ok=True)
     steps = tuple(range(args.start_step, args.end_step + 1, args.step_interval))
-    records = _collect_records(root=root, protocol=args.protocol_name, mode=args.eval_mode, steps=steps)
+    records = _collect_records(root=root, protocol=args.protocol_name, mode=args.eval_mode, steps=steps,
+                               additional_roots=args.additional_result_study_root)
     aggregates = _aggregate_records(records, steps)
     record_rows = [asdict(record) for record in records]
     score_columns = [field.name for field in ScoreRecord.__dataclass_fields__.values()]
@@ -286,6 +288,8 @@ def main() -> None:
         "schema_version": 1,
         "generated_at_utc": datetime.now(UTC).isoformat(),
         "result_study_root": str(root),
+        "additional_result_study_roots": [str(path) for path in args.additional_result_study_root],
+        "duplicate_task_policy": "first_root_wins_no_averaging",
         "protocol_name": args.protocol_name,
         "eval_mode": args.eval_mode,
         "expected_arms": list(_expected_arms()),

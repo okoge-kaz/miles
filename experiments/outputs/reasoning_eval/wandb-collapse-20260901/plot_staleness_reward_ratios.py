@@ -248,7 +248,11 @@ def render(
 
 
 def main() -> None:
-    histories = cross_cohort.read_histories(cross_cohort.sources())
+    selected_sources = [
+        source for source in cross_cohort.sources()
+        if source.treatment == TREATMENT and source.max_response_len == MAX_RESPONSE_LEN
+    ]
+    histories = cross_cohort.read_histories(selected_sources)
     cross_cohort.atomic_write(OUTPUT_PATH, render(histories))
     cross_cohort.atomic_write(
         STALENESS_ONLY_OUTPUT_PATH,

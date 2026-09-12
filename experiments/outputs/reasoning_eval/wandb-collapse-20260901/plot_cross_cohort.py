@@ -39,7 +39,7 @@ ALLOWED_RATIOS = ((1, 7), (2, 6))
 TRAINING_METRICS = (
     ("rollout/response_len/mean", "Response length (mean)", "tokens"),
     (RESPONSE_QUANTILE_METRIC, "Response length (p10–p90)", "tokens"),
-    ("staleness/total/mean", "Staleness total mean", "staleness"),
+    ("staleness/total/mean", "Realized staleness", "staleness"),
     ("rollout/raw_reward", "Raw reward", "raw reward"),
 )
 AUXILIARY_TRAINING_METRICS = {
@@ -119,7 +119,7 @@ def sources() -> list[Source]:
             16384,
             "original-grid-tbq1000",
             original_analysis / "staleness" / "training-history.csv",
-            original_analysis / "aggregate-results.csv",
+            generated_downstream / original_namespace / "aggregate-results.csv",
         ),
         (
             "sr-20260826-141753-p1497131",
@@ -171,6 +171,12 @@ def sources() -> list[Source]:
             / "aggregate-results.csv",
         ),
         (
+            "zero-loss-trunc-s24-28-t1r7-step300-tbq6000-20260910-v1",
+            "zero-loss", 16384, "high-staleness-tbq6000", None,
+            generated_downstream / "zero-loss-trunc-s24-28-t1r7-step300-tbq6000-20260910-v1"
+            / "aggregate-results.csv",
+        ),
+        (
             "staleness-aware-safe4-t1r7-cb1c041f",
             "staleness-aware",
             16384,
@@ -202,7 +208,30 @@ def sources() -> list[Source]:
             ("s0-colocated",),
         ),
     )
-    return [Source(*definition) for definition in definitions]
+    high_staleness = (
+        ("zero-loss", "zero-loss-trunc-s32-40-t1r7-step300-tbq8000-20260908-v1"),
+        ("staleness-aware", "staleness-aware-loss-safe4-s32-40-t1r7-step300-tbq8000-20260908-v1"),
+    )
+    return [Source(*definition) for definition in definitions] + [
+        Source(
+            namespace, treatment, 16384, "high-staleness-tbq8000", None,
+            generated_downstream / namespace / "aggregate-results.csv",
+        )
+        for treatment, namespace in high_staleness
+    ]
+
+
+def policy_lag_rerun_sources() -> list[Source]:
+    """Keep independent S8/12/16 reruns separate from historical trajectories."""
+    return [
+        Source(
+            f"hiso-policy-lag-v1-20260908-r1-{suffix}",
+            treatment, 16384, "policy-lag-rerun-tbq6000", None,
+            OUTPUT_ROOT / "downstream" / f"hiso-policy-lag-v1-20260908-r1-{suffix}"
+            / "aggregate-results.csv",
+        )
+        for treatment, suffix in (("none", "no-treatment"), ("zero-loss", "zero-loss"))
+    ]
 
 
 def optional_float(value: Any) -> float | None:
@@ -405,6 +434,8 @@ def color(staleness: int) -> str:
         20: "#D55E00",
         24: "#CC79A7",
         28: "#6A3D9A",
+        32: "#0072B2",
+        40: "#009E73",
     }
     return palette.get(staleness, f"hsl({(staleness * 47) % 360},65%,42%)")
 
@@ -537,13 +568,16 @@ def render_training_group(
     left, top = 78.0, 76.0
     row_count = len(TRAINING_METRICS) + 1
     width = int(left + len(ratios) * panel_width + (len(ratios) - 1) * column_gap + 25)
+    staleness_levels = sorted({series_identity.staleness for series_identity in selected})
+    legend_columns = max(1, int((width - left - 25) // 92))
+    legend_rows = math.ceil(len(staleness_levels) / legend_columns)
+    top += 24 * (legend_rows - 1)
     height = int(
         top
         + row_count * panel_height
         + (row_count - 1) * row_gap
         + 30
     )
-    staleness_levels = sorted({series_identity.staleness for series_identity in selected})
     max_step = 300
     elements = svg_canvas(width, height)
     for column, ratio in enumerate(ratios):
@@ -553,8 +587,9 @@ def render_training_group(
             f'text-anchor="middle">Train:Rollout = {ratio[0]}:{ratio[1]}</text>'
         )
     for index, staleness in enumerate(staleness_levels):
-        legend_x = left + index * 92.0
-        legend_y = 53.0
+        legend_row, legend_column = divmod(index, legend_columns)
+        legend_x = left + legend_column * 92.0
+        legend_y = 53.0 + legend_row * 24.0
         elements.extend(
             [
                 f'<line x1="{legend_x:.1f}" y1="{legend_y:.1f}" x2="{legend_x + 25:.1f}" y2="{legend_y:.1f}" stroke="{color(staleness)}" stroke-width="2.5"/>',
@@ -676,11 +711,15 @@ def render_training_group(
                             if series_identity.arm == "s0-colocated"
                             else f"S={series_identity.staleness}"
                         )
-                        elements.extend(
-                            [
-                                f'<line x1="{x_map(last_step) + 3:.1f}" y1="{endpoint_y:.1f}" x2="{label_x - 4:.1f}" y2="{label_y:.1f}" stroke="{color(series_identity.staleness)}" stroke-width=".8"/>',
-                                f'<text class="endpoint" x="{label_x:.1f}" y="{label_y + 3.5:.1f}" style="fill:{color(series_identity.staleness)}">{endpoint_label}: {last_value:.1f}</text>',
-                            ]
+                        # Do not draw an apparent trajectory from an early
+                        # evaluation endpoint through the still-unevaluated span.
+                        if last_step >= max_step:
+                            elements.append(
+                                f'<line class="endpoint-leader" x1="{x_map(last_step) + 3:.1f}" y1="{endpoint_y:.1f}" x2="{label_x - 4:.1f}" y2="{label_y:.1f}" stroke="#999" stroke-dasharray="2 2" stroke-width=".8"/>'
+                            )
+                        step_suffix = f" @{last_step:g}" if last_step < max_step else ""
+                        elements.append(
+                            f'<text class="endpoint" x="{label_x:.1f}" y="{label_y + 3.5:.1f}" style="fill:{color(series_identity.staleness)}">{endpoint_label}: {last_value:.1f}{step_suffix}</text>'
                         )
                 continue
             if metric == RESPONSE_QUANTILE_METRIC:
@@ -1955,6 +1994,9 @@ def main() -> None:
     configured_sources = sources()
     histories = read_histories(configured_sources)
     downstream = read_downstream(configured_sources)
+    rerun_sources = policy_lag_rerun_sources()
+    rerun_histories = read_histories(rerun_sources)
+    rerun_downstream = read_downstream(rerun_sources)
     figures = OUTPUT_ROOT / "figures"
     training_groups = sorted(
         {(series_identity.treatment, series_identity.max_response_len) for series_identity in histories}
@@ -1965,6 +2007,13 @@ def main() -> None:
         atomic_write(
             figures / name,
             render_training_group(treatment, max_response_len, histories, downstream),
+        )
+        generated.append(name)
+    for treatment in ("none", "zero-loss"):
+        name = f"training-and-aime-{treatment}-policy-lag-rerun-maxlen16384.svg"
+        atomic_write(
+            figures / name,
+            render_training_group(treatment, 16384, rerun_histories, rerun_downstream),
         )
         generated.append(name)
     wave_figures = (
@@ -2027,8 +2076,8 @@ def main() -> None:
     )
     for obsolete_name in obsolete_names:
         (figures / obsolete_name).unlink(missing_ok=True)
-    summary_rows = series_summary(histories)
-    downstream_rows = downstream_values(downstream)
+    summary_rows = series_summary({**histories, **rerun_histories})
+    downstream_rows = downstream_values({**downstream, **rerun_downstream})
     wave_rows = response_wave_summary(histories)
     throughput_rows = throughput_summary_t2r6(histories)
     write_csv(OUTPUT_ROOT / "series-summary.csv", summary_rows)
@@ -2040,7 +2089,8 @@ def main() -> None:
         "",
         "Each figure combines mean/p90 response length, raw reward, training total mean staleness, and AIME24/25/26 macro mean.",
         "Training curves use exact per-step W&B exports overlaid with newer local metrics.jsonl records; bold curves are trailing-5 means.",
-        "AIME curves use completed NeMo Skills task outputs without smoothing; labels show the latest completed mean.",
+        "The September policy-lag S8/12/16 reruns are separate figures, not continuations of the historical runs. S32/40 use tbq8000 and are distinguished from the tbq6000 lower-staleness cohorts in series-summary.csv.",
+        "AIME curves use completed NeMo Skills task outputs without smoothing; labels show the latest completed mean. @N denotes the last evaluated step when evaluation has not reached step 300; no label leader extends through that unevaluated interval.",
         (
             f"Data-quality exclusion: {EXCLUDED_RUN_ARM} steps "
             f">={EXCLUDED_RUN_START_STEP} are excluded from every figure and "
