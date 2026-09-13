@@ -1,0 +1,109 @@
+{
+  "fresh_allocation": 7114990,
+  "resume_job": 7115209,
+  "smoke_tag": "lightning-r3-inflight-20260913-7114990",
+  "sha256": {
+    "miles/utils/arguments.py": "3160574f838ee0375be5bc78fad505991d29aa46fef1c51d34a4aa299308993a",
+    "miles/rollout/replay_buffer.py": "5cc0c9d39a897971b7220508507f7dd9e66109971199e2c45171fcc3fc8c6765",
+    "miles/rollout/generate_hub/single_turn.py": "59cc30555667d7854c51f1c742fd265f85bccb51cedcb703138c0cfa8c6a8481",
+    "miles/rollout/generate_utils/generate_endpoint_utils.py": "590d1d1217bfb11e8e1dc8df8a224477310970a6092703f45c49b4e99ccfa05d",
+    "miles/rollout/generate_utils/routing_replay.py": "9ce0f2204e894874588fe46d5457c8b1e9f478dc58cf29fb7bc65e8c68fba20e",
+    "tests/manual/run_oci_async_smoke.sbatch": "0402ca176d114e2c5860d9084b507233c74f52a930520b298d4613c098976c8a",
+    "experiments/scripts/math/async/dapo-math-17k/nemotron-3.5-lightning/train.sh": "1557a31d0c850df9d6f4bdf940a5cac2f60b0419791d496015d78937ca1adc3a",
+    "tests/manual/oci_validation/replay_routing_probe.py": "2a50d7b0ac59b5d6819d9042c13ebcfbf84311380d1d679fd0fa60f15e62fc50",
+    "tests/manual/oci_validation/check_replay_routing.py": "bcf3dd1fb763ed5533ef7e2987eb38dbb02a064e227251bb64e4a4f4ade9d461"
+  },
+  "checkpoint": "/lustre/fsw/portfolios/coreai/users/kfujii/checkpoints/training/math/dapo-math-17k/Nemotron-3.5-Lightning-30B-A3B-SFT-upsampled-iter6000/lightning-r3-inflight-20260913-7114990",
+  "verification": {
+    "updates": 6,
+    "training_ranks_verified": 8,
+    "moe_streams_per_rank": 23,
+    "restored_samples_trained_with_identical_prefix": {
+      "completed": 34,
+      "inflight": 22
+    }
+  },
+  "resume_result": {
+    "state": "COMPLETED",
+    "exit_code": "0:0",
+    "elapsed": "00:14:43"
+  },
+  "fresh_launcher_result": {
+    "ray_training": "SUCCEEDED",
+    "shell_exit_code": 127,
+    "reason": "Launcher was edited while active; post-training shell read offset error. Separate resume job completed successfully."
+  },
+  "hf_verification": {
+    "tensor_count": 6243,
+    "sampled_matrices": 16,
+    "sample_shape": [
+      64,
+      64
+    ],
+    "changed_elements_initial_to_2": 5292,
+    "changed_elements_initial_to_5": 7742,
+    "changed_elements_2_to_5": 5569
+  },
+  "buffer_overhead": {
+    "snapshots": [
+      {
+        "update": 0,
+        "bytes": 511432400,
+        "capture_seconds": 1.328,
+        "write_seconds": 0.823,
+        "total_seconds": 2.151
+      },
+      {
+        "update": 1,
+        "bytes": 318192295,
+        "capture_seconds": 0.708,
+        "write_seconds": 0.588,
+        "total_seconds": 1.296
+      },
+      {
+        "update": 2,
+        "bytes": 474416871,
+        "capture_seconds": 1.201,
+        "write_seconds": 0.833,
+        "total_seconds": 2.034
+      },
+      {
+        "update": 3,
+        "bytes": 617434656,
+        "capture_seconds": 1.708,
+        "write_seconds": 0.964,
+        "total_seconds": 2.672
+      },
+      {
+        "update": 4,
+        "bytes": 513563395,
+        "capture_seconds": 0.888,
+        "write_seconds": 0.973,
+        "total_seconds": 1.861
+      },
+      {
+        "update": 5,
+        "bytes": 632417041,
+        "capture_seconds": 0.854,
+        "write_seconds": 1.068,
+        "total_seconds": 1.922
+      }
+    ],
+    "restore_2_seconds": {
+      "read": 0.656,
+      "restore": 0.411,
+      "total": 1.068
+    },
+    "routing_payload_bytes": {
+      "2": 468657696,
+      "5": 625025856
+    },
+    "routing_bytes_per_token_row": 1248,
+    "r3_off_control_run": false
+  },
+  "logs": [
+    "experiments/outputs/nemotron-3.5-lightning/math/train-rollout-ratio/lightning-r3-inflight-20260913-7114990-fresh.log",
+    "experiments/outputs/nemotron-3.5-lightning/math/train-rollout-ratio/lightning-r3-resume-7115209.log"
+  ],
+  "source_hash_scope": "Hashes identify the GPU validation working tree. The committed arguments.py excludes an unrelated rm-type help change; later import ordering and formatting do not change R3 behavior."
+}
