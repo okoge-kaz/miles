@@ -89,13 +89,15 @@ def _validate_replay_buffer(args) -> None:
             not any(
                 getattr(args, flag, False)
                 for flag in (
-                    "use_routing_replay",
-                    "use_rollout_routing_replay",
                     "use_indexer_replay",
                     "use_rollout_indexer_replay",
                 )
             ),
-            "no routing/indexer replay",
+            "no indexer replay",
+        ),
+        (
+            not getattr(args, "use_routing_replay", False) or getattr(args, "use_rollout_routing_replay", False),
+            "rollout routing replay when routing replay is enabled",
         ),
         (args.update_weight_transfer_mode != "disk-delta", "a non-delta weight transfer mode"),
         (args.update_weights_interval == 1, "--update-weights-interval 1"),
@@ -115,6 +117,11 @@ def _validate_replay_buffer(args) -> None:
         and getattr(args, "custom_generate_function_path", None) is not None
     ):
         raise ValueError("--replay-buffer-type inflight currently requires the built-in single-turn generate function")
+
+    if getattr(args, "use_rollout_routing_replay", False) and (
+        use_legacy_rollout_v1() or getattr(args, "custom_generate_function_path", None) is not None
+    ):
+        raise ValueError("Replay-buffer routing replay requires the refactored built-in single-turn generate function")
 
 
 def _resolve_rollout_functions(args) -> None:

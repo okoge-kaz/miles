@@ -115,10 +115,9 @@ def _replay_buffer_args(**overrides) -> SimpleNamespace:
         ({"debug_rollout_only": True}, "trainer consumption enabled"),
         ({"debug_skip_weight_update": True}, "real rollout-engine weight updates"),
         ({"lora_rank": 8}, "dense model training"),
-        ({"use_routing_replay": True}, "no routing/indexer replay"),
-        ({"use_rollout_routing_replay": True}, "no routing/indexer replay"),
-        ({"use_indexer_replay": True}, "no routing/indexer replay"),
-        ({"use_rollout_indexer_replay": True}, "no routing/indexer replay"),
+        ({"use_routing_replay": True}, "rollout routing replay when routing replay is enabled"),
+        ({"use_indexer_replay": True}, "no indexer replay"),
+        ({"use_rollout_indexer_replay": True}, "no indexer replay"),
         ({"update_weight_transfer_mode": "disk-delta"}, "non-delta weight transfer"),
         ({"update_weights_interval": 2}, "update-weights-interval 1"),
         ({"save": None}, "--save for the durable replay buffer"),
@@ -156,6 +155,24 @@ def test_inflight_replay_buffer_rejects_custom_generate_function(monkeypatch):
         custom_generate_function_path="custom.generate",
     )
     with pytest.raises(ValueError, match="built-in single-turn"):
+        _resolve_rollout_functions(args)
+
+
+@pytest.mark.parametrize("buffer_type", ["rollout", "inflight"])
+@pytest.mark.parametrize("trainer_flag", [False, True])
+def test_replay_buffer_accepts_rollout_routing_replay(monkeypatch, buffer_type, trainer_flag):
+    monkeypatch.setattr("miles.utils.arguments.use_legacy_rollout_v1", lambda: False)
+    args = _replay_buffer_args(
+        replay_buffer_type=buffer_type, use_rollout_routing_replay=True, use_routing_replay=trainer_flag
+    )
+    _resolve_rollout_functions(args)
+
+
+@pytest.mark.parametrize("legacy,custom_generate", [(True, None), (False, "custom.generate")])
+def test_replay_buffer_routing_requires_builtin_single_turn(monkeypatch, legacy, custom_generate):
+    monkeypatch.setattr("miles.utils.arguments.use_legacy_rollout_v1", lambda: legacy)
+    args = _replay_buffer_args(use_rollout_routing_replay=True, custom_generate_function_path=custom_generate)
+    with pytest.raises(ValueError, match="refactored built-in single-turn"):
         _resolve_rollout_functions(args)
 
 

@@ -49,6 +49,12 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
         return GenerateFnOutput(samples=sample)
 
     output = await post(url, payload, headers=compute_routing_headers(args, sample))
-    await update_sample_from_response(args, sample, payload=payload, output=output)
+    await update_sample_from_response(
+        args,
+        sample,
+        payload=payload,
+        output=output,
+        preserve_routing_prefix=(getattr(args, "use_replay_buffer", False) and args.use_rollout_routing_replay),
+    )
 
     return GenerateFnOutput(samples=sample)

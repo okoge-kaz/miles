@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 import pybase64
 
+from miles.rollout.generate_utils.routing_replay import merge_routing_prefix
 from miles.utils.lora import LORA_ADAPTER_NAME, lora_rollout_enabled
 from miles.utils.processing_utils import encode_image_for_rollout_engine, extract_multimodal_train_inputs
 from miles.utils.types import Sample
@@ -78,7 +79,13 @@ def compute_request_payload(
 
 
 async def update_sample_from_response(
-    args, sample: Sample, payload: dict, output: dict, update_loss_mask: bool = False
+    args,
+    sample: Sample,
+    payload: dict,
+    output: dict,
+    update_loss_mask: bool = False,
+    *,
+    preserve_routing_prefix: bool = False,
 ):
     # Initialize sample.tokens for the first turn
     if (len(sample.response) == 0) and not sample.tokens:
@@ -89,6 +96,18 @@ async def update_sample_from_response(
         new_response_log_probs = [item[0] for item in x]
     else:
         new_response_tokens, new_response_log_probs = [], []
+
+    routed_experts = get_routed_experts_from_response(args, output, len(sample.tokens) + len(new_response_tokens) - 1)
+    if preserve_routing_prefix:
+        routed_experts = merge_routing_prefix(
+            sample.rollout_routed_experts,
+            routed_experts,
+            prefix_tokens=len(sample.tokens),
+            prefix_response_tokens=sample.response_length,
+            new_tokens=len(new_response_tokens),
+            num_layers=args.num_layers,
+            topk=args.moe_router_topk,
+        )
 
     # Update sample with tokens directly - avoiding re-tokenization
     sample.tokens = sample.tokens + new_response_tokens
@@ -105,7 +124,7 @@ async def update_sample_from_response(
         sample.loss_mask += [1] * len(new_response_tokens)
 
     # TODO handle multi-turn cases (may need concat instead of assignment)
-    sample.rollout_routed_experts = get_routed_experts_from_response(args, output, len(sample.tokens) - 1)
+    sample.rollout_routed_experts = routed_experts
     sample.rollout_indexer_topk = get_indexer_topk_from_response(args, output, sample)
 
     # TODO may unify (currently there are both methods inside Sample and separate functions)

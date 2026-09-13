@@ -163,6 +163,13 @@ def dataset_fingerprint(args, data_source) -> str:
         "custom_reward_post_process_path": getattr(args, "custom_reward_post_process_path", None),
         "custom_convert_samples_to_train_data_path": getattr(args, "custom_convert_samples_to_train_data_path", None),
     }
+    if getattr(args, "use_rollout_routing_replay", False):
+        config["rollout_routing_replay"] = {
+            "prefix_semantics": 1,
+            "num_layers": args.num_layers,
+            "moe_router_topk": args.moe_router_topk,
+            "num_experts": args.num_experts,
+        }
     encoded = json.dumps(config, sort_keys=True, separators=(",", ":"), default=str).encode()
     return hashlib.sha256(encoded).hexdigest()
 
