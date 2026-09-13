@@ -11,6 +11,10 @@ from miles.backends.training_utils.loss_hub.policy_lag_metrics import (
     POLICY_LAG_PART_PREFIX,
     finalize_policy_lag_parts,
 )
+from miles.backends.training_utils.loss_hub.sequence_filter import (
+    SEQUENCE_FILTER_PART_PREFIX,
+    finalize_sequence_filter_metrics,
+)
 from miles.backends.training_utils.loss_hub.staleness_aware_loss import (
     STALENESS_AWARE_LOSS_PART_PREFIX,
     finalize_staleness_aware_loss_parts,
@@ -545,10 +549,19 @@ def aggregate_train_losses(
 
     metric_sums = dict(zip(keys, values[1:], strict=True))
     diagnostic_metric_sums = {}
+    if any(key.startswith(SEQUENCE_FILTER_PART_PREFIX) for key in metric_sums):
+        # An entire update can be filtered. Match Megatron's zero-token guard.
+        num_samples_or_tokens = max(num_samples_or_tokens, 1)
 
     for key, value in metric_sums.items():
         if key.startswith(
-            (UPDATE_PART_PREFIX, STALENESS_AWARE_LOSS_PART_PREFIX, TIS_POPULATION_PART_PREFIX, POLICY_LAG_PART_PREFIX)
+            (
+                UPDATE_PART_PREFIX,
+                STALENESS_AWARE_LOSS_PART_PREFIX,
+                TIS_POPULATION_PART_PREFIX,
+                POLICY_LAG_PART_PREFIX,
+                SEQUENCE_FILTER_PART_PREFIX,
+            )
         ):
             continue
         loss_reduced[key] = value * cp_factor / num_samples_or_tokens
@@ -573,6 +586,7 @@ def aggregate_train_losses(
             loss_reduced[dst] = (a * a) / (b * c)
 
     loss_reduced.update(finalize_update_diagnostic_parts(metric_sums))
+    loss_reduced.update(finalize_sequence_filter_metrics(metric_sums))
     loss_reduced.update(finalize_staleness_aware_loss_parts(metric_sums))
     loss_reduced.update(finalize_tis_abs_population_parts(diagnostic_metric_sums))
     loss_reduced.update(finalize_policy_lag_parts(diagnostic_metric_sums))

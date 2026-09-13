@@ -1718,6 +1718,18 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--lambd", type=float, default=1.0, help="PPO GAE lambd")
             parser.add_argument("--normalize-advantages", action="store_true", default=False)
             parser.add_argument(
+                "--advantage-clip-low",
+                type=float,
+                default=None,
+                help="Lower advantage bound applied after normalization; unset disables the lower bound.",
+            )
+            parser.add_argument(
+                "--advantage-clip-high",
+                type=float,
+                default=None,
+                help="Upper advantage bound applied after normalization; unset disables the upper bound.",
+            )
+            parser.add_argument(
                 "--log-sample-staleness-metrics",
                 dest="log_sample_staleness_metrics",
                 action="store_true",
@@ -1879,6 +1891,22 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 type=float,
                 default=0,
                 help="Lower bound clipping threshold C for importance sampling ratios to control variance.",
+            )
+            parser.add_argument(
+                "--use-train-rollout-logprob-sequence-filter",
+                action="store_true",
+                help=(
+                    "Exclude an entire response when the mean over valid response tokens of "
+                    "exp(abs(log pi_train - log mu_rollout)) exceeds the threshold. Uses the "
+                    "training forward and removes rejected tokens from loss normalization. "
+                    "Requires Megatron, fused one-step actor logprobs and per-token loss."
+                ),
+            )
+            parser.add_argument(
+                "--train-rollout-logprob-sequence-filter-threshold",
+                type=float,
+                default=2.0,
+                help="Maximum response-mean symmetric probability ratio allowed by the sequence filter (>=1).",
             )
             parser.add_argument(
                 "--custom-tis-function-path",
@@ -3307,12 +3335,44 @@ def validate_fused_one_step_actor_logprobs(args: argparse.Namespace) -> None:
         if not valid:
             raise ValueError(f"--fuse-one-step-actor-logprobs requires {requirement}")
 
-    enabled_replays = [flag for flag in _FUSED_ONE_STEP_REPLAY_FLAGS if getattr(args, flag, False)]
+    # Rollout routing replay preloads both replay queues before any actor forward.
+    # The training forward consumes the backward queue even when scoring is fused.
+    # Trainer-only replay still needs a standalone forward to record its routes.
+    rollout_routing = getattr(args, "use_rollout_routing_replay", False)
+    enabled_replays = [
+        flag
+        for flag in _FUSED_ONE_STEP_REPLAY_FLAGS
+        if getattr(args, flag, False)
+        and not (rollout_routing and not verify and flag in ("use_routing_replay", "use_rollout_routing_replay"))
+    ]
     if enabled_replays:
         flags = ", ".join(f"--{flag.replace('_', '-')}" for flag in enabled_replays)
         raise ValueError(
-            "--fuse-one-step-actor-logprobs does not yet support routing/indexer replay; " f"disable {flags}"
+            "--fuse-one-step-actor-logprobs supports rollout routing replay without shadow verification, "
+            f"but not the requested routing/indexer replay combination: {flags}"
         )
+
+
+def validate_train_rollout_logprob_sequence_filter(args: argparse.Namespace) -> None:
+    if not getattr(args, "use_train_rollout_logprob_sequence_filter", False):
+        return
+    threshold = args.train_rollout_logprob_sequence_filter_threshold
+    if not 1 <= threshold < float("inf"):
+        raise ValueError("--train-rollout-logprob-sequence-filter-threshold must be finite and >= 1")
+    requirements = (
+        (args.train_backend == "megatron", "--train-backend megatron"),
+        (getattr(args, "fuse_one_step_actor_logprobs", False), "--fuse-one-step-actor-logprobs"),
+        (args.calculate_per_token_loss, "--calculate-per-token-loss"),
+        (args.loss_type == "policy_loss", "--loss-type policy_loss"),
+        (not getattr(args, "multi_lora", False), "single-policy training"),
+        (not getattr(args, "indep_dp", False), "--indep-dp disabled"),
+        (not getattr(args, "enable_mtp_training", False), "MTP training disabled"),
+        (args.custom_pg_loss_reducer_function_path is None, "the standard policy loss reducer"),
+        (args.custom_tis_function_path is None, "built-in TIS (or no TIS)"),
+    )
+    for valid, requirement in requirements:
+        if not valid:
+            raise ValueError(f"--use-train-rollout-logprob-sequence-filter requires {requirement}")
 
 
 def validate_fused_one_step_actor_logprobs_runtime(
@@ -4205,6 +4265,11 @@ def miles_validate_args(args):
     _validate_replay_buffer(args)
 
     validate_fused_one_step_actor_logprobs(args)
+    validate_train_rollout_logprob_sequence_filter(args)
+
+    if args.advantage_clip_low is not None and args.advantage_clip_high is not None:
+        if args.advantage_clip_low > args.advantage_clip_high:
+            raise ValueError("--advantage-clip-low must not exceed --advantage-clip-high")
 
     if args.eval_max_context_len is None:
         logger.info(

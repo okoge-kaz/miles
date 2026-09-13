@@ -9,6 +9,7 @@ from miles.backends.training_utils.loss_hub.losses import get_loss_function
 from miles.backends.training_utils.loss_hub.math_utils import compute_approx_kl
 from miles.backends.training_utils.loss_hub.opd import apply_opd_kl_to_advantages
 from miles.backends.training_utils.loss_hub.policy_lag_metrics import POLICY_LAG_PART_PREFIX
+from miles.backends.training_utils.loss_hub.sequence_filter import SEQUENCE_FILTER_TOKEN_COUNT
 from miles.backends.training_utils.loss_hub.tis_population_metrics import TIS_POPULATION_PART_PREFIX
 from miles.backends.training_utils.parallel import get_parallel_state
 from miles.utils.audit_utils.event_logger.logger import get_event_logger, is_event_logger_initialized
@@ -180,6 +181,12 @@ def compute_advantages_and_returns(
     if args.normalize_advantages:
         advantages = normalize_advantages(args, advantages, loss_masks, total_lengths, response_lengths, max_seq_lens)
 
+    clip_low = getattr(args, "advantage_clip_low", None)
+    clip_high = getattr(args, "advantage_clip_high", None)
+    if clip_low is not None or clip_high is not None:
+        # GRPO advantages can alias returns; clipping must not change value targets.
+        advantages = [advantage.clamp(min=clip_low, max=clip_high) for advantage in advantages]
+
     rollout_data["advantages"] = advantages
     rollout_data["returns"] = returns
 
@@ -244,6 +251,10 @@ def loss_function(
     else:
         loss, log = func(args, batch, logits, sum_of_sample_mean)
 
+    # Megatron sums this count over microbatches and DP/CP before scaling grads.
+    # Do not count rejected responses (or clamp each empty response to one).
+    num_tokens = log.pop(SEQUENCE_FILTER_TOKEN_COUNT, num_tokens)
+
     # Forces autograd to traverse the full graph on every rank to avoid hang.
     # fp32 sum: an fp16 logits sum can overflow to inf, and 0 * inf is nan.
     if parallel_state.cp.size > 1 and args.allgather_cp:
@@ -274,14 +285,13 @@ def loss_function(
         if apply_megatron_loss_scaling:
             loss = loss * parallel_state.cp.size
 
+    logging_values = _pack_logging_values(
+        num_samples if not args.calculate_per_token_loss else num_tokens, log, device=logits.device
+    )
     return (
         loss,
-        torch.tensor(num_tokens if args.calculate_per_token_loss else 1, device=logits.device),
-        _pack_logging_values(
-            num_samples if not args.calculate_per_token_loss else num_tokens,
-            log,
-            device=logits.device,
-        ),
+        torch.as_tensor(num_tokens if args.calculate_per_token_loss else 1, device=logits.device).detach().clone(),
+        logging_values,
     )
 
 

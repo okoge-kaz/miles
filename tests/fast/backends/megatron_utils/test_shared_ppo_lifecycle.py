@@ -405,10 +405,11 @@ def test_skip_actor_forward_only_preserves_reference_teacher_and_training_forwar
 
 
 @pytest.mark.parametrize(
-    ("manager_cls", "rollout_flag", "data_key"),
+    ("manager_cls", "rollout_flag", "data_key", "forward_option"),
     [
-        (RoutingReplayManager, "use_rollout_routing_replay", "rollout_routed_experts"),
-        (IndexerReplayManager, "use_rollout_indexer_replay", "rollout_indexer_topk"),
+        (RoutingReplayManager, "use_rollout_routing_replay", "rollout_routed_experts", "skip_actor_forward_only"),
+        (IndexerReplayManager, "use_rollout_indexer_replay", "rollout_indexer_topk", "skip_actor_forward_only"),
+        (RoutingReplayManager, "use_rollout_routing_replay", "rollout_routed_experts", "fuse_one_step_actor_logprobs"),
     ],
 )
 def test_skip_actor_forward_only_consumes_preloaded_rollout_replay_during_training(
@@ -417,6 +418,7 @@ def test_skip_actor_forward_only_consumes_preloaded_rollout_replay_during_traini
     manager_cls,
     rollout_flag,
     data_key,
+    forward_option,
 ):
     manager = manager_cls()
     manager.enabled = True
@@ -430,8 +432,7 @@ def test_skip_actor_forward_only_consumes_preloaded_rollout_replay_during_traini
 
     worker = _actor_reuse_worker(
         actor_module,
-        skip_actor_forward_only=True,
-        **{rollout_flag: True},
+        **{forward_option: True, rollout_flag: True},
     )
     _patch_actor_reuse_dependencies(actor_module, monkeypatch, num_microbatches=[1])
     monkeypatch.setattr(actor_module, "all_replay_managers", [manager])

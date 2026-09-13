@@ -24,6 +24,10 @@ from miles.backends.training_utils.loss_hub.policy_lag_metrics import (
     compute_policy_lag_parts,
     compute_ppo_loss_sensitivity,
 )
+from miles.backends.training_utils.loss_hub.sequence_filter import (
+    filter_train_rollout_logprob_sequences,
+    sequence_filter_reducer,
+)
 from miles.backends.training_utils.loss_hub.staleness_aware_loss import (
     apply_staleness_aware_loss,
     apply_staleness_aware_loss_with_weights,
@@ -280,6 +284,10 @@ def policy_loss_function(
     )
 
     log_probs = log_probs_and_entropy["log_probs"]
+    sequence_filter_metrics: dict[str, torch.Tensor] = {}
+    if getattr(args, "use_train_rollout_logprob_sequence_filter", False):
+        batch, sequence_filter_metrics = filter_train_rollout_logprob_sequences(args, batch, log_probs)
+        sum_of_sample_mean = sequence_filter_reducer(args, batch)
     if args.skip_actor_forward_only or fused_logprobs:
         trainer_scored_log_probs = [log_prob.detach() for log_prob in log_probs]
     else:
@@ -802,6 +810,7 @@ def policy_loss_function(
         "ess_ratio": ess_ratio_sum.squeeze(),
     }
     reported_loss |= {name: value.clone().detach() for name, value in fused_metrics.items()}
+    reported_loss |= sequence_filter_metrics
     reported_loss |= sample_staleness_parts
     reported_loss |= staleness_aware_loss_parts
     reported_loss |= tis_population_parts
