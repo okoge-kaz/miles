@@ -26,6 +26,11 @@ SGLANG_BRANCH="${SGLANG_BRANCH:-miles-staleness-weight-boundaries}"
 : "${SGLANG_COMMIT:?set the full SHA of the provenance port compatible with BASE_IMAGE}"
 OUTPUT_IMAGE="${OUTPUT_IMAGE:-${CONTAINER_DIR}/miles-oci-${CONTAINER_ARCH}-prefill-${SGLANG_COMMIT:0:9}.sqsh}"
 
+case "$(realpath -m -- "${OUTPUT_IMAGE}")" in
+    "$(realpath -m -- "${CONTAINER_DIR}")"/*) ;;
+    *) echo "OUTPUT_IMAGE must be under CONTAINER_DIR=${CONTAINER_DIR}" >&2; exit 1 ;;
+esac
+
 test -f "${BASE_IMAGE}"
 test ! -e "${OUTPUT_IMAGE}"
 

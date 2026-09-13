@@ -58,6 +58,12 @@ trap 'rm -rf "${LOCAL_SCRATCH}"' EXIT
 DATED_IMAGE="${IMPORT_OUTPUT_IMAGE:-${CONTAINER_DIR}/miles-oci-${CONTAINER_ARCH}-$(date +%Y%m%d-%H%M%S).sqsh}"
 SQSH_LINK="${SQSH_LINK-${CONTAINER_DIR}/miles-oci-${CONTAINER_ARCH}.sqsh}"
 
+# Keep image artifacts under container/; outputs/ is for execution logs.
+case "$(realpath -m -- "${DATED_IMAGE}")" in
+    "$(realpath -m -- "${CONTAINER_DIR}")"/*) ;;
+    *) echo "IMPORT_OUTPUT_IMAGE must be under CONTAINER_DIR=${CONTAINER_DIR}" >&2; exit 1 ;;
+esac
+
 [[ "${DATED_IMAGE}" == /* ]] || {
     echo "IMPORT_OUTPUT_IMAGE must be absolute: ${DATED_IMAGE}" >&2
     exit 1

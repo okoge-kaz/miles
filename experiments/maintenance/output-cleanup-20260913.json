@@ -1,0 +1,85 @@
+{
+  "date": "2026-09-13T03:33:32.403563+00:00",
+  "changes": [
+    {
+      "action": "delete",
+      "path": "experiments/outputs/lightning-setup/README.md",
+      "reason": "Identical to /lustre/fsw/portfolios/coreai/users/kfujii/checkpoints/hf/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16/README.md",
+      "bytes": 85345,
+      "sha256": "5d9d96d2f2b154d72625d39628a011e39e0477ffb99e45967eefe4cfd269b928"
+    },
+    {
+      "action": "delete",
+      "path": "experiments/outputs/lightning-setup/config.json",
+      "reason": "Identical to /lustre/fsw/portfolios/coreai/users/kfujii/checkpoints/hf/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16/config.json",
+      "bytes": 2352,
+      "sha256": "a3827a0f5e311547b40943dc081e3ff2f8a277466e8c1a3df2291e8db8a7617c"
+    },
+    {
+      "action": "delete",
+      "path": "experiments/outputs/lightning-setup/chat_template.jinja",
+      "reason": "Identical to /lustre/fsw/portfolios/coreai/users/kfujii/checkpoints/hf/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16/chat_template.jinja",
+      "bytes": 9867,
+      "sha256": "58933db77d3099b4f78c55a38347a72e1ea05b97d6bd8f38775303dc0194e0a9"
+    },
+    {
+      "action": "delete",
+      "path": "experiments/outputs/lightning-setup/tokenizer_config.json",
+      "reason": "Identical to /lustre/fsw/portfolios/coreai/users/kfujii/checkpoints/hf/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16/tokenizer_config.json",
+      "bytes": 177209,
+      "sha256": "10f93eabcb9b1602fbb991d6308e787ce1df28ee9cd7a1c6d1e8c3f338b957bc"
+    },
+    {
+      "action": "delete",
+      "path": "experiments/outputs/lightning-setup/run-full-7094021.sbatch",
+      "reason": "Identical to experiments/scripts/math/sync/dapo-math-17k/nemotron-3.5-lightning/run.sbatch",
+      "bytes": 4873,
+      "sha256": "faca4feec13d9371469fa3c7adf9e10791e9b837e089d28d666d1a9269e22850"
+    },
+    {
+      "action": "delete",
+      "path": "experiments/outputs/lightning-setup/run-resume-7094021.sbatch",
+      "reason": "Identical to experiments/scripts/math/sync/dapo-math-17k/nemotron-3.5-lightning/run.sbatch",
+      "bytes": 4873,
+      "sha256": "faca4feec13d9371469fa3c7adf9e10791e9b837e089d28d666d1a9269e22850"
+    },
+    {
+      "action": "delete",
+      "path": "experiments/outputs/lightning-setup/sglang-nemotron-original.py",
+      "reason": "Obsolete backup; original model source retained in the immutable runtime image; current compatibility code is experiments/src/math/lightning_sglang_compat.py",
+      "bytes": 49966,
+      "sha256": "1882ff1678a714e8f5a1bca055f4e51a05b2c62611c5f4ac609900a6d7f9cd10"
+    },
+    {
+      "action": "delete",
+      "path": "experiments/outputs/validation/container-import/import-oci-validation.sbatch",
+      "reason": "Superseded by experiments/container/import_image.sbatch; obsolete build wrote image/cache into outputs",
+      "bytes": 793,
+      "sha256": "658006392c5bab28c6c03a0cbaee98e4febd1583b253a65f2908eba405785c6a"
+    },
+    {
+      "action": "move",
+      "path": "experiments/outputs/validation/oci-migration/check_loss_parity.py",
+      "destination": "tests/manual/oci_validation/check_loss_parity.py",
+      "reason": "Reusable verification belongs under tests/manual",
+      "bytes": 935,
+      "sha256": "9c352eafe568436d527d9bf9ff2b8c3a1eeb221b22ef30a8e9090d05ba62335f"
+    },
+    {
+      "action": "move",
+      "path": "experiments/outputs/validation/oci-migration/compare_loss_parity.py",
+      "destination": "tests/manual/oci_validation/compare_loss_parity.py",
+      "reason": "Reusable verification belongs under tests/manual",
+      "bytes": 1761,
+      "sha256": "ad41b595fb045c8096cba8c76233d5cf3c9304c72e7d2d5b71fe0f69bf2ff142"
+    },
+    {
+      "action": "move",
+      "path": "experiments/outputs/validation/oci-step4000/check_step4000_resume_artifacts.py",
+      "destination": "tests/manual/oci_validation/check_step4000_resume_artifacts.py",
+      "reason": "Reusable verification belongs under tests/manual",
+      "bytes": 1786,
+      "sha256": "33a274fb4b6ca847064590e559cb3c79a46dcfad25c7458e78de5b283304fc94"
+    }
+  ]
+}

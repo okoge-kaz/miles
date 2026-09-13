@@ -10,6 +10,11 @@ sbatch -A nemotron_sw_post -p cpu --qos=cpu-interactive \
   experiments/container/import_image.sbatch
 ```
 
+Final images belong in `${WS}/container/`, currently
+`/lustre/fsw/portfolios/coreai/users/kfujii/container/`. Build scripts stay in
+`experiments/container/`; only their execution logs go into `outputs/`.
+The import and derivation scripts reject image output paths outside `CONTAINER_DIR`.
+
 The recipe imports with `enroot import --arch aarch64`, writes a unique dated
 `miles-oci-aarch64-*.sqsh`, and updates `miles-oci-aarch64.sqsh`.
 Pin an immutable file via SQSH_IMAGE for measurements. The mutable Docker
@@ -23,8 +28,17 @@ do not put ENROOT_DATA_PATH there. Confirm local free space before importing.
 ## Verification image, 2026-09-09
 
 CPU interactive job 7035384 imported `docker://radixark/miles:latest` explicitly
-as aarch64 into `experiments/outputs/miles-oci-aarch64-7035384.sqsh` (38 GB).
-The associated import log is in the same outputs directory. The GB200 container
+as aarch64 into the original `experiments/outputs/miles-oci-aarch64-7035384.sqsh`.
+Its canonical path is now
+`/lustre/fsw/portfolios/coreai/users/kfujii/container/miles-oci-aarch64-7035384.sqsh`
+(40.2 GB). CPU job 7114760 completed after the `afterany:7114153:7114396`
+dependencies, replacing the temporary alias with the original regular file.
+The rename preserved the inode and removed the old image path.
+`experiments/maintenance/relocate-runtime-image-20260913.completed.json`
+records completion. Active-job and destination checks ran before the move.
+The associated import log is under `experiments/outputs/validation/container-import/`.
+The completed import's layer cache was removed during the 2026-09-12 output cleanup.
+The GB200 container
 probe reported Python 3.12.3, PyTorch 2.13.0+cu130 / CUDA 13.0, Ray 2.58.0,
 SGLang 0.5.20.dev54+ga8e5c63, and a successful CUDA matrix product.
 These versions describe this one imported artifact, not future latest pulls.

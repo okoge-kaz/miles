@@ -31,6 +31,13 @@ experiments/
   outputs/                      job logs (git-ignored)
 ```
 
+Classify Slurm logs as `outputs/<model>/<task>/<experiment>/`; Lightning's
+node-ratio study uses `outputs/nemotron-3.5-lightning/math/train-rollout-ratio/`.
+Create the log directory before submission. Keep build scripts in
+`experiments/container/`, final container images in `${WS}/container/`, and
+build/extraction scratch on node-local storage; do not write them into `outputs/`.
+Reusable verification scripts belong in `tests/`.
+
 A recipe is `<task>/<mode>/<dataset>/<model>/` below `scripts/`, e.g.
 `math/sync/dapo-math-p10-90/qwen3-4b/`. The task and mode directories fix the
 RL setup (rollout mode, reward, generate function),
