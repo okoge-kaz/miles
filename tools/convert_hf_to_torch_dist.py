@@ -15,6 +15,7 @@ from miles.backends.megatron_utils.arguments import set_default_megatron_args
 from miles.backends.megatron_utils.initialize import init
 from miles.backends.megatron_utils.model_provider import get_model_provider_func
 from miles.utils.logging_utils import configure_logger_raw
+from miles.utils.megatron_bridge_utils import patch_megatron_model
 from miles.utils.memory_utils import print_memory
 from miles_plugins.models.deepseek_v4.arguments import add_dsv4_arguments
 
@@ -54,6 +55,9 @@ def get_args():
 
     args.debug_deterministic_collective = False
     args.enable_witness = False
+    # Offline conversion builds a model without Miles' rollout argument parser.
+    # Bridge providers still consume this runtime sequence setting.
+    args.variable_seq_lengths = False
 
     # set to pass megatron validate_args
     args.save_interval = 1
@@ -120,9 +124,16 @@ def main():
 
     # Load model
     hf_model_path = args.hf_checkpoint
-    bridge = AutoBridge.from_pretrained(hf_model_path, trust_remote_code=True)
+    if args.megatron_to_hf_mode == "bridge":
+        # NVIDIA Bridge is optional for the default mbridge conversion path.
+        from megatron.bridge import AutoBridge as MegatronBridge
 
-    bridge.load_weights(model, hf_model_path, memory_efficient=True)
+        bridge = MegatronBridge.from_hf_pretrained(hf_model_path, trust_remote_code=True)
+        with patch_megatron_model(model):
+            bridge.load_hf_weights(model)
+    else:
+        bridge = AutoBridge.from_pretrained(hf_model_path, trust_remote_code=True)
+        bridge.load_weights(model, hf_model_path, memory_efficient=True)
     print(f"Model loaded: {hf_model_path}")
 
     print_memory("after loading model")
