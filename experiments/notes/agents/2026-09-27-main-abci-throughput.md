@@ -58,25 +58,29 @@ The `reasoing-sft` spelling is the actual asset path.
 All eight model/tokenizer/config files, including both safetensors shards,
 match the SHA256 values in the filtering metadata.
 
-| Setting | 2:6 | 3:5 |
-| --- | --- | --- |
-| Exclusive nodes / total GPUs | 8 / 64 | 8 / 64 |
-| Actor nodes / GPUs | 2 / 16 | 3 / 24 |
-| Rollout nodes / GPUs | 6 / 48 | 5 / 40 |
-| Actor TP / CP | 2 / 1 | 2 / 1 |
-| Prompt groups × samples | 192 × 16 | 192 × 16 |
-| Global batch / updates per rollout | 3072 / 1 | 3072 / 1 |
-| Response / context limits | 16384 / 32768 | 16384 / 32768 |
-| Concurrent rollout samples | 3072 | 3072 |
-| Queue / staleness reference / bound | recycle / prefill / 8 | recycle / prefill / 8 |
-| Measured optimizer updates | 20 | 20 |
+The requested validation uses the production workload at 2:6 and staleness 16;
+the earlier 3:5 comparison is no longer scheduled.
 
-Both retain the existing GRPO/TIS recipe, learning rate 1e-6, zero reward on
+| Setting | 2:6 |
+| --- | --- |
+| Exclusive nodes / total GPUs | 8 / 64 |
+| Actor nodes / GPUs | 2 / 16 |
+| Rollout nodes / GPUs | 6 / 48 |
+| Actor TP / CP | 2 / 1 |
+| Prompt groups × samples | 192 × 16 |
+| Global batch / updates per rollout | 3072 / 1 |
+| Response / context limits | 16384 / 32768 |
+| Concurrent rollout samples | 3072 |
+| Queue / staleness reference / bound | recycle / prefill / 16 |
+| Completed queue capacity | 6000 prompt groups |
+| Measured optimizer updates | 20 |
+
+The run retains the existing GRPO/TIS recipe, learning rate 1e-6, zero reward on
 truncation, fused one-step actor logprobs, inflight replay, and exact provenance.
 W&B uses entity `okoge`, project `async-rl-staleness-dapo-math-miles`.
-The throughput jobs are disposable: no in-run eval or HF/model checkpoint is
-scheduled in the measured interval. `NUM_ROLLOUT=300` and debug exit at 20 avoid
-changing the scheduler horizon or triggering the last-rollout checkpoint.
+Production checkpoint settings are retained: Megatron and HF saves every 10
+updates, with a Megatron retention interval of 100. In-run evaluation is off.
+`NUM_ROLLOUT=300` and debug exit at 20 retain the production scheduler horizon.
 The two-node smoke/resume jobs do save both distributed and HF checkpoints.
 
 ## Execution after the image is ready
@@ -91,18 +95,13 @@ credentials are resolved on the compute host from the owner's `~/.netrc`.
 ```bash
 export PBS_PROJECT=gai51740
 export CONTAINER_IMAGE=/groups/gai51740/kazuki_fujii/containers/miles-main-20260927.sif
-export BENCHMARK_ID=main-20260927-a
-bash experiments/submit_abci_math_benchmark.sh convert 2:6
-bash experiments/submit_abci_math_benchmark.sh smoke 2:6
-bash experiments/submit_abci_math_benchmark.sh resume 2:6
-bash experiments/submit_abci_math_benchmark.sh fit 2:6
-bash experiments/submit_abci_math_benchmark.sh fit 3:5
+export BENCHMARK_ID=main-20260927-m16-prod
 bash experiments/submit_abci_math_benchmark.sh throughput 2:6
-bash experiments/submit_abci_math_benchmark.sh throughput 3:5
 ```
 
-These commands preview by default. Append `--submit` to execute one stage after
-the preceding stage has been checked. Confirm node joins, 192-CPU affinity,
+This command previews by default; append `--submit` to execute. The user requested
+the eight-node production validation after the successful two-node smoke.
+Confirm node joins, 192-CPU affinity,
 placement, finite losses, reward/response samples, saved artifacts and actual
 resume, then full-shape memory fit. Inspect the SGLang runtime tests and the
 Megatron checkpoint-selection tests in the new image before training. The smoke
@@ -115,14 +114,16 @@ Job IDs, source revision and image are recorded in
 ## Throughput analysis
 
 ```bash
-python experiments/tools/analyze_abci_throughput.py t2r6.log t3r5.log > throughput.json
+python experiments/tools/analyze_abci_throughput.py t2r6.log > throughput.json
 ```
 
 The analyzer requires exactly rollout IDs 0–19 with one completed optimizer
-update each. It reports total wall time, seconds/update, generated tokens/s,
+update each. It reports total pipeline-window time, seconds/update, generated tokens/s,
 accepted loss tokens/s, trainer starvation and rollout backpressure. Rates use
 summed counters divided by summed window durations. Both all 20 windows and
-windows 1–19 are reported; the first includes pipeline startup. These are short
+windows 1–19 are reported; the first includes pipeline startup. Checkpoint work
+inside these windows contributes to their duration; report final checkpoint and
+job teardown time separately from the pipeline windows. These are short
 throughput observations, not learning-quality measurements. Throughput numbers
 remain pending the GPU bring-up and measurement jobs.
 
@@ -152,4 +153,12 @@ These CPU checks do not execute CUDA kernels, multi-node collectives,
 checkpoint conversion, or either throughput run. GPU conversion subsequently
 passed in job `2450315.pbs1` (1m47s, exit 0), producing the named checkpoint's
 `release/.metadata` and `latest_checkpointed_iteration.txt = release`.
-Multi-node smoke/resume and throughput measurements remain pending.
+Two-node smoke `2450324.pbs1` subsequently passed (7m35s, exit 0): both updates
+completed, exact token provenance coverage was 100%, and Megatron, HF and replay
+artifacts were saved for iterations 0 and 1. The deliberately short 512-token
+responses were all truncated, giving zero reward and gradient; this establishes
+execution and saving, not learning. Its four image-native checkpoint-selection
+tests also passed. W&B: https://wandb.ai/okoge/async-rl-staleness-dapo-math-miles/runs/qflo5ukh.
+Resume job `2450359.pbs1` was canceled when the user requested the eight-node
+production run; actual restore remains unverified. The production throughput
+measurement remains pending.
