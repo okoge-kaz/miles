@@ -474,6 +474,7 @@ _NOT_ACTUALLY_SECRET_ARG_NAMES = frozenset(
         "metadata_key",
         "opd_teacher_key",
         "reward_key",
+        "router_allow_requests_without_routing_key",  # Boolean routing policy, not a credential.
         "tool_key",
     }
 )
@@ -761,6 +762,32 @@ class TestEventDirectoryDefaults:
         miles_validate_args(args)
 
         assert args.save_debug_event_data == "/debug/run/events"
+
+    def test_sample_dumps_can_be_disabled_while_dashboard_and_audit_remain_enabled(self) -> None:
+        args = self._parse(
+            [
+                "--save",
+                "/checkpoints/run",
+                "--dump-details",
+                "/debug/run",
+                "--use-miles-dashboard",
+                "--no-dump-rollout-data",
+                "--no-dump-train-data",
+                "--no-log-rollout-repetition",
+                "--no-log-token-lag-metrics",
+                "--log-rollout-timing",
+            ]
+        )
+        miles_validate_args(args)
+
+        assert args.save_debug_rollout_data is None
+        assert args.save_debug_trajectory_data is None
+        assert args.save_debug_train_data is None
+        assert args.save_debug_event_data == "/debug/run/events"
+        assert args.use_miles_dashboard
+        assert not args.log_rollout_repetition
+        assert not args.log_token_lag_metrics
+        assert args.log_rollout_timing
 
 
 class TestMaybeApplyDumperOverrides:

@@ -565,6 +565,7 @@ def finalize_useful_rollout_metrics(
     *,
     has_custom_converter: bool,
     zero_loss_on_truncated: bool = False,
+    log_token_lag_metrics: bool = True,
 ) -> None:
     """Finalize efficiency after flattening/trimming, immediately before logging."""
     if metrics is None or GENERATED_TOKENS_KEY not in metrics:
@@ -626,6 +627,7 @@ def finalize_useful_rollout_metrics(
                 samples,
                 train_version=train_version,
                 loss_token_counts=loss_token_counts,
+                log_token_lag_metrics=log_token_lag_metrics,
             )
         )
     metrics.update(prequeue_phase_metrics(samples))
@@ -1044,9 +1046,10 @@ def sample_lag_metrics(
     *,
     train_version: int,
     loss_token_counts: list[int] | None = None,
+    log_token_lag_metrics: bool = True,
 ) -> dict[str, float]:
     """Compute generation-to-training lag components over admitted samples."""
-    has_exact_segments = any(sample.response_weight_version_segments for sample in samples)
+    has_exact_segments = log_token_lag_metrics and any(sample.response_weight_version_segments for sample in samples)
     if loss_token_counts is None and has_exact_segments:
         loss_token_counts = [_loss_input_tokens(sample) for sample in samples]
     if loss_token_counts is not None and len(loss_token_counts) != len(samples):
@@ -1080,7 +1083,7 @@ def sample_lag_metrics(
         "staleness/sample_lag/provenance_sample_frac": len(rows) / len(samples) if samples else 0.0,
     }
     metrics.update(_version_mix_metrics(samples))
-    if not rows:
+    if log_token_lag_metrics:
         metrics.update(
             _exact_token_lag_metrics(
                 samples,
@@ -1089,6 +1092,7 @@ def sample_lag_metrics(
                 has_exact_segments=has_exact_segments,
             )
         )
+    if not rows:
         return metrics
 
     components = {
@@ -1130,14 +1134,6 @@ def sample_lag_metrics(
     if reward_corr is not None:
         metrics["staleness/sample_lag/corr_reward_total"] = reward_corr
 
-    metrics.update(
-        _exact_token_lag_metrics(
-            samples,
-            train_version,
-            loss_token_counts=loss_token_counts,
-            has_exact_segments=has_exact_segments,
-        )
-    )
     return metrics
 
 

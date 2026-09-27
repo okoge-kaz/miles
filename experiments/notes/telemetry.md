@@ -1279,6 +1279,32 @@ Adam parameter displacement.
 
 ### Exact token versions and throughput
 
+`--no-log-token-lag-metrics` skips exact token-lag aggregation and its coverage
+counters for experimental fully-async and synchronous partial rollouts. It does
+not change sample-level staleness, queue admission, loss inputs, or the SGLang
+response-version provenance setting. The default remains enabled.
+
+`--no-log-rollout-repetition` skips compression-based `repetition_frac` for both
+rollout and evaluation; the key is omitted rather than reported as zero.
+
+For the async Math recipe, `LOG_TOKEN_LAG_METRICS=0` and
+`LOG_ROLLOUT_REPETITION=0` pass these switches. `DUMP_ROLLOUT_DATA=0` passes
+`--no-dump-rollout-data`, disabling rollout PT, trajectory JSONL, and token-column
+Parquet while preserving the dashboard collector and audit events. Combine it
+with `DUMP_TRAIN_DATA=0` and `DUMP_POLICY_LOSS_DEBUG=0` to disable sample/tensor
+dumps.
+
+`LOG_ROLLOUT_TIMING=1` passes `--log-rollout-timing`. It reports
+`perf/rollout_batch_ready_time` from entry into `RolloutExecutor.get` through
+completed object-store publication. Phase times cover `get_data`, `dump`,
+`metrics`, `batch_snapshot`, `convert`, and `object_store`; the last includes DP
+scheduling and serialization. `sample_metrics` and `tracking` are nested inside
+`metrics`, so do not add them again. Synchronous phases additionally report
+`*_thread_cpu_time`; the awaited `get_data` phase reports wall time only.
+Timing publication itself follows the batch-ready endpoint. Existing
+`perf/rollout_time` retains its earlier endpoint immediately before rollout
+logging and therefore excludes metrics, conversion, and publication.
+
 The SGLang flag `--sglang-enable-response-weight-version-segments` returns compact
 `[start, end, applied_weight_version]` runs for response tokens.  It is off by
 default.  Consecutive forwards under one version merge, speculative accepted

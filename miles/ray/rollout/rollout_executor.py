@@ -15,9 +15,11 @@ from miles.ray.rollout.metrics import (
     log_rollout_batch_consumption,
     log_rollout_data,
     log_rollout_pipeline_throughput,
+    log_rollout_timing,
 )
 from miles.ray.rollout.rollout_data_conversion import postprocess_rollout_data
 from miles.ray.rollout.router_manager import resolve_router_addrs, wait_session_server_ready
+from miles.ray.rollout.timing import measure_rollout_phase
 from miles.ray.rollout.train_data_conversion import (
     ROLLOUT_DATA_VALUE_SPEC,
     convert_samples_to_train_data,
@@ -176,6 +178,8 @@ class RolloutExecutor:
         self, rollout_id: int, trainer_model_id: str | None = None, *, updates_before_train: int = 0
     ) -> RolloutDataPack:
         start_time = time.time()
+        ready_started = time.perf_counter()
+        timing_metrics = {} if getattr(self.args, "log_rollout_timing", False) else None
         self.rollout_id = rollout_id
         self._rollouts_since_publish_of_model_id[trainer_model_id] += 1
         assert_weight_version_is_published(
@@ -183,52 +187,72 @@ class RolloutExecutor:
         )
         if (get_buffer_length := getattr(self.data_source, "get_buffer_length", None)) is not None:
             dashboard_hooks.report_data_buffer(get_buffer_length())
-        with timer("rollout" if trainer_model_id is None else f"{trainer_model_id}/rollout"):
+        with (
+            timer("rollout" if trainer_model_id is None else f"{trainer_model_id}/rollout"),
+            measure_rollout_phase(timing_metrics, "get_data", thread_cpu=False),
+        ):
             data, metadata, metrics, debug_metadata, batch_token = await self._get_rollout_data(
                 rollout_id=rollout_id, trainer_model_id=trainer_model_id, updates_before_train=updates_before_train
             )
         dump_metadata = dict(metadata)
         if debug_metadata is not None:
             dump_metadata[ROLLOUT_FN_DEBUG_METADATA_KEY] = debug_metadata
-        save_debug_rollout_data(
-            self.args,
-            data,
-            rollout_id=rollout_id,
-            evaluation=False,
-            metadata=dump_metadata,
-            trainer_model_id=trainer_model_id,
-        )
-        log_rollout_data(
-            rollout_id, self.args, data, metrics, time.time() - start_time, trainer_model_id=trainer_model_id
-        )
-        if self.args.fully_async:
-            self._fully_async_consumption_snapshots[rollout_id] = build_batch_consumption_snapshot(
+        with measure_rollout_phase(timing_metrics, "dump"):
+            save_debug_rollout_data(
+                self.args,
                 data,
-                optimizer_updates=len(data)
-                // int(metadata.get("dynamic_global_batch_size", self.args.global_batch_size)),
-                cohort_generated_tokens=(
-                    int(metrics[GENERATED_TOKENS_KEY])
-                    if metrics is not None and GENERATED_TOKENS_KEY in metrics
-                    else None
-                ),
-                has_custom_converter=self.custom_convert_samples_to_train_data_func is not None,
+                rollout_id=rollout_id,
+                evaluation=False,
+                metadata=dump_metadata,
+                trainer_model_id=trainer_model_id,
             )
-        metadata["training_step"] = rollout_id
-        data = convert_samples_to_train_data(
-            self.args,
-            data,
-            metadata=metadata,
-            custom_convert_samples_to_train_data_func=self.custom_convert_samples_to_train_data_func,
-            custom_reward_post_process_func=self.custom_reward_post_process_func,
-        )
-        sample_indices = data.get("sample_indices")
-        if self.args.delay_split_train_data_by_dp:
-            data_ref = object_store.get_instance().put(value=data, value_spec=ROLLOUT_DATA_VALUE_SPEC)
-        else:
-            data_ref = split_train_data_by_dp(
-                self.args, data, self._train_parallel_configs_of_model_id[trainer_model_id]
+        with measure_rollout_phase(timing_metrics, "metrics"):
+            log_rollout_data(
+                rollout_id,
+                self.args,
+                data,
+                metrics,
+                time.time() - start_time,
+                trainer_model_id=trainer_model_id,
+                timing_metrics=timing_metrics,
             )
-        return RolloutDataPack(sample_indices=sample_indices, data_ref=data_ref, replay_buffer_batch_token=batch_token)
+        with measure_rollout_phase(timing_metrics, "batch_snapshot"):
+            if self.args.fully_async:
+                self._fully_async_consumption_snapshots[rollout_id] = build_batch_consumption_snapshot(
+                    data,
+                    optimizer_updates=len(data)
+                    // int(metadata.get("dynamic_global_batch_size", self.args.global_batch_size)),
+                    cohort_generated_tokens=(
+                        int(metrics[GENERATED_TOKENS_KEY])
+                        if metrics is not None and GENERATED_TOKENS_KEY in metrics
+                        else None
+                    ),
+                    has_custom_converter=self.custom_convert_samples_to_train_data_func is not None,
+                )
+        with measure_rollout_phase(timing_metrics, "convert"):
+            metadata["training_step"] = rollout_id
+            data = convert_samples_to_train_data(
+                self.args,
+                data,
+                metadata=metadata,
+                custom_convert_samples_to_train_data_func=self.custom_convert_samples_to_train_data_func,
+                custom_reward_post_process_func=self.custom_reward_post_process_func,
+            )
+        with measure_rollout_phase(timing_metrics, "object_store"):
+            sample_indices = data.get("sample_indices")
+            if self.args.delay_split_train_data_by_dp:
+                data_ref = object_store.get_instance().put(value=data, value_spec=ROLLOUT_DATA_VALUE_SPEC)
+            else:
+                data_ref = split_train_data_by_dp(
+                    self.args, data, self._train_parallel_configs_of_model_id[trainer_model_id]
+                )
+            batch = RolloutDataPack(
+                sample_indices=sample_indices, data_ref=data_ref, replay_buffer_batch_token=batch_token
+            )
+        if timing_metrics is not None:
+            timing_metrics["perf/rollout_batch_ready_time"] = time.perf_counter() - ready_started
+            log_rollout_timing(rollout_id, self.args, timing_metrics, trainer_model_id=trainer_model_id)
+        return batch
 
     async def eval(
         self,
@@ -348,6 +372,7 @@ class RolloutExecutor:
                 metrics,
                 has_custom_converter=self.custom_convert_samples_to_train_data_func is not None,
                 zero_loss_on_truncated=getattr(self.args, "zero_loss_on_truncated", False),
+                log_token_lag_metrics=getattr(self.args, "log_token_lag_metrics", True),
             )
             append_final_consumed_records(
                 debug_metadata,

@@ -22,6 +22,8 @@ fi
 export BENCHMARK_ID="${BENCHMARK_ID:-main-$(date -u +%Y%m%dT%H%M%SZ)}"
 export BENCHMARK_STAGE="${stage}" BENCHMARK_ACTOR_NODES="${split%:*}"
 export MILES_REPO="${repo}"
+export DUMP_ROLLOUT_DATA="${DUMP_ROLLOUT_DATA:-1}" LOG_ROLLOUT_REPETITION="${LOG_ROLLOUT_REPETITION:-1}"
+export LOG_TOKEN_LAG_METRICS="${LOG_TOKEN_LAG_METRICS:-1}" LOG_ROLLOUT_TIMING="${LOG_ROLLOUT_TIMING:-0}"
 mkdir -p experiments/outputs/abci-throughput
 options=(--test-only)
 if [[ "${mode}" == --submit ]]; then
@@ -38,6 +40,7 @@ fi
 # assets and run identity, so unrelated shell overrides cannot alter a split.
 exports="BENCHMARK_ID,BENCHMARK_STAGE,BENCHMARK_ACTOR_NODES,MILES_REPO,MILES_WORKSPACE_ROOT"
 exports+=",CONTAINER_IMAGE,HF_CKPT_DIR,MEGATRON_CKPT_DIR,RL_DATASET_DIR,CACHE_DIR"
+exports+=",DUMP_ROLLOUT_DATA,LOG_ROLLOUT_REPETITION,LOG_TOKEN_LAG_METRICS,LOG_ROLLOUT_TIMING"
 result="$(pbs_submit "${options[@]}" --profile gpu --nodes="${nodes}" --time=04:00:00 \
     --job-name="math-${stage}-t${BENCHMARK_ACTOR_NODES}" \
     --output="${repo}/experiments/outputs/abci-throughput/" --export="${exports}" \

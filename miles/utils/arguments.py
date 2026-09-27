@@ -2337,6 +2337,26 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
 
         # wandb
         def add_wandb_arguments(parser):
+            parser.add_argument(
+                "--log-rollout-repetition",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help="Compute response repetition metrics using text compression for rollout and evaluation.",
+            )
+            parser.add_argument(
+                "--log-token-lag-metrics",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help="Compute exact token-lag distributions for experimental fully-async and partial rollouts. "
+                "Disabling this leaves sample staleness, admission bounds and version provenance unchanged.",
+            )
+            parser.add_argument(
+                "--log-rollout-timing",
+                action="store_true",
+                default=False,
+                help="Measure batch-ready latency through object-store publication and rollout phase overheads. "
+                "Synchronous phases report both wall time and thread CPU time.",
+            )
             # wandb parameters
             parser.add_argument("--use-wandb", action="store_true", default=False)
             parser.add_argument(
@@ -2543,6 +2563,13 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 type=str,
                 default=None,
                 help=("Dump all details of training for post-hoc analysis and visualization."),
+            )
+            parser.add_argument(
+                "--dump-rollout-data",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help="Whether --dump-details writes rollout samples, trajectory sidecars and token-column Parquet. "
+                "Disable together with --no-dump-train-data to retain only dashboard and audit telemetry.",
             )
             parser.add_argument(
                 "--dump-train-data",
@@ -4186,10 +4213,14 @@ def miles_validate_args(args):
         args.eval_reward_key = args.reward_key
 
     if args.dump_details is not None:
-        args.save_debug_rollout_data = f"{args.dump_details}/rollout_data/{{rollout_id}}.pt"
+        if args.dump_rollout_data:
+            args.save_debug_rollout_data = f"{args.dump_details}/rollout_data/{{rollout_id}}.pt"
+            args.save_debug_trajectory_data = f"{args.dump_details}/trajectory/{{rollout_id}}.jsonl"
+        else:
+            args.save_debug_rollout_data = None
+            args.save_debug_trajectory_data = None
         if args.dump_train_data:
             args.save_debug_train_data = f"{args.dump_details}/train_data/{{rollout_id}}_{{rank}}.pt"
-        args.save_debug_trajectory_data = f"{args.dump_details}/trajectory/{{rollout_id}}.jsonl"
         args.save_debug_event_data = f"{args.dump_details}/{EVENTS_DIRNAME}"
 
     if args.save_debug_event_data is None and args.save is not None:

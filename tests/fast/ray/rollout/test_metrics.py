@@ -20,6 +20,21 @@ from miles.utils.tracking_utils.wandb_utils import _STEP_METRIC_PREFIXES
 from miles.utils.types import Sample, WeightVersionSpan, WeightVersionsPerCall
 
 
+def test_disabled_repetition_skips_text_compression(monkeypatch):
+    from miles.ray.rollout import metrics as metrics_module
+
+    def unexpected_compression(_text):
+        pytest.fail("disabled repetition metric must not inspect response text")
+
+    samples = make_samples_grouped(1, 4)
+    expected = _compute_metrics_from_samples(make_args(), samples)
+    monkeypatch.setattr(metrics_module, "has_repetition", unexpected_compression)
+    actual = _compute_metrics_from_samples(make_args(log_rollout_repetition=False), samples)
+
+    assert "repetition_frac" not in actual
+    assert actual == {key: value for key, value in expected.items() if key != "repetition_frac"}
+
+
 class TestEpisodeResponseLengthMetrics:
     def test_compacted_siblings_are_summed_before_computing_statistics(self):
         samples = [

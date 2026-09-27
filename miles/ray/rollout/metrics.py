@@ -4,6 +4,7 @@ from typing import Any
 
 import numpy as np
 
+from miles.ray.rollout.timing import measure_rollout_phase
 from miles.rollout.session.v2.metrics import SESSION_ROLLOUT_METRICS_KEY
 from miles.utils.function_registry import load_function
 from miles.utils.iter_utils import group_by
@@ -100,7 +101,14 @@ def log_eval_skip(rollout_id, args, reason: str):
 
 
 def log_rollout_data(
-    rollout_id, args, samples, rollout_extra_metrics, rollout_time, trainer_model_id: str | None = None
+    rollout_id,
+    args,
+    samples,
+    rollout_extra_metrics,
+    rollout_time,
+    trainer_model_id: str | None = None,
+    *,
+    timing_metrics: dict[str, float] | None = None,
 ):
     if (x := args.custom_rollout_log_function_path) is not None:
         custom_log_func = load_function(x)
@@ -111,7 +119,8 @@ def log_rollout_data(
         return
 
     log_dict = {**(rollout_extra_metrics or {})}
-    log_dict |= dict_add_prefix(_compute_metrics_from_samples(args, samples), "rollout/")
+    with measure_rollout_phase(timing_metrics, "sample_metrics"):
+        log_dict |= dict_add_prefix(_compute_metrics_from_samples(args, samples), "rollout/")
     log_dict |= dict_add_prefix(_compute_perf_metrics_from_samples(args, samples, rollout_time), "perf/")
     if args.log_passrate:
         log_dict |= dict_add_prefix(
@@ -121,6 +130,19 @@ def log_rollout_data(
     logger.info(f"perf {rollout_id}: {log_dict}")
     log_dict, step_key = namespace_metrics(
         log_dict,
+        trainer_model_id=trainer_model_id,
+        step_name="rollout/step",
+        step=compute_rollout_step(args, rollout_id),
+    )
+    with measure_rollout_phase(timing_metrics, "tracking"):
+        tracking.log(args, log_dict, step_key=step_key)
+
+
+def log_rollout_timing(rollout_id, args, metrics, trainer_model_id: str | None = None) -> None:
+    """Publish timing after the batch references are ready; publication is outside the measured latency."""
+    logger.info(f"rollout timing {rollout_id}: {metrics}")
+    log_dict, step_key = namespace_metrics(
+        metrics,
         trainer_model_id=trainer_model_id,
         step_name="rollout/step",
         step=compute_rollout_step(args, rollout_id),
@@ -139,7 +161,8 @@ def _compute_metrics_from_samples(args, samples):
     log_dict |= _compute_spec_metrics(args, samples)
     log_dict |= _compute_prefix_cache_metrics(args, samples)
     log_dict |= _compute_reward_cat_metrics(args, samples)
-    log_dict["repetition_frac"] = np.mean([int(has_repetition(s.response)) for s in samples]).item()
+    if getattr(args, "log_rollout_repetition", True):
+        log_dict["repetition_frac"] = np.mean([int(has_repetition(s.response)) for s in samples]).item()
     log_dict["truncated_ratio"] = np.mean([int(s.status == Sample.Status.TRUNCATED) for s in samples]).item()
 
     oldest_versions = [s.oldest_weight_version for s in samples if s.oldest_weight_version is not None]

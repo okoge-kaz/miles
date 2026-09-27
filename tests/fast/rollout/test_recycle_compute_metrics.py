@@ -493,6 +493,27 @@ def test_exact_loss_token_lag_intersects_compact_segments_with_loss_mask() -> No
     assert metrics["staleness/token_lag/exact/loss_sequence/mean"] == pytest.approx(4 / 3)
 
 
+@pytest.mark.parametrize("with_forward_provenance", [False, True])
+def test_token_lag_can_be_disabled_without_changing_sample_metrics(monkeypatch, with_forward_provenance) -> None:
+    from miles.rollout import recycle_compute_metrics as metrics_module
+
+    sample = _sample(1, 5, [1] * 5)
+    sample.response_weight_version_segments = [[[0, 2, 8], [2, 5, 9]]]
+    if with_forward_provenance:
+        sample.first_prefill_weight_versions = [8]
+        sample.last_forward_weight_versions = [9]
+    expected = sample_lag_metrics([sample], train_version=10)
+
+    def unexpected_token_scan(*args, **kwargs):
+        pytest.fail("disabled exact token lag must skip the computation")
+
+    monkeypatch.setattr(metrics_module, "_exact_token_lag_metrics", unexpected_token_scan)
+    actual = sample_lag_metrics([sample], train_version=10, log_token_lag_metrics=False)
+
+    assert actual == {key: value for key, value in expected.items() if not key.startswith("staleness/token_lag/")}
+    assert sample.response_weight_version_segments == [[[0, 2, 8], [2, 5, 9]]]
+
+
 def test_version_mix_metrics_cover_trained_samples_without_token_expansion() -> None:
     mixed = _sample(1, 5, [1] * 5)
     mixed.first_prefill_weight_versions = [8]

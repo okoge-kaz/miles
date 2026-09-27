@@ -120,6 +120,18 @@ TELEMETRY_ARGS=(
    --use-miles-dashboard
    --observe-training-entropy
 )
+if [[ "${DUMP_ROLLOUT_DATA:-1}" == 0 ]]; then
+   TELEMETRY_ARGS+=(--no-dump-rollout-data)
+fi
+if [[ "${LOG_ROLLOUT_REPETITION:-1}" == 0 ]]; then
+   TELEMETRY_ARGS+=(--no-log-rollout-repetition)
+fi
+if [[ "${LOG_TOKEN_LAG_METRICS:-1}" == 0 ]]; then
+   TELEMETRY_ARGS+=(--no-log-token-lag-metrics)
+fi
+if [[ "${LOG_ROLLOUT_TIMING:-0}" == 1 ]]; then
+   TELEMETRY_ARGS+=(--log-rollout-timing)
+fi
 if [[ "${DUMP_POLICY_LOSS_DEBUG:-0}" != "0" ]]; then
    TELEMETRY_ARGS+=(--dump-policy-loss-debug)
 else

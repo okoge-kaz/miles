@@ -11,6 +11,22 @@ from miles.rollout.recycle_compute_metrics import SAMPLE_REFERENCE_VERSION_KEY, 
 from miles.utils.types import Sample
 
 
+def test_disabled_token_lag_preserves_partial_rollout_sample_staleness(monkeypatch) -> None:
+    from miles.rollout import partial_rollout_telemetry as telemetry
+
+    sample = Sample(index=0, group_index=0, response_length=3)
+    expected = telemetry.collect_partial_rollout_staleness_metrics([[sample]], 5)
+
+    def unexpected_token_scan(*args, **kwargs):
+        pytest.fail("disabled exact token lag must skip partial token accounting")
+
+    monkeypatch.setattr(telemetry, "_token_staleness_metrics", unexpected_token_scan)
+    actual = telemetry.collect_partial_rollout_staleness_metrics([[sample]], 5, log_token_lag_metrics=False)
+
+    assert not any(key.startswith("staleness/token_lag/") for key in actual)
+    assert actual["staleness/total/mean"] == expected["staleness/total/mean"]
+
+
 def test_stamp_partial_rollout_start_uses_token_length_and_keeps_origin() -> None:
     sample = Sample(index=7, response="", response_length=1)
 

@@ -574,7 +574,11 @@ async def generate_rollout_async(
 
     metrics = metric_gatherer.collect()
     if args.partial_rollout:
-        metrics.update(collect_partial_rollout_staleness_metrics(data, rollout_id))
+        metrics.update(
+            collect_partial_rollout_staleness_metrics(
+                data, rollout_id, log_token_lag_metrics=getattr(args, "log_token_lag_metrics", True)
+            )
+        )
         metrics.update(
             collect_partial_rollout_work_metrics(
                 launched_groups=launched_groups,

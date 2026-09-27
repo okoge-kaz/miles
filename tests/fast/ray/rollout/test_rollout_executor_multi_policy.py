@@ -90,6 +90,40 @@ def _record_logged_model_ids(monkeypatch) -> list[str | None]:
 
 
 class TestPerPolicyKeying:
+    async def test_batch_ready_timing_includes_conversion_and_object_store(self, monkeypatch):
+        executor = _make_executor()
+        executor.args.log_rollout_timing = True
+        executor._train_parallel_configs_of_model_id[None] = {}
+        clock = [0.0]
+        recorded = []
+
+        def spend(seconds, value=None):
+            clock[0] += seconds
+            return value
+
+        async def get_data(**kwargs):
+            return spend(2.0, ([], {}, {}, None, None))
+
+        monkeypatch.setattr(rollout_executor_module.time, "perf_counter", lambda: clock[0])
+        monkeypatch.setattr(executor, "_get_rollout_data", get_data)
+        monkeypatch.setattr(rollout_executor_module, "save_debug_rollout_data", lambda *a, **k: spend(3.0))
+        monkeypatch.setattr(rollout_executor_module, "log_rollout_data", lambda *a, **k: spend(5.0))
+        monkeypatch.setattr(rollout_executor_module, "convert_samples_to_train_data", lambda *a, **k: spend(7.0, {}))
+        monkeypatch.setattr(rollout_executor_module, "split_train_data_by_dp", lambda *a, **k: spend(11.0, []))
+        monkeypatch.setattr(
+            rollout_executor_module,
+            "log_rollout_timing",
+            lambda _id, _args, metrics, **k: recorded.append(dict(metrics)),
+        )
+
+        batch = await executor.get(0)
+
+        assert batch.data_ref == []
+        assert recorded[0]["perf/rollout_batch_ready_time"] == 28.0
+        assert recorded[0]["perf/rollout_convert_time"] == 7.0
+        assert recorded[0]["perf/rollout_object_store_time"] == 11.0
+        assert "perf/rollout_get_data_thread_cpu_time" not in recorded[0]
+
     def test_every_policy_keeps_its_own_weight_version(self):
         """One shared version would let a policy's samples be judged against another policy's weights."""
         executor = _make_executor()

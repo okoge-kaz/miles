@@ -29,7 +29,9 @@ def stamp_partial_rollout_start(group: Group, rollout_id: int) -> None:
             _append_token_boundary(sample, rollout_id)
 
 
-def collect_partial_rollout_staleness_metrics(groups: list[Group], rollout_id: int) -> dict[str, float]:
+def collect_partial_rollout_staleness_metrics(
+    groups: list[Group], rollout_id: int, *, log_token_lag_metrics: bool = True
+) -> dict[str, float]:
     """Measure accepted-batch lag in synchronous weight-update boundaries.
 
     Synchronous training pushes weights once after every rollout. A retained
@@ -73,7 +75,8 @@ def collect_partial_rollout_staleness_metrics(groups: list[Group], rollout_id: i
     sample_metrics = staleness_distribution_metrics(sample_ages)
     sample_metrics["num_samples"] = sample_metrics.pop("num_groups")
     metrics.update({f"staleness/partial_rollout/sample_total/{name}": value for name, value in sample_metrics.items()})
-    metrics.update(_token_staleness_metrics(samples, rollout_id))
+    if log_token_lag_metrics:
+        metrics.update(_token_staleness_metrics(samples, rollout_id))
     return metrics
 
 

@@ -167,16 +167,25 @@ Production validation `2450392.pbs1` started at 14:32 JST from frozen revision
 affinity; the actual command selected actor nodes 2, rollout GPUs 48, staleness
 16, global batch 3072, debug exit after 20 updates, and Megatron/HF save cadence
 10. W&B: https://wandb.ai/okoge/async-rl-staleness-dapo-math-miles/runs/rbc9n05y.
-The first four optimizer updates completed with finite, nonzero gradient norms.
-The first batch's raw reward was 0.6162, mean response length 3948.94, and
-truncation fraction 0.0260. These are initial checks; the 20-update result is
-still pending.
+All 20 optimizer updates completed with finite gradients and exit status 0.
+Normal steps, excluding startup and the checkpoint transition, averaged
+163.01 seconds: 122.70 seconds training and 40.31 seconds outside training.
+The recorded rollout time excludes synchronous metrics and batch conversion.
+Checkpoint worker restart also resets pipeline throughput windows, so those
+window sums must not be used as checkpoint-inclusive elapsed time.
 
-CPU finalizer `2450466.pbs1` waits for this training job with `afterany`, then
-audits its exit status, all 20 pipeline windows and optimizer updates, the
+CPU finalizer `2450466.pbs1` audited its exit status, all 20 pipeline windows and optimizer updates, the
 staleness bound and exact-token coverage, and final Megatron/HF/replay artifact
 publication. It writes both successful and incomplete results to
 `experiments/outputs/abci-throughput/results/2450392.pbs1.{json,md}`. The finalizer
 does not test checkpoint restore. Its script, checksum, job IDs, source paths
 and result paths are recorded beside `integration-manifest.json` in the ignored
 output directory.
+
+The overhead comparison uses the same workload and save cadence with
+`DUMP_ROLLOUT_DATA=0`, `LOG_ROLLOUT_REPETITION=0`,
+`LOG_TOKEN_LAG_METRICS=0`, and `LOG_ROLLOUT_TIMING=1`. Train and policy-loss
+dumps were already disabled. Dashboard/audit telemetry and sample-level
+staleness remain enabled. The new batch-ready timer includes conversion and
+object-store publication. Source changes are mounted into the existing verified
+SIF; no container rebuild is needed.

@@ -285,13 +285,12 @@ evaluation therefore runs against saved checkpoints outside the training path.
 
 ### Telemetry
 
-The rule is: anything without overhead is always on, and the one expensive
-artifact is opt-in.
-
-Always on — wandb, `--dump-details` and `--use-miles-dashboard`. The collector is
-fire-and-forget (a few ms per step, nothing on the training path waits on it) and
-the rollout dumps are one file per step from a single writer. View a run, live or
-finished, from anywhere that can see the directory:
+The recipes enable wandb, `--dump-details` and `--use-miles-dashboard` by default.
+Rollout sample dumps are written synchronously before the batch is handed to
+training. The async Math recipe accepts `DUMP_ROLLOUT_DATA=0` to disable its
+rollout PT, trajectory JSONL, and token-column Parquet while retaining dashboard
+and audit telemetry. View a run, live or finished, from anywhere that can see
+the directory:
 
 ```bash
 python -m miles.dashboard.serve --dump-details <ckpt-path>/dump --follow
