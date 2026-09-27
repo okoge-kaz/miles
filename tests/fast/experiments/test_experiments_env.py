@@ -98,8 +98,8 @@ def test_experiments_env_derives_layout_caches_and_mounts(tmp_path: Path) -> Non
     assert resolved["ASYNC_CONTAINER_IMAGE_OVERRIDE"] == str(image)
     assert resolved["MILES_NCCL_TRANSPORT"] == "system"
     assert resolved["SGLANG_REPO"] == "okoge-kaz/sglang"
-    assert resolved["SGLANG_BRANCH"] == "miles-staleness-weight-boundaries"
-    assert resolved["SGLANG_COMMIT"] == "f994b9aedfd0b1465dbb8f4e2a02eb789fc76dce"
+    assert resolved["SGLANG_BRANCH"] == "miles-staleness-weight-boundaries-v0.5.20"
+    assert resolved["SGLANG_COMMIT"] == "164a43b253cceccaaab1d386550a0227419740e5"
     assert resolved["PBS_CONTAINER_WALLTIME"] == "00:30:00"
     assert resolved["PBS_GPU_RESOURCE_TYPE"] == "rt_HF"
     assert resolved["PBS_CPU_RESOURCE_TYPE"] == "rt_HC"

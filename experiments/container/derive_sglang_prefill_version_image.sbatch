@@ -15,7 +15,7 @@ set -euo pipefail
 REPO_ROOT="${PBS_O_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." &>/dev/null && pwd)}"
 source "${REPO_ROOT}/experiments/env.sh"
 
-expected_commit="${SGLANG_COMMIT:-f994b9aedfd0b1465dbb8f4e2a02eb789fc76dce}"
+expected_commit="${SGLANG_COMMIT:-164a43b253cceccaaab1d386550a0227419740e5}"
 [[ -r "${CONTAINER_IMAGE}" ]] || {
     echo "missing CONTAINER_IMAGE=${CONTAINER_IMAGE}; run experiments/setup.sh container --submit" >&2
     exit 1

@@ -6,21 +6,23 @@ import signal
 import time
 from pathlib import Path
 
-from miles.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
+from miles.ray.placement_group import (
+    create_rollout_components,
+    create_training_models,
+    maybe_start_api_server,
+    update_weights,
+)
 from miles.ray.rollout.eval_dispatch import EvalDispatcher
-from miles.rollout.queue_policy import should_prefetch_rollout_batches
-from miles.utils import object_store
+from miles.rollout.queue_policy import should_prefetch_rollout_batches, uses_experiment_async_queue
 from miles.utils.arguments import parse_args, validate_async_off_policy_correction
-from miles.utils.audit_utils.process_identity import MainProcessIdentity
-from miles.utils.data import remove_rollout_data_refs
-from miles.utils.debug_utils.periodic_py_spy import maybe_start_periodic_pyspy_dump
-from miles.utils.ft_utils.control_server.server import start_control_server
+from miles.utils.async_utils import Disposer, eager_create_task, with_disposer
+from miles.utils.data import remove_rollout_data_refs, remove_train_output_refs
 from miles.utils.ft_utils.mini_ft_controller import maybe_start_mini_ft_controller
-from miles.utils.logging_utils import configure_logger
 from miles.utils.misc import checkpoint_artifacts_due, should_run_periodic_action
-from miles.utils.tracking_utils.tracking import finish_tracking, init_tracking
+from miles.utils.orchestration_utils import init_orchestration_script
 
 logger = logging.getLogger(__name__)
+
 
 _RESUME_METRIC_PREFIX = "resume/benchmark/checkpoint"
 
@@ -114,9 +116,7 @@ def _maybe_inject_debug_failure(
     if fail_after is None or rollout_id - args.start_rollout_id + 1 < fail_after:
         return
     if not checkpoint_committed:
-        raise RuntimeError(
-            f"Injected failure reached rollout {rollout_id} without a committed distributed checkpoint"
-        )
+        raise RuntimeError(f"Injected failure reached rollout {rollout_id} without a committed distributed checkpoint")
     if checkpoint_metrics is None:
         raise RuntimeError("Injected failure requires checkpoint replay/conservation metrics")
     for name, minimum in _debug_failure_thresholds(args).items():
@@ -148,49 +148,41 @@ def _maybe_inject_debug_failure(
 
 
 # The framework supports other asynchronous approaches such as fully async (see miles/rollout/fully_async_rollout.py).
-async def train(args):
+async def train(args, *, disposer: Disposer):
     assert not args.colocate, "Colocation is not supported for async training."
     use_replay_buffer = getattr(args, "use_replay_buffer", False)
     _validate_debug_failure_configuration(args)
     validate_async_off_policy_correction(args)
-    configure_logger(args, source=MainProcessIdentity())
-    maybe_start_periodic_pyspy_dump()
-    # allocate the GPUs
-    pgs = create_placement_groups(args)
-    object_store.init_instance(args, contribute_segment=False)
-    init_tracking(args)
+    _worker_manager = init_orchestration_script(args, disposer=disposer)
 
     # create the rollout manager, with sglang engines inside.
     # need to initialize rollout manager first to calculate num_rollout
-    rollout_manager, num_rollout_per_epoch = create_rollout_manager(args, pgs["rollout"])
+    inference_controller, rollout_executor, num_rollout_per_epoch = await create_rollout_components(args)
+    disposer.add(inference_controller, rollout_executor)
 
     # create the actor and critic models
-    actor_model, critic_model = await create_training_models(args, pgs, rollout_manager)
+    actor_model, critic_model = await create_training_models(args, rollout_executor)
+    disposer.add(critic_model, actor_model)
 
-    if args.control_server_port:
-        start_control_server(
-            actor_model=actor_model,
-            rollout_manager=rollout_manager,
-            port=args.control_server_port,
-            ft_components=args.ft_components,
-        )
-
+    maybe_start_api_server(args, trainer_models={"actor": actor_model}, inference_controller=inference_controller)
     maybe_start_mini_ft_controller(args)
 
     # always update weight first so that sglang has the loaded weights from training.
-    await actor_model.update_weights()
+    await update_weights(args, actor_model, rollout_executor, inference_controller)
 
     if args.check_weight_update_equal:
-        await rollout_manager.check_weights.remote(
+        await inference_controller.check_weights(
             action="compare",
             allow_quant_error=args.check_weight_update_allow_quant_error,
             selector=args.check_weight_update_selector,
             skip_list=args.check_weight_update_skip_list,
         )
 
-    eval_dispatcher = EvalDispatcher(args, actor_model, rollout_manager)
+    eval_dispatcher = EvalDispatcher(args, actor_model, rollout_executor)
+    disposer.add(eval_dispatcher.drain)
 
     if args.eval_interval is not None and args.start_rollout_id == 0 and not args.skip_eval_before_train:
+        await inference_controller.prepare_eval()
         await eval_dispatcher.dispatch(0, hf_dir=args.hf_checkpoint)
 
     async def save_training_model(model, rollout_id, force_sync, *, write_dist=True, write_hf=True):
@@ -200,32 +192,39 @@ async def train(args):
         if args.use_critic and args.offload_train:
             await model.offload()
 
+    async def prepare_and_generate(rollout_id, *, updates_before_train=0):
+        await inference_controller.prepare_rollout(rollout_id)
+        return await rollout_executor.get(rollout_id, updates_before_train=updates_before_train)
+
     # async train loop.
-    prefetch_rollout_batches = should_prefetch_rollout_batches(args)
-    rollout_data_next_future = rollout_manager.generate.remote(
-        args.start_rollout_id,
-        updates_before_train=0,
-    )
+    rollout_data_next_future = await eager_create_task(prepare_and_generate(args.start_rollout_id))
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
-        checkpoint_committed = False
-        checkpoint_metrics = None
         # Sync the last generation
         if rollout_data_next_future is not None:
             rollout_data_curr_ref = await rollout_data_next_future
 
+        # The experimental queue-recycle admits a lookahead batch with an
+        # explicit future train version. Upstream fully-async drains after a
+        # weight push, while still overlapping steps that do not publish.
+        prefetch_rollout_batches = should_prefetch_rollout_batches(args) and (
+            not args.fully_async
+            or uses_experiment_async_queue(args)
+            or (rollout_id + 1) % args.update_weights_interval != 0
+        )
         # Start the next rollout early.
         if prefetch_rollout_batches and rollout_id + 1 < args.num_rollout:
-            rollout_data_next_future = rollout_manager.generate.remote(
-                rollout_id + 1,
-                updates_before_train=_updates_before_training_rollout(args, rollout_id + 1),
+            rollout_data_next_future = await eager_create_task(
+                prepare_and_generate(
+                    rollout_id + 1, updates_before_train=_updates_before_training_rollout(args, rollout_id + 1)
+                )
             )
         elif not prefetch_rollout_batches:
             rollout_data_next_future = None
 
-        if args.fully_async:
+        if args.fully_async and uses_experiment_async_queue(args):
             # Close the batch's queue-wait window and retain its throughput inputs
             # immediately before the trainer call.
-            await rollout_manager.record_batch_consumption.remote(rollout_id)
+            await rollout_executor.record_batch_consumption(rollout_id)
 
         actor_trained = False
         if args.use_critic:
@@ -237,21 +236,24 @@ async def train(args):
                 actor_trained = True
                 if args.offload_train:
                     await actor_model.offload()
+            remove_train_output_refs(values)
         else:
             await actor_model.train(rollout_id, rollout_data_curr_ref)
             actor_trained = True
-        if args.fully_async:
-            await rollout_manager.record_batch_trained.remote(
+        if args.fully_async and uses_experiment_async_queue(args):
+            await rollout_executor.record_batch_trained(
                 rollout_id,
                 actor_trained=actor_trained,
             )
         if use_replay_buffer:
-            await rollout_manager.acknowledge_trained_batch.remote(
+            await rollout_executor.acknowledge_trained_batch(
                 rollout_id,
-                rollout_data_curr_ref.get("replay_buffer_batch_token"),
+                rollout_data_curr_ref.replay_buffer_batch_token,
             )
         remove_rollout_data_refs(args, rollout_data_curr_ref)
 
+        checkpoint_committed = False
+        checkpoint_metrics = None
         external_save = args.save_trigger_sentinel is not None and os.path.exists(args.save_trigger_sentinel)
         write_dist, write_hf = checkpoint_artifacts_due(
             rollout_id,
@@ -279,7 +281,7 @@ async def train(args):
             # The model tracker is the commit record. Publish the matching replay
             # buffer first so a visible model checkpoint can never lack replay state.
             if write_dist and use_replay_buffer:
-                checkpoint_metrics = await rollout_manager.save.remote(rollout_id)
+                checkpoint_metrics = await rollout_executor.save(rollout_id)
             await save_training_model(actor_model, rollout_id, force_sync, write_dist=write_dist, write_hf=write_hf)
             if args.use_critic:
                 await save_training_model(
@@ -287,10 +289,10 @@ async def train(args):
                 )
             if write_dist:
                 if use_replay_buffer:
-                    await rollout_manager.mark_replay_buffer_committed.remote(rollout_id)
+                    await rollout_executor.mark_replay_buffer_committed(rollout_id)
                 else:
                     # Preserve the legacy cursor-only checkpoint order.
-                    checkpoint_metrics = await rollout_manager.save.remote(rollout_id)
+                    checkpoint_metrics = await rollout_executor.save(rollout_id)
                 checkpoint_committed = True
             if external_save:
                 os.remove(args.save_trigger_sentinel)
@@ -307,9 +309,10 @@ async def train(args):
             if prefetch_rollout_batches:
                 rollout_data_curr_ref = (await x) if (x := rollout_data_next_future) is not None else None
                 rollout_data_next_future = None
-            await actor_model.update_weights(rollout_id=rollout_id)
+            await update_weights(args, actor_model, rollout_executor, inference_controller, rollout_id=rollout_id)
 
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch, args.num_rollout):
+            await inference_controller.prepare_eval()
             await eval_dispatcher.dispatch(rollout_id, force=rollout_id == args.num_rollout - 1)
 
         if (
@@ -324,21 +327,9 @@ async def train(args):
             break
 
         if not prefetch_rollout_batches and rollout_id + 1 < args.num_rollout:
-            # The persistent rollout worker kept filling its policy queue during
-            # training. Ask it to select the next batch only now, when the trainer
-            # is ready to consume that batch.
-            rollout_data_next_future = rollout_manager.generate.remote(
-                rollout_id + 1,
-                updates_before_train=0,
-            )
-
-    await eval_dispatcher.drain()
-    await rollout_manager.dispose.remote()
+            rollout_data_next_future = await eager_create_task(prepare_and_generate(rollout_id + 1))
 
 
 if __name__ == "__main__":
     args = parse_args()
-    try:
-        asyncio.run(train(args))
-    finally:
-        finish_tracking()
+    asyncio.run(with_disposer(train, args))

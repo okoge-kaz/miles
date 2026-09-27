@@ -8,13 +8,17 @@ import torch
 
 from miles.rollout.replay_buffer import decode_group, encode_group
 from miles.utils.data import Dataset
-from miles.utils.misc import load_function
+from miles.utils.function_registry import load_function
 from miles.utils.processing_utils import load_processor, load_tokenizer
 from miles.utils.types import Sample
 
 logger = logging.getLogger(__name__)
 
 PARTIAL_ROLLOUT_BUFFER_KEY = "partial_rollout_buffer"
+
+
+def compute_global_dataset_state_path(directory: str, *, rollout_id: int | None) -> str:
+    return os.path.join(directory, f"rollout/global_dataset_state_dict_{rollout_id}.pt")
 
 
 class DataSource(abc.ABC):
@@ -133,7 +137,7 @@ class RolloutDataSource(DataSource):
             return
 
         state_dict = self.checkpoint_state()
-        path = os.path.join(self.args.save, f"rollout/global_dataset_state_dict_{rollout_id}.pt")
+        path = compute_global_dataset_state_path(self.args.save, rollout_id=rollout_id)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         torch.save(state_dict, path)
 
@@ -160,14 +164,16 @@ class RolloutDataSource(DataSource):
 
     def load(self, rollout_id=None):
         if not self.args.rollout_global_dataset:
+            logger.warning("--disable-rollout-global-dataset: the dataset starts where a fresh run's would")
             return
 
         if self.args.load is None:
+            logger.warning("no --load: the dataset starts where a fresh run's would")
             return
 
-        path = os.path.join(self.args.load, f"rollout/global_dataset_state_dict_{rollout_id}.pt")
+        path = compute_global_dataset_state_path(self.args.load, rollout_id=rollout_id)
         if not os.path.exists(path):
-            logger.info(f"Checkpoint {path} does not exist.")
+            logger.warning(f"no dataset state under {path}: the dataset starts where a fresh run's would")
             return
 
         logger.info(f"load metadata from {path}")

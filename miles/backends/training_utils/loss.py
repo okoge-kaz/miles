@@ -1,4 +1,5 @@
 from argparse import Namespace
+
 import torch
 from torch.utils.checkpoint import checkpoint
 
@@ -8,13 +9,21 @@ from miles.backends.training_utils.loss_hub.logit_processors import get_log_prob
 from miles.backends.training_utils.loss_hub.losses import get_loss_function
 from miles.backends.training_utils.loss_hub.math_utils import compute_approx_kl
 from miles.backends.training_utils.loss_hub.opd import apply_opd_kl_to_advantages
+from miles.backends.training_utils.loss_hub.policy_lag_metrics import POLICY_LAG_PART_PREFIX
+from miles.backends.training_utils.loss_hub.sequence_filter import SEQUENCE_FILTER_TOKEN_COUNT
+from miles.backends.training_utils.loss_hub.tis_population_metrics import TIS_POPULATION_PART_PREFIX
 from miles.backends.training_utils.parallel import get_parallel_state
 from miles.utils.audit_utils.event_logger.logger import get_event_logger, is_event_logger_initialized
 from miles.utils.audit_utils.event_logger.models import TrainAdvantageComputationEvent
-from miles.utils.multi_lora import is_multi_lora_enabled
+from miles.utils.lora.utils import is_multi_lora_enabled
 from miles.utils.types import RolloutBatch
 
 _SAMPLE_STALENESS_PART_PREFIX = "_sample_staleness_part/"
+_DIAGNOSTIC_PART_PREFIXES = (
+    _SAMPLE_STALENESS_PART_PREFIX,
+    TIS_POPULATION_PART_PREFIX,
+    POLICY_LAG_PART_PREFIX,
+)
 
 
 def _pack_logging_values(
@@ -25,12 +34,8 @@ def _pack_logging_values(
 ) -> dict[str, list[str] | torch.Tensor]:
     """Keep the historical vector unchanged and isolate opt-in diagnostics."""
 
-    standard_metrics = {
-        key: value for key, value in metrics.items() if not key.startswith(_SAMPLE_STALENESS_PART_PREFIX)
-    }
-    diagnostic_metrics = {
-        key: value for key, value in metrics.items() if key.startswith(_SAMPLE_STALENESS_PART_PREFIX)
-    }
+    standard_metrics = {key: value for key, value in metrics.items() if not key.startswith(_DIAGNOSTIC_PART_PREFIXES)}
+    diagnostic_metrics = {key: value for key, value in metrics.items() if key.startswith(_DIAGNOSTIC_PART_PREFIXES)}
     detached_values = [
         value.detach() if isinstance(value, torch.Tensor) else value for value in (count, *standard_metrics.values())
     ]
@@ -78,9 +83,10 @@ def compute_advantages_and_returns(
     `args.normalize_advantages` is True, advantages are whitened across the
     data-parallel group using masked statistics.
 
-    Early returns if both `log_probs` and `values` are None (intermediate
-    pipeline stages), unless the last stage is explicitly allowed to derive
-    zero-KL shapes without the standalone actor pass.
+    Early returns on intermediate pipeline stages; the last stage also
+    returns early when neither `log_probs` nor `values` is present, unless
+    it is explicitly allowed to derive zero-KL shapes without the standalone
+    actor pass.
 
     Args:
         args: Configuration specifying estimator type, KL coefficient,
@@ -105,7 +111,7 @@ def compute_advantages_and_returns(
         kl_template: list[torch.Tensor] | None = rollout_data.get("rollout_log_probs")
     else:
         log_probs: list[torch.Tensor] | None = rollout_data.get(
-            log_probs_key
+            "rollout_log_probs" if args.use_rollout_logprobs else "log_probs"
         )
         kl_template = log_probs
     ref_log_probs: list[torch.Tensor] = rollout_data.get("ref_log_probs")
@@ -116,10 +122,11 @@ def compute_advantages_and_returns(
     total_lengths: list[int] = rollout_data.get("total_lengths")
     max_seq_lens: list[int] | None = rollout_data.get("max_seq_lens", None)
 
-    # return when not the last pp stage.
-    if kl_template is None and values is None:
-        if not (allow_missing_log_probs and get_parallel_state().is_pp_last_stage):
-            return
+    # under --use-rollout-logprobs every stage holds log-probs, so ask the parallel state, not the tensors
+    if not get_parallel_state().is_pp_last_stage:
+        return
+    if kl_template is None and values is None and not allow_missing_log_probs:
+        return
 
     # This is the authoritative persistence boundary: scores produced before
     # the policy update are fixed training data and must not retain a graph.
@@ -127,11 +134,11 @@ def compute_advantages_and_returns(
     _detach_rollout_tensor_list(rollout_data, "rollout_log_probs")
     _detach_rollout_tensor_list(rollout_data, "ref_log_probs")
     _detach_rollout_tensor_list(rollout_data, "teacher_log_probs")
-    if not fused_logprobs:
-        log_probs = rollout_data.get(log_probs_key)
+    log_probs = None if fused_logprobs else rollout_data.get(log_probs_key)
+    kl_template = rollout_data.get("rollout_log_probs") if fused_logprobs else log_probs
     ref_log_probs = rollout_data.get("ref_log_probs")
 
-    if log_probs is None and values is None:
+    if kl_template is None and values is None:
         local_masks = get_local_response_loss_masks(
             total_lengths, response_lengths, loss_masks, args.qkv_format, max_seq_lens
         )
@@ -175,6 +182,12 @@ def compute_advantages_and_returns(
     if args.normalize_advantages:
         advantages = normalize_advantages(args, advantages, loss_masks, total_lengths, response_lengths, max_seq_lens)
 
+    clip_low = getattr(args, "advantage_clip_low", None)
+    clip_high = getattr(args, "advantage_clip_high", None)
+    if clip_low is not None or clip_high is not None:
+        # GRPO advantages can alias returns; clipping must not change value targets.
+        advantages = [advantage.clamp(min=clip_low, max=clip_high) for advantage in advantages]
+
     rollout_data["advantages"] = advantages
     rollout_data["returns"] = returns
 
@@ -186,11 +199,12 @@ def loss_function(
     logits: torch.Tensor,
     apply_megatron_loss_scaling: bool = False,
     num_rollouts: int | None = None,
-) -> tuple[torch.Tensor, int | torch.Tensor, dict[str, list[str] | torch.Tensor]]:
+) -> tuple[torch.Tensor, int | torch.Tensor, dict]:
     """Dispatch to the configured loss and rescale for Megatron integration.
 
     Selects one of "policy_loss", "value_loss", "sft_loss", or a custom loss
-    function based on `args.loss_type`, computes the loss and metrics, then
+    function based on `args.loss_type`, or the Tinker loss specified by
+    `batch["loss_fn"]`. Computes the loss and metrics, then
     rescales the loss by micro-batch and parallelism factors to integrate with
     Megatron's gradient accumulation.
 
@@ -211,6 +225,7 @@ def loss_function(
           `args.calculate_per_token_loss` is True, else `1` (int).
         - `logging_dict` has keys "keys" (list of str metric names) and
           "values" (1D tensor: [count, metric1, metric2, ...]).
+          Tinker losses may also return "per_datum" outputs.
     """
     parallel_state = get_parallel_state()
     num_tokens = sum([torch.clamp_min(loss_mask.sum(), 1) for loss_mask in batch["loss_masks"]])
@@ -226,7 +241,7 @@ def loss_function(
         denominators=batch.get("rollout_mask_sums", None),
     )
 
-    func = get_loss_function(args)
+    func = get_loss_function(args, batch.get("loss_fn"))
 
     if args.recompute_loss_function:
         loss, log = checkpoint(
@@ -239,9 +254,14 @@ def loss_function(
     else:
         loss, log = func(args, batch, logits, sum_of_sample_mean)
 
+    # Megatron sums this count over microbatches and DP/CP before scaling grads.
+    # Do not count rejected responses (or clamp each empty response to one).
+    num_tokens = log.pop(SEQUENCE_FILTER_TOKEN_COUNT, num_tokens)
+
     # Forces autograd to traverse the full graph on every rank to avoid hang.
+    # fp32 sum: an fp16 logits sum can overflow to inf, and 0 * inf is nan.
     if parallel_state.cp.size > 1 and args.allgather_cp:
-        loss = loss + 0 * logits.sum()
+        loss = loss + 0 * logits.sum(dtype=torch.float32)
 
     # Here we need to divide by cp_size because to cancel the multiply in Megatron.
     if num_rollouts is not None:
@@ -249,11 +269,8 @@ def loss_function(
     else:
         assert args.use_dynamic_global_batch_size == ("dynamic_global_batch_size" in batch)
         global_batch_size = batch.get("dynamic_global_batch_size", args.global_batch_size)
-    # Multi-LoRA: samples enter the gradient buffers with weight 1; per-adapter
-    # normalization (1/adapter_global_batch_size, a constant known in advance)
-    # is applied to the accumulated slot gradient at optimizer-step time.
-    if is_multi_lora_enabled(args):
-        global_batch_size = 1
+    # Tinker losses already carry the client's normalization
+    loss_normalizer = 1 if is_multi_lora_enabled(args) else global_batch_size
     if not args.calculate_per_token_loss:
         if apply_megatron_loss_scaling:
             loss_parallel_size = (
@@ -261,21 +278,23 @@ def loss_function(
                 if args.true_on_policy_mode and parallel_state.is_ulysses_cp
                 else parallel_state.intra_dp_cp.size
             )
-            loss = loss * num_microbatches / global_batch_size * loss_parallel_size
+            loss = loss * num_microbatches / loss_normalizer * loss_parallel_size
         else:
-            loss = loss / global_batch_size * parallel_state.intra_dp.size
+            loss = loss / loss_normalizer * parallel_state.intra_dp.size
     else:
         if apply_megatron_loss_scaling:
             loss = loss * parallel_state.cp.size
 
+    per_datum = log.pop("per_datum", None) if batch.get("loss_fn") is not None else None
+    logging_values = _pack_logging_values(
+        num_samples if not args.calculate_per_token_loss else num_tokens, log, device=logits.device
+    )
+    if per_datum is not None:
+        logging_values["per_datum"] = per_datum
     return (
         loss,
-        torch.tensor(num_tokens if args.calculate_per_token_loss else 1, device=logits.device),
-        _pack_logging_values(
-            num_samples if not args.calculate_per_token_loss else num_tokens,
-            log,
-            device=logits.device,
-        ),
+        torch.as_tensor(num_tokens if args.calculate_per_token_loss else 1, device=logits.device).detach().clone(),
+        logging_values,
     )
 
 

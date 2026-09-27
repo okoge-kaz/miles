@@ -31,7 +31,8 @@ def test_explicit_checkpoint_step_selects_requested_archive(checkpoint_args, mon
         return iteration, 0
 
     monkeypatch.setattr(checkpoint, "_load_checkpoint_megatron", load)
-    iteration, _ = checkpoint.load_checkpoint([], None, None, {}, False)
+    iteration, _, native_optimizer_restored = checkpoint.load_checkpoint([], None, None, {}, False)
+    assert native_optimizer_restored is False
 
     assert iteration == expected
     assert checkpoint_args.ckpt_step is selected

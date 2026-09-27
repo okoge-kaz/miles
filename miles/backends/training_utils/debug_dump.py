@@ -123,6 +123,9 @@ def maybe_dump_policy_loss_debug(
     dump_dir = getattr(args, "dump_details", None)
     if dump_dir is None or not getattr(args, "dump_policy_loss_debug", True):
         return
+    # TP peers compute the loss on identical data; CP ranks hold distinct token slices
+    if get_parallel_state().tp.rank != 0:
+        return
 
     global _POLICY_LOSS_DUMP_COUNTER
     counter = _POLICY_LOSS_DUMP_COUNTER

@@ -9,17 +9,16 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
-
 from experiments.src.environments.swe.result import HarborSWEOutcome
 from experiments.src.environments.swe.timeouts import TRIAL_REQUEST_TIMEOUT_SEC
+
 from miles.rollout.harbor.auth import (
     derive_harbor_cancel_bearer,
     derive_harbor_flush_bearer,
     derive_harbor_run_bearer,
 )
 
-
-_MODULE_PATH = Path(__file__).parents[3] / "examples" / "swe-agent" / "swe_agent_function.py"
+_MODULE_PATH = Path(__file__).parents[3] / "examples" / "swe-agent-harbor-docker" / "swe_agent_function.py"
 _SPEC = importlib.util.spec_from_file_location("miles_swe_agent_function", _MODULE_PATH)
 assert _SPEC is not None and _SPEC.loader is not None
 _MODULE = importlib.util.module_from_spec(_SPEC)
@@ -294,17 +293,13 @@ def test_abort_requires_and_sends_rollout_authentication(monkeypatch) -> None:
     monkeypatch.setenv("AGENT_SERVER_URL", "http://127.0.0.1:11000")
     monkeypatch.setenv("HARBOR_RUN_SECRET", "r" * 32)
 
-    asyncio.run(
-        _MODULE.abort(SimpleNamespace(session_server_instance_id="session-1"))
-    )
+    asyncio.run(_MODULE.abort(SimpleNamespace(session_server_instance_id="session-1")))
 
     expected_bearer = derive_harbor_flush_bearer(
         "r" * 32,
         session_server_instance_id="session-1",
     )
-    assert post.await_args.kwargs["headers"] == {
-        "Authorization": f"Bearer {expected_bearer}"
-    }
+    assert post.await_args.kwargs["headers"] == {"Authorization": f"Bearer {expected_bearer}"}
     assert post.await_args.args[1] == {"session_server_instance_id": "session-1"}
 
 
@@ -315,13 +310,7 @@ def test_abort_flushes_the_real_driver_instance_map(monkeypatch) -> None:
     monkeypatch.setenv("AGENT_SERVER_URL", "http://127.0.0.1:11000")
     monkeypatch.setenv("HARBOR_RUN_SECRET", run_secret)
 
-    asyncio.run(
-        _MODULE.abort(
-            SimpleNamespace(
-                session_server_instance_ids={31001: "session-b", 31000: "session-a"}
-            )
-        )
-    )
+    asyncio.run(_MODULE.abort(SimpleNamespace(session_server_instance_ids={31001: "session-b", 31000: "session-a"})))
 
     post.assert_has_awaits(
         [
@@ -361,9 +350,7 @@ def test_abort_rejects_the_entire_invalid_driver_inventory(
     monkeypatch.setenv("AGENT_SERVER_URL", "http://127.0.0.1:11000")
     monkeypatch.setenv("HARBOR_RUN_SECRET", "r" * 32)
 
-    asyncio.run(
-        _MODULE.abort(SimpleNamespace(session_server_instance_ids=instance_ids))
-    )
+    asyncio.run(_MODULE.abort(SimpleNamespace(session_server_instance_ids=instance_ids)))
 
     post.assert_not_awaited()
 
@@ -374,8 +361,6 @@ def test_abort_refuses_to_dispatch_without_rollout_authentication(monkeypatch) -
     monkeypatch.setenv("AGENT_SERVER_URL", "http://127.0.0.1:11000")
     monkeypatch.delenv("HARBOR_RUN_SECRET", raising=False)
 
-    asyncio.run(
-        _MODULE.abort(SimpleNamespace(session_server_instance_id="session-1"))
-    )
+    asyncio.run(_MODULE.abort(SimpleNamespace(session_server_instance_id="session-1")))
 
     post.assert_not_awaited()

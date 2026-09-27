@@ -45,6 +45,9 @@ CKPT_ARGS=(
    --save-interval "${SAVE_INTERVAL}"
    --save-retain-interval "${SAVE_RETAIN_INTERVAL}"
 )
+if [[ "${USE_CHECKPOINT_OPT_PARAM_SCHEDULER:-0}" == 1 ]]; then
+   CKPT_ARGS+=(--use-checkpoint-opt-param-scheduler)
+fi
 [[ -z "${CKPT_STEP:-}" ]] || CKPT_ARGS+=(--ckpt-step "${CKPT_STEP}")
 if [[ "${SAVE_HF}" != "0" ]]; then
    CKPT_ARGS+=(--save-hf "${CKPT_PATH}/hf/{rollout_id}")
@@ -142,6 +145,10 @@ if [[ "${LOG_SAMPLE_STALENESS_RATIO_HISTOGRAM:-0}" != "0" ]]; then
 fi
 if [[ "${LOG_UPDATE_DIAGNOSTICS:-0}" != "0" ]]; then
    TELEMETRY_ARGS+=(--log-update-diagnostics)
+fi
+
+if [[ "${LOG_POLICY_LAG_METRICS:-0}" != "0" ]]; then
+   TELEMETRY_ARGS+=(--log-policy-lag-metrics)
 fi
 
 # EVAL_INTERVAL=0 passes no --eval-interval at all, which is what leaves

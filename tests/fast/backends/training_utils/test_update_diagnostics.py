@@ -1,5 +1,5 @@
-from argparse import Namespace
 import math
+from argparse import Namespace
 
 import pytest
 import torch

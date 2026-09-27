@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 import torch
+import torch.distributed as dist
 
 from miles.backends.training_utils.loss import compute_advantages_and_returns, loss_function
 from miles.backends.training_utils.loss_hub.corrections import icepop_function, vanilla_tis_function
@@ -71,6 +72,27 @@ CONFIGS = [
         [40, 60],
         [20, 40],
     ),
+    # chunked non-true-on-policy path (fused vocab-parallel CE)
+    (
+        "grpo_chunked_temp_b2",
+        dict(
+            advantage_estimator="grpo",
+            loss_type="policy_loss",
+            true_on_policy_mode=False,
+            log_probs_chunk_size=8,
+            rollout_temperature=0.7,
+        ),
+        2,
+        [40, 60],
+        [20, 40],
+    ),
+    (
+        "sft_chunked_b2",
+        dict(loss_type="sft_loss", true_on_policy_mode=False, log_probs_chunk_size=8),
+        2,
+        [64, 128],
+        [32, 64],
+    ),
     # bshd format (padded sequences)
     (
         "grpo_bshd_b3",
@@ -92,6 +114,21 @@ CONFIGS = [
 # ---------------------------------------------------------------------------
 # pytest hooks & fixtures
 # ---------------------------------------------------------------------------
+
+
+# The non-true-on-policy configs reach collectives (fused CE); give them a 1-rank group.
+@pytest.fixture(scope="module", autouse=True)
+def process_group(tmp_path_factory):
+    if dist.is_initialized():
+        yield
+        return
+
+    rendezvous = tmp_path_factory.mktemp("loss-snapshot") / "process-group"
+    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=0, world_size=1)
+    try:
+        yield
+    finally:
+        dist.destroy_process_group()
 
 
 @pytest.fixture
@@ -217,6 +254,42 @@ def run_all(args, parallel_state, inputs):
 # ---------------------------------------------------------------------------
 
 
+_ADDED_DIAGNOSTIC_KEYS = {
+    "policy_rollout_kl",
+    "policy_rollout_abs_diff",
+    "policy_rollout_token_ess",
+    "rollout_token_level_ess",
+    "_policy_seq_ess_sum_w",
+    "_policy_seq_ess_sum_w2",
+    "_policy_seq_ess_n",
+    "_seq_ess_sum_w",
+    "_seq_ess_sum_w2",
+    "_seq_ess_n",
+}
+
+
+def _project_legacy_diagnostics(outputs, saved_outputs):
+    """Keep frozen loss/gradient coverage when explicitly named metrics are added.
+
+    New ESS/lag values have their own tests. Do not regenerate the old numeric
+    snapshots or weaken their tolerance on architectures with different math.
+    Unexpected extra metrics still fail the strict comparison below.
+    """
+    outputs = deep_clone(outputs)
+    metrics = outputs["loss_fn"]["metrics"]
+    saved_metrics = saved_outputs["loss_fn"]["metrics"]
+    for key in _ADDED_DIAGNOSTIC_KEYS - saved_metrics.keys():
+        metrics.pop(key, None)
+    dispatcher = outputs["loss_function_dispatcher"]
+    saved_keys = saved_outputs["loss_function_dispatcher"]["log_dict_keys"]
+    excluded = _ADDED_DIAGNOSTIC_KEYS - set(saved_keys)
+    keys = dispatcher["log_dict_keys"]
+    keep = [i for i, key in enumerate(keys) if key not in excluded]
+    dispatcher["log_dict_keys"] = [keys[i] for i in keep]
+    dispatcher["log_dict_values"] = dispatcher["log_dict_values"][[0, *[i + 1 for i in keep]]]
+    return outputs
+
+
 @pytest.mark.parametrize("config", CONFIGS, ids=[c[0] for c in CONFIGS])
 class TestLossSnapshot:
 
@@ -252,4 +325,4 @@ class TestLossSnapshot:
             saved_inputs, saved_outputs = load_snapshot(path)
             saved_args = args_from_dict(saved_inputs["args_dict"])
             outputs = run_all(saved_args, parallel_state, saved_inputs)
-            assert_outputs_equal(outputs, saved_outputs)
+            assert_outputs_equal(_project_legacy_diagnostics(outputs, saved_outputs), saved_outputs)

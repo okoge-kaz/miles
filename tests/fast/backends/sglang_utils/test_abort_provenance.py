@@ -120,8 +120,15 @@ def test_installed_sglang_abort_echo_preserves_cached_prefix():
     from sglang.srt.managers.io_struct import AbortReq
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
-    manager, state = _manager(TokenizerManager._handle_abort_req)
-    _cache_batch(manager, [_scheduler_stats()])
+    _, state = _manager()
+    state.finished = False
+    state.prompt_token_ids = None
+    state.policy_version_meta_info = _scheduler_stats().convert_to_policy_version_meta_info(5)
+    manager = TokenizerManager.__new__(TokenizerManager)
+    manager.rid_to_state = {"test-request": state}
+    manager.config_value = lambda key: "99"
+    manager.incremental_streaming_output = False
+    manager._finalize_lora_lease = lambda state: None
     manager._handle_abort_req(AbortReq(rid="test-request"))
     metadata = state.out_list[-1]["meta_info"]
     assert metadata["weight_version"] == "99"

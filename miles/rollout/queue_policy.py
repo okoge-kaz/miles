@@ -7,6 +7,10 @@ FULLY_ASYNC_QUEUE_POLICIES = (QUEUE_RECYCLE_POLICY, QUEUE_MAX_POLICY, QUEUE_DROP
 DEFAULT_TRAINING_BUFFER_QUEUE_SIZE = 1000
 
 
+def uses_experiment_async_queue(args) -> bool:
+    return bool(getattr(args, "fully_async_queue_type", None) or getattr(args, "use_replay_buffer", False))
+
+
 def should_prefetch_rollout_batches(args) -> bool:
     """Whether the driver may reserve the next batch during the current train step."""
     queue_type = getattr(args, "fully_async_queue_type", QUEUE_RECYCLE_POLICY)
@@ -15,9 +19,7 @@ def should_prefetch_rollout_batches(args) -> bool:
 
 def fully_async_queue_capacity_groups(args) -> int:
     """Resolve the completed-group queue capacity for one fully-async run."""
-    queue_type = getattr(args, "fully_async_queue_type", None)
-    if queue_type is None:
-        return int(args.async_data_buffer_capacity_factor * args.rollout_batch_size)
+    queue_type = getattr(args, "fully_async_queue_type", QUEUE_RECYCLE_POLICY)
     if queue_type == QUEUE_DROP_POLICY:
         return getattr(args, "fully_async_queue_factor", 1) * args.rollout_batch_size
 
@@ -35,31 +37,27 @@ def fully_async_queue_capacity_groups(args) -> int:
 
 def validate_fully_async_queue_args(args) -> None:
     """Reject configurations that change a named queue algorithm's semantics."""
-    queue_type = getattr(args, "fully_async_queue_type", None)
+    if not uses_experiment_async_queue(args):
+        return
+    if getattr(args, "custom_async_data_buffer_path", None) is not None:
+        raise ValueError("Experiment queues cannot be combined with --custom-async-data-buffer-path")
+    if getattr(args, "rollout_submission_granularity", None) not in (None, "group"):
+        raise ValueError("Experiment queues require group-level submission")
+    if args.fully_async_queue_type is None:
+        args.fully_async_queue_type = QUEUE_RECYCLE_POLICY
+    queue_type = args.fully_async_queue_type
     training_buffer_queue_size = getattr(
         args,
         "training_buffer_queue_size",
         DEFAULT_TRAINING_BUFFER_QUEUE_SIZE,
     )
-    if queue_type is not None and not args.fully_async:
+    if queue_type != QUEUE_RECYCLE_POLICY and not args.fully_async:
         raise ValueError("--fully-async-queue-type requires --fully-async")
     if training_buffer_queue_size < 1:
         raise ValueError("--training-buffer-queue-size must be at least 1")
     if not args.fully_async:
         if training_buffer_queue_size != DEFAULT_TRAINING_BUFFER_QUEUE_SIZE:
             raise ValueError("--training-buffer-queue-size requires --fully-async")
-        return
-    if args.async_data_buffer_capacity_factor <= 0:
-        raise ValueError("--async-data-buffer-capacity-factor must be positive")
-    if queue_type is not None and getattr(args, "custom_async_data_buffer_path", None) is not None:
-        raise ValueError("--custom-async-data-buffer-path cannot be combined with --fully-async-queue-type")
-    if queue_type is None:
-        if args.fully_async_queue_factor != 1:
-            raise ValueError("--fully-async-queue-factor requires --fully-async-queue-type queue-drop")
-        if training_buffer_queue_size != DEFAULT_TRAINING_BUFFER_QUEUE_SIZE:
-            raise ValueError("--training-buffer-queue-size requires --fully-async-queue-type")
-        if args.max_weight_staleness is not None and args.max_weight_staleness < 0:
-            raise ValueError("--max-weight-staleness must be non-negative")
         return
     if args.fully_async_queue_factor < 1:
         raise ValueError("--fully-async-queue-factor must be at least 1")

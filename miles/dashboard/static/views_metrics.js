@@ -60,8 +60,10 @@ function describeMetric(key) {
   return hit ? hit[1] : undefined;
 }
 
-function axisOf(key) {
+function axisOf(key, meta) {
   if (key.startsWith("dump/")) return "dump";
+  const recorded = meta?.step_key_of_metric_key?.[key];
+  if (recorded) return recorded;
   if (key.startsWith("sample_staleness/")) return "train/step";
   if (key.startsWith("train/")) return "train/step";
   if (key.startsWith("eval/")) return "eval/step";
@@ -90,14 +92,25 @@ export async function renderMetrics(view, meta) {
   const filterInput = el("input", { type: "text", placeholder: "filter…" });
   const catList = el("div", { class: "keylist" });
 
+  const keysIn = (cat) => (cat === "sglang" ? meta.engine_metric_keys : meta.metric_keys.filter((k) => categoryOf(k) === cat));
+  const matching = (keys) => {
+    const needle = filterInput.value.toLowerCase();
+    return keys.filter((k) => k.toLowerCase().includes(needle));
+  };
+
+  // while a filter is typed, every family shows how many of its metrics match,
+  // so a metric outside the selected family is one glance away instead of
+  // silently reading as "no such metric"
   const renderCategories = () => {
+    const filtering = filterInput.value !== "";
     catList.replaceChildren(
-      ...cats.map((cat) =>
-        el(
+      ...cats.map((cat) => {
+        const hits = filtering ? matching(keysIn(cat)).length : null;
+        return el(
           "button",
           {
             class: cat === active ? "active" : "",
-            style: "text-align: left",
+            style: `text-align: left${hits === 0 ? "; opacity: 0.45" : ""}`,
             onclick: () => {
               active = cat;
               sessionStorage.setItem("metricsCategory", cat);
@@ -105,17 +118,13 @@ export async function renderMetrics(view, meta) {
               buildPanels();
             },
           },
-          [cat],
-        ),
-      ),
+          [filtering ? `${cat} (${hits})` : cat],
+        );
+      }),
     );
   };
 
-  const activeKeys = () => {
-    const needle = filterInput.value.toLowerCase();
-    const pool = active === "sglang" ? meta.engine_metric_keys : meta.metric_keys.filter((k) => categoryOf(k) === active);
-    return pool.filter((k) => k.toLowerCase().includes(needle));
-  };
+  const activeKeys = () => matching(keysIn(active));
 
   // slots persist across refreshes; a chart repaints ONLY when its data
   // changed (signature check), so a live page sits visually still between
@@ -238,7 +247,7 @@ export async function renderMetrics(view, meta) {
     }
     const byAxis = new Map();
     for (const key of slots.keys()) {
-      const axis = axisOf(key);
+      const axis = axisOf(key, meta);
       if (!byAxis.has(axis)) byAxis.set(axis, []);
       byAxis.get(axis).push(key);
     }
@@ -270,7 +279,10 @@ export async function renderMetrics(view, meta) {
     }
   }
 
-  filterInput.oninput = buildPanels;
+  filterInput.oninput = () => {
+    renderCategories();
+    buildPanels();
+  };
 
   view.replaceChildren(
     el("div", { class: "row" }, [

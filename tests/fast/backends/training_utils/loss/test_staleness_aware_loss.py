@@ -10,6 +10,7 @@ from miles.backends.training_utils.loss import _pack_logging_values
 from miles.backends.training_utils.loss_hub.staleness_aware_loss import (
     STALENESS_AWARE_LOSS_PART_PREFIX,
     apply_staleness_aware_loss,
+    apply_staleness_aware_loss_with_weights,
     compute_staleness_decay_weights,
 )
 
@@ -61,6 +62,27 @@ def test_only_truncated_zero_reward_pg_loss_is_attenuated() -> None:
     weighted_loss.sum().backward()
     torch.testing.assert_close(pg_loss.grad, torch.tensor([0.25, 0.25, 1.0, 1.0, 1.0]))
     assert all(not value.requires_grad for value in parts.values())
+
+
+def test_weight_return_is_the_exact_tensor_applied_to_training_loss() -> None:
+    make_parallel_state()
+    pg_loss = torch.tensor([2.0, 4.0, 1.0])
+
+    weighted_loss, _, applied_weights = apply_staleness_aware_loss_with_weights(
+        args=_args(),
+        batch={
+            "total_lengths": [3, 2],
+            "response_lengths": [2, 1],
+            "sample_staleness": [5, 20],
+            "truncated": [1, 0],
+        },
+        pg_loss_tokens=pg_loss,
+        final_masks=[torch.ones(2), torch.ones(1)],
+    )
+
+    torch.testing.assert_close(applied_weights, torch.tensor([0.25, 0.25, 1.0]))
+    torch.testing.assert_close(weighted_loss, pg_loss * applied_weights)
+    assert not applied_weights.requires_grad
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the interactive-node smoke")

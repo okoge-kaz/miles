@@ -151,7 +151,7 @@ def test_deterministic_algorithm_setting_is_restored() -> None:
 
 def test_actor_sample_staleness_metrics_use_a_root_namespace() -> None:
     metrics = log_train_step(
-        args=Namespace(),
+        args=Namespace(trainer_model_id=None),
         loss_dict={
             "loss": torch.tensor(1.5),
             "sample_staleness/s_0/consumed_sequence_mass": torch.tensor(1.0),
@@ -171,7 +171,7 @@ def test_actor_sample_staleness_metrics_use_a_root_namespace() -> None:
 
 def test_non_actor_sample_staleness_metrics_remain_role_scoped() -> None:
     metrics = log_train_step(
-        args=Namespace(),
+        args=Namespace(trainer_model_id=None),
         loss_dict={"sample_staleness/s_0/consumed_sequence_mass": 1.0},
         grad_norm=2.0,
         rollout_id=0,

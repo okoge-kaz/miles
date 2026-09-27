@@ -247,15 +247,15 @@ done
 PYTHONPATH=/root/Megatron-LM:/root/miles python3 -c "import megatron, miles, sglang"
 python3 - <<PY
 import inspect
-from dataclasses import fields
 from pathlib import Path
 
 import sglang
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.arg_groups.arg_utils import record_fields
 
 source = Path(inspect.getfile(sglang)).resolve()
 assert source.is_relative_to(Path("/sgl-workspace/sglang/python")), source
-assert "enable_response_weight_version_segments" in {field.name for field in fields(ServerArgs)}
+assert "enable_response_weight_version_segments" in {field.name for field in record_fields(ServerArgs)}
 PY
 python3 -m pytest -q -p no:cacheprovider \
     /sgl-workspace/sglang/test/registered/unit/managers/test_policy_weight_version.py

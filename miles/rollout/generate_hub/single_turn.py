@@ -13,12 +13,12 @@ from miles.utils.http_utils import post
 from miles.utils.types import Sample
 
 
-async def generate(input: GenerateFnInput) -> GenerateFnOutput:
+async def generate(input: GenerateFnInput, url: str | None = None) -> GenerateFnOutput:
     args = input.args
     sample = input.sample
     sampling_params = input.sampling_params
     assert sample.status in {Sample.Status.PENDING, Sample.Status.ABORTED}, f"{sample.status=}"
-    url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
+    url = url or f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
 
     prompt_ids = compute_prompt_ids_from_sample(input.state, sample)
 
@@ -42,13 +42,23 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
         input_ids = prompt_ids
 
     payload, halt_status = compute_request_payload(
-        args, input_ids=input_ids, sampling_params=sampling_params, multimodal_inputs=sample.multimodal_inputs
+        args,
+        input_ids=input_ids,
+        sampling_params=sampling_params,
+        multimodal_inputs=sample.multimodal_inputs,
+        evaluation=input.evaluation,
     )
     if payload is None:
         sample.status = halt_status
         return GenerateFnOutput(samples=sample)
 
     output = await post(url, payload, headers=compute_routing_headers(args, sample))
-    await update_sample_from_response(args, sample, payload=payload, output=output)
+    await update_sample_from_response(
+        args,
+        sample,
+        payload=payload,
+        output=output,
+        preserve_routing_prefix=(getattr(args, "use_replay_buffer", False) and args.use_rollout_routing_replay),
+    )
 
     return GenerateFnOutput(samples=sample)

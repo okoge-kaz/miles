@@ -5,8 +5,8 @@ register_cpu_ci(est_time=5, suite="stage-a-cpu", labels=[])
 import asyncio
 import sys
 from argparse import Namespace
-from types import ModuleType
-from unittest.mock import patch
+from types import ModuleType, SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -14,8 +14,8 @@ from miles.ray.train.types import TrainResultWithTiming
 
 # Import the sync orchestration loop without loading GPU-backed placement code.
 _placement_group_stub = ModuleType("miles.ray.placement_group")
-_placement_group_stub.create_placement_groups = None
-_placement_group_stub.create_rollout_manager = None
+_placement_group_stub.create_rollout_components = None
+_placement_group_stub.update_weights = None
 _placement_group_stub.create_training_models = None
 with patch.dict(sys.modules, {"miles.ray.placement_group": _placement_group_stub}):
     import train
@@ -30,6 +30,28 @@ class _Clock:
 
     def monotonic(self) -> float:
         return self.now
+
+
+def _patch_components(monkeypatch, module, manager, actor):
+    controller = SimpleNamespace(
+        prepare_rollout=AsyncMock(),
+        prepare_eval=AsyncMock(),
+        dispose=AsyncMock(),
+        offload=AsyncMock(side_effect=manager._offload),
+        onload_weights=AsyncMock(side_effect=manager._onload_weights),
+        onload_kv=AsyncMock(side_effect=manager._onload_kv),
+    )
+    monkeypatch.setattr(module, "launch_worker_manager", lambda args: None)
+    monkeypatch.setattr(module, "create_rollout_components", AsyncMock(return_value=(controller, manager, 1)))
+
+    async def update(model, executor, rollout_id=None):
+        result = await model.update_weights(rollout_id)
+        actor._switch_metrics = result
+        return 1
+
+    monkeypatch.setattr(module, "update_weights", update)
+    actor.dispose = AsyncMock()
+    actor.pop_colocate_switch_metrics = AsyncMock(side_effect=lambda: actor._switch_metrics)
 
 
 class _RemoteMethod:
@@ -51,7 +73,7 @@ class _RolloutManager:
     def __init__(self, clock: _Clock, events: list) -> None:
         self._clock = clock
         self._events = events
-        self.generate = _RemoteMethod(self._generate)
+        self.get = _RemoteMethod(self._generate)
         self.offload = _RemoteMethod(self._offload)
         self.onload_weights = _RemoteMethod(self._onload_weights)
         self.onload_kv = _RemoteMethod(self._onload_kv)
@@ -129,7 +151,8 @@ class _ActorModel:
 def _args(**overrides) -> Namespace:
     values = dict(
         fully_async=False,
-        control_server_port=None,
+        api_server_port=None,
+        colocate_memory_peak_device="cpu",
         ft_components=[],
         offload_rollout=True,
         offload_rollout_level=["kv_cache", "weight"],
@@ -162,8 +185,7 @@ async def test_colocate_switch_metrics_are_current_step_and_exclude_bootstrap_tr
     actor = _ActorModel(clock, events)
 
     monkeypatch.setattr(train.time, "monotonic", clock.monotonic)
-    monkeypatch.setattr(train, "create_placement_groups", lambda _args: {"rollout": object()})
-    monkeypatch.setattr(train, "create_rollout_manager", lambda _args, _pg: (manager, 1))
+    _patch_components(monkeypatch, train, manager, actor)
 
     async def create_models(_args, _pgs, _manager):
         return actor, None
@@ -221,8 +243,7 @@ async def test_colocate_switch_logging_is_opt_in(monkeypatch):
     actor = _ActorModel(clock, events)
 
     monkeypatch.setattr(train.time, "monotonic", clock.monotonic)
-    monkeypatch.setattr(train, "create_placement_groups", lambda _args: {"rollout": object()})
-    monkeypatch.setattr(train, "create_rollout_manager", lambda _args, _pg: (manager, 1))
+    _patch_components(monkeypatch, train, manager, actor)
 
     async def create_models(_args, _pgs, _manager):
         return actor, None

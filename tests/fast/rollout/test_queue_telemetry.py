@@ -1,6 +1,7 @@
 import copy
 
 import pytest
+from tests.fast.rollout.experimental_test_utils import make_weight_versions
 
 from miles.rollout.queue_telemetry import (
     _QueueLifecycleRecorder,
@@ -15,7 +16,7 @@ def _group(group_index: int, lengths: tuple[int, ...]) -> list[Sample]:
     for offset, length in enumerate(lengths):
         sample = Sample(group_index=group_index, index=group_index * 10 + offset)
         sample.response_length = length
-        sample.weight_versions = ["2"]
+        sample.weight_versions = make_weight_versions(["2"])
         sample.first_prefill_weight_versions = [1]
         group.append(sample)
     return group

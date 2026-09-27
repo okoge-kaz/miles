@@ -3,30 +3,42 @@ from tests.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=10, suite="stage-a-cpu", labels=[])
 
 import asyncio
-import json
 import sys
 from argparse import Namespace
-from types import ModuleType
-from unittest.mock import patch
+from types import ModuleType, SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import pytest
+import train_async
 
-# Import the orchestration loop without importing the real placement module.
-# The latter initializes SGLang/Megatron/Transformer Engine at module import and
-# requires libcuda even though these tests use only pure-Python fakes.
-_placement_group_stub = ModuleType("miles.ray.placement_group")
-_placement_group_stub.create_placement_groups = None
-_placement_group_stub.create_rollout_manager = None
-_placement_group_stub.create_training_models = None
-with patch.dict(sys.modules, {"miles.ray.placement_group": _placement_group_stub}):
-    import train_async
+from miles.utils.async_utils import with_disposer
+from miles.utils.data import RolloutDataPack
+
+
+def _patch_components(monkeypatch, module, manager, actor):
+    controller = SimpleNamespace(
+        prepare_rollout=AsyncMock(),
+        prepare_eval=AsyncMock(),
+        dispose=AsyncMock(),
+    )
+    monkeypatch.setattr(module, "init_orchestration_script", lambda args, *, disposer: None)
+    monkeypatch.setattr(module, "create_rollout_components", AsyncMock(return_value=(controller, manager, 1)))
+
+    async def update(args, model, executor, controller, *, rollout_id=None):
+        result = await model.update_weights(rollout_id)
+        return 1
+
+    monkeypatch.setattr(module, "update_weights", update)
+    actor.dispose = AsyncMock()
+    dispatcher = SimpleNamespace(drain=AsyncMock(), dispatch=AsyncMock())
+    monkeypatch.setattr(module, "EvalDispatcher", lambda *args: dispatcher)
 
 
 class _RemoteMethod:
     def __init__(self, fn):
         self._fn = fn
 
-    def remote(self, *args, **kwargs):
+    def __call__(self, *args, **kwargs):
         result = self._fn(*args, **kwargs)
         if asyncio.iscoroutine(result):
             return asyncio.create_task(result)
@@ -38,10 +50,9 @@ class _RemoteMethod:
 
 
 class _RolloutManager:
-    def __init__(self, events, checkpoint_metrics=None):
+    def __init__(self, events):
         self.events = events
-        self.checkpoint_metrics = checkpoint_metrics
-        self.generate = _RemoteMethod(self._generate)
+        self.get = _RemoteMethod(self._generate)
         self.record_batch_consumption = _RemoteMethod(self._record_batch_consumption)
         self.record_batch_trained = _RemoteMethod(self._record_batch_trained)
         self.acknowledge_trained_batch = _RemoteMethod(self._acknowledge)
@@ -53,11 +64,7 @@ class _RolloutManager:
     async def _generate(self, rollout_id, *, updates_before_train):
         await asyncio.sleep(0)
         self.events.append(("generate", rollout_id, updates_before_train))
-        return {
-            "sample_indices": [rollout_id],
-            "data_ref": object(),
-            "replay_buffer_batch_token": f"token-{rollout_id}",
-        }
+        return RolloutDataPack(replay_buffer_batch_token=f"token-{rollout_id}")
 
     async def _record_batch_consumption(self, rollout_id):
         await asyncio.sleep(0)
@@ -72,7 +79,6 @@ class _RolloutManager:
 
     def _save(self, rollout_id):
         self.events.append(("rollout_save", rollout_id))
-        return self.checkpoint_metrics
 
     def _mark_committed(self, rollout_id):
         self.events.append(("prune", rollout_id))
@@ -104,7 +110,7 @@ def _args(**overrides):
         "fully_async": False,
         "fully_async_queue_type": "queue-recycle",
         "use_replay_buffer": True,
-        "control_server_port": None,
+        "api_server_port": None,
         "ft_components": [],
         "use_critic": False,
         "offload_train": False,
@@ -118,14 +124,6 @@ def _args(**overrides):
         "hf_save_interval": None,
         "update_weights_interval": 1,
         "debug_exit_after_rollout": None,
-        "debug_fail_after_rollout": None,
-        "debug_failure_marker": None,
-        "debug_failure_min_outstanding_groups": 0,
-        "debug_failure_min_completed_groups": 0,
-        "debug_failure_min_inflight_groups": 0,
-        "debug_failure_min_inflight_tokens": 0,
-        "debug_failure_min_regenerate_groups": 0,
-        "save": None,
     }
     values.update(overrides)
     return Namespace(**values)
@@ -133,14 +131,9 @@ def _args(**overrides):
 
 def _patch_runtime(monkeypatch, manager, actor):
     monkeypatch.setattr(train_async, "validate_async_off_policy_correction", lambda args: None)
-    monkeypatch.setattr(train_async, "configure_logger", lambda *args, **kwargs: None)
-    monkeypatch.setattr(train_async, "maybe_start_periodic_pyspy_dump", lambda: None)
-    monkeypatch.setattr(train_async, "create_placement_groups", lambda args: {"rollout": object()})
-    monkeypatch.setattr(train_async.object_store, "init_instance", lambda *args, **kwargs: None)
-    monkeypatch.setattr(train_async, "init_tracking", lambda args: None)
-    monkeypatch.setattr(train_async, "create_rollout_manager", lambda args, pg: (manager, None))
+    _patch_components(monkeypatch, train_async, manager, actor)
 
-    async def create_models(args, pgs, rollout_manager):
+    async def create_models(args, rollout_executor):
         return actor, None
 
     monkeypatch.setattr(train_async, "create_training_models", create_models)
@@ -168,7 +161,7 @@ async def test_replay_buffer_commit_order(monkeypatch):
     actor = _ActorModel(events)
     _patch_runtime(monkeypatch, manager, actor)
 
-    await train_async.train(_args())
+    await with_disposer(train_async.train, _args())
 
     assert events.index(("train", 0)) < events.index(("ack", 0, "token-0"))
     assert events.index(("generate", 1, 1)) < events.index(("rollout_save", 0))
@@ -183,7 +176,7 @@ async def test_replay_buffer_does_not_ack_failed_training(monkeypatch):
     _patch_runtime(monkeypatch, manager, actor)
 
     with pytest.raises(RuntimeError, match="synthetic trainer failure"):
-        await train_async.train(_args(num_rollout=1))
+        await with_disposer(train_async.train, _args(num_rollout=1))
 
     assert not any(event[0] == "ack" for event in events)
     assert not any(event[0] == "rollout_save" for event in events)
@@ -195,11 +188,12 @@ async def test_legacy_checkpoint_order_and_async_save_semantics_are_unchanged(mo
     actor = _ActorModel(events)
     _patch_runtime(monkeypatch, manager, actor)
 
-    await train_async.train(
+    await with_disposer(
+        train_async.train,
         _args(
             use_replay_buffer=False,
             debug_exit_after_rollout=1,
-        )
+        ),
     )
 
     assert not any(event[0] == "ack" for event in events)
@@ -208,65 +202,18 @@ async def test_legacy_checkpoint_order_and_async_save_semantics_are_unchanged(mo
     assert events.index(model_event) < events.index(("rollout_save", 0))
 
 
-async def test_debug_failure_requires_committed_replay_work_and_writes_marker(monkeypatch, tmp_path):
-    events = []
-    metrics = {
-        "resume/benchmark/checkpoint/outstanding_groups": 4.0,
-        "resume/benchmark/checkpoint/completed_groups_reused": 3.0,
-        "resume/benchmark/checkpoint/partial_groups_continued": 1.0,
-        "resume/benchmark/checkpoint/partial_response_tokens_continued": 128.0,
-        "resume/benchmark/checkpoint/groups_to_regenerate": 0.0,
-    }
-    manager = _RolloutManager(events, checkpoint_metrics=metrics)
-    actor = _ActorModel(events)
-    _patch_runtime(monkeypatch, manager, actor)
-
-    checkpoint = tmp_path / "checkpoint"
-    checkpoint.mkdir()
-    (checkpoint / "latest_checkpointed_iteration.txt").write_text("0\n", encoding="utf-8")
-    marker = checkpoint / "intentional-failure.json"
-
-    class InjectedFailure(Exception):
-        pass
-
-    monkeypatch.setattr(
-        train_async,
-        "_terminate_for_debug_failure",
-        lambda: (_ for _ in ()).throw(InjectedFailure()),
-    )
-    with pytest.raises(InjectedFailure):
-        await train_async.train(
-            _args(
-                num_rollout=2,
-                debug_fail_after_rollout=1,
-                debug_failure_marker=str(marker),
-                debug_failure_min_outstanding_groups=3,
-                debug_failure_min_completed_groups=3,
-                debug_failure_min_inflight_groups=1,
-                debug_failure_min_inflight_tokens=64,
-                save=str(checkpoint),
-            )
-        )
-
-    payload = json.loads(marker.read_text(encoding="utf-8"))
-    assert payload["event"] == "intentional_whole_job_failure"
-    assert payload["rollout_id"] == 0
-    assert payload["checkpoint"]["tracker_iteration"] == 0
-    assert events.index(("model", 0, True, True, False)) < events.index(("prune", 0))
-    assert not any(event[0] == "update_weights" and event[1] == 0 for event in events)
-
-
 async def test_queue_recycle_prefetches_next_batch_before_its_weight_update(monkeypatch):
     events = []
     manager = _RolloutManager(events)
     actor = _ActorModel(events)
     _patch_runtime(monkeypatch, manager, actor)
 
-    await train_async.train(
+    await with_disposer(
+        train_async.train,
         _args(
             fully_async=True,
             use_replay_buffer=False,
-        )
+        ),
     )
 
     assert events.index(("generate", 0, 0)) < events.index(("generate", 1, 1))
@@ -285,12 +232,13 @@ async def test_selection_policies_defer_next_batch_until_after_weight_update(mon
     actor = _ActorModel(events)
     _patch_runtime(monkeypatch, manager, actor)
 
-    await train_async.train(
+    await with_disposer(
+        train_async.train,
         _args(
             fully_async=True,
             fully_async_queue_type=policy,
             use_replay_buffer=False,
-        )
+        ),
     )
 
     assert events.index(("consume", 0)) < events.index(("train", 0))

@@ -1,10 +1,12 @@
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Generic, TypeVar
+
+_ResultT = TypeVar("_ResultT")
 
 
 @dataclass(frozen=True)
-class TrainResultWithTiming:
+class TrainResultWithTiming(Generic[_ResultT]):
     """Opt-in train result carrying one worker-local wake-up timer component.
 
     ``local_wake_up_time`` is measured inside one worker and excludes group
@@ -14,7 +16,7 @@ class TrainResultWithTiming:
     metric remains independent of this opt-in result.
     """
 
-    result: Any
+    result: _ResultT
     local_wake_up_time: float
 
 

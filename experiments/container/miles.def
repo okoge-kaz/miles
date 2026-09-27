@@ -52,7 +52,7 @@ From: {{ DOCKER_IMAGE }}
     test "$(git -c safe.directory=/sgl-workspace/sglang \
         -C /sgl-workspace/sglang rev-parse HEAD)" = "${sglang_commit}"
     cd /sgl-workspace/sglang
-    python3 -m pip install -e "python[all]" --no-deps
+    SGLANG_BUILD_RUST_EXTS=none python3 -m pip install -e "python[all]" --no-deps
 
     # Tau was a separate Enroot-derived layer in the old cluster. Build it into
     # the final SIF here so the Singularity workflow does not depend on whether
@@ -185,6 +185,7 @@ From: {{ DOCKER_IMAGE }}
     export HF_HOME="${test_cache}/hf"
     export NUMBA_CACHE_DIR="${test_cache}/numba"
     export PYTHONPYCACHEPREFIX="${test_cache}/pycache"
+    export SGLANG_CACHE_DIR="${test_cache}/sglang"
     export SGLANG_DG_CACHE_DIR="${test_cache}/deep-gemm"
     export TORCH_HOME="${test_cache}/torch"
     export TORCH_EXTENSIONS_DIR="${test_cache}/torch-extensions"

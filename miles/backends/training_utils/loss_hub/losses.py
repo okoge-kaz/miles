@@ -20,11 +20,24 @@ from miles.backends.training_utils.loss_hub.math_utils import (
     compute_policy_loss,
     compute_sequence_level_ess_parts,
 )
-from miles.backends.training_utils.loss_hub.staleness_aware_loss import apply_staleness_aware_loss
+from miles.backends.training_utils.loss_hub.policy_lag_metrics import (
+    compute_policy_lag_parts,
+    compute_ppo_loss_sensitivity,
+)
+from miles.backends.training_utils.loss_hub.sequence_filter import (
+    filter_train_rollout_logprob_sequences,
+    sequence_filter_reducer,
+)
+from miles.backends.training_utils.loss_hub.staleness_aware_loss import (
+    apply_staleness_aware_loss,
+    apply_staleness_aware_loss_with_weights,
+)
 from miles.backends.training_utils.loss_hub.staleness_metrics import compute_sample_staleness_parts
+from miles.backends.training_utils.loss_hub.tis_population_metrics import compute_tis_abs_population_parts
 from miles.backends.training_utils.parallel import get_parallel_state
+from miles.backends.training_utils.sampling_mask import get_rollout_sampling_masks
 from miles.backends.training_utils.update_diagnostics import compute_update_diagnostic_parts
-from miles.utils.misc import load_function
+from miles.utils.function_registry import load_function
 from miles.utils.types import RolloutBatch
 
 
@@ -72,6 +85,55 @@ def _scalar_as_token_metric(
 ) -> torch.Tensor:
     """Broadcast a batch scalar so the train metric normalizer preserves it."""
     return reducer(torch.ones_like(template) * value)
+
+
+def _same_masks(first: list[torch.Tensor], second: list[torch.Tensor]) -> bool:
+    if first is second:
+        return True
+    return len(first) == len(second) and all(
+        torch.equal(left.detach(), right.detach()) for left, right in zip(first, second, strict=True)
+    )
+
+
+def _policy_lag_initial_masks_and_targets(
+    args: Namespace,
+    batch: RolloutBatch,
+    *,
+    template: torch.Tensor,
+    staleness_weights: torch.Tensor,
+) -> tuple[list[torch.Tensor], torch.Tensor]:
+    initial_masks = batch.get("policy_lag_initial_loss_masks")
+    stored_target_weights = batch.get("policy_lag_target_weights")
+    if getattr(args, "zero_loss_on_truncated", False) and initial_masks is None:
+        raise RuntimeError("--log-policy-lag-metrics with zero-loss truncation requires pre-target masks")
+    if initial_masks is None:
+        initial_masks = batch["loss_masks"]
+    if stored_target_weights is None:
+        truncated = batch.get("truncated")
+        if truncated is None or len(truncated) != len(initial_masks):
+            raise RuntimeError("Policy-lag target weights require one truncated indicator per response")
+        truncated = [int(value) for value in truncated]
+        if any(value not in (0, 1) for value in truncated):
+            raise ValueError("truncated indicators must be 0 or 1")
+        zero_loss = getattr(args, "zero_loss_on_truncated", False)
+        stored_target_weights = [
+            torch.full_like(initial_mask, 0.0 if zero_loss and is_truncated else 1.0, dtype=torch.float32)
+            for initial_mask, is_truncated in zip(initial_masks, truncated, strict=True)
+        ]
+
+    local_targets = get_local_response_loss_masks(
+        batch["total_lengths"],
+        batch["response_lengths"],
+        stored_target_weights,
+        args.qkv_format,
+        batch.get("max_seq_lens"),
+    )
+    target_weights = torch.cat(local_targets).detach().to(device=template.device, dtype=torch.float32)
+    if target_weights.shape != staleness_weights.shape:
+        raise ValueError(
+            f"Target weights have shape {tuple(target_weights.shape)}, " f"expected {tuple(staleness_weights.shape)}"
+        )
+    return initial_masks, target_weights * staleness_weights.detach().float()
 
 
 def _absolute_difference_metrics(
@@ -186,8 +248,11 @@ def policy_loss_function(
         weight is the *sum* of that mismatch over the sequence.
     """
     parallel_state = get_parallel_state()
+    log_policy_lag_metrics = getattr(args, "log_policy_lag_metrics", False)
+    fused_logprobs = getattr(args, "fuse_one_step_actor_logprobs", False)
     advantages_list = [advantage.detach() for advantage in batch["advantages"]]
     advantages = torch.cat(advantages_list, dim=0)
+    unfiltered_advantages = advantages.detach() if log_policy_lag_metrics else None
     rollout_old_log_probs = (
         [log_prob.detach() for log_prob in batch["rollout_log_probs"]]
         if batch.get("rollout_log_probs") is not None
@@ -196,7 +261,6 @@ def policy_loss_function(
     reference_log_probs = (
         [log_prob.detach() for log_prob in batch["ref_log_probs"]] if batch.get("ref_log_probs") is not None else None
     )
-    fused_logprobs = getattr(args, "fuse_one_step_actor_logprobs", False)
     if args.use_rollout_logprobs:
         assert (
             rollout_old_log_probs is not None
@@ -208,6 +272,7 @@ def policy_loss_function(
     total_lengths = batch["total_lengths"]
     max_seq_lens = batch.get("max_seq_lens", None)
     calculate_entropy = args.entropy_coef != 0 or args.observe_training_entropy
+    rollout_sampling_mask = get_rollout_sampling_masks(batch) if args.use_sampling_support_replay else None
 
     log_probs_and_entropy = get_log_probs_and_entropy(
         logits,
@@ -218,11 +283,15 @@ def policy_loss_function(
         with_entropy=calculate_entropy,
         entropy_requires_grad=args.entropy_coef != 0,
         max_seq_lens=max_seq_lens,
+        rollout_sampling_mask=rollout_sampling_mask,
     )
 
     log_probs = log_probs_and_entropy["log_probs"]
-    anchor_from_training_forward = args.skip_actor_forward_only or fused_logprobs
-    if anchor_from_training_forward:
+    sequence_filter_metrics: dict[str, torch.Tensor] = {}
+    if getattr(args, "use_train_rollout_logprob_sequence_filter", False):
+        batch, sequence_filter_metrics = filter_train_rollout_logprob_sequences(args, batch, log_probs)
+        sum_of_sample_mean = sequence_filter_reducer(args, batch)
+    if args.skip_actor_forward_only or fused_logprobs:
         trainer_scored_log_probs = [log_prob.detach() for log_prob in log_probs]
     else:
         trainer_scored_log_probs = (
@@ -232,11 +301,8 @@ def policy_loss_function(
         old_log_probs = rollout_old_log_probs
     else:
         old_log_probs = trainer_scored_log_probs
-    if fused_logprobs:
-        actor_anchor_logprobs = trainer_scored_log_probs
-    else:
-        actor_anchor_logprobs = []
-    assert old_log_probs is not None, "policy loss requires old-policy log-probs"
+
+    actor_anchor_logprobs = trainer_scored_log_probs if fused_logprobs else []
     train_log_probs_list = log_probs
     old_log_probs_list = old_log_probs
 
@@ -252,7 +318,7 @@ def policy_loss_function(
                 log_probs, total_lengths, response_lengths, strict=False
             )
         ]
-        if anchor_from_training_forward and not args.use_rollout_logprobs:
+        if args.skip_actor_forward_only and not args.use_rollout_logprobs:
             full_old_log_probs = [full_log_prob.detach() for full_log_prob in full_log_probs]
         else:
             full_old_log_probs = [
@@ -286,6 +352,7 @@ def policy_loss_function(
         old_log_probs = torch.cat(old_log_probs, dim=0)
         log_probs = torch.cat(log_probs, dim=0)
         ppo_kl = old_log_probs - log_probs
+    unfiltered_ppo_log_ratio = -ppo_kl.detach() if log_policy_lag_metrics else None
 
     local_loss_mask_list = get_local_response_loss_masks(
         total_lengths,
@@ -373,6 +440,8 @@ def policy_loss_function(
 
     # Apply off-policy correction using importance sampling if enabled
     tis_metrics: dict[str, torch.Tensor] = {}
+    tis_population_parts: dict[str, torch.Tensor] = {}
+    tis_applied_weight = None
     modified_response_masks = batch["loss_masks"]
     if args.get_mismatch_metrics or args.use_tis:
         # NOTE:
@@ -406,6 +475,13 @@ def policy_loss_function(
         }
 
         pg_loss, modified_response_masks, tis_metrics = tis_func(**tis_kwargs)
+        tis_applied_weight = tis_metrics.pop("_tis_applied_weight", None)
+        if log_policy_lag_metrics and "tis_abs" in tis_metrics:
+            tis_population_parts = compute_tis_abs_population_parts(
+                args=args,
+                batch=batch,
+                tis_abs=tis_metrics["tis_abs"],
+            )
 
         # [decouple IS and rejection] modified masks correct the numerator only;
         # denominators stay the precomputed rollout_mask_sums.
@@ -432,18 +508,100 @@ def policy_loss_function(
 
     # Apply after OPSM/TIS so the decay follows the final policy-gradient mask.
     # Entropy and explicit KL losses below remain untouched.
-    pg_loss, staleness_aware_loss_parts = apply_staleness_aware_loss(
-        args=args,
-        batch=batch,
-        pg_loss_tokens=pg_loss,
-        final_masks=modified_response_masks,
-    )
+    if log_policy_lag_metrics:
+        pg_loss, staleness_aware_loss_parts, staleness_target_weights = apply_staleness_aware_loss_with_weights(
+            args=args,
+            batch=batch,
+            pg_loss_tokens=pg_loss,
+            final_masks=modified_response_masks,
+        )
+    else:
+        pg_loss, staleness_aware_loss_parts = apply_staleness_aware_loss(
+            args=args,
+            batch=batch,
+            pg_loss_tokens=pg_loss,
+            final_masks=modified_response_masks,
+        )
+        staleness_target_weights = None
 
     policy_log_ratio = None
-    if batch.get("rollout_log_probs") is not None and (
-        getattr(args, "log_sample_staleness_metrics", False) or debug_base_pg_loss is not None
-    ):
-        policy_log_ratio = log_probs.detach() - torch.cat(batch["rollout_log_probs"], dim=0).detach()
+    if batch.get("rollout_log_probs") is not None:
+        policy_log_ratio = log_probs.detach().float() - torch.cat(batch["rollout_log_probs"], dim=0).detach().float()
+
+    policy_lag_parts: dict[str, torch.Tensor] = {}
+    if log_policy_lag_metrics:
+        if policy_log_ratio is None:
+            raise RuntimeError("--log-policy-lag-metrics requires rollout_log_probs")
+        assert unfiltered_ppo_log_ratio is not None
+        assert unfiltered_advantages is not None
+        assert staleness_target_weights is not None
+        initial_masks, target_weights = _policy_lag_initial_masks_and_targets(
+            args,
+            batch,
+            template=policy_log_ratio,
+            staleness_weights=staleness_target_weights,
+        )
+        correction_enabled = args.get_mismatch_metrics or args.use_tis
+        sensitivity_supported = (
+            args.advantage_estimator != "gspo"
+            and args.custom_pg_loss_reducer_function_path is None
+            and (not correction_enabled or (args.custom_tis_function_path is None and tis_applied_weight is not None))
+            and _same_masks(modified_response_masks, batch["loss_masks"])
+            and not (args.use_opsm and getattr(args, "zero_loss_on_truncated", False))
+        )
+
+        sensitivity_base = None
+        if sensitivity_supported:
+            local_initial_masks = get_local_response_loss_masks(
+                total_lengths,
+                response_lengths,
+                initial_masks,
+                args.qkv_format,
+                max_seq_lens,
+            )
+            initial_active = torch.cat(local_initial_masks).to(device=policy_log_ratio.device).bool()
+            reference_ppo_log_ratio = torch.where(
+                initial_active,
+                torch.nan_to_num(unfiltered_ppo_log_ratio, nan=0.0, posinf=0.0, neginf=0.0),
+                unfiltered_ppo_log_ratio.new_zeros(()),
+            )
+            reference_advantages = torch.where(
+                initial_active,
+                torch.nan_to_num(unfiltered_advantages, nan=0.0, posinf=0.0, neginf=0.0),
+                unfiltered_advantages.new_zeros(()),
+            )
+            sensitivity_base = compute_ppo_loss_sensitivity(
+                ppo_log_ratio=reference_ppo_log_ratio,
+                advantages=reference_advantages,
+                eps_clip=eps_clip,
+                eps_clip_high=eps_clip_high,
+                eps_clip_c=getattr(args, "eps_clip_c", None),
+            )
+            invalid_sensitivity_input = ~torch.isfinite(unfiltered_ppo_log_ratio) | ~torch.isfinite(
+                unfiltered_advantages
+            )
+            sensitivity_base = torch.where(
+                invalid_sensitivity_input,
+                torch.full_like(sensitivity_base, torch.nan),
+                sensitivity_base,
+            )
+            if args.use_opsm:
+                sensitivity_base = sensitivity_base * opsm_mask.detach().float().abs()
+            if correction_enabled:
+                sensitivity_base = sensitivity_base * tis_applied_weight.detach().float().abs()
+
+        actual_post_masks = None
+        if sensitivity_supported and args.calculate_per_token_loss and getattr(args, "zero_loss_on_truncated", False):
+            actual_post_masks = modified_response_masks
+        policy_lag_parts = compute_policy_lag_parts(
+            args=args,
+            batch=batch,
+            delta=policy_log_ratio,
+            initial_loss_masks=initial_masks,
+            target_weights=target_weights,
+            loss_sensitivity_base=sensitivity_base,
+            actual_post_loss_masks=actual_post_masks,
+        )
 
     sample_staleness_parts: dict[str, torch.Tensor] = {}
     if getattr(args, "log_sample_staleness_metrics", False):
@@ -536,11 +694,10 @@ def policy_loss_function(
         if args.kl_loss_coef != 0:
             loss = loss + args.kl_loss_coef * kl_loss
 
-    # make sure the gradient could backprop correctly.
+    # make sure the gradient could backprop correctly; fp32 sum avoids fp16 inf -> nan
     if log_probs.numel() == 0:
-        loss += 0 * logits.sum()
+        loss += 0 * logits.sum(dtype=torch.float32)
 
-    train_scored_log_probs = old_log_probs
     train_rollout_logprob_abs_diff = None
     train_rollout_kl = None
     rollout_ess_ratio = None
@@ -548,6 +705,11 @@ def policy_loss_function(
     policy_rollout_abs_diff = policy_rollout_kl = policy_rollout_token_ess = None
     policy_seq_sum_w = policy_seq_sum_w2 = policy_seq_n = None
     if rollout_old_log_probs:
+        # The loss baseline may be rollout log-probs. Diagnostics must use an
+        # independently scored trainer policy, even in that case.
+        train_scored_log_probs = (
+            torch.cat(trainer_scored_log_probs, dim=0) if trainer_scored_log_probs is not None else log_probs.detach()
+        )
         rollout_log_probs = torch.cat(rollout_old_log_probs, dim=0)
 
         # ESS of w = pi_train / pi_rollout, the importance weights policy lag actually
@@ -579,6 +741,7 @@ def policy_loss_function(
             max_seq_lens=max_seq_lens,
             calculate_per_token_loss=args.calculate_per_token_loss,
         ).squeeze()
+
         abs_diff = (train_scored_log_probs - rollout_log_probs).abs()
         abs_diff = torch.where(
             active_tokens,
@@ -608,9 +771,10 @@ def policy_loss_function(
         # It measures engine mismatch *and* policy lag together; the on-policy
         # colocated arm puts the first at ~5e-04 per token, so do not read it as
         # lag alone.
+        assert policy_log_ratio is not None
         policy_neg_log_ratio = torch.where(
             active_tokens,
-            torch.nan_to_num(rollout_log_probs - log_probs.detach(), nan=0.0, posinf=0.0, neginf=0.0),
+            torch.nan_to_num(-policy_log_ratio, nan=0.0, posinf=0.0, neginf=0.0),
             rollout_log_probs.new_zeros(()),
         )
         policy_seq_sum_w, policy_seq_sum_w2, policy_seq_n = compute_sequence_level_ess_parts(
@@ -653,8 +817,11 @@ def policy_loss_function(
         "ess_ratio": ess_ratio_sum.squeeze(),
     }
     reported_loss |= {name: value.clone().detach() for name, value in fused_metrics.items()}
+    reported_loss |= sequence_filter_metrics
     reported_loss |= sample_staleness_parts
     reported_loss |= staleness_aware_loss_parts
+    reported_loss |= tis_population_parts
+    reported_loss |= policy_lag_parts
     reported_loss |= compute_update_diagnostic_parts(
         args,
         batch,
@@ -806,9 +973,9 @@ def sft_loss_function(
     log_probs = torch.cat(log_probs, dim=0)
     loss = -sum_of_sample_mean(log_probs)
 
-    # make sure the gradient could backprop correctly.
+    # make sure the gradient could backprop correctly; fp32 sum avoids fp16 inf -> nan
     if log_probs.numel() == 0:
-        loss += 0 * logits.sum()
+        loss += 0 * logits.sum(dtype=torch.float32)
 
     return (
         loss,
@@ -818,7 +985,11 @@ def sft_loss_function(
     )
 
 
-def get_loss_function(args: Namespace) -> LossFunction:
+def get_loss_function(args: Namespace, loss_fn: str | None = None) -> LossFunction:
+    if loss_fn is not None:
+        from miles.backends.training_utils.loss_hub.tinker_losses import TINKER_LOSS_FUNCTIONS
+
+        return TINKER_LOSS_FUNCTIONS[loss_fn]
     match args.loss_type:
         case "policy_loss":
             return policy_loss_function

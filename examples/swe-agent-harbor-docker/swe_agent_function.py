@@ -18,12 +18,12 @@ import secrets
 import socket
 from collections.abc import Mapping
 from typing import Any
-from urllib.parse import urlparse, urlsplit, urlunparse
+from urllib.parse import urlsplit
 
 import httpx
-
 from experiments.src.environments.swe.result import HarborSWEOutcome
 from experiments.src.environments.swe.timeouts import TRIAL_REQUEST_TIMEOUT_SEC
+
 from miles.rollout.generate_hub.agentic_types import AgentFunctionOutput
 from miles.rollout.harbor.auth import (
     derive_harbor_cancel_bearer,
@@ -46,6 +46,7 @@ _MAX_SECRET_LENGTH = 4096
 _MAX_ABORT_INSTANCES = 256
 _ABORT_CONCURRENCY = 16
 _ABORT_REQUEST_TIMEOUT_SEC = 30
+
 
 def _get_agent_server_client() -> httpx.AsyncClient:
     """Return a client whose long-running requests survive idle network paths."""
@@ -117,9 +118,7 @@ def _safe_http_endpoint(raw_url: str, *, setting: str) -> str:
         or parsed.query
         or parsed.fragment
     ):
-        raise ValueError(
-            f"{setting} must be HTTP(S) without credentials, query, or fragment"
-        )
+        raise ValueError(f"{setting} must be HTTP(S) without credentials, query, or fragment")
     return raw_url.rstrip("/")
 
 
@@ -153,10 +152,7 @@ def _required_process_secret(setting: str) -> str:
 
 def _required_client_id() -> str:
     client_id = os.getenv("HARBOR_CLIENT_ID")
-    if (
-        not isinstance(client_id, str)
-        or _SAFE_CLIENT_ID.fullmatch(client_id) is None
-    ):
+    if not isinstance(client_id, str) or _SAFE_CLIENT_ID.fullmatch(client_id) is None:
         raise ValueError("HARBOR_CLIENT_ID is missing or invalid")
     return client_id
 
@@ -212,10 +208,7 @@ def _abort_instance_ids(args: Any) -> tuple[str, ...]:
     instance_id = getattr(args, "session_server_instance_id", None)
     if instance_id is None:
         return ()
-    if (
-        not isinstance(instance_id, str)
-        or _SAFE_SESSION_BINDING.fullmatch(instance_id) is None
-    ):
+    if not isinstance(instance_id, str) or _SAFE_SESSION_BINDING.fullmatch(instance_id) is None:
         raise ValueError("session_server_instance_id is invalid")
     return (instance_id,)
 
@@ -317,9 +310,7 @@ async def run(
         session_url = _safe_http_endpoint(f"{base_url.rstrip('/')}/v1", setting="base_url")
         external_host = os.getenv("MILES_ROUTER_EXTERNAL_HOST")
         if external_host:
-            if "://" in external_host or any(
-                character in external_host for character in "/?#@"
-            ):
+            if "://" in external_host or any(character in external_host for character in "/?#@"):
                 raise ValueError("MILES_ROUTER_EXTERNAL_HOST must be a bare hostname")
             parsed = urlparse(session_url)
             port = parsed.port
@@ -341,11 +332,7 @@ async def run(
         }
         max_seq_len = metadata.get("max_seq_len")
         if max_seq_len is not None:
-            if (
-                isinstance(max_seq_len, bool)
-                or not isinstance(max_seq_len, int)
-                or max_seq_len <= 0
-            ):
+            if isinstance(max_seq_len, bool) or not isinstance(max_seq_len, int) or max_seq_len <= 0:
                 raise ValueError("metadata.max_seq_len must be a positive integer")
             request["max_seq_len"] = max_seq_len
 
@@ -421,13 +408,10 @@ async def run(
     trial_metadata = _validated_trial_metadata(response)
     if trial_metadata is None:
         logger.warning(
-            "Harbor trial was not verifier-scored; marking the rollout aborted "
-            "(exit_status=%r)",
+            "Harbor trial was not verifier-scored; marking the rollout aborted " "(exit_status=%r)",
             response.get("exit_status"),
         )
-        return AgentFunctionOutput.abort(
-            {"exit_status": str(response.get("exit_status") or "Ungraded")}
-        )
+        return AgentFunctionOutput.abort({"exit_status": str(response.get("exit_status") or "Ungraded")})
     return AgentFunctionOutput(metadata=trial_metadata)
 
 

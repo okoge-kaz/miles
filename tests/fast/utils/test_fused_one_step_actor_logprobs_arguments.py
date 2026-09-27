@@ -56,7 +56,6 @@ def test_static_fused_guard_rejects_invalid_configuration(overrides, message):
     "flag",
     [
         "use_routing_replay",
-        "use_rollout_routing_replay",
         "use_indexer_replay",
         "use_rollout_indexer_replay",
     ],
@@ -64,6 +63,20 @@ def test_static_fused_guard_rejects_invalid_configuration(overrides, message):
 def test_static_fused_guard_rejects_replay_that_depends_on_legacy_forward(flag):
     with pytest.raises(ValueError, match="routing/indexer replay"):
         validate_fused_one_step_actor_logprobs(_args(**{flag: True}))
+
+
+@pytest.mark.parametrize("derived_routing_flag", [False, True])
+def test_static_fused_guard_accepts_preloaded_rollout_routing_replay(derived_routing_flag):
+    validate_fused_one_step_actor_logprobs(
+        _args(use_routing_replay=derived_routing_flag, use_rollout_routing_replay=True)
+    )
+
+
+def test_rollout_routing_replay_does_not_enable_shadow_verification():
+    with pytest.raises(ValueError, match="shadow verification"):
+        validate_fused_one_step_actor_logprobs(
+            _args(use_rollout_routing_replay=True, verify_fused_one_step_actor_logprobs=True)
+        )
 
 
 def test_verify_requires_fused_mode():

@@ -6,11 +6,7 @@ from miles.rollout.rm_hub import async_rm
 from miles.rollout.rm_hub.search_r1 import compute_search_r1_reward
 from miles.utils.types import Sample
 
-
-PROMPT = (
-    "<|im_start|>user\nUse <answer> final answer </answer>."
-    "<|im_end|>\n<|im_start|>assistant\n"
-)
+PROMPT = "<|im_start|>user\nUse <answer> final answer </answer>." "<|im_end|>\n<|im_start|>assistant\n"
 LABEL = {"ground_truth": {"target": ["McComb, Mississippi"]}, "style": "rule"}
 
 

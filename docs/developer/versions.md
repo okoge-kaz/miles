@@ -44,7 +44,7 @@ The default build-args are the version surface:
 | `MILES_COMMIT` | `main` | The Miles checkout baked into the image |
 | `ENABLE_CUDA_13` | `1` | CUDA 13 plus the Mooncake structured-object-store wheel; `0` selects the CUDA 12.9 path |
 | `WHEELS_REPO` | `yueming-yuan/miles-wheels` | The prebuilt-wheels repository |
-| `WHEELS_TAG_X86` / `WHEELS_TAG_ARM64` | `cu130-x86_64` / `cu130-aarch64` | Two complete wheels releases, selected by `TARGETARCH` and installed verbatim |
+| `WHEELS_TAG_X86` / `WHEELS_TAG_ARM64` | `cu130-torch213-x86_64` / `cu130-torch213-aarch64` | Two complete wheels releases, selected by `TARGETARCH` and installed verbatim |
 
 Two design choices are worth naming. The Dockerfile holds the defaults and `build.py` owns
 the per-variant deltas, so there is exactly one place to look for what a variant changes.
@@ -70,14 +70,14 @@ Release values represent different facts. Each row below names the source used b
 | Fact | Authoritative source | Derived or consumed values |
 |---|---|---|
 | Base Miles version | `setup.py` | Release branch `release/vX.Y.Z`; base-version check before tagging |
-| Exact published version | `version` input to `release-tag.yml`, persisted as annotated Git tag `v<exact-version>` | CUDA image tags `v<exact-version>` and `v<exact-version>-cu12` |
+| Exact published version | `version` input to `release-tag.yml`, persisted as annotated Git tag `v<exact-version>` | CUDA 13 image tag `v<exact-version>` |
 | Frozen dependency selection | `release-lock.json` committed on the release branch | SGLang commit, Megatron-LM commit, and the CUDA image tag used by release CI |
 
 For example, base version `0.3.0` owns branch `release/v0.3.0`; that branch can produce exact tags `v0.3.0rc0`, `v0.3.0`, and `v0.3.0.post1` without changing `setup.py` between tags.
 
 `release-lock.json` freezes the two dependency source commits and names the prune-exempt CUDA image used by release CI. Miles itself is frozen by the release commit and final Git tag. Wheels asset fingerprints are audit records, not content-addressed inputs.
 
-Use [Release a Version](/ci/04-release) for the maintainer procedure. That runbook owns workflow order, inputs, success signals, and recovery; this page owns the identity and pinning model.
+Use [Release a Version](/developer/ci/04-release) for the maintainer procedure. That runbook owns workflow order, inputs, success signals, and recovery; this page owns the identity and pinning model.
 
 ## The images
 
@@ -92,9 +92,9 @@ fleet's image is.
 | `cu13` | `radixark/miles:dev` | `linux/amd64` + `linux/arm64`, one manifest. This is the daily image |
 | `cu13-x86` / `cu13-aarch64` | `radixark/miles:dev` | Single-arch rebuilds of the same image |
 | `cu12-x86` | `radixark/miles:dev-cu12` | `linux/amd64`, CUDA 12.9 legacy |
-| `rocm-mi300` / `rocm-mi350` | `rocm/sgl-dev:miles-rocm7xx-mi3xx` | Native |
+| `rocm724-mi35x` / `rocm10-mi35x` | `rocm/sgl-dev:miles-rocm*-mi35x` | Native |
 
-`--image-tag dev` also publishes a timestamped sibling. Scheduled retention and manual tag behavior are documented in [Docker build](/ci/02-docker-build).
+`--image-tag dev` also publishes a timestamped sibling. Scheduled retention and manual tag behavior are documented in [Docker build](/developer/ci/02-docker-build).
 
 Build one yourself with `docker/build.py`:
 
@@ -102,10 +102,10 @@ Build one yourself with `docker/build.py`:
 python docker/build.py --variant cu13-x86 --image-tag custom --custom-tag my-experiment --push
 ```
 
-[Docker build](/ci/02-docker-build) is the full reference for the build script, the
+[Docker build](/developer/ci/02-docker-build) is the full reference for the build script, the
 workflow and the tag rules.
 
-Official versioned releases add `radixark/miles:v<exact-version>` for the CUDA 13 multi-arch image and `radixark/miles:v<exact-version>-cu12` for the CUDA 12.9 image. Publishing them does not move the rolling `dev` or `latest` families.
+Official versioned releases add `radixark/miles:v<exact-version>` for the CUDA 13 multi-arch image. Starting with v0.1.1, CUDA 12 release images are not published; previously published CUDA 12 tags remain available. Publishing a release does not move the rolling `dev` or `latest` families.
 
 ## What CI moves, and what it does not
 
@@ -128,7 +128,7 @@ It never reinstalls the three source trees, because they are editable installs. 
 | SGLang or Megatron-LM code | No. Point CI at a ref instead |
 | Miles code | No |
 
-The ROCm stage is the exception: it takes SGLang and Megatron-LM from `rocm/sgl-dev` and exposes no dependency-ref inputs, so the only way to move them there is a new ROCm image. A release call can select the Miles ref, but its baked dependencies still make the run a smoke signal rather than a lock-accurate check.
+The ROCm stage is the exception: it takes SGLang and Megatron-LM from `rocm/sgl-dev` unless the run names a ref for one, and never reads `release-lock.json`. ROCm CI runs independently and is not part of the versioned release gate.
 
 ## Bumping principle
 
@@ -159,15 +159,17 @@ before it lands on `sglang-miles`. See
 [Contributing](/developer/contributor-guide#pr-description-ci-tags) for all three
 directives.
 
-**Expect `dev` to move on its own, within a bound.** The scheduled build (00:00 and 12:00
-UTC) polls the SGLang and Megatron-LM branch heads plus a fingerprint of the wheels release,
-and rebuilds when any of them moved. It deliberately does not poll Miles, which would
-rebuild constantly, and instead forces a build once the last one is 24 hours old. So `dev`
-follows its dependencies immediately and trails Miles `main` by at most a day. When you need
-that to stop moving underneath you, pin `ci-image-tag:` to a timestamped tag.
+**Expect `dev` to move on its own, within a bound.** The scheduled check (every 10 minutes)
+polls the SGLang and Megatron-LM branch heads plus a fingerprint of the wheels release,
+and starts a rebuild within about 30 minutes of any of them moving. It deliberately does not
+poll Miles, which would rebuild constantly, and instead forces a build once the last one is
+12 hours old. So `dev` follows its dependencies closely and trails Miles `main` by at most
+half a day. When you need that to stop moving underneath you, pin `ci-image-tag:` to a
+timestamped tag; the scheduled prune keeps every timestamped tag for at least 14 days.
 
-**Bump the ROCm images by hand.** They have no automatic path, so a ROCm bump is a
-`workflow_dispatch` on the variant you want.
+**The ROCm images move daily too.** The sgl-project/sglang nightlies rebuild the undated
+`rocm/sgl-dev:miles-rocm*-mi35x` tags from Miles `main` every day and publish a dated
+`-YYYYMMDD` sibling; an out-of-band rebuild is a `workflow_dispatch` on the variant you want.
 
 ## After a bump, the usual suspects
 
@@ -182,8 +184,8 @@ that to stop moving underneath you, pin `ci-image-tag:` to a timestamped tag.
 ## Related
 
 - [Installation](/getting-started/installation) for pulling and running the image.
-- [Release a Version](/ci/04-release) for the maintainer release runbook.
+- [Release a Version](/developer/ci/04-release) for the maintainer release runbook.
 - [Contributing](/developer/contributor-guide) for the CI labels and PR-description
   directives.
-- [Docker build](/ci/02-docker-build) for the build script, workflow triggers and tag
+- [Docker build](/developer/ci/02-docker-build) for the build script, workflow triggers and tag
   mechanics.

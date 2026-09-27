@@ -15,8 +15,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
+from tests.fast.rollout.experimental_test_utils import make_weight_versions
 
-import miles.rollout.fully_async_rollout as fully_async
+import miles.rollout.experimental_fully_async_rollout as fully_async
 import miles.rollout.replay_buffer as replay_buffer_module
 import miles.rollout.replay_buffer_codec as codec_module
 from miles.rollout.base_types import RolloutFnConstructorInput, RolloutFnTrainInput
@@ -95,13 +96,6 @@ def _args(**overrides) -> Namespace:
         "n_samples_per_prompt": 2,
         "max_weight_staleness": None,
         "async_max_concurrent_samples": 2,
-        "async_data_buffer_capacity_factor": 2.0,
-        "async_unused_samples_handler": "retry",
-        "custom_async_data_buffer_path": None,
-        "rollout_submission_granularity": None,
-        "fully_async_queue_type": "queue-recycle",
-        "fully_async_queue_factor": 1,
-        "training_buffer_queue_size": 1000,
         "dynamic_sampling_filter_path": None,
         "rollout_sample_filter_path": None,
         "sglang_router_ip": "127.0.0.1",
@@ -128,7 +122,7 @@ def _complete(group: list[Sample], version: int) -> list[Sample]:
         sample.response_length = 1
         sample.reward = 1.0
         sample.status = Sample.Status.COMPLETED
-        sample.weight_versions = [str(version)]
+        sample.weight_versions = make_weight_versions([str(version)])
     return group
 
 
@@ -371,12 +365,6 @@ async def test_prepared_batch_is_a_warm_resume_hit_and_active_prompt_is_regenera
     warm_output = await restored(RolloutFnTrainInput(rollout_id=0))
     assert warm_output.samples[0][0].index == output.samples[0][0].index
     assert warm_output.debug_metadata == output.debug_metadata
-    original_staleness = {key: value for key, value in output.metrics.items() if key.startswith("staleness/")}
-    resumed_staleness = {key: value for key, value in warm_output.metrics.items() if key.startswith("staleness/")}
-    assert resumed_staleness == original_staleness
-    assert (
-        warm_output.metrics["fully_async/train_weight_version"] == output.metrics["fully_async/train_weight_version"]
-    )
     assert warm_output.metrics["resume/replay_buffer/warm_prepared_batch_hit"] == 1
     assert restored._worker is None
     assert [group[0].group_index for group in restored_source.buffer] == [2]
@@ -1095,30 +1083,6 @@ def test_replay_buffer_checksum_fingerprint_and_retention(tmp_path: Path):
     assert (tmp_path / "rollout" / "replay_buffer_8.pt").is_file()
 
 
-def test_replay_buffer_retention_preserves_zero_based_model_archives(tmp_path: Path):
-    state = {
-        "dataset_fingerprint": "dataset-a",
-        "data_source": {},
-        "applied_weight_version": 0,
-        "pending_prompts": [],
-        "ready_items": [],
-        "drain_progress": [],
-        "prepared_batches": [],
-        "regeneration_group_ids": [],
-    }
-    for rollout_id in range(4):
-        save_replay_buffer(tmp_path, rollout_id, state)
-
-    # ABCI's Megatron keeps model iterations 0 and 2 plus latest iteration 3.
-    prune_replay_buffers(tmp_path, current_rollout_id=3, keep_last=2, archive_interval=2)
-
-    remaining = {int(path.stem.rsplit("_", 1)[1]) for path in (tmp_path / "rollout").glob("*.pt")}
-    assert remaining == {0, 2, 3}
-    for rollout_id in (0, 2, 3):
-        loaded = load_replay_buffer(tmp_path, rollout_id, expected_fingerprint="dataset-a")
-        assert loaded["rollout_id"] == rollout_id
-
-
 def test_rollout_replay_buffer_rejects_inflight_payload(tmp_path: Path):
     state = {
         "dataset_fingerprint": "dataset-a",
@@ -1312,38 +1276,6 @@ def test_dataset_fingerprint_includes_model_tokenizer_and_chat_template(tmp_path
     assert dataset_fingerprint(args, source) != initial
 
 
-@pytest.mark.parametrize(
-    ("argument", "changed_value"),
-    (
-        ("tau_max_turns", 12),
-        ("tau_max_steps", 80),
-        ("tau_user_provider", "gemini"),
-        ("tau_user_model", "gemini-2.5-flash-lite"),
-        ("tau_user_max_tokens", 256),
-        ("tau_user_temperature", 0.5),
-        ("tau_user_top_p", 0.9),
-        ("tau_user_request_timeout", 30.0),
-        ("tau_user_max_retries", 2),
-        ("tau_tool_call_parser", "qwen25"),
-        ("tau_overlap_db_restore_with_prefill", True),
-    ),
-)
-def test_dataset_fingerprint_includes_tau_environment_configuration(
-    tmp_path: Path,
-    argument: str,
-    changed_value,
-):
-    prompt_path = tmp_path / "tau-prompts.jsonl"
-    prompt_path.write_text('{"prompt": "tau"}\n', encoding="utf-8")
-    source = Namespace(dataset=[object()])
-    args = Namespace(prompt_data=str(prompt_path))
-    initial = dataset_fingerprint(args, source)
-
-    setattr(args, argument, changed_value)
-
-    assert dataset_fingerprint(args, source) != initial
-
-
 def test_replay_buffer_retention_counts_existing_sparse_buffers(tmp_path: Path):
     state = {
         "dataset_fingerprint": "dataset-a",
@@ -1363,3 +1295,27 @@ def test_replay_buffer_retention_counts_existing_sparse_buffers(tmp_path: Path):
     assert not (tmp_path / "rollout" / "replay_buffer_9.pt").exists()
     assert (tmp_path / "rollout" / "replay_buffer_19.pt").is_file()
     assert (tmp_path / "rollout" / "replay_buffer_29.pt").is_file()
+
+
+def test_replay_buffer_retention_preserves_zero_based_model_archives(tmp_path: Path):
+    state = {
+        "dataset_fingerprint": "dataset-a",
+        "data_source": {},
+        "applied_weight_version": 0,
+        "pending_prompts": [],
+        "ready_items": [],
+        "drain_progress": [],
+        "prepared_batches": [],
+        "regeneration_group_ids": [],
+    }
+    for rollout_id in range(4):
+        save_replay_buffer(tmp_path, rollout_id, state)
+
+    # ABCI's Megatron keeps model iterations 0 and 2 plus latest iteration 3.
+    prune_replay_buffers(tmp_path, current_rollout_id=3, keep_last=2, archive_interval=2)
+
+    remaining = {int(path.stem.rsplit("_", 1)[1]) for path in (tmp_path / "rollout").glob("*.pt")}
+    assert remaining == {0, 2, 3}
+    for rollout_id in (0, 2, 3):
+        loaded = load_replay_buffer(tmp_path, rollout_id, expected_fingerprint="dataset-a")
+        assert loaded["rollout_id"] == rollout_id

@@ -10,6 +10,7 @@ from miles.backends.training_utils.loss_hub import losses as loss_utils
 def _make_args(*, use_rollout_logprobs: bool) -> Namespace:
     return Namespace(
         use_rollout_logprobs=use_rollout_logprobs,
+        use_sampling_support_replay=False,
         skip_actor_forward_only=False,
         fuse_one_step_actor_logprobs=False,
         verify_fused_one_step_actor_logprobs=False,
@@ -87,11 +88,11 @@ def _patch_single_rank_loss_helpers(monkeypatch):
             torch.tensor([0.50, 1.00], dtype=torch.float32),
             torch.tensor([0.10, 0.20], dtype=torch.float32),
             torch.tensor([0.40, 0.80], dtype=torch.float32),
-            0.0,
+            0.45,
         ),
     ],
 )
-def test_train_rollout_logprob_abs_diff_uses_policy_loss_reference_logprobs(
+def test_train_rollout_logprob_abs_diff_uses_trainer_scores(
     monkeypatch,
     use_rollout_logprobs: bool,
     train_log_probs: torch.Tensor,
@@ -401,9 +402,7 @@ def test_m2po_metrics_survive_the_token_normaliser(monkeypatch):
         rollout_log_probs=torch.tensor([0.10, 0.20], dtype=torch.float32),
     )
 
-    monkeypatch.setattr(
-        loss_utils, "get_parallel_state", lambda: SimpleNamespace(tp=SimpleNamespace(group=None))
-    )
+    monkeypatch.setattr(loss_utils, "get_parallel_state", lambda: SimpleNamespace(tp=SimpleNamespace(group=None)))
     _patch_single_rank_loss_helpers(monkeypatch)
     monkeypatch.setattr(
         loss_utils,
@@ -453,9 +452,7 @@ def test_policy_rollout_metrics_survive_use_rollout_logprobs(monkeypatch):
     # The trainer's forward disagrees with the rollout engine -- the thing to measure.
     train_log_probs = torch.tensor([0.40, 0.80], dtype=torch.float32)
 
-    monkeypatch.setattr(
-        loss_utils, "get_parallel_state", lambda: SimpleNamespace(tp=SimpleNamespace(group=None))
-    )
+    monkeypatch.setattr(loss_utils, "get_parallel_state", lambda: SimpleNamespace(tp=SimpleNamespace(group=None)))
     _patch_single_rank_loss_helpers(monkeypatch)
     monkeypatch.setattr(
         loss_utils,

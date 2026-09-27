@@ -15,22 +15,18 @@ Agent function contract:
       request_kwargs: dict,
       metadata: dict,       # sample.metadata — env-specific fields
       **kwargs,
-  ) -> dict | AgentFunctionOutput | None:
+  ) -> dict | None:
       ...
 
   Returning None means no extra metadata to attach.
   Returning a dict merges it into every sample's metadata, so downstream
   reward models (--custom-rm-path) can read whatever the agent left there.
-  Returning AgentFunctionOutput.abort(...) preserves any recorded policy calls
-  for diagnostics but marks the resulting sample ABORTED before reward
-  evaluation. Use it for environment, agent, or verifier infrastructure
-  failures that must not be trained as reward-zero model attempts.
 """
 
 import argparse
 import logging
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from copy import deepcopy
 from typing import Any
 
@@ -38,36 +34,25 @@ import httpx
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 
 from miles.rollout.base_types import GenerateFnInput, GenerateFnOutput
-from miles.rollout.generate_hub.agentic_types import AgentFunctionOutput
 from miles.rollout.generate_utils.openai_endpoint_utils import OpenAIEndpointTracer
-from miles.utils.misc import load_function
+from miles.rollout.session.v2.metrics import SESSION_ROLLOUT_METRICS_KEY
+from miles.utils.function_registry import load_function
 from miles.utils.types import Sample
 
 logger = logging.getLogger(__name__)
 
 
-def _normalize_agent_output(
-    output: Mapping[str, Any] | AgentFunctionOutput | None,
-) -> tuple[dict[str, Any], bool]:
-    if output is None:
-        return {}, False
-    if isinstance(output, AgentFunctionOutput):
-        return dict(output.metadata), output.aborted
-    if isinstance(output, Mapping):
-        return dict(output), False
-    raise TypeError(
-        "custom agent function must return a mapping, AgentFunctionOutput, or None; "
-        f"got {type(output).__name__}"
-    )
-
-
 async def generate(input: GenerateFnInput) -> GenerateFnOutput:
-    assert getattr(input.args, "session_server_ip", None) and getattr(input.args, "session_server_ports", None), (
-        "agentic_tool_call.generate requires session_server_ip/session_server_ports. "
+    assert not input.args.partial_rollout, "Partial rollout is not supported"
+    assert getattr(input.args, "session_server_instances", None), (
+        "agentic_tool_call.generate requires session_server_instances. "
         "Pass --use-session-server to start the session server."
     )
     use_v2 = getattr(input.args, "use_session_server", None) == "v2"
-    tracer = await OpenAIEndpointTracer.create(input.args)
+    collect_spec_metrics = use_v2 and input.args.sglang_speculative_algorithm is not None
+    tracer = await OpenAIEndpointTracer.create(
+        input.args, evaluation=input.evaluation, sampling_params=input.sampling_params
+    )
 
     custom_agent_function: Callable = load_function(input.args.custom_agent_function_path)
     assert (
@@ -87,22 +72,19 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
     # From the tracer, not args: with multiple instances the owning ip:port is per-session.
     metadata = {**metadata, "session_server_id": tracer.session_server_id}
 
-    agent_metadata: dict[str, Any] = {}
-    agent_aborted = False
+    agent_metadata = None
     collect_failed = False
     t_start = time.monotonic()
     try:
         logger.debug(f"{log_prefix} Starting agent function call")
-        raw_agent_output = await custom_agent_function(
-            base_url=tracer.base_url,
+        agent_metadata = await custom_agent_function(
+            base_url=tracer.agent_base_url,
             prompt=input.sample.prompt,
             request_kwargs=build_chat_request_kwargs(input.sampling_params),
             metadata=metadata,
         )
-        agent_metadata, agent_aborted = _normalize_agent_output(raw_agent_output)
         logger.debug(f"{log_prefix} Agent function returned in {time.monotonic()-t_start:.1f}s")
     except Exception as e:
-        agent_aborted = True
         logger.warning(f"{log_prefix} Agent function failed: {e}", exc_info=True)
 
     finally:
@@ -126,6 +108,8 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
     if collect_failed:
         sample = deepcopy(input.sample)
         sample.status = Sample.Status.ABORTED
+        if collect_spec_metrics:
+            sample.metadata.pop(SESSION_ROLLOUT_METRICS_KEY, None)
         return GenerateFnOutput(samples=[sample] if use_v2 else sample)
 
     if not result.samples:
@@ -135,9 +119,26 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
             logger.warning("No model calls recorded for sample")
         sample = deepcopy(input.sample)
         sample.status = Sample.Status.ABORTED
+        if collect_spec_metrics:
+            sample.metadata.pop(SESSION_ROLLOUT_METRICS_KEY, None)
         return GenerateFnOutput(samples=[sample] if use_v2 else sample)
 
+    session_rollout_metrics = None
+    if collect_spec_metrics:
+        session_rollout_metrics = result.session_metadata[SESSION_ROLLOUT_METRICS_KEY]
+        if session_rollout_metrics["session_id"] != tracer.session_id:
+            raise ValueError(
+                "session_rollout_metrics.session_id does not match the collected session: "
+                f"{session_rollout_metrics['session_id']!r} != {tracer.session_id!r}"
+            )
+        if session_rollout_metrics["metrics"] is None:
+            raise ValueError("a successful session collect must carry metrics")
+
     samples = result.samples
+    if collect_spec_metrics:
+        for sample in samples:
+            sample.metadata.pop(SESSION_ROLLOUT_METRICS_KEY, None)
+            sample.metadata[SESSION_ROLLOUT_METRICS_KEY] = session_rollout_metrics
     if use_v2 and len(samples) > 1:
         # FIXME: handle sample index issues.
         rollout_id = input.sample.rollout_id if input.sample.rollout_id is not None else input.sample.index
@@ -151,14 +152,10 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
         for s in samples:
             s.metadata.update(agent_metadata or {})
 
-    if agent_aborted:
-        for s in samples:
-            s.status = Sample.Status.ABORTED
-
     # If the agent function reports wall-clock time spent outside policy generation
     # (env/tool steps), surface it on Sample.non_generation_time so throughput
     # accounting subtracts it.
-    ngt = (agent_metadata.get("agent_metrics") or {}).get("total_tool_time")
+    ngt = ((agent_metadata or {}).get("agent_metrics") or {}).get("total_tool_time")
     if ngt is not None:
         for s in samples:
             s.non_generation_time = ngt

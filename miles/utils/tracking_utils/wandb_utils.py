@@ -1,16 +1,16 @@
 import logging
 import os
-import secrets
 from copy import deepcopy
 
 import wandb
+from wandb.sdk.lib.runid import generate_id
 
-from miles.utils.env_report import decode_env_report
+from miles.utils.env_report.launcher_report import read_launcher_report
 
 logger = logging.getLogger(__name__)
 
 _STEP_METRIC_PREFIXES = {
-    "train/step": ("train", "sample_staleness"),
+    "train/step": ("train", "sample_staleness", "policy_lag"),
     "rollout/step": (
         "rollout",
         "fully_async",
@@ -64,9 +64,10 @@ def init_wandb_primary(args):
     if (not offline) and args.wandb_key is not None:
         wandb.login(key=args.wandb_key, host=args.wandb_host)
 
-    # Add an eight-character random suffix to avoid run-name collisions.
+    # Prepare wandb init parameters
+    # add random 6 length string with characters
     if args.wandb_random_suffix:
-        group = args.wandb_group + "_" + secrets.token_hex(4)
+        group = args.wandb_group + "_" + generate_id()
         run_name = f"{group}-RANK_{args.rank}"
     else:
         group = args.wandb_group
@@ -80,6 +81,8 @@ def init_wandb_primary(args):
         "name": run_name,
         "config": _compute_config_for_logging(args),
     }
+    if args.wandb_run_id is not None:
+        init_kwargs |= {"id": args.wandb_run_id, "resume": "allow"}
 
     # Configure settings based on offline/online mode
     if offline:
@@ -112,7 +115,7 @@ def _compute_config_for_logging(args):
     output["env_vars"] = {k: v for k, v in os.environ.items() if k in whitelist_env_vars}
 
     if env_report_raw := args.env_report:
-        if launcher_report := decode_env_report(env_report_raw):
+        if launcher_report := read_launcher_report(env_report_raw):
             output["launcher_env_report"] = launcher_report
 
     return output

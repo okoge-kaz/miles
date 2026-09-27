@@ -4,7 +4,6 @@ import re
 import string
 from typing import Any
 
-
 _ASSISTANT_PATTERN = re.compile(r"<\|im_start\|>assistant\s*")
 _ANSWER_PATTERN = re.compile(r"<answer>(.*?)</answer>", re.DOTALL)
 _TAG_PATTERN = re.compile(r"(</?(?:think|search|information|answer)>)")

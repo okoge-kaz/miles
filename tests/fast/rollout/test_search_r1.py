@@ -37,7 +37,6 @@ if "torch" not in sys.modules:
 
 from miles.rollout.filter_hub.dynamic_sampling_filters import check_no_aborted_and_reward_nonzero_std
 from miles.utils.types import Sample
-from experiments.src.environments.search_r1 import retrieval_server
 
 SEARCH_R1_DIR = Path(__file__).resolve().parents[3] / "examples" / "experimental" / "search-r1"
 sys.path.insert(0, str(SEARCH_R1_DIR))
@@ -154,76 +153,6 @@ def test_local_retriever_contract_rejects_malformed_payloads(payload):
         local_search_server._extract_contexts(payload)
 
 
-def test_retrieval_server_combines_requests_into_one_native_search():
-    class FakeEncoder:
-        def __init__(self):
-            self.calls = []
-
-        def __call__(self, queries):
-            self.calls.append(queries)
-            return queries
-
-    class FakeIndex:
-        def __init__(self):
-            self.calls = []
-
-        def search(self, embeddings, topk):
-            self.calls.append((embeddings, topk))
-            return [[0.9, 0.8], [0.7, 0.6]], [[0, 1], [2, 3]]
-
-    encoder = FakeEncoder()
-    index = FakeIndex()
-    requests = [
-        retrieval_server.SearchRequest(queries=("first",), topk=1, return_scores=False),
-        retrieval_server.SearchRequest(queries=("second",), topk=2, return_scores=True),
-    ]
-
-    responses = retrieval_server.search_batch(
-        index,
-        ["title 0", "title 1", "title 2", "title 3"],
-        ["text 0", "text 1", "text 2", "text 3"],
-        encoder,
-        requests,
-    )
-
-    assert encoder.calls == [["first", "second"]]
-    assert index.calls == [(["first", "second"], 2)]
-    assert responses == [
-        {"result": [[{"document": {"contents": '"title 0"\ntext 0'}}]]},
-        {
-            "result": [
-                [
-                    {"document": {"contents": '"title 2"\ntext 2'}, "score": 0.7},
-                    {"document": {"contents": '"title 3"\ntext 3'}, "score": 0.6},
-                ]
-            ]
-        },
-    ]
-
-
-async def test_retrieval_server_serializes_concurrent_requests_as_one_batch():
-    batches = []
-
-    def fake_search(requests):
-        batches.append(requests)
-        return [{"result": [[request.queries[0]]]} for request in requests]
-
-    batcher = retrieval_server.RequestBatcher(fake_search, max_requests=8, wait_ms=50)
-    await batcher.start()
-    try:
-        requests = [
-            retrieval_server.SearchRequest(queries=(f"query-{index}",), topk=3, return_scores=False)
-            for index in range(4)
-        ]
-        responses = await asyncio.gather(*(batcher.submit(request) for request in requests))
-    finally:
-        await batcher.stop()
-
-    assert len(batches) == 1
-    assert [request.queries[0] for request in batches[0]] == [f"query-{index}" for index in range(4)]
-    assert responses == [{"result": [[f"query-{index}"]]} for index in range(4)]
-
-
 def test_search_r1_requires_exact_action_stops():
     with pytest.raises(ValueError, match="</search>"):
         search_r1._validate_sampling_params({"stop": ["</answer>"], "no_stop_trim": True})
@@ -261,7 +190,11 @@ async def test_generate_masks_observations_and_records_every_policy_version(monk
     assert result.response == first_text + observation + second_text
     assert result.loss_mask == [1, 1] + [0] * observation_length + [1, 1]
     assert result.rollout_log_probs == [-0.1, -0.2] + [0.0] * observation_length + [-0.1, -0.2]
-    assert result.weight_versions == ["4", "5"]
+    assert [span.version for span in result.all_weight_version_spans] == ["4", "5"]
+    assert [(span.abs_start, span.abs_end) for span in result.all_weight_version_spans] == [
+        (6, 8),
+        (8 + observation_length, 10 + observation_length),
+    ]
     assert result.first_prefill_weight_versions == [4, 5]
     assert result.min_forward_weight_versions == [4, 5]
     assert result.max_forward_weight_versions == [4, 5]
@@ -291,7 +224,7 @@ async def test_generate_aborts_instead_of_training_on_retriever_failure(monkeypa
 
     assert result.status == Sample.Status.ABORTED
     assert result.response == "<think>lookup</think><search>alpha</search>"
-    assert result.weight_versions == ["7"]
+    assert [span.version for span in result.all_weight_version_spans] == ["7"]
     assert result.metadata["search_r1_search_calls"] == 1
     assert result.metadata["search_r1_error"] == "retriever unavailable"
     assert result.reward is None

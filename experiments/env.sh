@@ -93,8 +93,8 @@ export DOCKER_IMAGE="${DOCKER_IMAGE:-radixark/miles:latest}"
 # Singularity build therefore reapplies and verifies the scheduler-authoritative
 # policy-provenance revision instead of trusting whichever checkout the tag has.
 export SGLANG_REPO="${SGLANG_REPO:-okoge-kaz/sglang}"
-export SGLANG_BRANCH="${SGLANG_BRANCH:-miles-staleness-weight-boundaries}"
-export SGLANG_COMMIT="${SGLANG_COMMIT:-f994b9aedfd0b1465dbb8f4e2a02eb789fc76dce}"
+export SGLANG_BRANCH="${SGLANG_BRANCH:-miles-staleness-weight-boundaries-v0.5.20}"
+export SGLANG_COMMIT="${SGLANG_COMMIT:-164a43b253cceccaaab1d386550a0227419740e5}"
 export CONTAINER_IMAGE="${CONTAINER_IMAGE:-${CONTAINER_DIR}/miles.sif}"
 export ASYNC_CONTAINER_IMAGE_OVERRIDE="${ASYNC_CONTAINER_IMAGE_OVERRIDE:-${CONTAINER_IMAGE}}"
 
@@ -173,6 +173,7 @@ export NUMBA_CACHE_DIR="${CONTAINER_CACHE_DIR}/numba"
 # It reads the env var first, so setting it here wins; PER_PROCESS=1 is the
 # supported way to keep the per-rank isolation under a shared directory
 # (the TODO at server_group.py:105, and scripts/run_deepseek_v4.py:575).
+export SGLANG_CACHE_DIR="${CONTAINER_CACHE_DIR}/sglang"
 export SGLANG_DG_CACHE_DIR="${CONTAINER_CACHE_DIR}/sglang/deep_gemm"
 export SGLANG_DG_CACHE_DIR_PER_PROCESS="${SGLANG_DG_CACHE_DIR_PER_PROCESS:-1}"
 
@@ -201,7 +202,7 @@ for _cache_name in \
     HF_DATASETS_CACHE TRANSFORMERS_CACHE TRITON_CACHE_DIR \
     TORCHINDUCTOR_CACHE_DIR TORCH_HOME TORCH_EXTENSIONS_DIR CUDA_CACHE_PATH \
     CUDA_CACHE_MAXSIZE VLLM_CACHE_ROOT PIP_CACHE_DIR UV_CACHE_DIR \
-    NUMBA_CACHE_DIR SGLANG_DG_CACHE_DIR SGLANG_DG_CACHE_DIR_PER_PROCESS; do
+    NUMBA_CACHE_DIR SGLANG_CACHE_DIR SGLANG_DG_CACHE_DIR SGLANG_DG_CACHE_DIR_PER_PROCESS; do
     printf -v "SINGULARITYENV_${_cache_name}" '%s' "${!_cache_name}"
     export "SINGULARITYENV_${_cache_name}"
 done

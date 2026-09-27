@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# doc-dev: docs/ci/02-docker-build.md
+# doc-dev: docs/developer/ci/02-docker-build.md
 """Build and push Miles Docker images.
 
 Usage:
@@ -15,13 +15,14 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 
+import image_inputs
 import typer
 
 CACHE_DIR = "/tmp/miles-docker-cache"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_SGLANG_REPO = "okoge-kaz/sglang"
-DEFAULT_SGLANG_BRANCH = "miles-staleness-weight-boundaries"
-DEFAULT_SGLANG_COMMIT = "f994b9aedfd0b1465dbb8f4e2a02eb789fc76dce"
+DEFAULT_SGLANG_BRANCH = "miles-staleness-weight-boundaries-v0.5.20"
+DEFAULT_SGLANG_COMMIT = "164a43b253cceccaaab1d386550a0227419740e5"
 
 VARIANTS = {
     "cu13": {
@@ -48,43 +49,38 @@ VARIANTS = {
         "tag_postfix": "-cu12",
         "build_args": {
             "ENABLE_CUDA_13": "0",
-            "SGLANG_IMAGE_TAG": "v0.5.16-cu129",
+            "SGLANG_IMAGE_TAG": "v0.5.19-cu129",
+            # Frozen with the base image: sglang publishes no cu12 image from v0.5.20 on,
+            # so this variant cannot follow the branch the cu13 images track.
+            "SGLANG_BRANCH": "sglang-miles-v0.5.19-final",
             "WHEELS_TAG_X86": "cu129-x86_64",
         },
     },
-    "rocm700-mi35x": {
+    "rocm724-mi35x": {
         "image": "rocm/sgl-dev",
-        "tag_postfix": "-rocm700-mi35x",
+        "tag_postfix": "-rocm724-mi35x",
         "tag_prefix": "miles",
         "dockerfile": "docker/Dockerfile.rocm",
         "build_args": {
             "GPU_ARCH": "gfx950",
             "SGLANG_IMAGE_REPO": "rocm/sgl-dev",
-            "SGLANG_IMAGE_TAG": "v0.5.14-rocm700-mi35x-20260627",
-            "SGLANG_USE_ROCM700A": "1",
-        },
-    },
-    "rocm700-mi30x": {
-        "image": "rocm/sgl-dev",
-        "tag_postfix": "-rocm700-mi30x",
-        "tag_prefix": "miles",
-        "dockerfile": "docker/Dockerfile.rocm",
-        "build_args": {
-            "GPU_ARCH": "gfx942",
-            "SGLANG_IMAGE_TAG": "v0.5.10-rocm700-mi30x",
-            "SGLANG_USE_ROCM700A": "1",
-        },
-    },
-    "rocm720-mi35x": {
-        "image": "rocm/sgl-dev",
-        "tag_postfix": "-rocm720-mi35x",
-        "tag_prefix": "miles",
-        "dockerfile": "docker/Dockerfile.rocm",
-        "build_args": {
-            "GPU_ARCH": "gfx950",
-            "SGLANG_IMAGE_REPO": "rocm/sgl-dev",
-            "SGLANG_IMAGE_TAG": "v0.5.16-rocm720-mi35x-20260730",
+            "SGLANG_IMAGE_TAG": "v0.5.20-rocm724-mi35x-20260919",
+            "WHEELS_TAG_ROCM": "rocm724-gfx950-v0.5.20",
             "APPLY_ROCR_VMMFIX": "1",
+            "TE_USE_WHEEL": "1",
+        },
+    },
+    "rocm10-mi35x": {
+        "image": "rocm/sgl-dev",
+        "tag_postfix": "-rocm10-mi35x",
+        "tag_prefix": "miles",
+        "dockerfile": "docker/Dockerfile.rocm",
+        "build_args": {
+            "GPU_ARCH": "gfx950",
+            "SGLANG_IMAGE_REPO": "rocm/sgl-dev",
+            "SGLANG_IMAGE_TAG": "v0.5.20-rocm10-mi35x-20260919",
+            "WHEELS_TAG_ROCM": "rocm10-gfx950-v0.5.18",
+            "APEX_USE_PREBUILT": "1",
             "TE_USE_WHEEL": "1",
         },
     },
@@ -109,6 +105,8 @@ def build_and_push(
     sglang_repo: str = "",
     sglang_branch: str = "",
     sglang_commit: str = "",
+    context: Path = REPO_ROOT,
+    output: str = "",
 ) -> None:
     extra_build_args = extra_build_args or []
     config = VARIANTS[variant]
@@ -136,7 +134,7 @@ def build_and_push(
         "buildx",
         "build",
         "-f",
-        dockerfile,
+        str(context / dockerfile),
     ]
 
     if platforms:
@@ -144,6 +142,8 @@ def build_and_push(
 
     if push:
         cmd += ["--push"]
+    if output:
+        cmd += ["--output", output]
 
     # Proxy args (pass through if set in environment, check both cases)
     for arg_name in ["HTTP_PROXY", "HTTPS_PROXY"]:
@@ -171,11 +171,14 @@ def build_and_push(
         assert "=" in spec, f"--build-arg expects KEY=VALUE, got {spec!r}"
         cmd += ["--build-arg", spec]
 
+    # CI reads this back off the published tag to skip rebuilds whose inputs are unchanged.
+    cmd += ["--label", f"{image_inputs.LABEL_KEY}={image_inputs.compute(root=context)}"]
+
     for tag in tags:
         cmd += ["-t", tag]
 
     # Context is repo root
-    cmd += ["."]
+    cmd += [str(context)]
 
     print(f"\n=== Building {' '.join(tags)} ===", flush=True)
     run(cmd, dry_run)
@@ -186,9 +189,8 @@ class Variant(str, Enum):
     cu13_x86 = "cu13-x86"
     cu13_aarch64 = "cu13-aarch64"
     cu12_x86 = "cu12-x86"
-    rocm700_mi35x = "rocm700-mi35x"
-    rocm700_mi30x = "rocm700-mi30x"
-    rocm720_mi35x = "rocm720-mi35x"
+    rocm724_mi35x = "rocm724-mi35x"
+    rocm10_mi35x = "rocm10-mi35x"
 
 
 class ImageTag(str, Enum):
@@ -217,6 +219,8 @@ def main(
         DEFAULT_SGLANG_COMMIT,
         help="Exact SGLang commit to install.",
     ),
+    context: Path = typer.Option(REPO_ROOT, help="Repository build context, separate from this driver."),  # noqa: B008
+    output: str = typer.Option("", help="Buildx exporter, e.g. type=oci,dest=/tmp/image,tar=false."),  # noqa: B008
 ) -> None:
     build_and_push(
         variant.value,
@@ -229,6 +233,8 @@ def main(
         sglang_repo=sglang_repo,
         sglang_branch=sglang_branch,
         sglang_commit=sglang_commit,
+        context=context.resolve(),
+        output=output,
     )
 
 

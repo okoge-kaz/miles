@@ -4,7 +4,6 @@ import os
 import subprocess
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[3]
 IMPORT_SCRIPT = REPO_ROOT / "experiments/container/import_image.sbatch"
 DEFINITION_FILE = REPO_ROOT / "experiments/container/miles.def"
@@ -126,8 +125,7 @@ fi
     assert first_result.returncode == 0, first_result.stdout + first_result.stderr
 
     invocations = [
-        _captured_arguments(path)
-        for path in sorted(capture_dir.glob("*.args"), key=lambda item: int(item.stem))
+        _captured_arguments(path) for path in sorted(capture_dir.glob("*.args"), key=lambda item: int(item.stem))
     ]
     build = next(arguments for arguments in invocations if arguments[0] == "build")
     smoke_invocations = [arguments for arguments in invocations if arguments[0] == "exec"]
@@ -139,8 +137,8 @@ fi
     assert "--fix-perms" in build
     assert "DOCKER_IMAGE=registry.example/miles:test" in build
     assert "SGLANG_REPO=okoge-kaz/sglang" in build
-    assert "SGLANG_BRANCH=miles-staleness-weight-boundaries" in build
-    assert "SGLANG_COMMIT=f994b9aedfd0b1465dbb8f4e2a02eb789fc76dce" in build
+    assert "SGLANG_BRANCH=miles-staleness-weight-boundaries-v0.5.20" in build
+    assert "SGLANG_COMMIT=164a43b253cceccaaab1d386550a0227419740e5" in build
     assert build[-1] == str(build_cwd / "miles.def")
     assert (build_cwd / "miles.def").parent == build_cwd
     assert "--no-eval" in baked_smoke
@@ -214,8 +212,7 @@ fi
     )
 
     all_invocations = [
-        _captured_arguments(path)
-        for path in sorted(capture_dir.glob("*.args"), key=lambda item: int(item.stem))
+        _captured_arguments(path) for path in sorted(capture_dir.glob("*.args"), key=lambda item: int(item.stem))
     ]
     assert sum(arguments[0] == "build" for arguments in all_invocations) == 1
     assert list(local_root.iterdir()) == []
@@ -223,8 +220,8 @@ fi
     provenance = image.with_suffix(".sif.provenance.env")
     provenance_source = provenance.read_text(encoding="utf-8")
     assert "sglang_repo=okoge-kaz/sglang" in provenance_source
-    assert "sglang_branch=miles-staleness-weight-boundaries" in provenance_source
-    assert "sglang_commit=f994b9aedfd0b1465dbb8f4e2a02eb789fc76dce" in provenance_source
+    assert "sglang_branch=miles-staleness-weight-boundaries-v0.5.20" in provenance_source
+    assert "sglang_commit=164a43b253cceccaaab1d386550a0227419740e5" in provenance_source
     provenance.write_text(
         provenance_source.replace("definition_sha256=", "definition_sha256=stale-"),
         encoding="utf-8",

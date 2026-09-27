@@ -29,10 +29,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 
 # Files the rule spares for now. Entries exist to be deleted; adding one is a
 # decision to defend in review, not a formality.
-_KNOWN_ORPHANS = {
-    # TODO(#2557): move it under tests/ and delete this entry.
-    "miles/utils/test_wandb_utils.py",
-}
+_KNOWN_ORPHANS: set[str] = set()
 
 
 def _test_files_outside_the_tests_tree() -> list[str]:
@@ -53,7 +50,10 @@ def _test_files_outside_the_tests_tree() -> list[str]:
     return sorted(
         path
         for path in listing.split("\0")
-        if path and not path.startswith("tests/") and PurePosixPath(path).name.startswith("test_")
+        if path
+        # .claude/ holds agent-skill tooling whose test suites are run by the
+        # skill's own workflow, not by the CI runners this rule guards.
+        and not path.startswith(("tests/", ".claude/")) and PurePosixPath(path).name.startswith("test_")
     )
 
 

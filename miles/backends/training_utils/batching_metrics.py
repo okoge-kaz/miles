@@ -53,7 +53,10 @@ def _step_microbatch_indices(
         raise ValueError("fixed batching requires micro_batch_size")
 
     sample_offset = microbatch_offset * micro_batch_size
-    return tuple(tuple(range(sample_offset + i * micro_batch_size, sample_offset + (i + 1) * micro_batch_size)) for i in range(num_microbatches))
+    return tuple(
+        tuple(range(sample_offset + i * micro_batch_size, sample_offset + (i + 1) * micro_batch_size))
+        for i in range(num_microbatches)
+    )
 
 
 def _thd_scheduled_tokens(

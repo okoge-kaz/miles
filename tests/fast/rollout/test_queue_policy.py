@@ -21,8 +21,6 @@ def make_args(**overrides):
         rollout_batch_size=192,
         max_weight_staleness=2,
         staleness_reference="prefill",
-        async_data_buffer_capacity_factor=2.0,
-        custom_async_data_buffer_path=None,
     )
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -38,20 +36,6 @@ def make_args(**overrides):
 )
 def test_batch_prefetch_contract(policy, expected):
     assert should_prefetch_rollout_batches(make_args(fully_async_queue_type=policy)) is expected
-
-
-def test_v01_data_buffer_keeps_prefetch_and_uses_capacity_factor():
-    args = make_args(fully_async_queue_type=None, rollout_batch_size=12, async_data_buffer_capacity_factor=2.5)
-
-    validate_fully_async_queue_args(args)
-
-    assert should_prefetch_rollout_batches(args) is True
-    assert fully_async_queue_capacity_groups(args) == 30
-
-
-def test_custom_data_buffer_cannot_be_combined_with_named_queue():
-    with pytest.raises(ValueError, match="cannot be combined"):
-        validate_fully_async_queue_args(make_args(custom_async_data_buffer_path="custom.Buffer"))
 
 
 def test_non_fully_async_training_keeps_its_existing_prefetch():

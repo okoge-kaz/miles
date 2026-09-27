@@ -7,11 +7,23 @@ import psutil
 import torch
 import torch.distributed as dist
 
+from miles.backends.training_utils.loss_hub.policy_lag_metrics import (
+    POLICY_LAG_PART_PREFIX,
+    finalize_policy_lag_parts,
+)
+from miles.backends.training_utils.loss_hub.sequence_filter import (
+    SEQUENCE_FILTER_PART_PREFIX,
+    finalize_sequence_filter_metrics,
+)
 from miles.backends.training_utils.loss_hub.staleness_aware_loss import (
     STALENESS_AWARE_LOSS_PART_PREFIX,
     finalize_staleness_aware_loss_parts,
 )
 from miles.backends.training_utils.loss_hub.staleness_metrics import finalize_sample_staleness_metrics
+from miles.backends.training_utils.loss_hub.tis_population_metrics import (
+    TIS_POPULATION_PART_PREFIX,
+    finalize_tis_abs_population_parts,
+)
 from miles.backends.training_utils.update_diagnostics import (
     UPDATE_PART_PREFIX,
     finalize_update_diagnostic_parts,
@@ -19,7 +31,7 @@ from miles.backends.training_utils.update_diagnostics import (
 from miles.utils import train_metric_utils
 from miles.utils.flops_utils import fwd_tflops_per_gpu
 from miles.utils.ft_utils.process_group_utils import MultiPGUtil
-from miles.utils.metric_utils import compute_rollout_step
+from miles.utils.metric_utils import compute_rollout_step, namespace_metrics, strip_metrics_namespace
 from miles.utils.tracking_utils.structured_log import log_structured
 from miles.utils.types import RolloutBatch
 
@@ -30,6 +42,9 @@ from .parallel import get_parallel_state
 
 logger = logging.getLogger(__name__)
 
+_SAMPLE_STALENESS_PREFIX = "sample_staleness/"
+_POLICY_LAG_PREFIX = "policy_lag/"
+
 _MULTI_TURN_REDUCTION_BY_KEY = {
     "raw_response_length/response_length_max": "max",
     "raw_response_length/response_length_min": "min",
@@ -38,7 +53,6 @@ _MULTI_TURN_REDUCTION_BY_KEY = {
     "multi_turn_metric/round_number_max": "max",
     "multi_turn_metric/round_number_min": "min",
 }
-_SAMPLE_STALENESS_PREFIX = "sample_staleness/"
 
 
 def reduce_gathered_log_dict(
@@ -107,16 +121,19 @@ def gather_log_data(
     parallel_state = get_parallel_state()
 
     pg = parallel_state.effective_dp_cp
-    log_structured(logger.info, op="cross_cell", phase="start", kind="log_gather", rank=pg.rank)
+    log_structured(logger.info, tag="ft", op="cross_cell", phase="start", kind="log_gather", rank=pg.rank)
     try:
         gathered_log_dict = MultiPGUtil.gather_object(
             obj=log_dict,
             groups_inner_to_outer=pg.gloo_groups_inner_to_outer,
         )
-        log_structured(logger.info, op="cross_cell", phase="end", kind="log_gather", rank=pg.rank, success=True)
+        log_structured(
+            logger.info, tag="ft", op="cross_cell", phase="end", kind="log_gather", rank=pg.rank, success=True
+        )
     except RuntimeError:
         log_structured(
             logger.warning,
+            tag="ft",
             op="cross_cell",
             phase="end",
             kind="log_gather",
@@ -134,8 +151,10 @@ def gather_log_data(
 
         # Calculate step once to avoid duplication
         step = compute_rollout_step(args, rollout_id)
-        reduced_log_dict["rollout/step"] = step
-        tracking.log(args, reduced_log_dict, step_key="rollout/step")
+        reduced_log_dict, step_key = namespace_metrics(
+            reduced_log_dict, trainer_model_id=args.trainer_model_id, step_name="rollout/step", step=step
+        )
+        tracking.log(args, reduced_log_dict, step_key=step_key)
 
         return reduced_log_dict
     else:
@@ -208,6 +227,8 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
                 "training_steps",
                 "rollout_routed_experts",
                 "rollout_indexer_topk",
+                "rollout_sampling_mask_ids",
+                "rollout_sampling_mask_offsets",
                 "max_seq_lens",
                 "dynamic_global_batch_size",
                 "witness_ids",
@@ -218,10 +239,10 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
                 "num_rollouts",
                 "n_adapters",
                 "adapter_slots",
-                "step_slots",
-                "step_adapter_names",
-                "step_adapter_batch_sizes",
                 "prompt_group_sizes",
+                # Training-only reference mask consumed by policy-lag metrics.
+                # Its fraction is logged under policy_lag/* by the loss collector.
+                "policy_lag_initial_loss_masks",
                 # Debug-only fused shadow input. It is compared against the
                 # gradient-enabled anchor under train/verify_* metrics; logging it
                 # here would imply a production rollout-phase actor forward.
@@ -259,6 +280,8 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
                         if rollout_count_share is not None:
                             count = rollout_count_share
                     else:
+                        if not tensor.is_floating_point() and not tensor.is_complex():
+                            tensor = tensor.float()
                         per_rank_sum = tensor.mean() * cp_size * count
                     log_dict[key] = (per_rank_sum.item(), count)
                 else:
@@ -277,6 +300,7 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
 
         reduced_log_dict = gather_log_data("rollout", args, rollout_id, log_dict)
         if args.ci_test and not args.ci_disable_logprobs_checker and reduced_log_dict is not None:
+            reduced_log_dict = strip_metrics_namespace(reduced_log_dict, trainer_model_id=args.trainer_model_id)
             if (
                 rollout_id == 0
                 and "rollout/log_probs" in reduced_log_dict
@@ -376,10 +400,7 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
                 if len(correct_entropy) > 0:
                     # per-sample mean over the correct subset, not per-rollout
                     sum_of_sample_mean = get_sum_of_sample_mean(
-                        correct_total_lengths,
-                        correct_response_lengths,
-                        correct_loss_masks,
-                        denominators=None,
+                        correct_total_lengths, correct_response_lengths, correct_loss_masks, denominators=None
                     )
                     correct_entropy = sum_of_sample_mean(torch.cat(correct_entropy, dim=0))
                     rollout_data["correct_entropy"] = [correct_entropy.item()] * num_correct_responses
@@ -457,11 +478,13 @@ def log_cpu_memory(rollout_id: int, args: Namespace, label: str) -> None:
     cpu_mem_gb = psutil.virtual_memory().used / 1e9
     step = compute_rollout_step(args, rollout_id)
     logger.info(f"[CPU memory] {label}: {cpu_mem_gb:.2f} GB (rollout_id={rollout_id}, step={step})")
-    tracking.log(
-        args,
-        {f"perf/cpu_memory_{label}_gb": cpu_mem_gb, "rollout/step": step},
-        step_key="rollout/step",
+    log_dict, step_key = namespace_metrics(
+        {f"perf/cpu_memory_{label}_gb": cpu_mem_gb},
+        trainer_model_id=args.trainer_model_id,
+        step_name="rollout/step",
+        step=step,
     )
+    tracking.log(args, log_dict, step_key=step_key)
 
 
 def aggregate_train_losses(
@@ -475,14 +498,15 @@ def aggregate_train_losses(
 
     Args:
         losses_reduced: List of log_dict from each micro-batch.
-            Each log_dict has the historical ``keys``/``values`` vector and may
-            also carry isolated ``diagnostic_keys``/``diagnostic_values`` additive
-            parts for high-dynamic-range diagnostics.
+            Each log_dict has format: {"keys": list[str], "values": torch.Tensor}
         num_rollouts: report per-rollout means — divide every metric by this
             step's rollout count (no CP factor; CP-chunked numerators reconstruct
             exactly once under the DP*CP all-reduce). None keeps the legacy
             reduction: divide by the all-reduced ``values[0]`` count, cancelled
             by ``cp_size``.
+            Each log_dict has the historical ``keys``/``values`` vector and may
+            also carry isolated ``diagnostic_keys``/``diagnostic_values`` additive
+            parts for high-dynamic-range diagnostics.
 
     Returns:
         Dictionary mapping metric names to averaged values.
@@ -524,14 +548,30 @@ def aggregate_train_losses(
     else:
         num_samples_or_tokens = values[0]
         cp_factor = parallel_state.cp.size
+
     metric_sums = dict(zip(keys, values[1:], strict=True))
+    diagnostic_metric_sums = {}
+    if any(key.startswith(SEQUENCE_FILTER_PART_PREFIX) for key in metric_sums):
+        # An entire update can be filtered. Match Megatron's zero-token guard.
+        num_samples_or_tokens = max(num_samples_or_tokens, 1)
 
     for key, value in metric_sums.items():
-        if key.startswith((UPDATE_PART_PREFIX, STALENESS_AWARE_LOSS_PART_PREFIX)):
+        if key.startswith(
+            (
+                UPDATE_PART_PREFIX,
+                STALENESS_AWARE_LOSS_PART_PREFIX,
+                TIS_POPULATION_PART_PREFIX,
+                POLICY_LAG_PART_PREFIX,
+                SEQUENCE_FILTER_PART_PREFIX,
+            )
+        ):
             continue
         loss_reduced[key] = value * cp_factor / num_samples_or_tokens
     if diagnostic_values is not None:
-        for key, value in zip(diagnostic_keys, diagnostic_values.tolist(), strict=True):
+        diagnostic_metric_sums = dict(zip(diagnostic_keys, diagnostic_values.tolist(), strict=True))
+        for key, value in diagnostic_metric_sums.items():
+            if key.startswith((TIS_POPULATION_PART_PREFIX, POLICY_LAG_PART_PREFIX)):
+                continue
             loss_reduced[key] = value * cp_factor / num_samples_or_tokens
 
     # Sequence-level ESS: rho = (sum w)^2 / (B * sum w^2), which is a ratio of
@@ -548,15 +588,18 @@ def aggregate_train_losses(
             loss_reduced[dst] = (a * a) / (b * c)
 
     loss_reduced.update(finalize_update_diagnostic_parts(metric_sums))
+    loss_reduced.update(finalize_sequence_filter_metrics(metric_sums))
     loss_reduced.update(finalize_staleness_aware_loss_parts(metric_sums))
+    loss_reduced.update(finalize_tis_abs_population_parts(diagnostic_metric_sums))
+    loss_reduced.update(finalize_policy_lag_parts(diagnostic_metric_sums))
     finalize_sample_staleness_metrics(loss_reduced)
 
     return loss_reduced
 
 
 def _format_train_metric_key(key: str, role_tag: str) -> str:
-    """Keep actor sample-staleness diagnostics in their own root section."""
-    if not role_tag and key.startswith(_SAMPLE_STALENESS_PREFIX):
+    """Keep actor diagnostics with dedicated schemas in their root sections."""
+    if not role_tag and key.startswith((_SAMPLE_STALENESS_PREFIX, _POLICY_LAG_PREFIX)):
         return key
     return f"train/{role_tag}{key}"
 
@@ -603,13 +646,18 @@ def log_train_step(
         for key, val in extra_metrics.items():
             log_dict_out[_format_train_metric_key(key, role_tag)] = val
 
-    log_dict_out["train/step"] = accumulated_step_id
+    log_dict_out, step_key = namespace_metrics(
+        log_dict_out,
+        trainer_model_id=args.trainer_model_id,
+        step_name="train/step",
+        step=accumulated_step_id,
+    )
 
     if should_log is None:
         should_log = dist.get_rank() == 0
 
     if should_log:
-        tracking.log(args, log_dict_out, step_key="train/step")
+        tracking.log(args, log_dict_out, step_key=step_key)
         logger.info(f"{role_tag}step {accumulated_step_id}: {log_dict_out}")
 
     return log_dict_out

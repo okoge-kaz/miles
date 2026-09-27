@@ -6,7 +6,7 @@ import torch
 from miles.rollout.recycle_compute_metrics import SAMPLE_REFERENCE_VERSION_KEY, TRAIN_VERSION_KEY
 from miles.utils import object_store
 from miles.utils.dp_schedule import build_dp_schedule, has_full_schedule_config
-from miles.utils.multi_lora import is_multi_lora_enabled
+from miles.utils.lora.utils import is_multi_lora_enabled
 from miles.utils.object_store import ValueSpec
 from miles.utils.seqlen_balancing import get_seqlen_balanced_partitions
 from miles.utils.timer import Timer
@@ -16,8 +16,12 @@ logger = logging.getLogger(__name__)
 
 ROLLOUT_DATA_TENSOR_DTYPES = {
     "tokens": "int32",
+    "target_tokens": "int32",
     "loss_masks": "int32",
+    "policy_lag_initial_loss_masks": "uint8",
     "rollout_log_probs": "float32",
+    "rollout_sampling_mask_ids": "int32",
+    "rollout_sampling_mask_offsets": "int64",
     "teacher_log_probs": "float32",
     "opd_reverse_kl": "float32",
     "rollout_routed_experts": "int32",
@@ -26,6 +30,7 @@ ROLLOUT_DATA_TENSOR_DTYPES = {
 
 ROLLOUT_DATA_VALUE_SPEC: dict[str, ValueSpec] = {
     **{field: ValueSpec(codec="typed_ragged") for field in ROLLOUT_DATA_TENSOR_DTYPES},
+    "policy_lag_initial_loss_masks": ValueSpec(codec="typed_ragged", dtype="uint8"),
     "partition": ValueSpec(codec="ndarray", dtype="int64"),
     "seq_witness_ids": ValueSpec(codec="ndarray", dtype="int64"),
     "response_lengths": ValueSpec(codec="ndarray", dtype="int64"),
@@ -128,6 +133,10 @@ def convert_samples_to_train_data(
     # loss mask
     # TODO: compress the loss mask
     loss_masks = []
+    policy_lag_initial_loss_masks = []
+    preserve_policy_lag_zero_loss_inputs = getattr(args, "log_policy_lag_metrics", False) and getattr(
+        args, "zero_loss_on_truncated", False
+    )
     for sample in samples:
         # always instantiate loss_mask if not provided
         if sample.loss_mask is None:
@@ -136,13 +145,20 @@ def convert_samples_to_train_data(
         assert (
             len(sample.loss_mask) == sample.response_length
         ), f"loss mask length {len(sample.loss_mask)} != response length {sample.response_length}"
+        initial_loss_mask = list(sample.loss_mask)
+        if sample.remove_sample:
+            initial_loss_mask = [0] * sample.response_length
         zero_truncated_loss = (
             getattr(args, "zero_loss_on_truncated", False) and sample.status == Sample.Status.TRUNCATED
         )
         if sample.remove_sample or zero_truncated_loss:
             sample.loss_mask = [0] * sample.response_length
         loss_masks.append(sample.loss_mask)
+        if preserve_policy_lag_zero_loss_inputs:
+            policy_lag_initial_loss_masks.append(initial_loss_mask)
     train_data["loss_masks"] = loss_masks
+    if preserve_policy_lag_zero_loss_inputs:
+        train_data["policy_lag_initial_loss_masks"] = policy_lag_initial_loss_masks
 
     train_data["rollout_mask_sums"] = _compute_rollout_mask_sums(train_data["rollout_ids"], loss_masks)
 
@@ -158,11 +174,40 @@ def convert_samples_to_train_data(
     if samples[0].rollout_log_probs is not None:
         train_data["rollout_log_probs"] = [sample.rollout_log_probs for sample in samples]
 
+    has_sampling_mask = any(sample.rollout_sampling_mask is not None for sample in samples)
+    if has_sampling_mask:
+        sampling_mask_ids = []
+        sampling_mask_offsets = []
+        for position, sample in enumerate(samples):
+            sample.validate()
+            if sample.rollout_sampling_mask is None:
+                raise ValueError(
+                    "sampling-mask data must be present for every training sample; "
+                    f"missing at position={position}, sample_index={sample.index}, status={sample.status}"
+                )
+            ids, offsets = sample.rollout_sampling_mask._as_tensors()
+
+            sampling_mask_ids.append(ids)
+            sampling_mask_offsets.append(offsets)
+
+        train_data["rollout_sampling_mask_ids"] = sampling_mask_ids
+        train_data["rollout_sampling_mask_offsets"] = sampling_mask_offsets
+
     if samples[0].rollout_routed_experts is not None:
         train_data["rollout_routed_experts"] = [sample.rollout_routed_experts for sample in samples]
+    elif getattr(args, "use_rollout_routing_replay", False):
+        raise ValueError(
+            "--use-rollout-routing-replay is set but the rollout samples carry no "
+            "rollout_routed_experts: the engine response meta_info lacked 'routed_experts'."
+        )
 
     if samples[0].rollout_indexer_topk is not None:
         train_data["rollout_indexer_topk"] = [sample.rollout_indexer_topk for sample in samples]
+    elif getattr(args, "use_rollout_indexer_replay", False):
+        raise ValueError(
+            "--use-rollout-indexer-replay is set but the rollout samples carry no "
+            "rollout_indexer_topk: the engine response meta_info lacked 'indexer_topk'."
+        )
 
     if samples[0].train_metadata is not None:
         train_data["metadata"] = [sample.train_metadata for sample in samples]
@@ -171,7 +216,7 @@ def convert_samples_to_train_data(
         train_data["multimodal_train_inputs"] = [sample.multimodal_train_inputs for sample in samples]
 
     if any(sample.weight_versions for sample in samples):
-        train_data["weight_versions"] = [sample.weight_versions for sample in samples]
+        train_data["weight_versions"] = [[call.to_dicts() for call in sample.weight_versions] for sample in samples]
     for field in (
         "first_prefill_weight_versions",
         "min_forward_weight_versions",
@@ -184,21 +229,6 @@ def convert_samples_to_train_data(
 
     if samples[0].teacher_log_probs is not None:
         train_data["teacher_log_probs"] = [sample.teacher_log_probs for sample in samples]
-
-    if any(sample.adapter is not None for sample in samples):
-        assert all(sample.adapter is not None for sample in samples), "Cannot mix adapter and adapter-less samples"
-        train_data["adapter_slots"] = [sample.adapter.slot for sample in samples]
-        # Slots whose adapter batch completes with this batch: the trainer scales their
-        # accumulated gradients by 1/adapter-batch-size and advances the LR schedule.
-        step_slots = sorted(metadata.get("step_slots", []))
-        train_data["step_slots"] = step_slots
-        train_data["step_adapter_names"] = sorted(metadata.get("step_adapter_names", []))
-        step_slot_set = set(step_slots)
-        train_data["step_adapter_batch_sizes"] = {
-            sample.adapter.slot: sample.metadata["adapter_global_batch_size"]
-            for sample in samples
-            if sample.adapter.slot in step_slot_set
-        }
 
     if (prompt_group_sizes := metadata.get("prompt_group_sizes")) is not None:
         train_data["prompt_group_sizes"] = prompt_group_sizes
@@ -318,11 +348,7 @@ def _post_process_rewards(
     if (f := custom_reward_post_process_func) is not None:
         return f(args, samples)
 
-    zero_truncated_rewards = getattr(args, "zero_reward_on_truncated", False)
-    raw_rewards = [
-        0.0 if zero_truncated_rewards and sample.status == Sample.Status.TRUNCATED else sample.get_reward_value(args)
-        for sample in samples
-    ]
+    raw_rewards = [sample.get_reward_value(args) for sample in samples]
     if args.advantage_estimator in ["grpo", "gspo", "reinforce_plus_plus_baseline"] and args.rewards_normalization:
         normalized_rewards = _normalize_rewards_by_rollout(args, samples, raw_rewards, prompt_group_sizes)
         return raw_rewards, normalized_rewards
@@ -420,6 +446,7 @@ def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, An
             "rewards",
             "truncated",
             "loss_masks",
+            "policy_lag_initial_loss_masks",
             "round_number",
             "sample_indices",
             "rollout_ids",
@@ -429,6 +456,8 @@ def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, An
             "training_steps",
             "sample_staleness",
             "rollout_log_probs",
+            "rollout_sampling_mask_ids",
+            "rollout_sampling_mask_offsets",
             "rollout_routed_experts",
             "rollout_indexer_topk",
             "prompt",
@@ -442,6 +471,9 @@ def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, An
             "last_forward_weight_versions",
             "response_weight_versions",
             "adapter_slots",
+            "loss_weights",
+            "advantages",
+            "target_tokens",
         ]:
             if key not in data:
                 continue
@@ -452,10 +484,9 @@ def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, An
             "raw_reward",
             "total_lengths",
             "dynamic_global_batch_size",
-            "step_slots",
-            "step_adapter_names",
-            "step_adapter_batch_sizes",
             "prompt_group_sizes",
+            "loss_fn",
+            "loss_fn_config",
         ]:
             if key not in data:
                 continue

@@ -8,6 +8,7 @@ from copy import deepcopy
 from typing import Any
 
 from miles.rollout.base_types import (
+    BaseRolloutFn,
     GenerateFnInput,
     RolloutFnConstructorInput,
     RolloutFnEvalInput,
@@ -143,10 +144,10 @@ async def generate_and_rm(
     logger.debug(f"{log_prefix} Waiting for semaphore...")
     try:
         async with state.generate_fn_semaphore:
-            start_version = lifecycle_version_provider() if lifecycle_version_provider is not None else None
-            start_time = time.time() if lifecycle_version_provider is not None else None
             if state.aborted:
                 sample.status = Sample.Status.ABORTED
+                start_version = lifecycle_version_provider() if lifecycle_version_provider is not None else None
+                start_time = time.time() if lifecycle_version_provider is not None else None
                 finish_generation(sample, start_version, start_time)
                 return sample
 
@@ -155,6 +156,8 @@ async def generate_and_rm(
                 sink.gen_start(sample)
             # per-sample override, e.g. an eval dataset naming its own generate function
             generate_fn = load_generate_function(sample.generate_function_path) or state.generate_function
+            start_version = lifecycle_version_provider() if lifecycle_version_provider is not None else None
+            start_time = time.time() if lifecycle_version_provider is not None else None
             output = await generate_fn(
                 GenerateFnInput(
                     state=state,
@@ -320,8 +323,9 @@ def compute_sampling_params(
     )
 
 
-class InferenceRolloutFn:
+class InferenceRolloutFn(BaseRolloutFn):
     def __init__(self, input: RolloutFnConstructorInput):
+        super().__init__(input)
         self.data_source = input.data_source
         self.state = GenerateState(input.args)
         self.eval_prompt_dataset_cache = {}
