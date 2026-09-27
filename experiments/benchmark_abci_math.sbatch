@@ -6,8 +6,8 @@
 #PBS -l walltime=04:00:00
 #PBS -j oe
 
-# Disposable validation of the filtered Qwen3-4B SFT recipe. The submit wrapper
-# selects conversion, two-node bring-up/resume, full-shape fit, or 20 updates.
+# Filtered Qwen3-4B SFT validation and production runs. The submit wrapper
+# selects conversion, bring-up/resume, fit, 20 updates, or all 300 updates.
 set -euo pipefail
 export MILES_REPO="${MILES_REPO:-${PBS_O_WORKDIR:?}}"
 cd "${MILES_REPO}"
@@ -25,7 +25,11 @@ export WANDB_TEAM=okoge WANDB_PROJECT=async-rl-staleness-dapo-math-miles WANDB_M
 export ACTOR_GPUS_PER_NODE=8 TENSOR_PARALLEL_SIZE=2 CONTEXT_PARALLEL_SIZE=1 EXPERT_PARALLEL_SIZE=1
 export ROLLOUT_BATCH_SIZE=192 N_SAMPLES_PER_PROMPT=16 GLOBAL_BATCH_SIZE=3072 NUM_STEPS_PER_ROLLOUT=1
 export MAX_RESPONSE_LEN=16384 ROLLOUT_MAX_CONTEXT_LEN=32768 MAX_TOKENS_PER_GPU=32768
-export QUEUE_TYPE=queue-recycle MAX_WEIGHT_STALENESS=16 STALENESS_REFERENCE=prefill
+export QUEUE_TYPE=queue-recycle STALENESS_REFERENCE=prefill
+export MAX_WEIGHT_STALENESS="${MAX_WEIGHT_STALENESS:-16}"
+[[ "${MAX_WEIGHT_STALENESS}" =~ ^[1-9][0-9]*$ ]] || {
+    echo 'MAX_WEIGHT_STALENESS must be a positive integer' >&2; exit 2;
+}
 export PAUSE_GENERATION_MODE=in_place
 export ASYNC_MAX_CONCURRENT_SAMPLES="${ASYNC_MAX_CONCURRENT_SAMPLES:-3072}"
 export USE_REPLAY_BUFFER=1 REPLAY_BUFFER_TYPE=inflight SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS=1
@@ -61,13 +65,14 @@ case "${BENCHMARK_STAGE}" in
         [[ "${BENCHMARK_STAGE}" != resume ]] || export DEBUG_EXIT_AFTER_ROLLOUT=1
         export RUN_NAME="${BENCHMARK_ID}-smoke"
         ;;
-    fit|throughput)
+    fit|throughput|production)
         [[ "${MILES_JOB_NUM_NODES}" == 8 ]]
-        [[ "${BENCHMARK_ACTOR_NODES}" == 2 || "${BENCHMARK_ACTOR_NODES}" == 3 ]]
+        [[ "${BENCHMARK_ACTOR_NODES}" =~ ^[123]$ ]]
         export ACTOR_NUM_NODES="${BENCHMARK_ACTOR_NODES}"
         export ROLLOUT_NUM_GPUS="$(((8 - ACTOR_NUM_NODES) * 8))"
         export DEBUG_EXIT_AFTER_ROLLOUT=20
         [[ "${BENCHMARK_STAGE}" != fit ]] || export DEBUG_EXIT_AFTER_ROLLOUT=1
+        [[ "${BENCHMARK_STAGE}" != production ]] || export DEBUG_EXIT_AFTER_ROLLOUT=""
         export RUN_NAME="${BENCHMARK_ID}-${BENCHMARK_STAGE}-t${ACTOR_NUM_NODES}r$((8 - ACTOR_NUM_NODES))"
         ;;
     *) echo "unknown BENCHMARK_STAGE=${BENCHMARK_STAGE}" >&2; exit 2 ;;
@@ -80,6 +85,8 @@ printf 'ABCI benchmark: revision=%s stage=%s train_nodes=%s rollout_gpus=%s imag
     "$(git rev-parse HEAD)" "${BENCHMARK_STAGE}" "${ACTOR_NUM_NODES}" "${ROLLOUT_NUM_GPUS}" "${CONTAINER_IMAGE}"
 printf 'ABCI rollout: router_policy=%s concurrent_samples=%s\n' \
     "${SGLANG_ROUTER_POLICY}" "${ASYNC_MAX_CONCURRENT_SAMPLES}"
+printf 'ABCI schedule: max_weight_staleness=%s num_rollout=%s debug_exit_after_rollout=%s\n' \
+    "${MAX_WEIGHT_STALENESS}" "${NUM_ROLLOUT}" "${DEBUG_EXIT_AFTER_ROLLOUT:-none}"
 if [[ "${BENCHMARK_STAGE}" == smoke ]]; then
     # Transformer Engine needs libcuda even for these path-selection tests.
     # Validate the image's Megatron on the allocated GPU host before training.

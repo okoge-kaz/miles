@@ -245,3 +245,61 @@ passed. Logs and JUnit results are under
 No SIF rebuild is required because the checkout is mounted at runtime.
 This removes the version-query wait from the submission path; its impact on
 eight-node throughput has not yet been measured with the modified producer.
+
+## 300-update reward stability comparison (2026-09-28)
+
+The user requested four fresh 300-update runs: max-weight-staleness 12 and 16
+crossed with train:rollout 2:6 and 1:7, each using 8 nodes. The primary question
+is whether Miles exhibits the reward collapse the user observed in NeMo-RL
+despite low realized staleness. Throughput is secondary. The `production` stage
+removes the 20-update debug stop, keeps the 300-update schedule, and requests
+24 hours for 2:6 or 36 hours for 1:7, whose training has half as many GPUs.
+`MAX_WEIGHT_STALENESS` is forwarded explicitly by the submit wrapper; its
+default remains 16. Existing smoke, fit, and throughput lengths are unchanged.
+
+Keep the local submission-version tracker, `SGLANG_ROUTER_POLICY=round_robin`,
+`ASYNC_MAX_CONCURRENT_SAMPLES=3072`, filtered DAPO Math p10–90, Qwen3-4B SFT
+iter4000, and the same batch, sequence limits, optimizer, and seeds. Both bounds
+use the existing completed-queue capacity of 6000 groups. Prefill-based
+queue-recycle admission remains `D - F < M`, preserving the steady-state
+train-time bound `T - F <= M`; this run changes the configured cap only.
+Keep rollout/train/policy-loss dumps, repetition, and token-lag metrics off,
+and keep batch-ready timing and sample-level staleness telemetry on.
+
+Use a clean frozen checkout, with a fresh run ID for each bound and split:
+
+```bash
+export PBS_PROJECT=gai51740
+export CONTAINER_IMAGE=/groups/gai51740/kazuki_fujii/containers/miles-main-20260927-sg0520.sif
+export MAX_WEIGHT_STALENESS=12  # use 16 for the other run
+export BENCHMARK_ID=stability-20260928-m12-rr-c3072-local-300
+export SGLANG_ROUTER_POLICY=round_robin ASYNC_MAX_CONCURRENT_SAMPLES=3072
+export DUMP_ROLLOUT_DATA=0 LOG_ROLLOUT_REPETITION=0 LOG_TOKEN_LAG_METRICS=0 LOG_ROLLOUT_TIMING=1
+bash experiments/submit_abci_math_benchmark.sh production 2:6 --test-only  # also 1:7
+```
+
+After reviewing the preview, use `--submit`. Megatron, HF export, and inflight
+replay save every 10 updates; Megatron/replay retain the existing archive cadence
+of 100. Unique checkpoint directories prevent either run from resuming a prior
+20-update measurement. W&B remains `okoge/async-rl-staleness-dapo-math-miles`.
+Use the unnormalized `rollout/raw_reward` and generated/admitted reward traces
+to assess stability; GRPO-normalized `rollout/rewards` near zero is not evidence
+of collapse. Record per-step values, 20-update rolling means, and fixed
+50-update blocks for reward, response length, truncation, training entropy,
+policy/rollout KL, gradient norm, policy-update diagnostics, and realized
+staleness. Compare both the reward trajectory and the size/duration of any
+decline; do not label a run collapse-free from its configured bound or from
+a short startup window. These are training rewards, not held-out accuracy.
+Keep HF exports available for follow-up evaluation around any decline.
+
+The user's hypothesis is that collapse occurs only for 1:7 with cap 16 after
+realized staleness exceeds 12. Record the realized group staleness mean, p90,
+p99, maximum, and fraction strictly above 12, alongside the reward trajectory.
+If that arm never reaches values above 12, the hypothesized regime was not
+tested. Do not infer stability from a low configured/observed cap, or identify
+a NeMo-RL defect solely from a cross-framework outcome difference.
+
+Also report observed staleness and recycle activity: the preceding
+3072/20-update run observed a maximum of only 4, so different configured caps
+need not affect admission in every interval. Timing summaries should retain
+checkpoint-inclusive measurements and show normal steps separately.

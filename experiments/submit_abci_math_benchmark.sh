@@ -9,12 +9,17 @@ stage="${1:-throughput}"
 split="${2:-2:6}"
 mode="${3:---test-only}"
 [[ $# -le 3 && ( "${mode}" == --submit || "${mode}" == --test-only ) ]] || exit 2
-case "${split}" in 2:6|3:5) ;; *) echo 'split must be 2:6 or 3:5' >&2; exit 2 ;; esac
+case "${split}" in 1:7|2:6|3:5) ;; *) echo 'split must be 1:7, 2:6, or 3:5' >&2; exit 2 ;; esac
+walltime=04:00:00
 case "${stage}" in
     convert) nodes=1 ;;
     smoke|resume) nodes=2 ;;
     fit|throughput) nodes=8 ;;
-    *) echo 'stage must be convert, smoke, resume, fit, or throughput' >&2; exit 2 ;;
+    production)
+        nodes=8; walltime=24:00:00
+        [[ "${split}" != 1:7 ]] || walltime=36:00:00
+        ;;
+    *) echo 'stage must be convert, smoke, resume, fit, throughput, or production' >&2; exit 2 ;;
 esac
 if [[ "${stage}" == resume ]]; then
     : "${BENCHMARK_ID:?set the BENCHMARK_ID used for smoke}"
@@ -26,6 +31,10 @@ export DUMP_ROLLOUT_DATA="${DUMP_ROLLOUT_DATA:-1}" LOG_ROLLOUT_REPETITION="${LOG
 export LOG_TOKEN_LAG_METRICS="${LOG_TOKEN_LAG_METRICS:-1}" LOG_ROLLOUT_TIMING="${LOG_ROLLOUT_TIMING:-0}"
 export SGLANG_ROUTER_POLICY="${SGLANG_ROUTER_POLICY:-cache_aware}"
 export ASYNC_MAX_CONCURRENT_SAMPLES="${ASYNC_MAX_CONCURRENT_SAMPLES:-3072}"
+export MAX_WEIGHT_STALENESS="${MAX_WEIGHT_STALENESS:-16}"
+[[ "${MAX_WEIGHT_STALENESS}" =~ ^[1-9][0-9]*$ ]] || {
+    echo 'MAX_WEIGHT_STALENESS must be a positive integer' >&2; exit 2;
+}
 case "${SGLANG_ROUTER_POLICY}" in
     cache_aware|round_robin) ;;
     *) echo 'benchmark SGLANG_ROUTER_POLICY must be cache_aware or round_robin' >&2; exit 2 ;;
@@ -48,7 +57,8 @@ exports="BENCHMARK_ID,BENCHMARK_STAGE,BENCHMARK_ACTOR_NODES,MILES_REPO,MILES_WOR
 exports+=",CONTAINER_IMAGE,HF_CKPT_DIR,MEGATRON_CKPT_DIR,RL_DATASET_DIR,CACHE_DIR"
 exports+=",DUMP_ROLLOUT_DATA,LOG_ROLLOUT_REPETITION,LOG_TOKEN_LAG_METRICS,LOG_ROLLOUT_TIMING"
 exports+=",SGLANG_ROUTER_POLICY,ASYNC_MAX_CONCURRENT_SAMPLES"
-result="$(pbs_submit "${options[@]}" --profile gpu --nodes="${nodes}" --time=04:00:00 \
+exports+=",MAX_WEIGHT_STALENESS"
+result="$(pbs_submit "${options[@]}" --profile gpu --nodes="${nodes}" --time="${walltime}" \
     --job-name="math-${stage}-t${BENCHMARK_ACTOR_NODES}" \
     --output="${repo}/experiments/outputs/abci-throughput/" --export="${exports}" \
     experiments/benchmark_abci_math.sbatch)"
