@@ -160,5 +160,23 @@ responses were all truncated, giving zero reward and gradient; this establishes
 execution and saving, not learning. Its four image-native checkpoint-selection
 tests also passed. W&B: https://wandb.ai/okoge/async-rl-staleness-dapo-math-miles/runs/qflo5ukh.
 Resume job `2450359.pbs1` was canceled when the user requested the eight-node
-production run; actual restore remains unverified. The production throughput
-measurement remains pending.
+production run; actual restore remains unverified.
+
+Production validation `2450392.pbs1` started at 14:32 JST from frozen revision
+`2541733cfdac353ee669462fe21954ccabc6cf09`. All eight nodes reported 192-CPU
+affinity; the actual command selected actor nodes 2, rollout GPUs 48, staleness
+16, global batch 3072, debug exit after 20 updates, and Megatron/HF save cadence
+10. W&B: https://wandb.ai/okoge/async-rl-staleness-dapo-math-miles/runs/rbc9n05y.
+The first four optimizer updates completed with finite, nonzero gradient norms.
+The first batch's raw reward was 0.6162, mean response length 3948.94, and
+truncation fraction 0.0260. These are initial checks; the 20-update result is
+still pending.
+
+CPU finalizer `2450466.pbs1` waits for this training job with `afterany`, then
+audits its exit status, all 20 pipeline windows and optimizer updates, the
+staleness bound and exact-token coverage, and final Megatron/HF/replay artifact
+publication. It writes both successful and incomplete results to
+`experiments/outputs/abci-throughput/results/2450392.pbs1.{json,md}`. The finalizer
+does not test checkpoint restore. Its script, checksum, job IDs, source paths
+and result paths are recorded beside `integration-manifest.json` in the ignored
+output directory.
