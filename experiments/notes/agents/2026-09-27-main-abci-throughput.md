@@ -38,7 +38,11 @@ Omit `--submit` to preview. This requests a two-hour managed CPU build job with
 scratch space, non-root access checks, and the fork's runtime provenance tests.
 It publishes a separate image/link without replacing `miles.sif`. The immutable
 amd64 OCI digest was resolved from the official `radixark/miles:latest` image
-built on 2026-09-26. No image build has been submitted by this integration task.
+built on 2026-09-26. Build job `2449958.pbs1` completed with exit status 0 in
+13m37s. Its local workspace was `/local/2449958.pbs1/miles-singularity-2449958.Ty40jW`.
+The published SIF is 17,600,172,032 bytes, with SHA256
+`bba0977739d7825d2081794aa3eeb6387e32ef5adf0fe7f5a300beafc5acbc7a`;
+the fork's 10 tests passed both during build and under the ordinary-user mounts.
 
 ## Assets and comparison
 
@@ -101,7 +105,10 @@ These commands preview by default. Append `--submit` to execute one stage after
 the preceding stage has been checked. Confirm node joins, 192-CPU affinity,
 placement, finite losses, reward/response samples, saved artifacts and actual
 resume, then full-shape memory fit. Inspect the SGLang runtime tests and the
-Megatron checkpoint-selection tests in the new image before training.
+Megatron checkpoint-selection tests in the new image before training. The smoke
+stage runs the latter on its allocated GPU host: the image's Transformer Engine
+requires `libcuda.so.1` at import time, so these tests cannot run on the login
+node even though their assertions only concern checkpoint path selection.
 Job IDs, source revision and image are recorded in
 `experiments/outputs/abci-throughput/jobs.tsv`; live logs are under `logs/`.
 
@@ -116,8 +123,8 @@ update each. It reports total wall time, seconds/update, generated tokens/s,
 accepted loss tokens/s, trainer starvation and rollout backpressure. Rates use
 summed counters divided by summed window durations. Both all 20 windows and
 windows 1–19 are reported; the first includes pipeline startup. These are short
-throughput observations, not learning-quality measurements. GPU runs and
-throughput numbers remain pending the new SIF.
+throughput observations, not learning-quality measurements. Throughput numbers
+remain pending the GPU bring-up and measurement jobs.
 
 ## Integration validation before GPU allocation
 
@@ -141,6 +148,8 @@ Main's worker-handle API is used for this notification and for replay state;
 legacy Ray `.remote()` calls are not used for these handles.
 
 Logs are retained under `experiments/outputs/abci-throughput/validation/`.
-These checks do not execute CUDA kernels, multi-node collectives, checkpoint
-conversion, or either throughput run. The new SIF and real GPU runs are still
-required; no throughput values have been measured yet.
+These CPU checks do not execute CUDA kernels, multi-node collectives,
+checkpoint conversion, or either throughput run. GPU conversion subsequently
+passed in job `2450315.pbs1` (1m47s, exit 0), producing the named checkpoint's
+`release/.metadata` and `latest_checkpointed_iteration.txt = release`.
+Multi-node smoke/resume and throughput measurements remain pending.

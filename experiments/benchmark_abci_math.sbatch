@@ -40,6 +40,8 @@ test -r "${HF_CKPT_DIR}/${HF_MODEL_NAME}/config.json"
 test -r "${DATASET_DIR}/${PROMPT_DATA#/data/}"
 test -r "${CONTAINER_IMAGE}"
 if [[ "${BENCHMARK_STAGE}" == convert ]]; then
+    mkdir -p "${MILES_REPO}/experiments/outputs/abci-throughput/logs"
+    exec > >(tee -a "${MILES_REPO}/experiments/outputs/abci-throughput/logs/${BENCHMARK_ID}-convert-${PBS_JOBID}.log") 2>&1
     exec bash experiments/setup/models/convert_checkpoint.sbatch
 fi
 test -r "${MEGATRON_CKPT_DIR}/${MODEL_NAME}_torch_dist/latest_checkpointed_iteration.txt"
@@ -72,4 +74,11 @@ mkdir -p "${MILES_REPO}/experiments/outputs/abci-throughput/logs"
 exec > >(tee -a "${MILES_REPO}/experiments/outputs/abci-throughput/logs/${RUN_NAME}-${PBS_JOBID}.log") 2>&1
 printf 'ABCI benchmark: revision=%s stage=%s train_nodes=%s rollout_gpus=%s image=%s\n' \
     "$(git rev-parse HEAD)" "${BENCHMARK_STAGE}" "${ACTOR_NUM_NODES}" "${ROLLOUT_NUM_GPUS}" "${CONTAINER_IMAGE}"
+if [[ "${BENCHMARK_STAGE}" == smoke ]]; then
+    # Transformer Engine needs libcuda even for these path-selection tests.
+    # Validate the image's Megatron on the allocated GPU host before training.
+    miles_srun --nodes=1 --ntasks=1 --image="${CONTAINER_IMAGE}" \
+        --bind="${CONTAINER_MOUNTS}" --writable-tmpfs --no-home --export=ALL \
+        bash --noprofile --norc -c 'cd /root/miles; PYTHONPATH=/root/Megatron-LM:/root/miles OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python3 -m pytest tests/fast/backends/megatron_utils/test_checkpoint_step_selection.py -q -o addopts="" --tb=short'
+fi
 exec bash experiments/scripts/math/async/dapo-math-p10-90/qwen3-4b/run.sbatch
