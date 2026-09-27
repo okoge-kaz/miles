@@ -206,3 +206,19 @@ LOG_ROLLOUT_TIMING=1`, and use a new `BENCHMARK_ID` containing `round-robin`.
 Compare against the diagnostics-off cache-aware run `2451247.pbs1`, reporting
 step/train/batch-ready times and first-checkpoint-window engine telemetry with
 the same exclusions. More concurrent samples are a separate tuning point.
+
+## Concurrency comparison
+
+`ASYNC_MAX_CONCURRENT_SAMPLES=6144` now passes through the benchmark submit
+wrapper to the existing `--async-max-concurrent-samples` option; the default
+remains 3072. The two-node smoke/resume stages retain their reduced value of 32.
+The general recipe validates that the value is a positive multiple of the
+number of samples per prompt.
+
+The 6144 comparison keeps `SGLANG_ROUTER_POLICY=round_robin` and all other
+settings from the completed 3072 run `2451899.pbs1`, including 20 updates,
+8 nodes at 2:6, staleness 16, diagnostics off, and the production save cadence.
+Training still consumes 192 groups × 16 samples per update; only the in-flight
+group limit changes from 192 to 384. Use a fresh `BENCHMARK_ID` and checkpoint
+directory, and compare step/train/batch-ready times, request concurrency,
+generation tokens/s, KV usage, and observed staleness. No SIF rebuild is needed.
