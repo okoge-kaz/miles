@@ -193,6 +193,30 @@ def test_setup_uses_only_canonical_top_level_layout():
     assert root_level_scripts == []
 
 
+def test_container_setup_submits_with_abci_project(tmp_path: Path):
+    environment = _setup_test_environment(tmp_path / "workspace")
+    capture = tmp_path / "qsub.args"
+    fake_qsub = tmp_path / "qsub"
+    fake_qsub.write_text(
+        '#!/bin/bash\nprintf "%s\\0" "$@" > "${QSUB_CAPTURE}"\nprintf "42.pbs1\\n"\n', encoding="utf-8"
+    )
+    fake_qsub.chmod(0o700)
+    environment.update(PBS_PROJECT="gai51740", PBS_QSUB_BIN=str(fake_qsub), QSUB_CAPTURE=str(capture))
+    result = subprocess.run(
+        [str(SETUP_ENTRYPOINT), "container", "--submit"],
+        cwd=REPO_ROOT,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    arguments = capture.read_bytes().decode().split("\0")[:-1]
+    assert arguments[arguments.index("-P") + 1] == "gai51740"
+    assert arguments[arguments.index("-q") + 1] == "R9920261300"
+    assert "RTYPE=rt_HC," in arguments[arguments.index("-v") + 1]
+    assert "submitted container job=42.pbs1" in result.stdout
+
+
 def test_unified_setup_entrypoint_lists_asset_groups_and_dry_runs(tmp_path: Path):
     workspace = tmp_path / "workspace"
     environment = _setup_test_environment(workspace)

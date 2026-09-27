@@ -22,6 +22,8 @@ retention on synthetic abort replies, using native weight-update sessions.
 Run from this repository root:
 
 ```bash
+PBS_PROJECT=gai51740 \
+SETUP_CONTAINER_WALLTIME=02:00:00 \
 DOCKER_IMAGE=radixark/miles@sha256:046650ba356dccd3393ef5da4d50199941d16b5fdbaf6104394b3a6d800a5f19 \
 SGLANG_REPO=okoge-kaz/sglang \
 SGLANG_BRANCH=miles-staleness-weight-boundaries-v0.5.20 \
@@ -31,7 +33,8 @@ IMPORT_OUTPUT_IMAGE=/groups/gai51740/kazuki_fujii/containers/miles-main-20260927
 bash experiments/setup.sh container --submit
 ```
 
-Omit `--submit` to preview. This uses the managed CPU build job, its node-local
+Omit `--submit` to preview. This requests a two-hour managed CPU build job with
+`qsub -P gai51740`, its node-local
 scratch space, non-root access checks, and the fork's runtime provenance tests.
 It publishes a separate image/link without replacing `miles.sif`. The immutable
 amd64 OCI digest was resolved from the official `radixark/miles:latest` image
@@ -82,6 +85,7 @@ The submit wrapper exports only the selected assets and run identity. W&B
 credentials are resolved on the compute host from the owner's `~/.netrc`.
 
 ```bash
+export PBS_PROJECT=gai51740
 export CONTAINER_IMAGE=/groups/gai51740/kazuki_fujii/containers/miles-main-20260927.sif
 export BENCHMARK_ID=main-20260927-a
 bash experiments/submit_abci_math_benchmark.sh convert 2:6

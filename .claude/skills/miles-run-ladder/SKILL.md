@@ -38,9 +38,10 @@ qsub -P gai51740 -q R9920261300 \
 These are operator-facing `qsub` examples. Pass the project with the command;
 do not hard-code `#PBS -P gai51740` into reusable job scripts. Maintained Miles
 recipes use `pbs_submit` and project-neutral `#PBS` headers so the checkout can
-move between accounts. For GPU jobs, `pbs_submit` pairs the reservation queue
-with its configured `RTYPE=rt_HF`. Do not add `-P` to those scripts unless the
-user explicitly asks to change that repository-wide policy.
+move between accounts. Set `PBS_PROJECT=gai51740` for this ABCI workspace;
+`pbs_submit` forwards it to `qsub -P`. An explicit `pbs_submit --project <group>`
+overrides the environment. For GPU jobs, `pbs_submit` pairs the reservation
+queue with its configured `RTYPE=rt_HF`.
 
 The 12-hour value is a normal allocation example, not a cluster maximum. Size
 walltime to the task. Container preparation normally uses a 30-minute CPU-only

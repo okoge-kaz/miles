@@ -368,8 +368,10 @@ covering are in each dataset's README.
 
 Use `pbs_submit` for both short validation runs and production runs. The shared
 default for training is 24 hours; request a shorter walltime for a smoke run
-instead of changing the global default. `pbs_submit` intentionally remains
-project-neutral; pass a project only on a manual direct `qsub` command. See
+instead of changing the global default. Set `PBS_PROJECT=gai51740` for this
+ABCI workspace; `pbs_submit` forwards it to `qsub -P`. An explicit
+`pbs_submit --project <group>` overrides the environment. Job headers remain
+project-neutral. See
 [`PBS_SINGULARITY.md`](PBS_SINGULARITY.md) for the complete command pattern.
 
 ## Logs

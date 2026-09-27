@@ -12,6 +12,7 @@ shared environment:
 ```bash
 cd /groups/gai51740/kazuki_fujii/src/miles-v0.1
 export MILES_WORKSPACE_ROOT=/groups/gai51740/kazuki_fujii
+export PBS_PROJECT=gai51740
 source experiments/env.sh
 ```
 
@@ -173,10 +174,13 @@ submission, or one job with `pbs_submit --time=HH:MM:SS`. Setup-only overrides
 are `SETUP_CONTAINER_WALLTIME`, `SETUP_PREP_WALLTIME`,
 `SETUP_DOWNLOAD_WALLTIME`, and `SETUP_CONVERT_WALLTIME`.
 
-Reusable recipes and `pbs_submit` are project-neutral: do not add `#PBS -P` to
-job files, and `pbs_submit` never emits a project option. For a manual direct
-allocation, the operator may pass the project on the `qsub` command line, for
-example `-P gai51740`; the repository skill
+Reusable job headers remain project-neutral: do not add `#PBS -P` to job files.
+ABCI requires a group at submission. Set `PBS_PROJECT=gai51740` for this
+workspace; `pbs_submit` forwards it as `qsub -P gai51740`. An explicit
+`pbs_submit -P <group>` or `--project <group>` overrides the environment.
+When neither is set, the helper omits `-P`. Legacy Slurm `-A/--account` values
+are still ignored rather than treated as PBS projects. For a manual direct
+allocation, pass `-P gai51740` to `qsub`; the repository skill
 `.claude/skills/miles-run-ladder/SKILL.md` records the interactive and batch
 forms. This keeps account selection outside portable scripts.
 
@@ -200,7 +204,7 @@ pbs_submit \
 the log directory, and returns the full PBS job ID. Both profiles default to the
 reservation queue: `gpu` passes `RTYPE=rt_HF` and requests all eight GPUs plus
 192 CPUs per node, while `cpu` passes `RTYPE=rt_HC` and requests 32 CPUs with no
-GPUs. The helper still does not pass a project. Recipe launchers call the shared
+GPUs. Recipe launchers call the shared
 Singularity helper; multi-node commands load `ABCI_HPCX_MODULE` (default
 `hpcx/2.20`) and run one MPI task per unique `$PBS_NODEFILE` host with
 `-map-by ppr:1:node -bind-to none`. The node wrapper logs its allowed CPU set

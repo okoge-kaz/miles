@@ -4,6 +4,7 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 PBS_HELPER = REPO_ROOT / "experiments/common/pbs.sh"
@@ -20,6 +21,7 @@ def _scheduler_env() -> dict[str, str]:
             "PBS_LOCALDIR",
             "PBS_NODEFILE",
             "PBS_O_WORKDIR",
+            "PBS_PROJECT",
         }:
             environment.pop(name)
     return environment
@@ -39,6 +41,7 @@ def test_native_job_headers_match_queue_chunk_contracts() -> None:
         path
         for root_name in ("experiments", "tests", "examples")
         for path in (REPO_ROOT / root_name).rglob("*.sbatch")
+        if "outputs" not in path.relative_to(REPO_ROOT).parts
     )
     assert job_files
 
@@ -182,6 +185,31 @@ true
     assert "walltime=02:00:00" in resources
     assert arguments[arguments.index("-N") + 1] == "override-name"
     assert arguments[arguments.index("-v") + 1] == "RTYPE=rt_HC"
+
+
+@pytest.mark.parametrize("options", [[], ["-P", "gai51740"], ["-Pgai51740"], ["--project=gai51740"]])
+def test_pbs_submit_forwards_project_and_cli_overrides_environment(tmp_path: Path, options: list[str]) -> None:
+    capture = tmp_path / "qsub.args"
+    fake_qsub = tmp_path / "qsub"
+    _write_executable(fake_qsub, '#!/bin/bash\nprintf "%s\\0" "$@" > "${QSUB_CAPTURE}"\nprintf "42.pbs1\\n"\n')
+    script = tmp_path / "job.sbatch"
+    script.write_text("#!/bin/bash\ntrue\n", encoding="utf-8")
+    environment = _scheduler_env()
+    environment.update(
+        PBS_PROJECT="other-group" if options else "gai51740",
+        PBS_QSUB_BIN=str(fake_qsub),
+        QSUB_CAPTURE=str(capture),
+    )
+    subprocess.run(
+        ["bash", str(PBS_HELPER), "--parsable", *options, str(script)],
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    arguments = _captured_arguments(capture)
+    assert arguments.count("-P") == 1
+    assert arguments[arguments.index("-P") + 1] == "gai51740"
 
 
 def test_pbs_context_uses_unique_nodefile_hosts_and_full_job_id(tmp_path: Path) -> None:

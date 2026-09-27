@@ -199,14 +199,16 @@ _miles_pbs_usage() {
     cat >&2 <<'EOF'
 usage: pbs_submit [options] script [script arguments...]
 
-Recognized options include -N/--job-name, --nodes, --profile,
+Recognized options include -P/--project, -N/--job-name, --nodes, --profile,
 --time, --output, --export, --dependency, and --parsable.
+The project defaults to PBS_PROJECT when set and is passed to qsub as -P.
 Legacy -A/--account, -p/--partition, and --qos values are accepted but are not
 sent as PBS project/account options.
 EOF
 }
 
 pbs_submit() {
+    local project="${PBS_PROJECT:-}"
     local account="" partition="" profile="" job_kind="" nodes="" walltime=""
     local job_name="" output="" export_spec="" dependency="" chdir=""
     local script="" script_absolute job_output job_id output_path output_dir
@@ -226,11 +228,12 @@ pbs_submit() {
                 script_args=("$@")
                 break
                 ;;
-            -A|--account|-p|--partition|-N|--nodes|--time|--job-name|--output|-o|--export|--dependency|--profile|--job-kind|--chdir)
+            -P|--project|-A|--account|-p|--partition|-N|--nodes|--time|--job-name|--output|-o|--export|--dependency|--profile|--job-kind|--chdir)
                 [[ $# -ge 2 ]] || { echo "pbs_submit: ${option} needs a value" >&2; return 2; }
                 value="$2"
                 shift 2
                 case "${option}" in
+                    -P|--project) project="${value}" ;;
                     -A|--account) account="${value}" ;;
                     -p|--partition) partition="${value}" ;;
                     -N|--job-name) job_name="${value}" ;;
@@ -244,6 +247,8 @@ pbs_submit() {
                     --chdir) chdir="${value}" ;;
                 esac
                 ;;
+            -P?*) project="${option#-P}"; shift ;;
+            --project=*) project="${option#*=}"; shift ;;
             -A?*) account="${option#-A}"; shift ;;
             -p?*) partition="${option#-p}"; shift ;;
             -N?*) job_name="${option#-N}"; shift ;;
@@ -372,6 +377,7 @@ pbs_submit() {
     chdir="${chdir:-${MILES_SUBMIT_DIR:-${PWD}}}"
     [[ "${chdir}" == /* ]] || chdir="${PWD}/${chdir}"
 
+    [[ -z "${project}" ]] || qsub_args+=(-P "${project}")
     qsub_args+=(
         -l "${select_spec}"
         -l "place=${place}"

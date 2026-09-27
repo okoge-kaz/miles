@@ -3,9 +3,10 @@
 # Source this from a scheduler wrapper before resolving assets or mounts.
 
 # --- PBS --------------------------------------------------------------------
-# Keep reusable PBS headers project-neutral. Operators may pass a project to a
-# direct qsub command (for example, -P gai51740) without baking it into recipes.
+# Keep reusable PBS headers project-neutral. Set PBS_PROJECT (gai51740 for
+# this workspace) or pass pbs_submit --project to select qsub's -P group.
 # Queue and resource defaults remain overridable without repetition.
+export PBS_PROJECT="${PBS_PROJECT:-}"
 export PBS_GPU_QUEUE="${PBS_GPU_QUEUE:-R9920261300}"
 export PBS_GPU_RESOURCE_TYPE="${PBS_GPU_RESOURCE_TYPE:-rt_HF}"
 # CPU-only payloads also default to the project reservation. They request no

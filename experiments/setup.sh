@@ -26,6 +26,7 @@ Actions:
   all         Run container, models, datasets, and sft in that order.
 
 Asset actions are dry-run by default. Add --submit to enqueue PBS jobs.
+Set PBS_PROJECT=gai51740 to pass the ABCI group to qsub with -P.
 EOF
 }
 
@@ -240,7 +241,7 @@ stage_container() {
     fi
 
     if (( SUBMIT == 0 )); then
-        print_command pbs_submit --parsable --profile=cpu \
+        print_command pbs_submit --parsable --profile=cpu --project="${PBS_PROJECT}" \
             --time="${SETUP_CONTAINER_WALLTIME}" --export="${exports}" \
             experiments/container/import_image.sbatch
         return
