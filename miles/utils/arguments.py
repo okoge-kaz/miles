@@ -1046,13 +1046,13 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "Which end of generation --max-weight-staleness is measured from. "
                     "'completion' (default) uses the group's oldest completed weight version, so "
                     "the bound covers queue residency but not weight updates crossed during "
-                    "generation, and 0 does not imply on-policy. 'submission' uses the version the "
-                    "group was submitted under, so a bound of N allows N older policy versions end "
+                    "generation, and 0 does not imply on-policy. 'submission' uses the locally committed "
+                    "applied version at group submission, so a bound of N allows N older policy versions end "
                     "to end and 0 is genuinely on-policy. "
                     "'prefill' uses the scheduler-authoritative version at the first "
                     "prefill forward and requires the patched SGLang provenance metadata. "
                     "staleness/total ends at the scheduled train version and uses the selected reference. "
-                    "All references remain available for historical reproduction."
+                    "Submission snapshots require no router version query."
                 ),
             )
             parser.add_argument(

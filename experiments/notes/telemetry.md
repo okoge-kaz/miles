@@ -724,7 +724,7 @@ dynamic filter can also remove a group after it passes the bound. Neither
 distribution contains aborted groups or groups whose reference version could
 not be read.
 
-## Staleness reference and queue policy (2026-08-09; updated 2026-08-19)
+## Staleness reference and queue policy (2026-08-09; updated 2026-09-27)
 
 `Sample.weight_versions` alone cannot identify the policy at the start of a
 request. SGLang stamps it when it builds a reply, so single-turn generation
@@ -737,7 +737,7 @@ The patched SGLang image also returns scheduler-authoritative
 `first_prefill_weight_versions`, `min_forward_weight_versions`,
 `max_forward_weight_versions`, and `last_forward_weight_versions`. The
 `prefill` reference uses the minimum first-prefill version over every sample and
-turn in the group. Unlike the submission-side HTTP snapshot, it does not charge
+turn in the group. Unlike the submission-side local snapshot, it does not charge
 router or scheduler waiting before the first actual forward.
 
 ### The decomposition with `--staleness-reference prefill`
@@ -878,8 +878,19 @@ single-seed run can validate the queue mechanism and compare the queue-drop mean
 staleness with the closed form, but it cannot establish a seed-general
 downstream-task significance claim.
 
-The submission-side version is TTL-cached at 1 s; engine-reported prefill
-provenance is not. Replay-buffer persistence supports all three queue policies.
+The submission-side version now reads the rollout manager's local
+`AppliedWeightVersionTracker`. The weight updater commits this counter after all
+rollout engines acknowledge finalization, before resuming generation. Starting a
+group does not query the router, acquire an HTTP-cache lock, or wait for a version
+timeout. Before this change, submission diagnostics used a 1 s TTL HTTP cache
+with a 2 s query timeout; those historical stamps may differ near weight updates.
+
+The local submission snapshot is the latest fully committed version, not the
+version that a particular request will use at first prefill. Engine-reported
+prefill provenance and prefill-based admission remain unchanged. A fresh retry
+uses the current local version; an inflight continuation retains its original
+submission stamp. Replay restore reloads the committed counter before producers
+resume. Replay-buffer persistence supports all three queue policies.
 The replay buffer records policy plus effective capacity and rejects a cross-policy or
 cross-capacity restore. For `queue-drop`, snapshot-time completed-task promotion
 applies oldest-first overflow eviction before serialization, including the same

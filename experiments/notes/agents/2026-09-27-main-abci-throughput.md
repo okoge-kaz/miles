@@ -222,3 +222,26 @@ Training still consumes 192 groups × 16 samples per update; only the in-flight
 group limit changes from 192 to 384. Use a fresh `BENCHMARK_ID` and checkpoint
 directory, and compare step/train/batch-ready times, request concurrency,
 generation tokens/s, KV usage, and observed staleness. No SIF rebuild is needed.
+
+## Local submission-version snapshot
+
+The experimental fully-async producer now reads submission version directly
+from `AppliedWeightVersionTracker`, which is updated after engine weight
+finalization and restored with the replay buffer. The router version query,
+its 1 s TTL cache, shared lock, and 2 s timeout have been removed. No new option
+is required. Scheduler-reported prefill provenance, prefill-based admission,
+and the production staleness bound of 16 are unchanged. Fresh retries take a new
+submission snapshot; inflight continuations retain their original stamp.
+
+CPU validation job `2453570.pbs1` ran in the existing verified training SIF:
+565 tests passed and one was skipped. Coverage includes concurrent submissions
+without HTTP, observing a newly committed version without a cache delay,
+prefill/submit boundary differences, strict admission bounds, replay restore,
+inflight continuation, weight-update lifecycle, and argument validation.
+Ruff lint, formatting checks for changed regions/tests, and `git diff --check`
+passed. Logs and JUnit results are under
+`experiments/outputs/abci-throughput/local-submission-version/`.
+
+No SIF rebuild is required because the checkout is mounted at runtime.
+This removes the version-query wait from the submission path; its impact on
+eight-node throughput has not yet been measured with the modified producer.

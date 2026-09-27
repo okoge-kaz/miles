@@ -81,14 +81,6 @@ class _DataSource:
         self.buffer.clear()
 
 
-class _Version:
-    def __init__(self, value: int):
-        self.value = value
-
-    async def get(self, args) -> int:
-        return self.value
-
-
 def _args(**overrides) -> Namespace:
     values = {
         "rollout_global_dataset": True,
@@ -130,7 +122,6 @@ def _make_fn(monkeypatch, args, source, generate):
     monkeypatch.setattr(fully_async, "GenerateState", _GenerateState)
     monkeypatch.setattr(fully_async, "generate_and_rm_group", generate)
     fn = fully_async.FullyAsyncRolloutFn(RolloutFnConstructorInput(args=args, data_source=source))
-    fn._weight_version = _Version(5)
     fn.commit_applied_weight_version(5)
     return fn
 
@@ -140,6 +131,21 @@ async def _stop(fn: fully_async.FullyAsyncRolloutFn) -> None:
     for task in tasks:
         task.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def test_fresh_submission_uses_restored_applied_version(monkeypatch):
+    async def generate(state, group, sampling_params, evaluation=False):
+        return _complete(group, 8)
+
+    original = _make_fn(monkeypatch, _args(), _DataSource(), generate)
+    original.commit_applied_weight_version(8)
+    state = await original.replay_buffer_state(0)
+    restored = _make_fn(monkeypatch, _args(), _DataSource(), generate)
+    await restored.restore_replay_buffer_state(state)
+
+    assert restored.restored_applied_weight_version() == 8
+    _, samples = await restored._generate_group(_prompt_group(1))
+    assert {sample.metadata[fully_async.SUBMISSION_VERSION_KEY] for sample in samples} == {8}
 
 
 async def _wait_until(predicate, timeout: float = 2.0) -> None:
@@ -440,7 +446,6 @@ async def test_inflight_buffer_restores_partial_tokens_and_continues_generation(
     restored_source = _DataSource()
     restored = _make_fn(monkeypatch, args, restored_source, generate)
     await restored.restore_replay_buffer_state(state)
-    restored._weight_version = _Version(9)
     restored.commit_applied_weight_version(9)
     output = await restored(RolloutFnTrainInput(rollout_id=0))
 
@@ -742,7 +747,6 @@ async def test_ready_group_rechecks_staleness_after_resume(monkeypatch):
     restored_source = _DataSource()
     restored = _make_fn(monkeypatch, args, restored_source, resumed_generate)
     await restored.restore_replay_buffer_state(state)
-    restored._weight_version = _Version(6)
     restored.commit_applied_weight_version(6)
 
     output = await restored(RolloutFnTrainInput(rollout_id=0))
@@ -784,7 +788,6 @@ async def test_queue_max_ready_group_rechecks_prefill_staleness_after_resume(mon
 
     restored = _make_fn(monkeypatch, args, _DataSource(), resumed_generate)
     await restored.restore_replay_buffer_state(state)
-    restored._weight_version = _Version(6)
     restored.commit_applied_weight_version(6)
 
     output = await restored(RolloutFnTrainInput(rollout_id=0))
@@ -823,7 +826,6 @@ async def test_partial_drain_keeps_already_admitted_group_after_resume(monkeypat
     # A partial drain resumes with the model checkpoint that scheduled its fixed
     # train version. Advancing to version 6 here would change T_b halfway through
     # the same batch, which is not a valid resume sequence.
-    restored._weight_version = _Version(5)
     restored.commit_applied_weight_version(5)
 
     output = await restored(RolloutFnTrainInput(rollout_id=0))

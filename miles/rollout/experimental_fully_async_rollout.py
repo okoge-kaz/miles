@@ -23,7 +23,6 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
-import httpx
 import numpy as np
 
 from miles.rollout.base_types import (
@@ -57,7 +56,6 @@ from miles.rollout.queue_telemetry import (
     _ResponseLengthMetrics,
     group_first_prefill_weight_version,
     group_oldest_weight_version,
-    group_queue_entry_weight_version,
     group_response_tokens,
     group_reward_values,
 )
@@ -122,7 +120,6 @@ logger = logging.getLogger(__name__)
 
 ACKED_BATCH_HISTORY_SIZE = 16
 NO_PROGRESS_WARN_SECS = 30.0
-WEIGHT_VERSION_QUERY_TIMEOUT_SECS = 2.0
 # Realized lag is a small integer; anything past this goes in one overflow bucket
 # so the metric count stays bounded no matter how far behind a run drifts.
 #
@@ -435,20 +432,13 @@ def validate_prefill_policy_provenance(group: Group) -> None:
 
 
 def stamp_submission_weight_version(group: Group, version: int | None) -> None:
-    """Record the version the engines were serving when generation started.
+    """Record the locally committed applied version at group submission.
 
-    SGLang builds ``meta_info["weight_version"]`` from ``server_args.weight_version``
-    while handling a batch-output message (``tokenizer_manager.py:1982`` in
-    0.5.17.dev32+g3fe50ed, the build in the image), and ``Req`` carries no version
-    of its own, so there is nothing to snapshot at arrival: ``Sample.weight_versions``
-    only ever holds the version a turn *finished* under. Under
-    ``--pause-generation-mode in_place`` a request is frozen across a weight
-    update and resumed on the same KV cache: one response, no retraction, so
-    ``num_retractions`` is zero too and nothing in the reply records that the
-    sample spans versions. This stamp is the other end of that interval.
-
-    Survives ``reset_for_retry`` (``types.py:240-249`` keeps ``metadata``), which
-    is harmless because every submission re-stamps.
+    The tracker advances after every rollout engine acknowledges the weight
+    update. This snapshot needs no router query and can precede the version
+    actually used for first prefill, which remains engine-reported provenance.
+    Fresh attempts replace any stamp retained by ``reset_for_retry``; inflight
+    continuations preserve the original trajectory's submission stamp.
     """
     if version is None:
         return
@@ -460,95 +450,6 @@ def group_submission_weight_version(group: Group) -> int | None:
     """Return the weight version stamped on the group when it was submitted."""
     versions = [v for s in _iter_samples(group) if isinstance(v := s.metadata.get(SUBMISSION_VERSION_KEY), int)]
     return min(versions) if versions else None
-
-
-# Which name carries weight_version depends on the router, so it is discovered
-# rather than assumed. Checked against sglang 0.5.17:
-#
-#   engine (uvicorn)  /model_info is canonical; /get_model_info delegates to it
-#                     with a deprecation notice; /get_weight_version raises
-#                     (http_server.py:727-733), so it can never answer
-#   sglang_router     has its own /model_info route, which 404s; /get_model_info
-#                     is not a route, falls through to the engine, and answers
-#   MilesRouter       proxies everything (router.py:71), so both reach the engine
-#
-# Canonical name first: it is the one that survives, and it is right for
-# --use-miles-router and for any router that proxies. The fallback covers
-# sglang_router as it stands. A wrong first guess costs one 404 round trip, once,
-# because the name that answers is remembered.
-WEIGHT_VERSION_ENDPOINTS = ("/model_info", "/get_model_info")
-
-
-class _CachedWeightVersion:
-    """Throttled query of the current engine weight version via the router."""
-
-    def __init__(self, ttl: float = 1.0):
-        self._ttl = ttl
-        self._value: int | None = None
-        self._last_query = float("-inf")
-        self._failures = 0
-        self._endpoint: str | None = None
-        self._lock = asyncio.Lock()
-
-    async def get(self, args) -> int | None:
-        # Throttles failures too: the drain queries once per group, and an unreachable
-        # router would otherwise cost every one of them the full timeout.
-        if (time.monotonic() - self._last_query) < self._ttl:
-            return self._value
-        async with self._lock:
-            # Re-checked after the wait, because the submission side calls this from
-            # every in-flight group concurrently: the first fill starts
-            # `_max_in_flight_groups` tasks in one batch, and without single-flight
-            # each would put its own /model_info request on the router.
-            if (time.monotonic() - self._last_query) < self._ttl:
-                return self._value
-            return await self._query(args)
-
-    async def _query(self, args) -> int | None:
-        base = f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
-        # Remembered name first, then the rest: preferring it costs nothing, and
-        # keeping the others behind it means a router replaced under a resumed run
-        # recovers within the same query instead of after another TTL.
-        candidates = WEIGHT_VERSION_ENDPOINTS
-        if self._endpoint:
-            candidates = (self._endpoint, *(e for e in candidates if e != self._endpoint))
-        last_error: Exception | None = None
-        try:
-            for endpoint in candidates:
-                try:
-                    data = await asyncio.wait_for(get(f"{base}{endpoint}"), timeout=WEIGHT_VERSION_QUERY_TIMEOUT_SECS)
-                    self._value = int(data["weight_version"])
-                    self._endpoint = endpoint
-                    self._failures = 0
-                    return self._value
-                except (httpx.HTTPStatusError, KeyError, TypeError, ValueError) as e:
-                    # The endpoint answered but is not the right one: a 404 for a name
-                    # this build does not serve, or a payload with no usable
-                    # weight_version. Both mean "try the next name".
-                    last_error = e
-                except (httpx.HTTPError, asyncio.TimeoutError) as e:
-                    # The router itself is unreachable, so every other name is too.
-                    # Probing them would multiply the timeout by the endpoint count on
-                    # a path that already runs once per group.
-                    last_error = e
-                    break
-            self._failures += 1
-            self._warn_on_failure(f"{base}{{{','.join(candidates)}}}", last_error)
-        finally:
-            # Stamped on completion, so a router slower than the TTL still gets throttled.
-            self._last_query = time.monotonic()
-        return self._value
-
-    def _warn_on_failure(self, url: str, error: Exception) -> None:
-        """Report missing submission diagnostics without affecting control."""
-        if self._value is None:
-            logger.warning(
-                f"Cannot read the engine weight version from {url} ({error!r}). "
-                "submission_weight_version diagnostics will be absent; drain-side "
-                "staleness control still uses the committed applied-version tracker."
-            )
-        elif self._failures & (self._failures - 1) == 0:  # 1, 2, 4, 8, ... consecutive
-            logger.warning(f"Weight version query failed {self._failures}x, using cached value: {error!r}")
 
 
 def _record_reason(
@@ -653,7 +554,6 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         self._producer_resumed.set()
         self._dynamic_filter = load_function(input.args.dynamic_sampling_filter_path)
         self._sample_filter = load_function(input.args.rollout_sample_filter_path)
-        self._weight_version = _CachedWeightVersion()
         self._applied_weight_version = AppliedWeightVersionTracker()
         self._queue_lifecycle = _QueueLifecycleRecorder(
             enabled=getattr(input.args, "save_debug_rollout_data", None) is not None
@@ -1332,22 +1232,6 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
 
     # -------------------------- producer --------------------------
 
-    async def _current_weight_version(self) -> int | None:
-        """A cached submission-side diagnostic snapshot from the router.
-
-        Guarded because this is now on the submission path as well as the drain,
-        and reading it is instrumentation plus bound enforcement -- neither is
-        worth killing generation over. An uncaught error here would reach
-        ``_worker_loop``'s ``task.result()`` and take the whole rollout down.
-        ``_CachedWeightVersion`` stamps its query time in a ``finally``, so a
-        persistent failure costs one log line per TTL, not one per group.
-        """
-        try:
-            return await self._weight_version.get(self.args)
-        except Exception as e:  # noqa: BLE001 - degrade, never stop generating
-            logger.warning(f"Weight version unreadable, staleness not measured for this group: {e!r}")
-            return None
-
     def _max_in_flight_groups(self) -> int:
         if (x := self.args.async_max_concurrent_samples) is not None:
             # Whole groups are submitted, so the sample budget floors to a group count.
@@ -1389,7 +1273,7 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
             generation_group,
             continuation=continuation,
         )
-        submission_version = await self._current_weight_version()
+        submission_version = self._applied_weight_version.current()
         lifecycle_submission_version = (
             group_submission_weight_version(generation_group) if preserved_metadata is not None else submission_version
         )

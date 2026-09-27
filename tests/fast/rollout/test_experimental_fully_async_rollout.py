@@ -7,8 +7,8 @@ from argparse import Namespace
 from collections import deque
 from contextlib import suppress
 from dataclasses import replace
+from unittest.mock import AsyncMock
 
-import httpx
 import pytest
 from tests.fast.rollout.experimental_test_utils import make_weight_versions
 
@@ -213,11 +213,6 @@ async def test_stale_group_recycled(monkeypatch):
 
     fn = make_fn(monkeypatch, make_args(rollout_batch_size=1, max_weight_staleness=2), data_source)
 
-    class FakeWeightVersion:
-        async def get(self, args):
-            return 10
-
-    fn._weight_version = FakeWeightVersion()
     fn.commit_applied_weight_version(10)
 
     output = await fn(RolloutFnTrainInput(rollout_id=0))
@@ -323,11 +318,6 @@ async def test_trained_staleness_excludes_dynamic_filter_drops(monkeypatch):
 
     fn = make_fn(monkeypatch, make_args(rollout_batch_size=1, max_weight_staleness=4), data_source)
 
-    class FakeWeightVersion:
-        async def get(self, args):
-            return 10
-
-    fn._weight_version = FakeWeightVersion()
     fn.commit_applied_weight_version(10)
 
     # Drop the scripted group -- lag 1, comfortably inside the bound of 4 -- and
@@ -422,90 +412,18 @@ def test_shared_staleness_reducer_preserves_fully_async_legacy_api():
     assert fully_async._staleness_metrics(values) == staleness_distribution_metrics(values)
 
 
-async def test_weight_version_endpoint_is_discovered_not_assumed(monkeypatch):
-    """A 404 on one endpoint name must fall through to the next.
+async def test_concurrent_submissions_use_committed_version_without_http(monkeypatch):
+    """Filling inflight slots needs no router query, including just after an update."""
+    query = AsyncMock(side_effect=RuntimeError("router unavailable"))
+    monkeypatch.setattr(fully_async, "get", query)
+    fn = make_fn(monkeypatch, make_args(), FakeDataSource())
 
-    SGLang renamed this endpoint twice, and a router that does not serve a given
-    name answers 404 rather than erroring. Assuming one name made the cap silently
-    unenforceable on a build that serves another: job 15204795 logged 285 failures
-    against /model_info while /get_model_info returned weight_version fine.
-    """
-    seen = []
-
-    async def only_get_model_info(url, *args, **kwargs):
-        seen.append(url)
-        if url.endswith("/get_model_info"):
-            return {"weight_version": "4"}
-        raise httpx.HTTPStatusError("404", request=None, response=None)
-
-    monkeypatch.setattr(fully_async, "get", only_get_model_info)
-    cache = fully_async._CachedWeightVersion()
-    args = make_args(max_weight_staleness=2)
-
-    assert await cache.get(args) == 4
-    assert any(u.endswith("/get_model_info") for u in seen)
-
-    # The canonical name is tried first even though it is the one that 404s here.
-    assert seen[0].endswith("/model_info")
-
-    # The working name is remembered, so later queries do not re-probe the others.
-    cache._last_query = float("-inf")
-    seen.clear()
-    assert await cache.get(args) == 4
-    assert [u.rsplit("/", 1)[-1] for u in seen] == ["get_model_info"]
-
-
-@pytest.mark.asyncio
-async def test_remembered_endpoint_is_dropped_when_it_stops_answering(monkeypatch):
-    """A router swapped under a resumed run must not pin the cache to a dead name."""
-    serving = {"name": "/get_model_info"}
-
-    async def only_current(url, *args, **kwargs):
-        if url.endswith(serving["name"]):
-            return {"weight_version": "7"}
-        raise httpx.HTTPStatusError("404", request=None, response=None)
-
-    monkeypatch.setattr(fully_async, "get", only_current)
-    cache = fully_async._CachedWeightVersion(ttl=0.0)
-    args = make_args(max_weight_staleness=2)
-    assert await cache.get(args) == 7
-    assert cache._endpoint == "/get_model_info"
-
-    serving["name"] = "/model_info"  # router replaced
-    assert await cache.get(args) == 7
-    assert cache._endpoint == "/model_info"
-
-
-async def test_unreachable_router_only_disables_submission_diagnostics(monkeypatch, caplog):
-    """The HTTP cache is diagnostic-only; tracker-based drain control remains live."""
-
-    async def unreachable(url, *args, **kwargs):
-        raise httpx.ConnectError("no router")
-
-    monkeypatch.setattr(fully_async, "get", unreachable)
-    fn = make_fn(monkeypatch, make_args(rollout_batch_size=1, max_weight_staleness=2), FakeDataSource())
-
-    with caplog.at_level("WARNING"):
-        output = await fn(RolloutFnTrainInput(rollout_id=0))
-
-    assert "submission_weight_version diagnostics will be absent" in caplog.text
-    assert "staleness/rollout/mean" not in output.metrics
-    assert output.metrics["fully_async/train_weight_version"] == 0
-
-
-async def test_malformed_model_info_does_not_kill_the_drain(monkeypatch):
-    """A /model_info payload without weight_version used to raise KeyError out of
-    the drain; it is a configuration failure and must degrade, not crash."""
-
-    async def no_version(url, *args, **kwargs):
-        return {}
-
-    monkeypatch.setattr(fully_async, "get", no_version)
-    fn = make_fn(monkeypatch, make_args(rollout_batch_size=1, max_weight_staleness=2), FakeDataSource())
-
-    output = await fn(RolloutFnTrainInput(rollout_id=0))
-
-    assert len(output.samples) == 1
+    for version in (4, 5):
+        fn.commit_applied_weight_version(version)
+        results = await asyncio.gather(*(fn._generate_group(make_group(version * 100 + i)) for i in range(32)))
+        for _, group in results:
+            assert all(sample.metadata[fully_async.SUBMISSION_VERSION_KEY] == version for sample in group)
+        query.assert_not_called()
 
 
 async def test_worker_error_propagates(monkeypatch):
@@ -711,7 +629,6 @@ async def test_queue_max_at_one_accepts_one_step_and_drops_two_step_without_recy
         staleness_reference="prefill",
     )
     fn = make_fn(monkeypatch, args, data_source, generate=generate_with_prefill_version)
-    fn._weight_version = StubWeightVersion(3)
     fn.commit_applied_weight_version(3)
 
     output = await fn(RolloutFnTrainInput(rollout_id=0))
@@ -745,7 +662,6 @@ async def test_queue_max_at_zero_rejects_one_step_and_accepts_on_policy(monkeypa
         staleness_reference="prefill",
     )
     fn = make_fn(monkeypatch, args, data_source, generate=generate_with_prefill_version)
-    fn._weight_version = StubWeightVersion(3)
     fn.commit_applied_weight_version(3)
 
     output = await fn(RolloutFnTrainInput(rollout_id=0))
@@ -837,50 +753,11 @@ async def test_sample_filter_marks_samples_without_shrinking_the_batch(monkeypat
     assert [sample.remove_sample for sample in output.samples[0]] == [True, False]
 
 
-async def test_weight_version_throttles_failed_queries(monkeypatch):
-    """A drain queries once per group, so an unreachable router must not cost one timeout each."""
-    calls = []
-
-    async def unreachable_router(url):
-        calls.append(url)
-        raise httpx.ConnectError("router down")
-
-    monkeypatch.setattr(fully_async, "get", unreachable_router)
-    args = make_args()
-
-    # One probe, not one per candidate endpoint: an unreachable router means every
-    # name is unreachable, so discovery stops at the first connection error.
-    throttled = fully_async._CachedWeightVersion(ttl=60.0)
-    assert await throttled.get(args) is None
-    assert await throttled.get(args) is None
-    assert len(calls) == 1
-
-    calls.clear()
-    expired = fully_async._CachedWeightVersion(ttl=0.0)
-    assert await expired.get(args) is None
-    assert await expired.get(args) is None
-    assert len(calls) == 2
-
-
-class StubWeightVersion:
-    """A settable current version, so a test can move it mid-generation."""
-
-    def __init__(self, value: int | None):
-        self.value = value
-        self.calls = 0
-
-    async def get(self, args):
-        self.calls += 1
-        return self.value
-
-
 async def test_prefill_pre_queue_staleness_records_updates_crossed_during_generation(monkeypatch):
     """Prefill provenance exposes the span hidden by completion metadata."""
-    version = StubWeightVersion(4)
 
     async def generate_crossing_an_update(state, group, sampling_params, evaluation=False):
         await asyncio.sleep(0)
-        version.value = 6
         fn.commit_applied_weight_version(6)
         _stamp_prefill_provenance(group, first=4, minimum=4, maximum=6, last=6)
         return group
@@ -891,7 +768,6 @@ async def test_prefill_pre_queue_staleness_records_updates_crossed_during_genera
         FakeDataSource(),
         generate=generate_crossing_an_update,
     )
-    fn._weight_version = version
     fn.commit_applied_weight_version(4)
 
     output = await fn(RolloutFnTrainInput(rollout_id=0))
@@ -911,13 +787,11 @@ async def test_straggler_is_charged_to_pre_queue_not_in_queue(monkeypatch):
     oldest sample would charge that straggler's crossing to in-queue staleness --
     inverting the two components in exactly the case the decomposition exists for.
     """
-    version = StubWeightVersion(1)
 
     async def generate_with_a_straggler(state, group, sampling_params, evaluation=False):
         await asyncio.sleep(0)
         # First sample lands under v1; the update arrives; the straggler lands under v2.
         group[0].weight_versions = make_weight_versions(["1"])
-        version.value = 2
         fn.commit_applied_weight_version(2)
         for sample in group[1:]:
             sample.weight_versions = make_weight_versions(["2"])
@@ -929,7 +803,6 @@ async def test_straggler_is_charged_to_pre_queue_not_in_queue(monkeypatch):
         FakeDataSource(),
         generate=generate_with_a_straggler,
     )
-    fn._weight_version = version
     fn.commit_applied_weight_version(1)
 
     output = await fn(RolloutFnTrainInput(rollout_id=0))
@@ -946,14 +819,11 @@ async def test_straggler_is_charged_to_pre_queue_not_in_queue(monkeypatch):
 async def test_components_sum_to_the_total(monkeypatch):
     """`total = pre_queue + in_queue` has to hold per group, or the decomposition
     is two unrelated numbers rather than a split of one."""
-    version = StubWeightVersion(2)
 
     async def generate_then_let_the_queue_age(state, group, sampling_params, evaluation=False):
         await asyncio.sleep(0)
-        # max(), because the worker keeps submitting: a later group must not walk
-        # the version backwards and make the assertion depend on task scheduling.
-        version.value = max(version.value, 4)  # two updates during generation
-        fn.commit_applied_weight_version(4)
+        # Later groups may start after the queue-age update below.
+        fn.commit_applied_weight_version(max(fn._applied_weight_version.current(), 4))
         for sample in group:
             sample.weight_versions = make_weight_versions(["4"])
         return group
@@ -964,13 +834,11 @@ async def test_components_sum_to_the_total(monkeypatch):
         FakeDataSource(),
         generate=generate_then_let_the_queue_age,
     )
-    fn._weight_version = version
     fn.commit_applied_weight_version(2)
     original_next_group = fn._next_group
 
     async def next_group_after_queue_ages():
         item = await original_next_group()
-        version.value = max(version.value, 7)
         fn.commit_applied_weight_version(7)
         return item
 
@@ -989,14 +857,9 @@ async def test_components_sum_to_the_total(monkeypatch):
     assert output.metrics["staleness/rollout/max"] == output.metrics["staleness/total/max"]
 
 
-async def test_staleness_components_absent_when_the_router_never_answers(monkeypatch):
-    """No reference version means no stamp; the drain must degrade, not invent a zero.
-
-    A zero here would be the worst outcome: it reads as "nothing crossed" exactly
-    when the instrument is broken.
-    """
+async def test_completion_staleness_absent_without_engine_provenance(monkeypatch):
+    """A local submission stamp cannot stand in for missing completion provenance."""
     fn = make_fn(monkeypatch, make_args(rollout_batch_size=2), FakeDataSource())
-    fn._weight_version = StubWeightVersion(None)
 
     output = await fn(RolloutFnTrainInput(rollout_id=0))
 
@@ -1010,11 +873,9 @@ async def test_submission_stamp_is_refreshed_when_a_group_is_recycled(monkeypatc
     carries its old stamp. The regenerated attempt must be measured against the
     version *it* started under, not the one the discarded attempt did."""
     stale = make_group(1, weight_versions=["5"])
-    version = StubWeightVersion(10)
     data_source = FakeDataSource(scripted=[stale])
 
     fn = make_fn(monkeypatch, make_args(rollout_batch_size=1, max_weight_staleness=2), data_source)
-    fn._weight_version = version
     fn.commit_applied_weight_version(10)
 
     await fn(RolloutFnTrainInput(rollout_id=0))
@@ -1024,27 +885,6 @@ async def test_submission_stamp_is_refreshed_when_a_group_is_recycled(monkeypatc
         assert sample.metadata[fully_async.SUBMISSION_VERSION_KEY] == 10
 
 
-async def test_concurrent_submissions_share_one_weight_version_query(monkeypatch):
-    """The first fill starts a whole batch of groups in one pass, and each one now
-    asks for the current version before generating. Without single-flight that is
-    one /model_info request per group against the router, at once."""
-    calls = []
-
-    async def slow_router(url, *args, **kwargs):
-        calls.append(url)
-        await asyncio.sleep(0.01)
-        return {"weight_version": "4"}
-
-    monkeypatch.setattr(fully_async, "get", slow_router)
-    cache = fully_async._CachedWeightVersion(ttl=60.0)
-    args = make_args()
-
-    results = await asyncio.gather(*(cache.get(args) for _ in range(32)))
-
-    assert results == [4] * 32
-    assert len(calls) == 1
-
-
 async def _run_with_reference(monkeypatch, reference: str, bound: int):
     """One group submitted under v1 that finishes under v2, drained at v2.
 
@@ -1052,11 +892,9 @@ async def _run_with_reference(monkeypatch, reference: str, bound: int):
     references disagree at the strict queue-recycle bound of 1 -- which is the
     point of the option.
     """
-    version = StubWeightVersion(1)
 
     async def generate_crossing_an_update(state, group, sampling_params, evaluation=False):
         await asyncio.sleep(0)
-        version.value = max(version.value, 2)
         fn.commit_applied_weight_version(2)
         for sample in group:
             sample.weight_versions = make_weight_versions(["2"])
@@ -1069,7 +907,6 @@ async def _run_with_reference(monkeypatch, reference: str, bound: int):
         data_source,
         generate=generate_crossing_an_update,
     )
-    fn._weight_version = version
     fn.commit_applied_weight_version(1)
     return await fn(RolloutFnTrainInput(rollout_id=0)), data_source
 
@@ -1125,10 +962,6 @@ def _stamp_prefill_provenance(
 async def test_prefill_reference_ignores_update_while_waiting_for_prefill(monkeypatch):
     """submission=10, prefill=11, drain=11 has zero realized staleness."""
 
-    class SubmissionVersion:
-        async def get(self, args):
-            return 10
-
     async def generate_after_queue_update(state, group, sampling_params, evaluation=False):
         fn.commit_applied_weight_version(11)
         _stamp_prefill_provenance(group, first=11)
@@ -1144,7 +977,6 @@ async def test_prefill_reference_ignores_update_while_waiting_for_prefill(monkey
         FakeDataSource(),
         generate=generate_after_queue_update,
     )
-    fn._weight_version = SubmissionVersion()
     fn.commit_applied_weight_version(10)
 
     output = await fn(RolloutFnTrainInput(rollout_id=0))
@@ -1185,7 +1017,6 @@ async def test_prefill_reference_detects_mixed_generation_and_enforces_bound(mon
         data_source,
         generate=generate_mixed_then_fresh,
     )
-    fn._weight_version = StubWeightVersion(10)
     fn.commit_applied_weight_version(10)
 
     output = await fn(RolloutFnTrainInput(rollout_id=0, updates_before_train=1))
@@ -1214,7 +1045,6 @@ async def test_prefill_reference_trains_one_step_mixed_generation_at_max_two(mon
         FakeDataSource(),
         generate=generate_mixed,
     )
-    fn._weight_version = StubWeightVersion(10)
     fn.commit_applied_weight_version(10)
 
     output = await fn(RolloutFnTrainInput(rollout_id=0, updates_before_train=1))
@@ -1239,7 +1069,6 @@ async def test_prefill_reference_fails_fast_without_scheduler_metadata(monkeypat
         ),
         FakeDataSource(),
     )
-    fn._weight_version = StubWeightVersion(0)
 
     with pytest.raises(RuntimeError, match="patched SGLang image"):
         await fn(RolloutFnTrainInput(rollout_id=0))
