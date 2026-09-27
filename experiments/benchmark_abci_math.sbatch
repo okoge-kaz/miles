@@ -31,6 +31,7 @@ export USE_REPLAY_BUFFER=1 REPLAY_BUFFER_TYPE=inflight SGLANG_RESPONSE_WEIGHT_VE
 export TRAIN_SEED=1234 ROLLOUT_SEED=42 LR=1e-6
 export FUSE_ONE_STEP_ACTOR_LOGPROBS=1 ZERO_REWARD_ON_TRUNCATED=1 ZERO_LOSS_ON_TRUNCATED=0
 export ROLLOUT_NUM_GPUS_PER_ENGINE=1 SGLANG_MEM_FRACTION=0.70
+export SGLANG_ROUTER_POLICY="${SGLANG_ROUTER_POLICY:-cache_aware}"
 export NUM_ROLLOUT=300 SAVE_INTERVAL=10 SAVE_RETAIN_INTERVAL=100 SAVE_HF=1 HF_SAVE_INTERVAL=10
 export EVAL_INTERVAL=0 SKIP_EVAL_BEFORE_TRAIN=1 DUMP_TRAIN_DATA=0 DUMP_POLICY_LOSS_DEBUG=0
 export LOG_SAMPLE_STALENESS_METRICS=1 LOG_UPDATE_DIAGNOSTICS=1 LOG_POLICY_LAG_METRICS=1
@@ -76,6 +77,8 @@ mkdir -p "${MILES_REPO}/experiments/outputs/abci-throughput/logs"
 exec > >(tee -a "${MILES_REPO}/experiments/outputs/abci-throughput/logs/${RUN_NAME}-${PBS_JOBID}.log") 2>&1
 printf 'ABCI benchmark: revision=%s stage=%s train_nodes=%s rollout_gpus=%s image=%s\n' \
     "$(git rev-parse HEAD)" "${BENCHMARK_STAGE}" "${ACTOR_NUM_NODES}" "${ROLLOUT_NUM_GPUS}" "${CONTAINER_IMAGE}"
+printf 'ABCI rollout: router_policy=%s concurrent_samples=%s\n' \
+    "${SGLANG_ROUTER_POLICY}" "${ASYNC_MAX_CONCURRENT_SAMPLES}"
 if [[ "${BENCHMARK_STAGE}" == smoke ]]; then
     # Transformer Engine needs libcuda even for these path-selection tests.
     # Validate the image's Megatron on the allocated GPU host before training.

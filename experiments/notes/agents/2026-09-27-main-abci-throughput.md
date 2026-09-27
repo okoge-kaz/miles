@@ -189,3 +189,20 @@ dumps were already disabled. Dashboard/audit telemetry and sample-level
 staleness remain enabled. The new batch-ready timer includes conversion and
 object-store publication. Source changes are mounted into the existing verified
 SIF; no container rebuild is needed.
+
+## Routing comparison
+
+`SGLANG_ROUTER_POLICY=round_robin` passes the existing
+`--sglang-router-policy round_robin` option through the ABCI benchmark launcher.
+The benchmark defaults to `cache_aware`, matching the previous runs, and accepts
+these two policies for the controlled comparison. The general Qwen3-4B recipe
+leaves the router default unchanged when the environment variable is empty.
+No inference or queue implementation change or SIF rebuild is required.
+
+The round-robin comparison keeps 8 nodes, train:rollout 2:6, 3072 concurrent
+samples, staleness 16, the production batch/length/save settings, and 20 updates.
+Keep `DUMP_ROLLOUT_DATA=0 LOG_ROLLOUT_REPETITION=0 LOG_TOKEN_LAG_METRICS=0
+LOG_ROLLOUT_TIMING=1`, and use a new `BENCHMARK_ID` containing `round-robin`.
+Compare against the diagnostics-off cache-aware run `2451247.pbs1`, reporting
+step/train/batch-ready times and first-checkpoint-window engine telemetry with
+the same exclusions. More concurrent samples are a separate tuning point.

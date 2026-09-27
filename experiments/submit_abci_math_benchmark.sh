@@ -24,6 +24,11 @@ export BENCHMARK_STAGE="${stage}" BENCHMARK_ACTOR_NODES="${split%:*}"
 export MILES_REPO="${repo}"
 export DUMP_ROLLOUT_DATA="${DUMP_ROLLOUT_DATA:-1}" LOG_ROLLOUT_REPETITION="${LOG_ROLLOUT_REPETITION:-1}"
 export LOG_TOKEN_LAG_METRICS="${LOG_TOKEN_LAG_METRICS:-1}" LOG_ROLLOUT_TIMING="${LOG_ROLLOUT_TIMING:-0}"
+export SGLANG_ROUTER_POLICY="${SGLANG_ROUTER_POLICY:-cache_aware}"
+case "${SGLANG_ROUTER_POLICY}" in
+    cache_aware|round_robin) ;;
+    *) echo 'benchmark SGLANG_ROUTER_POLICY must be cache_aware or round_robin' >&2; exit 2 ;;
+esac
 mkdir -p experiments/outputs/abci-throughput
 options=(--test-only)
 if [[ "${mode}" == --submit ]]; then
@@ -41,6 +46,7 @@ fi
 exports="BENCHMARK_ID,BENCHMARK_STAGE,BENCHMARK_ACTOR_NODES,MILES_REPO,MILES_WORKSPACE_ROOT"
 exports+=",CONTAINER_IMAGE,HF_CKPT_DIR,MEGATRON_CKPT_DIR,RL_DATASET_DIR,CACHE_DIR"
 exports+=",DUMP_ROLLOUT_DATA,LOG_ROLLOUT_REPETITION,LOG_TOKEN_LAG_METRICS,LOG_ROLLOUT_TIMING"
+exports+=",SGLANG_ROUTER_POLICY"
 result="$(pbs_submit "${options[@]}" --profile gpu --nodes="${nodes}" --time=04:00:00 \
     --job-name="math-${stage}-t${BENCHMARK_ACTOR_NODES}" \
     --output="${repo}/experiments/outputs/abci-throughput/" --export="${exports}" \

@@ -273,6 +273,9 @@ SGLANG_ARGS=(
    --rollout-num-gpus-per-engine "${ROLLOUT_NUM_GPUS_PER_ENGINE}"
    --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION}"
 )
+if [[ -n "${SGLANG_ROUTER_POLICY:-}" ]]; then
+   SGLANG_ARGS+=(--sglang-router-policy "${SGLANG_ROUTER_POLICY}")
+fi
 if [[ -n "${SGLANG_MAX_RUNNING_REQUESTS:-}" ]]; then
    SGLANG_ARGS+=(--sglang-max-running-requests "${SGLANG_MAX_RUNNING_REQUESTS}")
 fi
