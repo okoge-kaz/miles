@@ -303,3 +303,41 @@ Also report observed staleness and recycle activity: the preceding
 3072/20-update run observed a maximum of only 4, so different configured caps
 need not affect admission in every interval. Timing summaries should retain
 checkpoint-inclusive measurements and show normal steps separately.
+
+## Zero-loss truncation comparison (2026-09-29)
+
+The user requested two further 300-update runs at train:rollout 1:7, with
+max-weight-staleness 16 and 28, to test whether overlong filtering prevents
+reward collapse. Use the existing `--zero-loss-on-truncated` option through
+`ZERO_LOSS_ON_TRUNCATED=1 ZERO_REWARD_ON_TRUNCATED=0`; these settings are
+mutually exclusive. No model, rollout, or loss implementation is changed.
+The benchmark launcher forwards both settings and retains zero-reward defaults
+for existing recipes. `BENCHMARK_WALLTIME=48:00:00` gives these runs room for
+long responses; without this override the existing stage/split limits remain.
+
+One optimizer update consumes 3072 samples / 16 samples per prompt = 192 groups.
+The completed-buffer policy requires `ceil(3072 * M / 16)` groups: 3072 for
+M=16 and 5376 for M=28. Both settings resolve to `TRAINING_BUFFER_QUEUE_SIZE=6000`
+completed groups (96000 sample slots), satisfying the capacity check without
+changing the queue size between arms. Concurrent generation remains 3072
+samples (192 groups), a separate limit from completed-buffer capacity.
+
+Start both from the same Qwen3-4B SFT iter4000 seed checkpoint with fresh run IDs,
+the unchanged filtered DAPO Math dataset, and all other settings from the
+preceding 1:7 study. Keep Megatron/HF/replay saving every 10 updates, production
+batch/length limits, round-robin routing, local submission version, prefill
+staleness, and the existing diagnostics settings. Compare cap16 against the
+previous zero-reward cap16 run; cap28 has no unfiltered cap28 control in this
+requested study.
+
+Zero-loss masking removes the complete truncated response from the direct
+training loss but preserves its verifier reward in the GRPO group baseline.
+It does not remove/refill groups or replace the static difficulty-filtered
+dataset. Since truncated verifier rewards are no longer forced to zero,
+interpret raw reward with truncation and non-truncated reward diagnostics.
+Verify `policy_lag/truncated/final_loss_mask_nonzero_fraction` and its weight
+mean are zero whenever truncated tokens are present, and retain loss-masked
+token counts. Track reward, entropy, response length, gradient norm, realized
+staleness and fractions above 12/16/24; a configured cap alone does not establish
+high-staleness exposure. Assess the hypothesis from the observed trajectories,
+without assuming that either run avoids collapse.

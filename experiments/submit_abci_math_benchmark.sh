@@ -21,6 +21,7 @@ case "${stage}" in
         ;;
     *) echo 'stage must be convert, smoke, resume, fit, throughput, or production' >&2; exit 2 ;;
 esac
+walltime="${BENCHMARK_WALLTIME:-${walltime}}"
 if [[ "${stage}" == resume ]]; then
     : "${BENCHMARK_ID:?set the BENCHMARK_ID used for smoke}"
 fi
@@ -32,6 +33,14 @@ export LOG_TOKEN_LAG_METRICS="${LOG_TOKEN_LAG_METRICS:-1}" LOG_ROLLOUT_TIMING="$
 export SGLANG_ROUTER_POLICY="${SGLANG_ROUTER_POLICY:-cache_aware}"
 export ASYNC_MAX_CONCURRENT_SAMPLES="${ASYNC_MAX_CONCURRENT_SAMPLES:-3072}"
 export MAX_WEIGHT_STALENESS="${MAX_WEIGHT_STALENESS:-16}"
+export ZERO_REWARD_ON_TRUNCATED="${ZERO_REWARD_ON_TRUNCATED:-1}"
+export ZERO_LOSS_ON_TRUNCATED="${ZERO_LOSS_ON_TRUNCATED:-0}"
+for truncation_flag in ZERO_REWARD_ON_TRUNCATED ZERO_LOSS_ON_TRUNCATED; do
+    [[ "${!truncation_flag}" =~ ^[01]$ ]] || { echo "${truncation_flag} must be 0 or 1" >&2; exit 2; }
+done
+[[ "${ZERO_REWARD_ON_TRUNCATED}" != 1 || "${ZERO_LOSS_ON_TRUNCATED}" != 1 ]] || {
+    echo 'ZERO_REWARD_ON_TRUNCATED and ZERO_LOSS_ON_TRUNCATED are mutually exclusive' >&2; exit 2;
+}
 [[ "${MAX_WEIGHT_STALENESS}" =~ ^[1-9][0-9]*$ ]] || {
     echo 'MAX_WEIGHT_STALENESS must be a positive integer' >&2; exit 2;
 }
@@ -58,6 +67,7 @@ exports+=",CONTAINER_IMAGE,HF_CKPT_DIR,MEGATRON_CKPT_DIR,RL_DATASET_DIR,CACHE_DI
 exports+=",DUMP_ROLLOUT_DATA,LOG_ROLLOUT_REPETITION,LOG_TOKEN_LAG_METRICS,LOG_ROLLOUT_TIMING"
 exports+=",SGLANG_ROUTER_POLICY,ASYNC_MAX_CONCURRENT_SAMPLES"
 exports+=",MAX_WEIGHT_STALENESS"
+exports+=",ZERO_REWARD_ON_TRUNCATED,ZERO_LOSS_ON_TRUNCATED"
 result="$(pbs_submit "${options[@]}" --profile gpu --nodes="${nodes}" --time="${walltime}" \
     --job-name="math-${stage}-t${BENCHMARK_ACTOR_NODES}" \
     --output="${repo}/experiments/outputs/abci-throughput/" --export="${exports}" \

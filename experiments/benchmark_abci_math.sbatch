@@ -34,7 +34,15 @@ export PAUSE_GENERATION_MODE=in_place
 export ASYNC_MAX_CONCURRENT_SAMPLES="${ASYNC_MAX_CONCURRENT_SAMPLES:-3072}"
 export USE_REPLAY_BUFFER=1 REPLAY_BUFFER_TYPE=inflight SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS=1
 export TRAIN_SEED=1234 ROLLOUT_SEED=42 LR=1e-6
-export FUSE_ONE_STEP_ACTOR_LOGPROBS=1 ZERO_REWARD_ON_TRUNCATED=1 ZERO_LOSS_ON_TRUNCATED=0
+export FUSE_ONE_STEP_ACTOR_LOGPROBS=1
+export ZERO_REWARD_ON_TRUNCATED="${ZERO_REWARD_ON_TRUNCATED:-1}"
+export ZERO_LOSS_ON_TRUNCATED="${ZERO_LOSS_ON_TRUNCATED:-0}"
+for truncation_flag in ZERO_REWARD_ON_TRUNCATED ZERO_LOSS_ON_TRUNCATED; do
+    [[ "${!truncation_flag}" =~ ^[01]$ ]] || { echo "${truncation_flag} must be 0 or 1" >&2; exit 2; }
+done
+[[ "${ZERO_REWARD_ON_TRUNCATED}" != 1 || "${ZERO_LOSS_ON_TRUNCATED}" != 1 ]] || {
+    echo 'ZERO_REWARD_ON_TRUNCATED and ZERO_LOSS_ON_TRUNCATED are mutually exclusive' >&2; exit 2;
+}
 export ROLLOUT_NUM_GPUS_PER_ENGINE=1 SGLANG_MEM_FRACTION=0.70
 export SGLANG_ROUTER_POLICY="${SGLANG_ROUTER_POLICY:-cache_aware}"
 export NUM_ROLLOUT=300 SAVE_INTERVAL=10 SAVE_RETAIN_INTERVAL=100 SAVE_HF=1 HF_SAVE_INTERVAL=10
@@ -87,6 +95,8 @@ printf 'ABCI rollout: router_policy=%s concurrent_samples=%s\n' \
     "${SGLANG_ROUTER_POLICY}" "${ASYNC_MAX_CONCURRENT_SAMPLES}"
 printf 'ABCI schedule: max_weight_staleness=%s num_rollout=%s debug_exit_after_rollout=%s\n' \
     "${MAX_WEIGHT_STALENESS}" "${NUM_ROLLOUT}" "${DEBUG_EXIT_AFTER_ROLLOUT:-none}"
+printf 'ABCI truncation: zero_reward=%s zero_loss=%s\n' \
+    "${ZERO_REWARD_ON_TRUNCATED}" "${ZERO_LOSS_ON_TRUNCATED}"
 if [[ "${BENCHMARK_STAGE}" == smoke ]]; then
     # Transformer Engine needs libcuda even for these path-selection tests.
     # Validate the image's Megatron on the allocated GPU host before training.
