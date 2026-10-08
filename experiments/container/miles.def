@@ -1,0 +1,61 @@
+Bootstrap: docker
+From: {{ DOCKER_IMAGE }}
+
+%labels
+    org.opencontainers.image.title Miles v0.1.1 ABCI runtime
+    ai.miles.sglang.commit {{ SGLANG_COMMIT }}
+    ai.miles.megatron.commit {{ MEGATRON_COMMIT }}
+    ai.miles.sglang.provenance-patch-enabled {{ APPLY_SGLANG_PROVENANCE_PATCH }}
+    ai.miles.sglang.provenance-patch-sha256 {{ SGLANG_PATCH_SHA256 }}
+
+%files
+    {{ SGLANG_PATCH_FILE }} /opt/miles/sglang-provenance.patch
+
+%post
+    set -eu
+    # Use the official release dependencies already installed in the OCI image.
+    test "$(git -c safe.directory=/sgl-workspace/sglang -C /sgl-workspace/sglang rev-parse HEAD)" = "{{ SGLANG_COMMIT }}"
+    test "$(git -c safe.directory=/root/Megatron-LM -C /root/Megatron-LM rev-parse HEAD)" = "{{ MEGATRON_COMMIT }}"
+    printf '%s  %s\n' '{{ SGLANG_PATCH_SHA256 }}' /opt/miles/sglang-provenance.patch | sha256sum --check --strict
+    if [ '{{ APPLY_SGLANG_PROVENANCE_PATCH }}' = 1 ]; then
+        git -c safe.directory=/sgl-workspace/sglang -C /sgl-workspace/sglang apply --check /opt/miles/sglang-provenance.patch
+        git -c safe.directory=/sgl-workspace/sglang -C /sgl-workspace/sglang apply /opt/miles/sglang-provenance.patch
+    fi
+
+    # Keep mlx5/InfiniBand; remove the AWS EFA network plugin from the base.
+    efa_packages=""
+    for package in libfabric1-aws libnccl-ofi-ngc-v3; do
+        if dpkg-query -W "${package}" >/dev/null 2>&1; then
+            efa_packages="${efa_packages} ${package}"
+        fi
+    done
+    if [ -n "${efa_packages}" ]; then
+        DEBIAN_FRONTEND=noninteractive apt-get purge -y ${efa_packages}
+    fi
+    rm -rf /opt/amazon
+    rm -f /etc/libibverbs.d/efa.driver /usr/include/infiniband/efadv.h /usr/include/rdma/efa-abi.h
+    find /usr/lib /usr/local/lib \( -type f -o -type l \) \
+        \( -name 'libefa.a' -o -name 'libefa.so*' -o -name 'libefa-rdmav*.so' \
+           -o -name 'libefa.pc' -o -name 'libnccl-net-ofi.so*' -o -name 'libnccl-tuner-ofi.so*' \) \
+        -delete
+
+    mkdir -p /root/.cache /data/pre-train /data/sft /ckpt/hf /ckpt/megatron /ckpt/training /cache/home
+    chmod 0755 /root /root/.cache /data /data/pre-train /data/sft /ckpt \
+        /ckpt/hf /ckpt/megatron /ckpt/training /cache /cache/home /sgl-workspace
+    chmod -R a+rX /root/miles /root/Megatron-LM /sgl-workspace/sglang
+    # SingularityCE binds host temporary directories during %post. Their
+    # ownership is outside the fakeroot mapping, so do not chmod those binds.
+    test -w /tmp
+    test -w /var/tmp
+
+%test
+    set -eux
+    test ! -e /opt/amazon
+    test ! -e /etc/libibverbs.d/efa.driver
+    test -r /etc/libibverbs.d/mlx5.driver
+    test -r /usr/lib/x86_64-linux-gnu/libibverbs.so.1
+    test -x /root
+    test -r /root/Megatron-LM/megatron/core/__init__.py
+    test -r /root/miles/train_async.py
+    test "$(git -c safe.directory=/sgl-workspace/sglang -C /sgl-workspace/sglang rev-parse HEAD)" = "{{ SGLANG_COMMIT }}"
+    test "$(git -c safe.directory=/root/Megatron-LM -C /root/Megatron-LM rev-parse HEAD)" = "{{ MEGATRON_COMMIT }}"
