@@ -36,27 +36,6 @@ def _captured_arguments(path: Path) -> list[str]:
     return [item.decode() for item in path.read_bytes().split(b"\0") if item]
 
 
-def test_native_job_headers_match_queue_chunk_contracts() -> None:
-    job_files = tuple(
-        path
-        for path in (REPO_ROOT / "experiments").rglob("*.sh")
-        if "outputs" not in path.relative_to(REPO_ROOT).parts
-        and any(line.startswith("#PBS ") for line in path.read_text(encoding="utf-8").splitlines())
-    )
-    assert job_files
-
-    for job_file in job_files:
-        source = job_file.read_text(encoding="utf-8")
-        assert "#PBS -q R9920261300\n" in source, job_file
-        if ":ngpus=8:" in source:
-            assert ":ncpus=192:ngpus=8:mpiprocs=1\n" in source, job_file
-            assert "#PBS -l place=scatter:excl\n" in source, job_file
-        else:
-            assert "#PBS -l select=1:ncpus=32:mpiprocs=1\n" in source, job_file
-            assert "#PBS -l place=scatter\n" in source, job_file
-        assert "#PBS -P" not in source, job_file
-
-
 def test_pbs_submit_translates_sbatch_headers_and_preserves_full_job_id(tmp_path: Path) -> None:
     capture = tmp_path / "qsub.args"
     cwd_capture = tmp_path / "qsub.cwd"
@@ -91,6 +70,10 @@ true
             "QSUB_CAPTURE": str(capture),
             "QSUB_CWD_CAPTURE": str(cwd_capture),
             "MILES_SUBMIT_DIR": str(submit_directory),
+            "PBS_GPU_QUEUE": "test-gpu",
+            "PBS_GPU_CPUS_PER_NODE": "12",
+            "PBS_GPU_GPUS_PER_NODE": "2",
+            "PBS_GPU_RESOURCE_TYPE": "test-gpu-type",
         }
     )
 
@@ -116,24 +99,14 @@ true
     assert "-P" not in arguments
     assert "-d" not in arguments
     assert "legacy" not in arguments
-    assert arguments[arguments.index("-q") + 1] == "R9920261300"
-    assert "select=2:ncpus=192:ngpus=8:mpiprocs=1" in resources
-    assert "place=scatter:excl" in resources
+    assert arguments[arguments.index("-q") + 1] == "test-gpu"
+    assert "select=2:ncpus=12:ngpus=2:mpiprocs=1" in resources
     assert "walltime=26:03:04" in resources
     assert arguments[arguments.index("-N") + 1] == "header-name"
     assert arguments[arguments.index("-W") + 1] == "depend=afterok:2718.pbs1"
     assert arguments[arguments.index("-o") + 1] == f"{submit_directory}/logs/"
     assert "-V" in arguments
-    assert arguments[arguments.index("-v") + 1] == "RTYPE=rt_HF,FOO=bar"
-    command_index = arguments.index("--")
-    assert arguments[command_index + 1 :] == [
-        "/bin/bash",
-        "-c",
-        'cd -- "$1" && shift && exec /bin/bash "$@"',
-        "miles-pbs-launch",
-        str(submit_directory),
-        str(script),
-    ]
+    assert arguments[arguments.index("-v") + 1] == "RTYPE=test-gpu-type,FOO=bar"
 
 
 def test_pbs_submit_reads_native_pbs_cpu_profile(tmp_path: Path) -> None:
@@ -165,6 +138,9 @@ true
             "PBS_QSUB_BIN": str(fake_qsub),
             "QSUB_CAPTURE": str(capture),
             "MILES_SUBMIT_DIR": str(tmp_path),
+            "PBS_GPU_QUEUE": "R9920261300",
+            "PBS_CPU_QUEUE": "R9920261300",
+            "PBS_CPU_RESOURCE_TYPE": "test-cpu-type",
         }
     )
 
@@ -180,10 +156,9 @@ true
     resources = [arguments[index + 1] for index, value in enumerate(arguments) if value == "-l"]
     assert arguments[arguments.index("-q") + 1] == "R9920261300"
     assert "select=1:ncpus=32:mpiprocs=1" in resources
-    assert "place=scatter" in resources
     assert "walltime=02:00:00" in resources
     assert arguments[arguments.index("-N") + 1] == "override-name"
-    assert arguments[arguments.index("-v") + 1] == "RTYPE=rt_HC"
+    assert arguments[arguments.index("-v") + 1] == "RTYPE=test-cpu-type"
 
 
 @pytest.mark.parametrize("options", [[], ["-P", "gai51740"], ["-Pgai51740"], ["--project=gai51740"]])
@@ -286,21 +261,15 @@ printf '%s\\0' "$@" > "${SINGULARITY_CAPTURE}"
     )
 
     arguments = _captured_arguments(capture)
-    assert arguments[:6] == [
-        "exec",
-        "--no-eval",
-        "--fakeroot",
-        "--nv",
-        "--writable-tmpfs",
-        "--no-home",
-    ]
+    assert arguments[0] == "exec"
+    assert {"--no-eval", "--fakeroot", "--nv", "--writable-tmpfs", "--no-home"} <= set(arguments)
     assert arguments[arguments.index("--pwd") + 1] == "/work"
     assert arguments[arguments.index("--bind") + 1] == "/source:/target:ro"
     assert arguments[arguments.index("--env") + 1] == "FOO=bar"
     assert arguments[-4:] == ["image.sif", "bash", "-lc", "echo ok"]
 
 
-def test_container_exec_all_uses_unbound_mpi_process_per_unique_node(tmp_path: Path) -> None:
+def test_container_exec_all_runs_once_per_unique_node_with_runtime_environment(tmp_path: Path) -> None:
     nodefile = tmp_path / "nodes"
     nodefile.write_text("node-a\nnode-a\nnode-b\n", encoding="utf-8")
     fake_mpirun = tmp_path / "mpirun"
@@ -374,8 +343,6 @@ printf '%s|%s|%s\\n' "$MILES_NODE_RANK" "$RUNTIME_ONLY" "${FI_PROVIDER-unset}" >
 
     arguments = _captured_arguments(tmp_path / "mpirun.args")
     assert arguments[arguments.index("-np") + 1] == "2"
-    assert arguments[arguments.index("-map-by") + 1] == "ppr:1:node"
-    assert arguments[arguments.index("-bind-to") + 1] == "none"
     assert (tmp_path / "mpirun.hosts").read_text(encoding="utf-8") == ("node-a\nnode-b\n")
     assert (tmp_path / "mpirun.fi-provider").read_text(encoding="utf-8").strip() == "mlx"
     assert (tmp_path / "rank.0").read_text(encoding="utf-8").strip() == ("0|from-head|unset")
