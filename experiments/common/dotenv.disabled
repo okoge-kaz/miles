@@ -1,0 +1,2 @@
+# The host checkout's .env is masked inside the container.
+# Pass required settings through the explicit job/container environment.
