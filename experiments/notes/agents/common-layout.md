@@ -25,7 +25,7 @@ cluster、workspace、mount、cache、image の既定値は `env.sh` に置く�
 | `run_identity.sh` | run 名と checkpoint path |
 | `clean_checkpoint.sh` | 指定 run の削除と path 検証 |
 
-モデル固有の設定は `scripts/models/`、dataset は `scripts/datasets/{train,eval}/`。
+モデル固有の設定は `scripts/models/`、学習 dataset は `scripts/datasets/train/`。
 各 `train.sh` に学習設定と実際の CLI 配列を列挙する。
 
 ## 起動
