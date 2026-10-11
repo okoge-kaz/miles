@@ -30,6 +30,7 @@ from miles.backends.training_utils.weight_update.utils import record_lora_checks
 from miles.utils.distributed_utils import get_gloo_group
 from miles.utils.lora.utils import LORA_ADAPTER_NAME
 from miles.utils.timer import timer
+from miles.rollout.replay_data_buffer_checkpoint import resume_weight_version
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +64,7 @@ class WeightUpdater:
             quantization_config=quantization_config,
         )
         self.weights_getter = weights_getter
-        self.weight_version = 0
+        self.weight_version = resume_weight_version(args)
         self.is_lora = is_lora
         if is_lora:
             assert lora_sync_config is not None

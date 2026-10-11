@@ -81,6 +81,27 @@ def _install_driver_fakes(
     return components
 
 
+async def test_replay_checkpoints_precede_next_drain_between_weight_updates(monkeypatch):
+    events = []
+    args = _make_args(
+        num_rollout=3, update_weights_interval=2, save_interval=1, fully_async=True, use_replay_data_buffer=True
+    )
+    components = _install_driver_fakes(monkeypatch, args, events)
+
+    async def save_model(rollout_id, *, force_sync=False, **kwargs):
+        assert force_sync, "Replay checkpoints must not precede asynchronous model saves"
+        events.append(f"model_checkpoint_complete:{rollout_id}")
+
+    monkeypatch.setattr(components.actor_model, "save_model", save_model)
+    await train_async_driver.train(args)
+
+    for rollout_id in range(3):
+        assert events.index(f"model_checkpoint_complete:{rollout_id}") < events.index(f"executor_save:{rollout_id}")
+        if rollout_id < 2:
+            assert events.index(f"executor_save:{rollout_id}") < events.index(f"generate_start:{rollout_id + 1}")
+    assert components.actor_model.trained == [0, 1, 2]
+
+
 class TestApiServer:
     async def test_api_server_receives_the_refactored_driver_handles(self, monkeypatch: pytest.MonkeyPatch):
         """The API server acts on the live actor and inference controller, so it must be handed those objects."""

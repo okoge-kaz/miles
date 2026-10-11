@@ -114,6 +114,7 @@ class DefaultDataBuffer(DataBuffer):
         self._current_version: int | None = None
         self._staleness_definition = getattr(args, "async_staleness_metric", "oldest")
         self._custom_staleness = load_function(getattr(args, "custom_staleness_function_path", None))
+        self._complete_restore_for_checkpoint = False
 
         self._metric_gatherer = MetricGatherer()
         self._metric_aborted_groups = 0
@@ -130,11 +131,28 @@ class DefaultDataBuffer(DataBuffer):
         if not self._preput_filter(input):
             return
 
+        await self.restore_entry(input)
+
+    async def restore_entry(self, input: DataBufferInput, *, wait_for_capacity: bool = True) -> None:
+        """Restore an already accepted entry without repeating reward/dynamic filters."""
         stats = group_weight_version_stats(input.group)
         async with self._cond:
-            while len(self._buffer) >= self._capacity:
+            while (
+                wait_for_capacity and not self._complete_restore_for_checkpoint and len(self._buffer) >= self._capacity
+            ):
                 await self._cond.wait()
             self._buffer.push(input, stats)
+            self._cond.notify_all()
+
+    def snapshot_entries(self) -> tuple[DataBufferInput, ...]:
+        return tuple(value.entry for value in self._buffer.snapshot())
+
+    def __len__(self):
+        return len(self._buffer)
+
+    async def request_restore_completion(self) -> None:
+        async with self._cond:
+            self._complete_restore_for_checkpoint = True
             self._cond.notify_all()
 
     def _preput_filter(self, input: DataBufferInput) -> bool:

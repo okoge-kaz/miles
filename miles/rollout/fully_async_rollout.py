@@ -17,6 +17,7 @@ rollout engines, pausing producer submissions for the duration of the
 """
 
 import asyncio
+import copy
 import logging
 from dataclasses import replace
 
@@ -30,6 +31,7 @@ from miles.rollout.base_types import (
     RolloutFnTrainInput,
     RolloutFnTrainOutput,
 )
+from miles.rollout.filter_hub.base_types import iter_samples
 from miles.rollout.fully_async_data_buffer import (
     DataBuffer,
     DataBufferConstructorInput,
@@ -38,11 +40,13 @@ from miles.rollout.fully_async_data_buffer import (
     Group,
     first_sample,
 )
-from miles.rollout.filter_hub.base_types import iter_samples
 from miles.rollout.generate_utils.sample_utils import reward_log_summary, sample_text_preview
 from miles.rollout.inference_rollout.inference_rollout_common import GenerateState, generate_and_rm_group
 from miles.rollout.inference_rollout.inference_rollout_eval import run_eval_datasets
+from miles.rollout.replay_data_buffer import ReplayDataBuffer
+from miles.rollout.replay_data_buffer_inflight import validate_inflight_group
 from miles.rollout.submission_scheduler import make_submission_scheduler
+from miles.utils import async_utils
 from miles.utils.function_registry import load_function
 from miles.utils.types import Sample
 
@@ -79,8 +83,14 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         self._producer_resumed.set()
         self._output: DataBuffer | None = None
         self._weight_version: int | None = None
+        self._active: dict[asyncio.Task, list[Sample]] = {}
+        self._original_prompts: dict[asyncio.Task, list[Sample]] = {}
+        self._pending_ready: dict[asyncio.Task, DataBufferInput] = {}
+        self._draining = False
+        self._replay_data_buffer = ReplayDataBuffer(self) if getattr(self.args, "use_replay_data_buffer", False) else None
         self._track_lifecycle = (
-            getattr(self.args, "log_category_staleness", False)
+            self._replay_data_buffer is not None
+            or getattr(self.args, "log_category_staleness", False)
             or getattr(self.args, "async_staleness_metric", "oldest") in ("submission", "ready", "first-prefill")
         )
 
@@ -90,16 +100,48 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         if input.weight_version is not None:
             self.on_weight_version(input.weight_version)
         if self._worker is None:
-            buffer_cls = load_function(self.args.custom_async_data_buffer_path) or DefaultDataBuffer
-            self._output = buffer_cls(
-                DataBufferConstructorInput(args=self.args, unused_handler_fn=self._handle_unused)
-            )
+            self._ensure_buffer()
             self._worker = asyncio.create_task(self._worker_loop())
             logger.info("Started fully-async rollout worker")
-        return await self._drain(input)
+        self._draining = True
+        try:
+            result = await self._drain(input)
+            if self._replay_data_buffer is not None:
+                result.metrics.update(self._replay_data_buffer.pop_metrics())
+            return result
+        finally:
+            self._draining = False
+
+    def _ensure_buffer(self) -> None:
+        if self._output is None:
+            buffer_cls = load_function(self.args.custom_async_data_buffer_path) or DefaultDataBuffer
+            self._output = buffer_cls(DataBufferConstructorInput(args=self.args, unused_handler_fn=self._handle_unused))
 
     def on_weight_version(self, version: int) -> None:
         self._weight_version = version
+
+    @property
+    def owns_data_source_checkpoint(self) -> bool:
+        return self._replay_data_buffer is not None
+
+    def save(self, rollout_id: int) -> None:
+        if self._replay_data_buffer is not None:
+            self._replay_data_buffer.save(rollout_id)
+
+    def load(self, rollout_id: int | None) -> None:
+        if self._replay_data_buffer is not None:
+            self._replay_data_buffer.load(rollout_id)
+
+    def close(self) -> None:
+        async_utils.run(self._close())
+
+    async def _close(self) -> None:
+        tasks = [*self._active, *([self._worker] if self._worker is not None else [])]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        if self._replay_data_buffer is not None:
+            await self._replay_data_buffer.close()
 
     async def _call_eval(self, input: RolloutFnEvalInput) -> RolloutFnOutput:
         if input.generate_state is not None:
@@ -124,7 +166,17 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         return self.args.rollout_batch_size
 
     def _submit_one_group(self) -> tuple[asyncio.Task, list[Sample]]:
+        inflight = self._replay_data_buffer.inflight if self._replay_data_buffer is not None else None
+        if inflight is not None and inflight.pending:
+            entry = inflight.pending.popleft()
+            validate_inflight_group(entry.group)
+            self._scheduler.on_submit([entry.group])
+            task = asyncio.create_task(self._generate_group(entry.group))
+            self._original_prompts[task] = entry.prompt_group
+            return task, entry.group
         samples = self.data_source.get_samples(1)
+        if inflight is not None:
+            validate_inflight_group(samples[0])
         self._scheduler.on_submit(samples)
         [prompt_group] = samples
         if self._track_lifecycle:
@@ -134,7 +186,13 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
                         key: value for key, value in sample.metadata.items() if key != "policy_provenance"
                     }
             self._stamp_lifecycle(prompt_group, "submitted_weight_version", self._weight_version)
-        return asyncio.create_task(self._generate_group(prompt_group)), prompt_group
+        original = copy.deepcopy(prompt_group) if self._replay_data_buffer is not None else None
+        task = asyncio.create_task(self._generate_group(prompt_group))
+        if original is not None:
+            for sample in original:
+                sample.reset_for_retry()
+            self._original_prompts[task] = original
+        return task, prompt_group
 
     async def _generate_group(self, prompt_group: list[Sample]) -> DataBufferInput:
         result = await generate_and_rm_group(
@@ -160,7 +218,9 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
             sample.metadata = metadata
 
     async def _worker_loop(self) -> None:
-        active: dict[asyncio.Task, list[Sample]] = {}
+        if self._replay_data_buffer is not None:
+            await self._replay_data_buffer.before_production()
+        active = self._active
         while True:
             await self._producer_resumed.wait()
             while self._scheduler.has_capacity(pending_groups=len(active), group_budget=self._max_in_flight_groups()):
@@ -168,12 +228,19 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
                 active[task] = prompt_group
             done, _ = await self._scheduler.wait_for_progress(set(active))
             for task in done:
-                entry = self._collect_group_result(task, active.pop(task))
+                entry = self._collect_group_result(task, active[task])
+                self._pending_ready[task] = entry
                 await self._output.put(entry)
+                active.pop(task)
+                self._pending_ready.pop(task)
+                self._original_prompts.pop(task, None)
 
     def _collect_group_result(self, task: asyncio.Task, prompt_group: list[Sample]) -> DataBufferInput:
         if not task.cancelled():
-            return task.result()
+            entry = task.result()
+            if self._replay_data_buffer is not None:
+                entry.prompt_group = self._original_prompts[task]
+            return entry
 
         logger.warning(
             "Rollout group was cancelled; marking samples aborted: indices=%s",
@@ -187,6 +254,8 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
     # -------------------------- consumer --------------------------
 
     async def _next_group(self, current_version: int | None) -> DataBufferInput:
+        if self._replay_data_buffer is not None:
+            self._replay_data_buffer.check_restore()
         queue_get = asyncio.create_task(self._output.get(current_version=current_version))
         try:
             while True:

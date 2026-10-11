@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 # The framework supports other asynchronous approaches such as fully async (see miles/rollout/fully_async_rollout.py).
 async def train(args):
+    use_replay_data_buffer = getattr(args, "use_replay_data_buffer", False)
     assert not args.colocate, "Colocation is not supported for async training."
     validate_async_off_policy_correction(args)
     configure_logger(args, source=MainProcessIdentity())
@@ -89,7 +90,7 @@ async def train(args):
 
         # A fully-async producer keeps generating without a pending get(). When
         # weights will change, defer the next drain so it uses the new version.
-        defer_next_drain = args.fully_async and has_next_rollout and weight_update_due
+        defer_next_drain = args.fully_async and has_next_rollout and (weight_update_due or use_replay_data_buffer)
         if has_next_rollout and not defer_next_drain:
             rollout_data_next_future = await eager_create_task(prepare_and_generate(rollout_id + 1))
 
@@ -109,7 +110,7 @@ async def train(args):
         if external_save or should_run_periodic_action(
             rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout
         ):
-            force_sync = external_save or rollout_id == args.num_rollout - 1
+            force_sync = external_save or rollout_id == args.num_rollout - 1 or use_replay_data_buffer
             await save_training_model(actor_model, rollout_id, force_sync)
             if args.use_critic:
                 await save_training_model(critic_model, rollout_id, force_sync)
@@ -123,8 +124,8 @@ async def train(args):
                 rollout_data_curr_ref = (await x) if (x := rollout_data_next_future) is not None else None
                 rollout_data_next_future = None
             await update_weights(actor_model, rollout_executor, rollout_id=rollout_id)
-            if defer_next_drain:
-                rollout_data_next_future = await eager_create_task(prepare_and_generate(rollout_id + 1))
+        if defer_next_drain:
+            rollout_data_next_future = await eager_create_task(prepare_and_generate(rollout_id + 1))
 
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch, args.num_rollout):
             await inference_controller.prepare_eval()

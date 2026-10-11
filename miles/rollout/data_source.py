@@ -7,6 +7,7 @@ from pathlib import Path
 import torch
 
 from miles.utils.data import Dataset
+from miles.utils.dataset_mixture import prompt_fingerprint
 from miles.utils.function_registry import load_function
 from miles.utils.processing_utils import load_processor, load_tokenizer
 from miles.utils.types import Sample
@@ -55,6 +56,7 @@ class RolloutDataSource(DataSource):
         self.sample_offset = 0
         # TODO remove this
         self.metadata = {}
+        self._fingerprint = None
 
         if args.rollout_global_dataset:
             tokenizer = load_tokenizer(
@@ -83,6 +85,8 @@ class RolloutDataSource(DataSource):
                 apply_chat_template_kwargs=args.apply_chat_template_kwargs,
                 seed=args.rollout_seed,
             )
+            if getattr(args, "use_replay_data_buffer", False):
+                self._fingerprint = prompt_fingerprint(args)
             if self.args.rollout_shuffle:
                 self.dataset.shuffle(self.epoch_id)
         else:
@@ -125,16 +129,20 @@ class RolloutDataSource(DataSource):
         if not self.args.rollout_global_dataset:
             return
 
-        state_dict = {
+        state_dict = self.state_dict()
+        path = os.path.join(self.args.save, f"rollout/global_dataset_state_dict_{rollout_id}.pt")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        torch.save(state_dict, path)
+
+    def state_dict(self):
+        return {
             "sample_offset": self.sample_offset,
             "epoch_id": self.epoch_id,
             "sample_group_index": self.sample_group_index,
             "sample_index": self.sample_index,
             "metadata": self.metadata,
+            "prompt_fingerprint": self._fingerprint,
         }
-        path = os.path.join(self.args.save, f"rollout/global_dataset_state_dict_{rollout_id}.pt")
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        torch.save(state_dict, path)
 
     def load(self, rollout_id=None):
         if not self.args.rollout_global_dataset:
@@ -150,7 +158,13 @@ class RolloutDataSource(DataSource):
 
         logger.info(f"load metadata from {path}")
         logger.info(f"load metadata: {self.metadata}")
-        state_dict = torch.load(path)
+        state_dict = torch.load(path, weights_only=False)
+        self.load_state_dict(state_dict)
+
+    def load_state_dict(self, state_dict):
+        expected = state_dict.get("prompt_fingerprint")
+        if self._fingerprint is not None and expected != self._fingerprint:
+            raise ValueError("Checkpoint prompt sources/settings differ from the current dataset")
         self.sample_offset = state_dict.get("sample_offset", 0)
         self.epoch_id = state_dict.get("epoch_id", 0)
         self.sample_group_index = state_dict.get("sample_group_index", 0)

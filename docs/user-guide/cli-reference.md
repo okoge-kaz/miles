@@ -297,6 +297,9 @@ Evaluation reports scored and unscored counts separately and computes reward met
 | `--async-data-buffer-order` | enum | `fifo` | Built-in fully-async buffer: `fifo` or `oldest-policy-first`. Priority uses the oldest generated version; ties retain insertion order and unknown versions come last. |
 | `--async-staleness-metric` | enum | `oldest` | Definition used by `--max-weight-staleness`: `oldest`, `newest`, `token-mean`, `submission`, `first-prefill`, or `ready`. Non-default definitions with a bound require measured provenance. |
 | `--custom-staleness-function-path` | str | – | Override with `(args, DataBufferInput, current_version) -> nonnegative finite lag or None`. Requires the built-in fully-async buffer. |
+| `--use-replay-data-buffer` | flag | off | Persist ready groups, prompt cursor, and unfinished work alongside training checkpoints. Requires fully-async global-dataset training, a single Megatron actor, and `--save` / `--save-interval`. Alias: `--use-replay-buffer`. |
+| `--replay-data-buffer-mode` | enum | `rollout` | `rollout` regenerates unfinished prompts; `inflight` retains and continues single-turn text prefixes. Inflight mode excludes custom generators, sessions, multimodal inputs, and routing/indexer replay. |
+| `--replay-data-buffer-async-restore` | flag | off | Restore the first part before starting training, then verify/load the remaining parts with capacity backpressure. Alias: `--replay-buffer-async-restore`. Requires replay and capacity for at least one batch. |
 
 ### SGLang and router
 
