@@ -24,11 +24,6 @@ fi
     echo "missing converted checkpoint: ${MODEL_NAME}_torch_dist; see experiments/setup.sh convert" >&2; exit 2
 }
 python3 -m experiments.common.dataset_args --check --data-root "${DATASET_DIR}" --repo-root "${MILES_REPO}"
-if (( EVAL_INTERVAL > 0 )); then
-    [[ "${EVAL_DATA}" == /data/* && -r "${DATASET_DIR}/${EVAL_DATA#/data/}" ]] || {
-        echo "missing evaluation data: ${EVAL_DATA}" >&2; exit 2
-    }
-fi
 
 case "${MILES_NCCL_TRANSPORT}" in
     system) export NCCL_IB_DISABLE=0; unset NCCL_NET NCCL_NET_PLUGIN NCCL_TUNER_PLUGIN FI_PROVIDER ;;
