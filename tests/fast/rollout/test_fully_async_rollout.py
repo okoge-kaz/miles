@@ -537,6 +537,59 @@ async def put_group(buffer, group):
     await buffer.put(data_buffer.DataBufferInput(prompt_group=group, group=group))
 
 
+async def test_production_time_includes_groups_completed_between_drains(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(data_buffer, "monotonic", lambda: now[0])
+    args = make_args(rollout_batch_size=2)
+    buffer = data_buffer.DefaultDataBuffer(
+        data_buffer.DataBufferConstructorInput(args=args, unused_handler_fn=lambda _: None)
+    )
+
+    # Production continues while the trainer does not request another batch.
+    for index in range(6):
+        await put_group(buffer, make_group(index))
+    now[0] += 12
+    await buffer.get()
+    await buffer.get()
+    metrics = buffer.get_metrics()
+    assert metrics["rollout/fully_async/accepted_groups"] == 6
+    assert metrics["perf/rollout_window_time"] == 12
+    assert metrics["perf/rollout_step_time"] == 4  # Three batches supplied in 12 seconds.
+
+    # The next measurement excludes both old production and old elapsed time.
+    await put_group(buffer, make_group(6))
+    now[0] += 5
+    metrics = buffer.get_metrics()
+    assert metrics["rollout/fully_async/accepted_groups"] == 1
+    assert metrics["perf/rollout_window_time"] == 5
+    assert metrics["perf/rollout_step_time"] == 10
+
+
+async def test_production_time_excludes_filtered_and_restored_groups(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(data_buffer, "monotonic", lambda: now[0])
+    args = make_args(rollout_batch_size=2, dynamic_sampling_filter_path=f"{__name__}.reject_group_1")
+    buffer = data_buffer.DefaultDataBuffer(
+        data_buffer.DataBufferConstructorInput(args=args, unused_handler_fn=lambda _: None)
+    )
+    await put_group(buffer, make_group(1))  # Rejected by dynamic filtering.
+    await put_group(buffer, make_group(2, status=Sample.Status.ABORTED))
+    await put_group(buffer, make_group(3))
+    restored = make_group(4)
+    await buffer.restore_entry(data_buffer.DataBufferInput(prompt_group=restored, group=restored))
+    now[0] += 12
+    metrics = buffer.get_metrics()
+    assert metrics["rollout/fully_async/accepted_groups"] == 1
+    assert metrics["perf/rollout_step_time"] == 24
+    assert metrics["rollout/fully_async/queue_size"] == 2
+
+    now[0] += 10
+    await buffer.get()
+    metrics = buffer.get_metrics()
+    assert metrics["rollout/fully_async/accepted_groups"] == 0
+    assert "perf/rollout_step_time" not in metrics  # No fabricated duration for an empty production window.
+
+
 async def test_buffer_blocks_producer_when_full():
     buffer, _ = make_buffer(max_groups=2)
     await put_group(buffer, make_group(1))

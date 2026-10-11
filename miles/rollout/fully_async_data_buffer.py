@@ -14,6 +14,7 @@ from abc import ABC, abstractmethod
 from argparse import Namespace
 from collections.abc import Callable
 from dataclasses import dataclass
+from time import monotonic
 
 from miles.rollout.buffer_ordering import OrderedGroupBuffer
 from miles.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter
@@ -126,12 +127,15 @@ class DefaultDataBuffer(DataBuffer):
         self._metric_selected_versioned_tokens = 0
         self._metric_selected_samples = 0
         self._metric_selected_versioned_samples = 0
+        self._metric_accepted_groups = 0
+        self._metric_window_start = monotonic()
 
     async def put(self, input: DataBufferInput) -> None:
         if not self._preput_filter(input):
             return
 
         await self.restore_entry(input)
+        self._metric_accepted_groups += 1
 
     async def restore_entry(self, input: DataBufferInput, *, wait_for_capacity: bool = True) -> None:
         """Restore an already accepted entry without repeating reward/dynamic filters."""
@@ -233,13 +237,21 @@ class DefaultDataBuffer(DataBuffer):
             self._metric_selected_versioned_tokens += stats.versioned_token_count
 
     def get_metrics(self) -> dict[str, float]:
+        now = monotonic()
+        elapsed = now - self._metric_window_start
         prefix = "rollout/fully_async/"
         metrics = {
             f"{prefix}queue_size": len(self._buffer),
+            f"{prefix}accepted_groups": self._metric_accepted_groups,
+            "perf/rollout_window_time": elapsed,
             f"{prefix}aborted_groups_filtered": self._metric_aborted_groups,
             f"{prefix}stale_groups_filtered": self._metric_stale_groups,
             **self._metric_gatherer.collect(),
         }
+        # Count fresh, accepted production even while the trainer is busy.
+        # restore_entry bypasses this counter; an empty window has no rate.
+        if elapsed > 0 and self._metric_accepted_groups:
+            metrics["perf/rollout_step_time"] = elapsed * self._args.rollout_batch_size / self._metric_accepted_groups
         if consumed := self._metric_consumed_staleness:
             metrics[f"{prefix}avg_staleness"] = sum(consumed) / len(consumed)
             metrics[f"{prefix}max_staleness"] = max(consumed)
@@ -270,4 +282,6 @@ class DefaultDataBuffer(DataBuffer):
         self._metric_selected_samples = 0
         self._metric_selected_versioned_samples = 0
         self._metric_aborted_groups = self._metric_stale_groups = 0
+        self._metric_accepted_groups = 0
+        self._metric_window_start = now
         return metrics
