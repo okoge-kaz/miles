@@ -1,0 +1,21 @@
+# Experiment tests
+
+| Directory | Scope |
+| --- | --- |
+| `common/` | PBS submission, job configuration, training launch and service lifecycle |
+| `container/` | Container validation and publication |
+| `checkpoint_convert/` | HF / Megatron conversion, assets, comparison and shared checkpoint state |
+| `datasets/` | Source conversion, parallel preparation and training mixture contracts |
+| `nemo_gym/` | Reward, environment and HTTP bridge contracts |
+| `training/` | Truncation, preflight, checkpoint controls, replay and training metrics |
+
+These are CPU checks, including Miles core extensions used by the experiments.
+They do not establish GPU training performance or convergence. Run them in the
+prepared Miles image:
+
+```bash
+python3 -m pytest --confcutdir=tests/fast/experiments tests/fast/experiments
+```
+
+The `--confcutdir` option excludes the repository-wide GPU/Ray fixtures for this
+standalone CPU run. Tests are collected recursively; no package initializer is needed.

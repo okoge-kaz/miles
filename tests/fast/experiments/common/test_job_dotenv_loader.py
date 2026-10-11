@@ -4,7 +4,7 @@ import os
 import subprocess
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+REPO_ROOT = Path(__file__).resolve().parents[4]
 LOADER = REPO_ROOT / "experiments/common/load_job_env.sh"
 
 
