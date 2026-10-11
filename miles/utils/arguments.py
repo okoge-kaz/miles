@@ -1434,6 +1434,12 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--hf-save-interval",
+                type=int,
+                default=None,
+                help="Independent HF export interval (Megatron only); unset follows --save-interval.",
+            )
+            parser.add_argument(
                 "--save-trigger-sentinel",
                 type=str,
                 default=None,
@@ -3098,6 +3104,11 @@ def miles_validate_args(args):
     if args.save_interval is not None:
         assert args.save is not None, "'--save' is required when save_interval is set."
 
+    if args.hf_save_interval is not None:
+        assert args.hf_save_interval > 0, "--hf-save-interval must be positive"
+        assert args.save_hf is not None, "--hf-save-interval requires --save-hf"
+        assert args.train_backend == "megatron", "--hf-save-interval requires the Megatron backend"
+
     if args.save_trigger_sentinel is not None:
         assert args.save is not None, "'--save' is required when save_trigger_sentinel is set."
 
@@ -3427,10 +3438,11 @@ def miles_validate_args(args):
             if not any(field == "rollout_id" for _, field, _, _ in Formatter().parse(args.save_hf)):
                 args.save_hf = os.path.join(args.save_hf, "step_{rollout_id}")
                 logger.info(f"Using per-step checkpoints for snapshot eval: --save-hf={args.save_hf}")
-            assert args.save_interval is not None and args.eval_interval % args.save_interval == 0, (
+            hf_interval = args.hf_save_interval if args.hf_save_interval is not None else args.save_interval
+            assert hf_interval is not None and args.eval_interval % hf_interval == 0, (
                 "Reusing --save-hf checkpoints for eval requires eval_interval to be a "
-                f"multiple of save_interval (got eval_interval={args.eval_interval}, "
-                f"save_interval={args.save_interval}). Set --eval-hf-dir for independent snapshots."
+                f"multiple of the HF save interval (got eval_interval={args.eval_interval}, "
+                f"hf_interval={hf_interval}). Set --eval-hf-dir for independent snapshots."
             )
 
     if args.num_steps_per_rollout is not None:
@@ -3642,6 +3654,7 @@ def _maybe_apply_dumper_overrides(args) -> None:
     args.eval_interval = None
     args.save = None
     args.save_interval = None
+    args.hf_save_interval = None
     args.save_retain_interval = None
 
 

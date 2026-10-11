@@ -1188,7 +1188,7 @@ class TestSaveModel:
 
         for handle in get_raw_actor_handles(_cell(group, 0)):
             save_calls = [c for c in ray.get(handle.get_calls.remote()) if c[0] == "save_model"]
-            assert [c[2] for c in save_calls] == [{"rollout_id": 9, "force_sync": True}]
+            assert [c[2] for c in save_calls] == [{"rollout_id": 9, "force_sync": True, "write_dist": True, "write_hf": True}]
 
 
 class TestExportHf:
