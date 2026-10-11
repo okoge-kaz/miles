@@ -147,7 +147,10 @@ def _recipe_args(environment: Mapping[str, str]) -> list[str]:
     experiment = environment["EXPERIMENT_NAME"]
     if any(re.fullmatch(r"[A-Za-z0-9_-]+", name) is None for name in (project, experiment)):
         raise ValueError("PROJECT_NAME and EXPERIMENT_NAME must be path-safe recipe names")
-    recipe = REPO_ROOT / "experiments/scripts" / project / experiment / "train.sh"
+    recipe_dir = REPO_ROOT / "experiments/scripts" / project
+    if experiment != project:
+        recipe_dir /= experiment
+    recipe = recipe_dir / "train.sh"
     if not recipe.is_file():
         raise ValueError(f"unknown training recipe: {recipe}")
     result = subprocess.run(
