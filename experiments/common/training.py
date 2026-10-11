@@ -1,5 +1,4 @@
 import argparse
-import math
 import os
 import re
 import shlex
@@ -13,20 +12,11 @@ from miles.utils.external_utils.model_args_utils import load_model_args
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-def _validate_reward_runtime(environment: Mapping[str, str]) -> None:
-    for name in ("CODE_EXEC_CONCURRENCY", "CODE_EXEC_MAX_TESTS", "CODE_EXEC_MAX_OUTPUT_BYTES"):
-        if environment.get(name) and int(environment[name]) <= 0:
-            raise ValueError(f"{name} must be a positive integer")
-    for name in ("CODE_EXEC_TIMEOUT", "CODE_EXEC_MEMORY_GB"):
-        if environment.get(name):
-            value = float(environment[name])
-            if not math.isfinite(value) or value <= 0:
-                raise ValueError(f"{name} must be positive and finite")
-
-
 def validate_config(environment: Mapping[str, str]) -> None:
     prompt_arguments(environment)
-    _validate_reward_runtime(environment)
+    judge_mode = environment.get("LLM_JUDGE_MODE", "off")
+    if judge_mode != "off":
+        raise ValueError("LLM_JUDGE_MODE was removed; select a native NeMo Gym judge in the dataset reward hook")
     if environment["PLACEMENT"] not in ("disaggregate", "colocated"):
         raise ValueError("PLACEMENT must be disaggregate or colocated")
     if environment["TRUNCATION_MODE"] not in ("none", "zero_reward", "zero_loss"):
@@ -194,32 +184,8 @@ def runtime_environment(environment: Mapping[str, str]) -> dict[str, dict[str, s
         "GLOO_SOCKET_IFNAME",
         "NCCL_DEBUG",
         "WANDB_MODE",
-        "LLM_JUDGE_MODE",
-        "LLM_JUDGE_ENDPOINT_FILE",
-        "LLM_JUDGE_CATEGORIES",
-        "LLM_JUDGE_TRIGGER",
-        "LLM_JUDGE_ALLOW_HARD_FAILURE_OVERRIDE",
-        "LLM_JUDGE_CONCURRENCY",
-        "LLM_JUDGE_QUEUE_CAPACITY",
-        "LLM_JUDGE_QUEUE_TIMEOUT",
-        "LLM_JUDGE_REQUEST_TIMEOUT",
-        "LLM_JUDGE_MAX_RETRIES",
-        "LLM_JUDGE_MAX_TOKENS",
-        "LLM_JUDGE_TEMPERATURE",
-        "LLM_JUDGE_MAX_REQUEST_BYTES",
-        "LLM_JUDGE_ON_ERROR",
-        "LLM_JUDGE_CACHE_DIR",
-        "LLM_JUDGE_CACHE_SIZE",
-        "LLM_JUDGE_BASE_RM_PATH",
-        "LLM_JUDGE_READY_TIMEOUT",
-        "CODE_EXEC_SANDBOX",
-        "CODE_EXEC_CONCURRENCY",
-        "CODE_EXEC_TIMEOUT",
-        "CODE_EXEC_MEMORY_GB",
-        "CODE_EXEC_MAX_TESTS",
-        "CODE_EXEC_MAX_OUTPUT_BYTES",
-        "OPEN_INSTRUCT_PATH",
-        "OPEN_INSTRUCT_DEPS_PATH",
+        "NEMO_GYM_ENDPOINTS",
+        "NEMO_GYM_REQUEST_TIMEOUT",
     )
     return {
         "env_vars": {
