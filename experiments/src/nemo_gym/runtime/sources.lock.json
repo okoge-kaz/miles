@@ -1,0 +1,7 @@
+{
+  "nemo_gym_commit": "1f8afc71d45fac14872d86fe300374afa2001e7a",
+  "verifiable_instructions_commit": "f46a5ac87b1400a4f8973039844b6be9b56e3faf",
+  "tau_commit": "60c2a0dbf974ea7533456a4706f837c3a6d14afc",
+  "tau_data_commit": "ce4013b0afe03c873488878b72851414f92f458b",
+  "python": "3.13.14"
+}
