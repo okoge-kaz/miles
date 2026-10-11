@@ -1841,6 +1841,12 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
 
         # wandb
         def add_wandb_arguments(parser):
+            parser.add_argument(
+                "--log-rollout-repetition",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help="Compute compression-based response repetition metrics for rollout and evaluation.",
+            )
             # wandb parameters
             parser.add_argument("--use-wandb", action="store_true", default=False)
             parser.add_argument(
