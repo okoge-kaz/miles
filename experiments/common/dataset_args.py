@@ -6,6 +6,9 @@ import sys
 from collections.abc import Mapping
 from pathlib import Path
 
+from miles.utils.dataset_mixture_config import read_prompt_config
+from miles.utils.file_arg_utils import PSEUDO_FILE_PREFIX
+
 
 def prompt_arguments(environment: Mapping[str, str]) -> list[str]:
     config = environment.get("PROMPT_DATA_CONFIG", "")
@@ -27,7 +30,9 @@ def prompt_arguments(environment: Mapping[str, str]) -> list[str]:
         if not files or not isinstance(values, list) or len(values) != len(paths):
             raise ValueError("PROMPT_DATA_RATIOS must be a JSON array matching PROMPT_DATA_FILES")
         if (
-            any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0 for v in values)
+            any(
+                isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0 for v in values
+            )
             or sum(values) <= 0
         ):
             raise ValueError("PROMPT_DATA_RATIOS must be finite, non-negative and have a positive sum")
@@ -73,19 +78,15 @@ def check_prompt_paths(environment: Mapping[str, str], *, data_root: Path, repo_
         return path
 
     if environment.get("PROMPT_DATA_CONFIG"):
-        path = mounted_path(environment["PROMPT_DATA_CONFIG"])
-        if path.suffix == ".json":
-            value = json.loads(path.read_text())
-        else:
-            # Optional only for a YAML config; ordinary previews stay stdlib-only.
-            import yaml
-
-            value = yaml.safe_load(path.read_text())
+        config = environment["PROMPT_DATA_CONFIG"]
+        value, directory = read_prompt_config(
+            config if config.startswith(PSEUDO_FILE_PREFIX) else mounted_path(config)
+        )
         for source in value["datasets"]:
             data = source["path"]
             if Path(data).is_absolute():
                 mounted_path(data)
-            elif not (path.parent / data.split("@[", 1)[0]).is_file():
+            elif not (directory / data.split("@[", 1)[0]).is_file():
                 raise ValueError(f"Missing relative prompt source: {data}")
     else:
         files = environment.get("PROMPT_DATA_FILES")

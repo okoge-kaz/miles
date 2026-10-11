@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import shlex
@@ -6,10 +7,32 @@ from pathlib import Path
 
 import pytest
 
+from experiments.common.dataset_args import check_prompt_paths
 from experiments.common.training import build_command, runtime_environment
 from miles.utils.dataset_mixture_config import read_prompt_config
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
+
+
+@pytest.mark.parametrize("encoding", ["inline", "json", "yaml"])
+def test_prompt_config_paths_resolve_mounts_slices_and_missing_sources(tmp_path, encoding):
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    source = data_root / "math problems.jsonl"
+    source.write_text('{"prompt":"x"}\n')
+    value = {"datasets": [{"name": "math", "path": "/data/math problems.jsonl@[0:1]"}]}
+    if encoding == "inline":
+        config = "base64:" + base64.b64encode(json.dumps(value).encode()).decode()
+    else:
+        value["datasets"].append({"name": "relative", "path": "math problems.jsonl@[0:1]"})
+        # JSON is also a valid YAML document; the extension selects the YAML loader.
+        (data_root / f"mix.{encoding}").write_text(json.dumps(value))
+        config = f"/data/mix.{encoding}"
+    environment = {"PROMPT_DATA_CONFIG": config}
+    check_prompt_paths(environment, data_root=data_root, repo_root=REPO_ROOT)
+    source.unlink()
+    with pytest.raises(ValueError, match="Missing prompt source"):
+        check_prompt_paths(environment, data_root=data_root, repo_root=REPO_ROOT)
 
 
 def _environment(tmp_path, **overrides):
