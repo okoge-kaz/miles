@@ -30,26 +30,36 @@ def log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any] 
     for key in data.keys():
         rewards = data[key]["rewards"]
         num_none = sum(1 for r in rewards if r is None)
+        scored_rewards = [reward for reward in rewards if reward is not None]
+        log_dict[f"eval/{key}-unscored_count"] = num_none
+        log_dict[f"eval/{key}-scored_count"] = len(scored_rewards)
         log_dict[f"eval/{key}-none_reward_ratio"] = num_none / len(rewards) if len(rewards) > 0 else 0.0
         if num_none:
-            logger.warning(
-                f"eval/{key}: {num_none}/{len(rewards)} samples have reward=None (likely errored/aborted trials); treating as 0.0 for metrics."
-            )
-            rewards = [0.0 if r is None else r for r in rewards]
-        log_dict[f"eval/{key}"] = sum(rewards) / len(rewards) if len(rewards) > 0 else 0.0
+            logger.warning(f"eval/{key}: excluding {num_none}/{len(rewards)} unscored samples from reward metrics.")
+        if scored_rewards:
+            log_dict[f"eval/{key}"] = sum(scored_rewards) / len(scored_rewards)
         if (samples := data[key].get("samples")) is not None:
-            log_dict |= dict_add_prefix(_compute_metrics_from_samples(args, samples), f"eval/{key}/")
+            scored_samples = [sample for sample, reward in zip(samples, rewards, strict=True) if reward is not None]
+            if scored_samples:
+                log_dict |= dict_add_prefix(_compute_metrics_from_samples(args, scored_samples), f"eval/{key}/")
         if "truncated" in data[key]:
             truncated = data[key]["truncated"]
-            log_dict[f"eval/{key}-truncated_ratio"] = sum(truncated) / len(truncated)
+            if truncated:
+                log_dict[f"eval/{key}-truncated_ratio"] = sum(truncated) / len(truncated)
         if args.log_passrate:
-            log_dict |= dict_add_prefix(
-                compute_pass_rate(
-                    flat_rewards=rewards,
-                    group_size=args.n_samples_per_eval_prompt,
-                ),
-                f"eval/{key}-",
-            )
+            group_size = args.n_samples_per_eval_prompt
+            assert len(rewards) % group_size == 0
+            groups = [rewards[i : i + group_size] for i in range(0, len(rewards), group_size)]
+            complete_groups = [group for group in groups if all(reward is not None for reward in group)]
+            log_dict[f"eval/{key}-passrate_excluded_group_count"] = len(groups) - len(complete_groups)
+            if complete_groups:
+                log_dict |= dict_add_prefix(
+                    compute_pass_rate(
+                        flat_rewards=[reward for group in complete_groups for reward in group],
+                        group_size=group_size,
+                    ),
+                    f"eval/{key}-",
+                )
 
     logger.info(f"eval {rollout_id}: {log_dict}")
 

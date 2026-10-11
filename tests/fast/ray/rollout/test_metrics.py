@@ -10,10 +10,36 @@ from miles.ray.rollout.metrics import (
     _compute_spec_metrics,
     _compute_training_sample_metrics,
     _compute_zero_std_metrics,
+    log_eval_rollout_data,
     log_rollout_data,
 )
 from miles.rollout.session.v2.metrics import SESSION_ROLLOUT_METRICS_KEY
 from miles.utils.types import Sample, WeightVersionSpan, WeightVersionsPerCall
+
+
+@pytest.mark.parametrize("rewards", [[1.0, None, 0.0, 1.0], [None, None], []])
+def test_eval_excludes_unscored_rewards_without_changing_passrate_groups(rewards, monkeypatch, caplog):
+    logged = []
+    monkeypatch.setattr(
+        "miles.ray.rollout.metrics.tracking.log", lambda args, metrics, **kwargs: logged.append(metrics)
+    )
+    args = make_args(custom_eval_rollout_log_function_path=None, log_passrate=True, n_samples_per_eval_prompt=2)
+    samples = [make_sample(index=i, group_index=i // 2, reward=reward) for i, reward in enumerate(rewards)]
+    result = log_eval_rollout_data(
+        0, args, {"remote": {"rewards": rewards, "samples": samples, "truncated": [False] * len(samples)}}
+    )
+    assert logged == [result]
+    assert result["eval/remote-unscored_count"] == rewards.count(None)
+    if rewards and rewards[0] is not None:
+        assert result["eval/remote"] == pytest.approx(2 / 3)
+        assert result["eval/remote-pass@1"] == pytest.approx(0.5)
+        assert result["eval/remote-pass@2"] == 1.0
+        assert result["eval/remote-passrate_excluded_group_count"] == 1
+    else:
+        assert "eval/remote" not in result
+        assert "eval/remote-pass@1" not in result
+    if None in rewards:
+        assert "unscored samples" in caplog.text
 
 
 class TestEpisodeResponseLengthMetrics:

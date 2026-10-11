@@ -1,5 +1,7 @@
 import asyncio
 import hashlib
+import logging
+import math
 import random
 
 import aiohttp
@@ -14,6 +16,8 @@ from .math_dapo_utils import compute_score as compute_score_dapo
 from .math_utils import extract_answer as extract_boxed_answer
 from .math_utils import grade_answer_verl
 
+logger = logging.getLogger(__name__)
+
 
 async def remote_rm(args, sample: Sample):
     payload = {
@@ -21,11 +25,36 @@ async def remote_rm(args, sample: Sample):
         "response": sample.response,
         "label": sample.label,
     }
-    session_kwargs = {}
-    async with aiohttp.ClientSession(**session_kwargs) as session:
-        async with session.post(args.rm_url, json=payload) as resp:
-            resp.raise_for_status()
-            return await resp.json()
+    max_retries = getattr(args, "rm_max_retries", 1)
+    request_timeout = getattr(args, "rm_request_timeout", 30.0)
+    if max_retries < 0 or not math.isfinite(request_timeout) or request_timeout <= 0:
+        raise ValueError("Remote reward requires nonnegative retries and a positive finite timeout")
+    timeout = aiohttp.ClientTimeout(total=request_timeout)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for attempt in range(max_retries + 1):
+            http_status = None
+            try:
+                async with session.post(args.rm_url, json=payload) as resp:
+                    http_status = resp.status
+                    resp.raise_for_status()
+                    result = await resp.json()
+                if isinstance(sample.metadata, dict):
+                    sample.metadata.pop("remote_reward_error", None)
+                return result
+            except (aiohttp.ClientError, TimeoutError, ValueError) as error:
+                if attempt == max_retries:
+                    details = {"attempts": attempt + 1, "http_status": http_status, "error": type(error).__name__}
+                    sample.metadata = {**(sample.metadata or {}), "remote_reward_error": details}
+                    logger.warning(
+                        "Remote reward sample excluded: group=%s sample=%s attempts=%s http_status=%s error=%s",
+                        sample.group_index,
+                        sample.index,
+                        attempt + 1,
+                        http_status,
+                        type(error).__name__,
+                    )
+                    return None
+            await asyncio.sleep(min(0.25 * 2**attempt, 2))
 
 
 def _resolve_reward_config(args, sample: Sample) -> tuple[str | None, str]:

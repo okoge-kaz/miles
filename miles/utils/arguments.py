@@ -2218,6 +2218,18 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="URL for the reward model service for --rm-type remote_rm, e.g. http://localhost:8000",
             )
             parser.add_argument(
+                "--rm-max-retries",
+                type=int,
+                default=1,
+                help="Retries after the first remote reward request; exhausted requests leave the sample unscored.",
+            )
+            parser.add_argument(
+                "--rm-request-timeout",
+                type=float,
+                default=30.0,
+                help="Timeout in seconds for each remote reward HTTP attempt.",
+            )
+            parser.add_argument(
                 "--custom-rm-path",
                 type=str,
                 default=None,

@@ -276,12 +276,18 @@ Sections mirror the launch-script argument groups.
 |---|---|---|---|
 | `--rm-type` | str | – | Built-in reward: `math`, `dapo`, `deepscaler`, `gemma_math`, `f1`, `gpqa`, `ifbench`, `remote_rm`, `random`, `deterministic_random`. A `boxed_` prefix (e.g. `boxed_math`) extracts `\boxed{}` from the response before grading. |
 | `--rm-url` | str | – | Endpoint when `--rm-type remote_rm`. |
+| `--rm-max-retries` | int | `1` | Nonnegative number of retries after the first `remote_rm` request; `0` disables retries. |
+| `--rm-request-timeout` | float | `30.0` | Positive, finite timeout in seconds for each `remote_rm` HTTP attempt. |
 | `--group-rm` | flag | off | Batched reward computation. |
 | `--custom-rm-path` | str | – | Custom reward function (see [Customization](/user-guide/customization)). |
 | `--dynamic-sampling-filter-path` | str | – | Group filter (DAPO-style). |
 | `--rollout-submission-granularity` | enum | driver | `group` or `sample`: what frees rollout submission capacity. Unset means `sample` under `--fully-async`, `group` otherwise. |
 | `--buffer-filter-path` | str | – | Buffer dequeue filter. |
 | `--rollout-sample-filter-path` | str | – | Per-sample filter. |
+
+For `remote_rm`, HTTP, connection, timeout, and JSON-decoding failures are retried. After the final failed attempt, the reward remains `None`; a warning and `Sample.metadata.remote_reward_error` record the attempt count, HTTP status (when available), and exception type. The standard rollout filter excludes its prompt group from training.
+
+Evaluation reports scored and unscored counts separately and computes reward metrics from scored samples. Pass-rate metrics use only complete prompt groups with no missing rewards. Metrics with no eligible samples or groups are omitted. Custom reward functions manage their own retry and timeout policies.
 
 ### SGLang and router
 
