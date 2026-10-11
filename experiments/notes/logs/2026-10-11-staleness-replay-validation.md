@@ -31,3 +31,15 @@ GPU のないホストで SGLang dumper の任意 Megatron plugin を読み込�
 - token 数の異なる microbatch・category を sum/count で集約し、学習 tracking に渡すこと。
 
 GPU 分散学習、実 engine の abort/resume、W&B への実送信はこの検証には含めていない。
+
+## Multi-env staleness recipe
+
+`staleness_multi_env/math_code_mcqa_if` の run / train / sweep を実験設定として別commitにした。
+math・code・MCQA・IF の比率は各0.25。policy lag logging は既定ON。
+全3レシピの既定ON／明示OFFを検査する pytest は **6 passed**。
+shell 構文と sweep のpreviewを確認した。job は投入していない。
+
+このrecipeは別途commitする共通起動・データ混合基盤に依存する。
+具体的には `run_nemo_gym_training.sh`、`sweep_training.sh`、`submit_training.sh`、
+`multi_env_preflight.py` と multi-source dataset / CLI の未commit差分が必要。
+recipe のcommitだけをcheckoutした状態での学習起動は未検証。

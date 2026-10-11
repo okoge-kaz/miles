@@ -38,11 +38,18 @@ python3 -c 'import json, os; print(json.dumps(dict(os.environ)))'
     return json.loads(result.stdout)
 
 
-@pytest.mark.parametrize("experiment", ["zero_loss_truncation", "zero_reward_truncation"])
+@pytest.mark.parametrize(
+    "project,experiment",
+    [
+        ("staleness_math", "zero_loss_truncation"),
+        ("staleness_math", "zero_reward_truncation"),
+        ("staleness_multi_env", "math_code_mcqa_if"),
+    ],
+)
 @pytest.mark.parametrize("enabled", [None, "0"])
-def test_staleness_policy_lag_logging_is_default_and_can_be_disabled(tmp_path, experiment, enabled):
+def test_staleness_policy_lag_logging_is_default_and_can_be_disabled(tmp_path, project, experiment, enabled):
     overrides = {} if enabled is None else {"LOG_POLICY_LAG_METRICS": enabled}
-    command = build_command(_recipe_config(tmp_path, experiment, **overrides))
+    command = build_command(_recipe_config(tmp_path, experiment, project=project, **overrides))
     assert ("--log-policy-lag-metrics" in command) == (enabled != "0")
 
 
