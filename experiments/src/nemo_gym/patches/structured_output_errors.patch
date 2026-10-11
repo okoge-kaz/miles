@@ -1,0 +1,28 @@
+--- a/resources_servers/structured_outputs/app.py
++++ b/resources_servers/structured_outputs/app.py
+@@ -24,6 +24,7 @@
+ import xmltodict
+ import yaml
+ from fastapi import FastAPI
++from jsonschema.exceptions import ValidationError
+ from openapi_schema_validator import validate as validate_against_schema_openapi
+ 
+ from nemo_gym.base_resources_server import (
+@@ -429,7 +430,7 @@
+         try:
+             validate_against_schema_openapi(response_obj, schema)
+             return 1.0, None, None
+-        except Exception as e:
++        except ValidationError as e:
+             return 0.0, "validation_error", f"{type(e).__name__}: {str(e)[:200]}"
+ 
+     def evaluate_structured_output_response(
+@@ -458,7 +459,7 @@
+                 response_obj = self.coerce_csv_types(response_obj, schema)
+             validate_against_schema_openapi(response_obj, schema)
+             return 1.0, None, None
+-        except Exception as e:
++        except ValidationError as e:
+             return 0.0, "validation_error", f"{type(e).__name__}: {str(e)[:200]}"
+ 
+ 

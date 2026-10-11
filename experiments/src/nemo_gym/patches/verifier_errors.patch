@@ -1,0 +1,63 @@
+diff --git a/resources_servers/calendar/app.py b/resources_servers/calendar/app.py
+index 1cb63b6..e01069f 100644
+--- a/resources_servers/calendar/app.py
++++ b/resources_servers/calendar/app.py
+@@ -73,7 +73,7 @@ class CalendarResourcesServer(SimpleResourcesServer):
+         try:
+             reward, reason = grade_assistant_response(assistant_response, exp_cal_state)
+         except Exception:
+-            reward = 0
++            raise
+ 
+         return BaseVerifyResponse(**body.model_dump(), reward=reward)
+ 
+diff --git a/resources_servers/ifbench/app.py b/resources_servers/ifbench/app.py
+index 8907d99..340828f 100644
+--- a/resources_servers/ifbench/app.py
++++ b/resources_servers/ifbench/app.py
+@@ -152,7 +152,7 @@ class IFBenchResourcesServer(SimpleResourcesServer):
+                         follows = bool(instruction.check_following(variant))
+                     except Exception:
+                         logger.exception("check_following failed for instruction %s", instruction_id)
+-                        follows = False
++                        raise
+                     if index == 0:  # variant[0] is the raw response -> strict
+                         strict = follows
+                     if follows:
+@@ -161,6 +161,7 @@ class IFBenchResourcesServer(SimpleResourcesServer):
+ 
+             except Exception:
+                 logger.exception("Error processing instruction %s", instruction_id)
++                raise
+ 
+             strict_list.append(strict)
+             loose_list.append(loose)
+diff --git a/resources_servers/instruction_following/app.py b/resources_servers/instruction_following/app.py
+index 32f8c5c..8c9b1d2 100644
+--- a/resources_servers/instruction_following/app.py
++++ b/resources_servers/instruction_following/app.py
+@@ -151,9 +151,7 @@ class InstructionFollowingResourcesServer(SimpleResourcesServer):
+                     is_following_list.append(False)
+ 
+             except Exception as e:
+-                # If there's an error processing the instruction, mark as failed
+-                print(f"Error processing instruction {instruction_id}: {e}")
+-                is_following_list.append(False)
++                raise RuntimeError(f"Instruction verifier failed: {instruction_id}") from e
+ 
+         # Calculate overall success
+         if grading_mode == "binary":
+diff --git a/resources_servers/reasoning_gym/app.py b/resources_servers/reasoning_gym/app.py
+index a1ff253..626fd76 100644
+--- a/resources_servers/reasoning_gym/app.py
++++ b/resources_servers/reasoning_gym/app.py
+@@ -69,8 +69,7 @@ class ReasoningGymResourcesServer(SimpleResourcesServer):
+             score_fn = reasoning_gym.get_score_answer_fn(task_name)
+             score = float(score_fn(answer=model_answer, entry=entry))
+         except Exception as e:
+-            print(f"Error scoring answer for task {task_name}: {e}")
+-            score = 0.0
++            raise RuntimeError(f"Reasoning Gym verifier failed: {task_name}") from e
+ 
+         return ReasoningGymVerifyResponse(
+             **body.model_dump(),

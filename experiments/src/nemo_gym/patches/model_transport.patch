@@ -1,0 +1,11 @@
+--- a/responses_api_models/vllm_model/app.py
++++ b/responses_api_models/vllm_model/app.py
+@@ -462,6 +462,8 @@
+             NeMoGymAsyncOpenAI(
+                 base_url=base_url,
+                 api_key=self.config.api_key,
++                max_num_tries=1,
++                request_timeout_seconds=120,
+                 default_headers=self.config.default_headers,
+                 max_connection_retries=(
+                     self.config.endpoint_connection_retries if self.config.endpoint_file else None

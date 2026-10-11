@@ -1,0 +1,14 @@
+--- a/responses_api_agents/tau2/source.py
++++ b/responses_api_agents/tau2/source.py
+@@ -116,6 +116,11 @@
+     ``NEMO_GYM_TAU2_BENCH_REF``.
+     """
+ 
++    if os.environ.get("NEMO_GYM_OFFLINE") == "1":
++        if not _has_banking_knowledge_data(data_dir):
++            raise RuntimeError(f"Preinstalled Tau data missing: {data_dir}")
++        return data_dir
++
+     data_dir.parent.mkdir(parents=True, exist_ok=True)
+     with _tau2_data_lock(data_dir):
+         if _has_banking_knowledge_data(data_dir):
