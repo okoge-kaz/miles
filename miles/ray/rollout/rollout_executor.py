@@ -22,6 +22,7 @@ from miles.rollout.base_types import (
 )
 from miles.rollout.checkpoint_eval import CheckpointEvalFn, EvalSkip
 from miles.rollout.inference_rollout.compatibility import call_rollout_function, load_rollout_function
+from miles.rollout.staleness_metrics import batch_category_staleness_metrics
 from miles.utils import object_store
 from miles.utils.audit_utils.event_analyzer import analyzer as event_analyzer
 from miles.utils.audit_utils.event_logger import checkpoint as event_logger_checkpoint
@@ -123,6 +124,14 @@ class RolloutExecutor:
         with timer("rollout"):
             data, metadata, metrics = await self._get_rollout_data(rollout_id=rollout_id)
         save_debug_rollout_data(self.args, data, rollout_id=rollout_id, evaluation=False, metadata=metadata)
+        if getattr(self.args, "log_category_staleness", False):
+            targets = getattr(getattr(self.data_source, "dataset", None), "category_target_group_fractions", None)
+            metrics = {
+                **(metrics or {}),
+                **batch_category_staleness_metrics(
+                    data, current_version=self.weight_version, target_group_fractions=targets
+                ),
+            }
         log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
         data = convert_samples_to_train_data(
             self.args,
@@ -274,6 +283,8 @@ class RolloutExecutor:
             assert self.args.indep_dp, message
             logger.warning(message)
         self.weight_version = weight_version
+        if (publish := getattr(self.generate_rollout, "on_weight_version", None)) is not None:
+            publish(weight_version)
         self._rollouts_since_weight_version_publish = 0
 
     def set_train_parallel_config(self, config: dict):

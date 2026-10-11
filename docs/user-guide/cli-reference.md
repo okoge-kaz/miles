@@ -289,6 +289,12 @@ For `remote_rm`, HTTP, connection, timeout, and JSON-decoding failures are retri
 
 Evaluation reports scored and unscored counts separately and computes reward metrics from scored samples. Pass-rate metrics use only complete prompt groups with no missing rewards. Metrics with no eligible samples or groups are omitted. Custom reward functions manage their own retry and timeout policies.
 
+### Staleness and replay buffer
+
+| Flag | Type | Default | Notes |
+|---|---|---|---|
+| `--log-category-staleness` | flag | off | Selected-batch category proportions and measured version-lag distributions, including missing-provenance coverage. |
+
 ### SGLang and router
 
 | Flag | Type | Default | Notes |

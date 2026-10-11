@@ -133,6 +133,33 @@ def _make_meta_info(output_ids: list[int], **extra) -> dict:
 
 
 class TestWeightVersions:
+    def test_scheduler_segments_and_first_prefill_survive_multiple_calls(self):
+        sample = _make_sample([1, 2], [3, 4, 5])
+        sample.update_from_meta_info(
+            _make_args(),
+            _make_meta_info(
+                [3, 4, 5],
+                response_weight_version_segments=[[0, 1, 2], [1, 3, 3]],
+                first_prefill_weight_version=1,
+                weight_version="9",
+            ),
+        )
+        assert sample.all_weight_version_spans == [WeightVersionSpan("2", 2, 3), WeightVersionSpan("3", 3, 5)]
+        sample.tokens.extend([6, 7])
+        sample.update_from_meta_info(
+            _make_args(),
+            _make_meta_info([6, 7], response_weight_version_segments=[[0, 2, 4]], first_prefill_weight_version=4),
+        )
+        assert sample.all_weight_version_spans[-1] == WeightVersionSpan("4", 5, 7)
+        assert sample.metadata["policy_provenance"]["first_prefill_weight_version"] == 1
+
+    @pytest.mark.parametrize("segments", [[[0, 1, 1]], [[0, 2, 1], [1, 3, 2]], [[0, 3, -1]]])
+    def test_scheduler_segments_reject_missing_overlapping_or_invalid_versions(self, segments):
+        with pytest.raises(ValueError, match="segments"):
+            WeightVersionsPerCall.from_meta_info(
+                _make_meta_info([3, 4, 5], response_weight_version_segments=segments), output_end=5
+            )
+
     def test_update_from_meta_info_parses_per_token_weight_versions(self):
         """Per-token weight_versions from meta_info are shifted to absolute token indices."""
         s = _make_sample([1, 2], [3, 4, 5])

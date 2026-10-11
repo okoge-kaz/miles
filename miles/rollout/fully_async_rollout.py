@@ -38,6 +38,7 @@ from miles.rollout.fully_async_data_buffer import (
     Group,
     first_sample,
 )
+from miles.rollout.filter_hub.base_types import iter_samples
 from miles.rollout.generate_utils.sample_utils import reward_log_summary, sample_text_preview
 from miles.rollout.inference_rollout.inference_rollout_common import GenerateState, generate_and_rm_group
 from miles.rollout.inference_rollout.inference_rollout_eval import run_eval_datasets
@@ -77,10 +78,17 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         self._producer_resumed = asyncio.Event()
         self._producer_resumed.set()
         self._output: DataBuffer | None = None
+        self._weight_version: int | None = None
+        self._track_lifecycle = (
+            getattr(self.args, "log_category_staleness", False)
+            or getattr(self.args, "async_staleness_metric", "oldest") in ("submission", "ready", "first-prefill")
+        )
 
     async def __call__(self, input: RolloutFnInput) -> RolloutFnOutput:
         if input.evaluation:
             return await self._call_eval(input)
+        if input.weight_version is not None:
+            self.on_weight_version(input.weight_version)
         if self._worker is None:
             buffer_cls = load_function(self.args.custom_async_data_buffer_path) or DefaultDataBuffer
             self._output = buffer_cls(
@@ -89,6 +97,9 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
             self._worker = asyncio.create_task(self._worker_loop())
             logger.info("Started fully-async rollout worker")
         return await self._drain(input)
+
+    def on_weight_version(self, version: int) -> None:
+        self._weight_version = version
 
     async def _call_eval(self, input: RolloutFnEvalInput) -> RolloutFnOutput:
         if input.generate_state is not None:
@@ -116,6 +127,13 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         samples = self.data_source.get_samples(1)
         self._scheduler.on_submit(samples)
         [prompt_group] = samples
+        if self._track_lifecycle:
+            for sample in prompt_group:
+                if sample.metadata:
+                    sample.metadata = {
+                        key: value for key, value in sample.metadata.items() if key != "policy_provenance"
+                    }
+            self._stamp_lifecycle(prompt_group, "submitted_weight_version", self._weight_version)
         return asyncio.create_task(self._generate_group(prompt_group)), prompt_group
 
     async def _generate_group(self, prompt_group: list[Sample]) -> DataBufferInput:
@@ -126,7 +144,20 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
             evaluation=False,
             sample_done_callback=self._scheduler.sample_done_callback,
         )
+        if self._track_lifecycle:
+            self._stamp_lifecycle(result, "ready_weight_version", self._weight_version)
         return DataBufferInput(prompt_group=prompt_group, group=result)
+
+    @staticmethod
+    def _stamp_lifecycle(group, key: str, version: int | None) -> None:
+        if version is None:
+            return
+        for sample in iter_samples(group):
+            metadata = dict(sample.metadata or {})
+            provenance = dict(metadata.get("policy_provenance") or {})
+            provenance[key] = version
+            metadata["policy_provenance"] = provenance
+            sample.metadata = metadata
 
     async def _worker_loop(self) -> None:
         active: dict[asyncio.Task, list[Sample]] = {}
@@ -218,4 +249,6 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
     def _recycle(self, prompt_group: list[Sample]) -> None:
         for sample in prompt_group:
             sample.reset_for_retry()
+            if sample.metadata:
+                sample.metadata = {key: value for key, value in sample.metadata.items() if key != "policy_provenance"}
         self.data_source.add_samples([prompt_group])

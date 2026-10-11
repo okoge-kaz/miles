@@ -12,6 +12,7 @@ from miles.backends.sglang_utils.arguments import add_sglang_arguments, collect_
 from miles.backends.sglang_utils.arguments import validate_args as sglang_validate_args
 from miles.dashboard.args import add_dashboard_arguments, validate_dashboard_args
 from miles.rollout.checkpoint_eval import is_checkpoint_eval_fn
+from miles.utils.async_buffer_arguments import add_buffer_arguments
 from miles.utils.chat_template_utils.tito_tokenizer import TITOTokenizerType
 from miles.utils.environ import use_legacy_rollout_v1
 from miles.utils.eval_config import EvalDatasetConfig, build_eval_dataset_configs, ensure_dataset_list
@@ -775,6 +776,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "unboundedly ahead of training."
                 ),
             )
+            add_buffer_arguments(parser)
             parser.add_argument(
                 "--async-unused-samples-handler",
                 type=str,

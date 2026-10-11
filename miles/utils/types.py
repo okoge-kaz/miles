@@ -32,7 +32,17 @@ class WeightVersionsPerCall:
     @staticmethod
     def from_meta_info(meta_info: dict, output_end: int) -> "WeightVersionsPerCall":
         num_output_tokens = len(meta_info.get("output_token_logprobs") or [])
-        if (raw_spans := meta_info.get("weight_versions")) is not None:
+        if (segments := meta_info.get("response_weight_version_segments")) is not None:
+            # An opt-in scheduler patch stamps the actual forward, including overlap boundaries.
+            output_relative = [(str(version), start, end) for start, end, version in segments]
+            previous_end = 0
+            for version, start, end in output_relative:
+                if not version.isdigit() or not previous_end == start < end <= num_output_tokens:
+                    raise ValueError("Invalid scheduler response-token policy-version segments")
+                previous_end = end
+            if previous_end != num_output_tokens:
+                raise ValueError("Scheduler policy-version segments do not cover every output token")
+        elif (raw_spans := meta_info.get("weight_versions")) is not None:
             output_relative = [(span["version"], span["start"], span["end"]) for span in raw_spans]
             assert all(end <= num_output_tokens for _, _, end in output_relative), (
                 f"weight version spans {raw_spans} extend past the {num_output_tokens} output tokens implied by "
@@ -366,6 +376,18 @@ class Sample:
         self.prefix_cache_info.add(meta_info=meta_info)
 
         self.weight_versions.append(WeightVersionsPerCall.from_meta_info(meta_info, output_end=len(self.tokens)))
+        if meta_info.get("first_prefill_weight_version") is not None:
+            metadata = dict(self.metadata or {})
+            provenance = dict(metadata.get("policy_provenance") or {})
+            version = meta_info["first_prefill_weight_version"]
+            if isinstance(version, bool) or not str(version).isdigit():
+                raise ValueError("Invalid scheduler first-prefill policy version")
+            # Multi-turn samples keep the earliest measured prefill in the same version clock.
+            provenance["first_prefill_weight_version"] = min(
+                int(version), provenance.get("first_prefill_weight_version", int(version))
+            )
+            metadata["policy_provenance"] = provenance
+            self.metadata = metadata
 
         match meta_info["finish_reason"]["type"]:
             case "length":
