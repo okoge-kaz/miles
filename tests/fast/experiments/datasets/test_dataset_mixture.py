@@ -51,6 +51,25 @@ def test_unweighted_concatenation_and_zero_ratio():
     assert source_quotas([1, 0, 2], 10) == [3, 0, 7]
 
 
+def test_empty_source_is_allowed_only_when_its_ratio_is_zero():
+    sources = [PromptSource("math", "math", 1), PromptSource("code", "code", 0)]
+    datasets = [SimpleNamespace(origin_samples=[Sample(prompt="m")]), SimpleNamespace(origin_samples=[])]
+    mixed = MixtureDataset(sources, datasets, seed=1, epoch_size=3, shuffle=True)
+    assert [sample.prompt for sample in mixed.samples] == ["m", "m", "m"]
+    sources[1] = PromptSource("code", "code", 1)
+    with pytest.raises(ValueError, match="empty after filtering"):
+        MixtureDataset(sources, datasets, seed=1, epoch_size=3, shuffle=True)
+
+
+@pytest.mark.parametrize("size", [0, True, 1.5])
+def test_config_epoch_size_is_validated_before_loading_data(tmp_path, size):
+    config = tmp_path / "mix.json"
+    config.write_text(json.dumps({"datasets": [{"name": "math", "path": "missing.jsonl"}], "epoch_size": size}))
+    args = Namespace(prompt_data=None, prompt_data_config=str(config))
+    with pytest.raises(ValueError, match="positive integer"):
+        prompt_sources(args)
+
+
 @pytest.mark.parametrize("weights,size", [([0, 0], 3), ([float("nan"), 1], 3), ([-1, 2], 3), ([1], 0), ([1], True)])
 def test_bad_ratios_rejected(weights, size):
     with pytest.raises(ValueError):
