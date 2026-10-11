@@ -3,6 +3,7 @@ from typing import Any
 
 import torch
 
+from miles.rollout.staleness_metrics import sample_category
 from miles.utils import object_store
 from miles.utils.dp_schedule import build_dp_schedule, has_full_schedule_config
 from miles.utils.lora.utils import is_multi_lora_enabled
@@ -41,6 +42,8 @@ ROLLOUT_DATA_VALUE_SPEC: dict[str, ValueSpec] = {
     "prompt": ValueSpec(codec="msgpack_ragged"),
     "metadata": ValueSpec(codec="msgpack_ragged"),
     "weight_versions": ValueSpec(codec="msgpack_ragged"),
+    "sample_categories": ValueSpec(codec="msgpack_ragged"),
+    "category_vocabulary": ValueSpec(codec="auto"),
     "raw_reward": ValueSpec(codec="auto"),
     "total_lengths": ValueSpec(codec="auto"),
     "dynamic_global_batch_size": ValueSpec(codec="auto"),
@@ -100,6 +103,11 @@ def convert_samples_to_train_data(
             sample.loss_mask = [0] * sample.response_length
         loss_masks.append(sample.loss_mask)
     train_data["loss_masks"] = loss_masks
+    if getattr(args, "log_policy_lag_metrics", False):
+        train_data["sample_categories"] = [sample_category(sample) for sample in samples]
+        train_data["category_vocabulary"] = sorted(set(train_data["sample_categories"]))
+        if any(sample.rollout_log_probs is None for sample in samples):
+            raise ValueError("Policy-lag logging requires engine logprobs for every training sample")
 
     train_data["rollout_mask_sums"] = _compute_rollout_mask_sums(train_data["rollout_ids"], loss_masks)
 
@@ -392,6 +400,7 @@ def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, An
             "opd_reverse_kl",
             "seq_witness_ids",
             "weight_versions",
+            "sample_categories",
             "adapter_slots",
             "loss_weights",
             "advantages",
@@ -409,6 +418,7 @@ def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, An
             "prompt_group_sizes",
             "loss_fn",
             "loss_fn_config",
+            "category_vocabulary",
         ]:
             if key not in data:
                 continue

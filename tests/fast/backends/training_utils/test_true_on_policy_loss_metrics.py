@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from miles.backends.training_utils.loss_hub import losses as loss_utils
+from miles.backends.training_utils.loss_hub.policy_lag_metrics import finalize_policy_lag_metrics
 
 
 def _make_args(*, use_rollout_logprobs: bool) -> Namespace:
@@ -367,3 +368,34 @@ def test_masked_nonfinite_ppo_terms_do_not_poison_policy_loss(monkeypatch):
 
     assert torch.isfinite(loss)
     assert torch.isfinite(metrics["ppo_kl"])
+
+
+@pytest.mark.parametrize("skip_actor", [False, True])
+def test_policy_lag_uses_current_forward_and_preserves_loss_and_gradients(monkeypatch, skip_actor):
+    args = _make_args(use_rollout_logprobs=False)
+    args.skip_actor_forward_only = skip_actor
+    current = torch.tensor([-1.0, -3.0], requires_grad=True)
+    batch = _make_batch(old_log_probs=torch.tensor([-7.0, -7.0]), rollout_log_probs=torch.tensor([-2.0, -2.5]))
+    batch.update(sample_categories=["math"], category_vocabulary=["math", "code"], truncated=[0])
+    batch["loss_masks"] = [torch.tensor([1.0, 0.0])]
+    calls = []
+
+    def scores(*unused, **kwargs):
+        calls.append(True)
+        return {"log_probs": [current], "entropy": [torch.zeros_like(current)]}
+
+    monkeypatch.setattr(loss_utils, "get_parallel_state", lambda: SimpleNamespace(tp=SimpleNamespace(group=None)))
+    _patch_single_rank_loss_helpers(monkeypatch)
+    monkeypatch.setattr(loss_utils, "get_log_probs_and_entropy", scores)
+    logits = torch.zeros((1, 3, 8))
+    baseline, _ = loss_utils.policy_loss_function(args, batch, logits, lambda values: values.sum())
+    baseline_gradient = torch.autograd.grad(baseline, current)[0]
+    args.log_policy_lag_metrics = True
+    loss, parts = loss_utils.policy_loss_function(args, batch, logits, lambda values: values.sum())
+    gradient = torch.autograd.grad(loss, current)[0]
+    metrics = finalize_policy_lag_metrics(parts)
+    assert len(calls) == 2  # One scoring call per loss invocation; diagnostics add no forward.
+    assert torch.equal(loss, baseline) and torch.equal(gradient, baseline_gradient)
+    assert metrics["policy_lag/total/all_response/delta_mean"] == pytest.approx(0.25)
+    assert metrics["policy_lag/category/math/loss_enabled/delta_mean"] == 1.0
+    assert metrics["policy_lag/category/code/all_response/token_count"] == 0

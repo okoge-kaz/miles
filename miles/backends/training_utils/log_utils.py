@@ -7,6 +7,10 @@ import psutil
 import torch
 import torch.distributed as dist
 
+from miles.backends.training_utils.loss_hub.policy_lag_metrics import (
+    POLICY_LAG_PART_PREFIX,
+    finalize_policy_lag_metrics,
+)
 from miles.utils import train_metric_utils
 from miles.utils.flops_utils import fwd_tflops_per_gpu
 from miles.utils.ft_utils.process_group_utils import MultiPGUtil
@@ -413,9 +417,7 @@ def log_perf_data(rollout_id: int, args: Namespace, extra_metrics: dict | None =
         rollout_id=rollout_id,
         args=args,
         is_primary_rank=(
-            parallel_state.tp.rank == 0
-            and parallel_state.is_pp_last_stage
-            and parallel_state.effective_dp_cp.rank == 0
+            parallel_state.tp.rank == 0 and parallel_state.is_pp_last_stage and parallel_state.effective_dp_cp.rank == 0
         ),
         compute_total_fwd_flops=lambda seq_lens: fwd_tflops_per_gpu(seq_lens, args, dist.get_world_size()),
         extra_metrics=extra_metrics,
@@ -487,7 +489,9 @@ def aggregate_train_losses(
         cp_factor = parallel_state.cp.size
 
     for key, value in zip(keys, values[1:], strict=False):
-        loss_reduced[key] = value * cp_factor / num_samples_or_tokens
+        loss_reduced[key] = (
+            value if key.startswith(POLICY_LAG_PART_PREFIX) else value * cp_factor / num_samples_or_tokens
+        )
 
     return loss_reduced
 
@@ -524,6 +528,7 @@ def log_train_step(
     accumulated_step_id = rollout_id * num_steps_per_rollout + step_id
     role_tag = "" if role == "actor" else f"{role}-"
 
+    loss_dict = finalize_policy_lag_metrics(loss_dict)
     log_dict_out = {
         f"train/{role_tag}{key}": val.mean().item() if isinstance(val, torch.Tensor) else val
         for key, val in loss_dict.items()

@@ -47,6 +47,12 @@ def add_buffer_arguments(parser) -> None:
         default=False,
         help="Actual selected-batch category fractions and measured version-lag distributions.",
     )
+    parser.add_argument(
+        "--log-policy-lag-metrics",
+        action="store_true",
+        default=False,
+        help="Signed current-training-forward logprob minus rollout logprob, pooled globally and per category.",
+    )
 
 
 def validate_buffer_arguments(args) -> None:

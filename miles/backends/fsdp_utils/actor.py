@@ -536,6 +536,8 @@ class FSDPTrainRayActor(TrainRayActor):
                             "returns",
                             "ref_log_probs",
                             "rollout_log_probs",
+                            "sample_categories",
+                            "truncated",
                             *sampling_mask_keys,
                         ],
                         self.args.data_pad_size_multiplier,

@@ -479,6 +479,8 @@ def run_forward_backward_pass(
                 "loss_weights",
                 "target_tokens",
                 "sample_indices",
+                "sample_categories",
+                "truncated",
                 *sampling_mask_keys,
             ],
             args.data_pad_size_multiplier,

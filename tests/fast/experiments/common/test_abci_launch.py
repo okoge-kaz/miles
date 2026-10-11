@@ -38,6 +38,14 @@ python3 -c 'import json, os; print(json.dumps(dict(os.environ)))'
     return json.loads(result.stdout)
 
 
+@pytest.mark.parametrize("experiment", ["zero_loss_truncation", "zero_reward_truncation"])
+@pytest.mark.parametrize("enabled", [None, "0"])
+def test_staleness_policy_lag_logging_is_default_and_can_be_disabled(tmp_path, experiment, enabled):
+    overrides = {} if enabled is None else {"LOG_POLICY_LAG_METRICS": enabled}
+    command = build_command(_recipe_config(tmp_path, experiment, **overrides))
+    assert ("--log-policy-lag-metrics" in command) == (enabled != "0")
+
+
 def test_colocated_recipe_does_not_request_dedicated_rollout_gpus(tmp_path):
     command = build_command(_recipe_config(tmp_path, PLACEMENT="colocated"))
     assert "--colocate" in command

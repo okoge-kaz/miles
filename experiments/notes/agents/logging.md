@@ -33,3 +33,22 @@ group 単位の coverage と欠損数、response/loss-enabled token 加重 lag �
 response 集計は過去の prompt/prefill span を除く。loss-enabled は mask 0 と `remove_sample` を除く。
 training 側はさらに TIS/OPSM rejection mask を反映する。
 multimodal span の対応を保証できない場合は欠損にする。
+
+## Logprob 差 δ
+
+`δ = log π_train − log μ_inf`。
+π は今回の training forward、μ は生成時に engine が返した token logprob。
+
+`train/policy_lag/{total,category/<category>}/{all_response,loss_enabled,truncated,non_truncated}/`
+に `delta_mean`、`delta_abs_mean`、`delta_sq_mean`、`delta_std`、token count、有限値 coverage を出す。
+DP/CP/microbatch の sum/count/二乗和を集約してから平均を求める。
+非有限値を含む母集団の平均は NaN、mask 外の値は loss-enabled に含めない。
+診断値は detach し、loss/gradient を変更しない。
+
+δ は KL ではない。現在の通常 sampler は temperature 後、top-p/top-k 再正規化前の logprob を返す。
+original-logprob、true-on-policy、sampling-support replay を変更した場合は π/μ の分布を確認する。
+
+
+`--log-policy-lag-metrics` (`LOG_POLICY_LAG_METRICS=1`) で有効化する。
+`staleness_math` と `staleness_multi_env` の recipe は既定で有効。
+`LOG_POLICY_LAG_METRICS=0` で無効化できる。core CLI の既定は無効。

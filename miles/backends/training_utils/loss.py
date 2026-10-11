@@ -221,9 +221,18 @@ def loss_function(
         {
             **({"per_datum": per_datum} if per_datum is not None else {}),
             "keys": list(log.keys()),
-            "values": torch.tensor(
-                [num_samples if not args.calculate_per_token_loss else num_tokens] + list(log.values()),
-                device=logits.device,
+            "values": (
+                torch.stack(
+                    [
+                        torch.as_tensor(value, dtype=torch.float64, device=logits.device).reshape(())
+                        for value in [num_samples if not args.calculate_per_token_loss else num_tokens, *log.values()]
+                    ]
+                )
+                if getattr(args, "log_policy_lag_metrics", False)
+                else torch.tensor(
+                    [num_samples if not args.calculate_per_token_loss else num_tokens] + list(log.values()),
+                    device=logits.device,
+                )
             ),
         },
     )

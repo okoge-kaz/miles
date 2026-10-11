@@ -300,6 +300,9 @@ Evaluation reports scored and unscored counts separately and computes reward met
 | `--use-replay-data-buffer` | flag | off | Persist ready groups, prompt cursor, and unfinished work alongside training checkpoints. Requires fully-async global-dataset training, a single Megatron actor, and `--save` / `--save-interval`. Alias: `--use-replay-buffer`. |
 | `--replay-data-buffer-mode` | enum | `rollout` | `rollout` regenerates unfinished prompts; `inflight` retains and continues single-turn text prefixes. Inflight mode excludes custom generators, sessions, multimodal inputs, and routing/indexer replay. |
 | `--replay-data-buffer-async-restore` | flag | off | Restore the first part before starting training, then verify/load the remaining parts with capacity backpressure. Alias: `--replay-buffer-async-restore`. Requires replay and capacity for at least one batch. |
+| `--log-policy-lag-metrics` | flag | off | Log detached `log π_train − log μ_inf` moments over response tokens, globally and per category. Requires engine rollout logprobs. The `staleness_math` and `staleness_multi_env` experiment recipes enable this by default; set `LOG_POLICY_LAG_METRICS=0` to opt out. |
+
+Policy-lag metrics appear under `train/policy_lag/`, separately for all response, loss-enabled, truncated, and non-truncated tokens. Token sums and counts are pooled across microbatches and DP/CP before computing means. These logprob differences are diagnostics, not KL estimates; their interpretation depends on the inference sampling/logprob convention.
 
 ### SGLang and router
 
