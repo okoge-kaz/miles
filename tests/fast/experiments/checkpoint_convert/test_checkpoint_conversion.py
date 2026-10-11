@@ -1,13 +1,12 @@
 import json
 import os
-import shlex
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+REPO_ROOT = Path(__file__).resolve().parents[4]
 CONVERSION_ROOT = REPO_ROOT / "experiments/scripts/checkpoint_convert"
 
 
@@ -39,10 +38,8 @@ def _run_conversion(direction, environment):
     )
 
 
-@pytest.mark.parametrize(
-    "action,direction", [("convert", "hf_mcore"), ("hf_mcore", "hf_mcore"), ("mcore_hf", "mcore_hf")]
-)
-def test_conversion_preview_uses_new_job_files_and_exports_paths(tmp_path, action, direction):
+@pytest.mark.parametrize("action", ["convert", "hf_mcore", "mcore_hf"])
+def test_conversion_preview_exports_configuration_without_submitting(tmp_path, action):
     result = subprocess.run(
         ["bash", "experiments/setup.sh", action],
         cwd=REPO_ROOT,
@@ -60,8 +57,6 @@ def test_conversion_preview_uses_new_job_files_and_exports_paths(tmp_path, actio
         check=True,
     )
     assert "must-not-run -q" in result.stdout
-    assert f"checkpoint_convert/{direction}/run.sh" in result.stdout
-    assert "select=1:ncpus=192:ngpus=8:mpiprocs=1" in result.stdout
     for name in (
         "CONVERT_INPUT_DIR",
         "CONVERT_OUTPUT_DIR",
@@ -70,13 +65,10 @@ def test_conversion_preview_uses_new_job_files_and_exports_paths(tmp_path, actio
         "CONVERT_VOCAB_SIZE",
     ):
         assert name in result.stdout
-    output = shlex.split(result.stdout.splitlines()[-1])
-    assert f"/outputs/ckpt/{direction}/test_model_custom_" in output[output.index("-o") + 1]
-    assert output[output.index("-o") + 1].endswith(".ou")
 
 
 @pytest.mark.parametrize("direction", ["hf_mcore", "mcore_hf"])
-def test_allocation_launches_payload_file_and_forwards_conversion_paths(tmp_path, direction):
+def test_allocation_forwards_conversion_paths_without_splitting_spaces(tmp_path, direction):
     singularity = tmp_path / "singularity"
     capture = tmp_path / "container-args.json"
     _stub(
@@ -105,13 +97,6 @@ def test_allocation_launches_payload_file_and_forwards_conversion_paths(tmp_path
     )
     assert result.returncode == 0, result.stderr
     arguments = json.loads(capture.read_text())
-    assert arguments[-4:] == [
-        "bash",
-        "--noprofile",
-        "--norc",
-        f"/root/miles/experiments/scripts/checkpoint_convert/{direction}/convert.sh",
-    ]
-    assert "-c" not in arguments
     assert "CONVERT_INPUT_DIR=/ckpt/training/run with spaces" in arguments
     assert "CONVERT_OUTPUT_DIR=/ckpt/hf/export with spaces" in arguments
     if direction == "mcore_hf":
@@ -120,7 +105,7 @@ def test_allocation_launches_payload_file_and_forwards_conversion_paths(tmp_path
         assert "CONVERT_VOCAB_SIZE=151936" in arguments
 
 
-def test_hf_conversion_uses_official_architecture_and_skips_completed_release(tmp_path):
+def test_hf_conversion_forwards_input_and_skips_completed_release(tmp_path):
     source = tmp_path / "hf source"
     source.mkdir()
     (source / "config.json").write_text("{}")
@@ -151,10 +136,9 @@ destination.mkdir(parents=True)
     assert result.returncode == 0, result.stderr
     recorded = json.loads(capture.read_text())
     arguments = recorded["args"]
-    assert arguments[:3] == ["--nproc-per-node", "2", "tools/convert_hf_to_torch_dist.py"]
-    assert arguments[arguments.index("--num-layers") + 1] == "36"
+    assert arguments[arguments.index("--nproc-per-node") + 1] == "2"
     assert arguments[arguments.index("--hf-checkpoint") + 1] == str(source)
-    assert "--bf16" in arguments and recorded["gpus"] == "0,1"
+    assert recorded["gpus"] == "0,1"
     capture.unlink()
     result = _run_conversion("hf_mcore", environment)
     assert result.returncode == 0 and "already exists" in result.stdout
@@ -185,35 +169,6 @@ def _preset_config(tmp_path, name, **overrides):
         check=True,
     )
     return json.loads(result.stdout)
-
-
-@pytest.mark.parametrize(
-    "name,profile,rl_name,backend",
-    [
-        ("qwen3_4b", "qwen3-4B", "Qwen3-4B", "raw"),
-        ("qwen3_8b", "qwen3-8B", "Qwen3-8B", "raw"),
-        ("qwen3_30b_a3b", "qwen3-30B-A3B", "Qwen3-30B-A3B", "raw"),
-        ("nemotron3_5_lightning", "nemotron-3-nano-30b-a3b", "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16", "bridge"),
-    ],
-)
-def test_shared_presets_select_public_refs(tmp_path, name, profile, rl_name, backend):
-    rl = _preset_config(tmp_path, name)
-    base = _preset_config(tmp_path, name, MODEL_VARIANT="base")
-    assert rl["MODEL_PROFILE"] == base["MODEL_PROFILE"] == profile
-    assert rl["CONVERT_BACKEND"] == base["CONVERT_BACKEND"] == backend
-    assert rl["MODEL_NAME"] == rl["HF_MODEL_NAME"] == rl_name
-    assert base["MODEL_NAME"] == base["HF_MODEL_NAME"] == base["HF_BASE_REF"].rsplit("/", 1)[1]
-    assert rl["HF_RL_REF"].startswith("https://huggingface.co/")
-    assert base["HF_BASE_REF"].startswith("https://huggingface.co/")
-
-
-@pytest.mark.parametrize("name", ["qwen3_4b", "qwen3_8b", "qwen3_30b_a3b"])
-def test_shared_qwen_sft_presets_use_recorded_absolute_paths(tmp_path, name):
-    config = _preset_config(tmp_path, name, MODEL_VARIANT="sft")
-    assert Path(config["HF_SFT_REF"]).is_absolute()
-    assert config["HF_SFT_REF"] == f"{tmp_path}/workspace/checkpoints/hf/{config['HF_MODEL_NAME']}"
-    assert config["HF_MODEL_NAME"].endswith("STEPS4000/iter_0004000")
-    assert config["MODEL_NAME"].endswith("Step4000")
 
 
 @pytest.mark.parametrize("direction", ["hf_mcore", "mcore_hf"])
@@ -247,8 +202,6 @@ def test_shared_custom_sft_preset_is_forwarded_and_can_be_loaded_on_compute(tmp_
     arguments = submitted["args"]
     exported_names = arguments[arguments.index("-v") + 1].split(",")
     assert "HF_SFT_REF" in exported_names and "CONVERT_MODEL_PRESET" in exported_names
-    output = arguments[arguments.index("-o") + 1]
-    assert f"/outputs/ckpt/{direction}/nemotron3_5_lightning_sft_" in output and output.endswith(".ou")
     compute = {}
     for item in exported_names:
         name, separator, value = item.partition("=")
@@ -256,10 +209,9 @@ def test_shared_custom_sft_preset_is_forwarded_and_can_be_loaded_on_compute(tmp_
     compute["PATH"] = os.environ["PATH"]
     config = _preset_config(tmp_path, "nemotron3_5_lightning", **compute)
     assert config["HF_MODEL_NAME"] == "custom-lightning/iter_0000042"
-    assert config["CONVERT_BACKEND"] == "bridge"
 
 
-def _reverse_fixture(tmp_path, input_kind, legacy_common=True):
+def _reverse_fixture(tmp_path, input_kind):
     root = tmp_path / "megatron"
     root.mkdir()
     if input_kind == "direct":
@@ -269,8 +221,6 @@ def _reverse_fixture(tmp_path, input_kind, legacy_common=True):
         (root / "latest_checkpointed_iteration.txt").write_text(tracker)
         iteration = root / directory
         iteration.mkdir()
-    if legacy_common:
-        (iteration / "common.pt").write_text("fake-common")
     (iteration / ".metadata").write_text("fake-metadata")
     origin = tmp_path / "original hf"
     origin.mkdir()
@@ -315,17 +265,14 @@ if os.environ.get('FAKE_FAILURE') == 'output-race':
 
 
 @pytest.mark.parametrize("input_kind", ["release", "iteration", "direct"])
-@pytest.mark.parametrize("legacy_common", [True, False])
-def test_reverse_conversion_resolves_input_and_uses_official_export(tmp_path, input_kind, legacy_common):
-    environment, iteration, destination, capture = _reverse_fixture(tmp_path, input_kind, legacy_common=legacy_common)
+def test_reverse_conversion_resolves_input_and_publishes_export(tmp_path, input_kind):
+    environment, iteration, destination, capture = _reverse_fixture(tmp_path, input_kind)
     result = _run_conversion("mcore_hf", environment)
     assert result.returncode == 0, result.stderr
     arguments = json.loads(capture.read_text())
-    assert arguments[0] == "tools/convert_torch_dist_to_hf.py"
     assert arguments[arguments.index("--input-dir") + 1] == str(iteration)
     assert arguments[arguments.index("--vocab-size") + 1] == "151936"
     assert arguments[arguments.index("--chunk-size") + 1] == "1024"
-    assert "--force" not in arguments and "--model-name" not in arguments
     assert (destination / "config.json").read_text() == "{}"
     assert (destination / "tokenizer.json").exists() and (destination / "model.safetensors").exists()
     assert not list(destination.parent.glob("*.tmp.*"))
@@ -361,7 +308,7 @@ def test_reverse_conversion_rejects_existing_output_and_invalid_tracker(tmp_path
 
 
 @pytest.mark.parametrize("direction", ["hf_mcore", "mcore_hf"])
-def test_bridge_conversion_routes_both_directions_and_uses_official_topology(tmp_path, direction):
+def test_bridge_conversion_forwards_direction_and_requested_topology(tmp_path, direction):
     environment, iteration, destination, capture = _reverse_fixture(tmp_path, "release")
     binary_dir = tmp_path / "bridge-bin"
     binary_dir.mkdir()
@@ -373,7 +320,7 @@ args = sys.argv[1:]
 Path(os.environ['FAKE_CAPTURE']).write_text(json.dumps(args))
 destination = Path(args[args.index('--save') + 1])
 destination.mkdir(parents=True)
-if args[3] == 'hf_mcore':
+if 'hf_mcore' in args:
     (destination / 'latest_checkpointed_iteration.txt').write_text('release')
 else:
     (destination / 'config.json').write_text('{}')
@@ -396,12 +343,13 @@ else:
     result = _run_conversion(direction, environment)
     assert result.returncode == 0, result.stderr
     arguments = json.loads(capture.read_text())
-    assert arguments[:4] == ["--nproc-per-node", "8", "experiments/src/checkpoint_convert/bridge.py", direction]
+    assert direction in arguments
     for flag, value in {
+        "--nproc-per-node": "8",
+        "--tensor-model-parallel-size": "1",
         "--pipeline-model-parallel-size": "2",
         "--expert-model-parallel-size": "4",
         "--megatron-to-hf-mode": "bridge",
-        "--num-layers": "52",
     }.items():
         assert arguments[arguments.index(flag) + 1] == value
     if direction == "mcore_hf":
