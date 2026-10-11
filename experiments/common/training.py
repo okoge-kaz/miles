@@ -50,10 +50,14 @@ def validate_config(environment: Mapping[str, str]) -> None:
         "MAX_CONTEXT_LEN",
         "MAX_TOKENS_PER_GPU",
         "SAVE_INTERVAL",
-        "SAVE_RETAIN_INTERVAL",
     ):
         if int(environment[name]) <= 0:
             raise ValueError(f"{name} must be a positive integer")
+    retain_interval = environment["SAVE_RETAIN_INTERVAL"]
+    if retain_interval != "none":
+        retain_interval = int(retain_interval)
+        if retain_interval <= 0 or retain_interval % int(environment["SAVE_INTERVAL"]) != 0:
+            raise ValueError("SAVE_RETAIN_INTERVAL must be none or a positive multiple of SAVE_INTERVAL")
     for name in ("SKIP_ACTOR_FORWARD_ONLY", "SAVE_HF", "DUMP_ROLLOUT_DATA", "USE_CHECKPOINT_OPT_PARAM_SCHEDULER"):
         if environment[name] not in ("0", "1"):
             raise ValueError(f"{name} must be 0 or 1")
