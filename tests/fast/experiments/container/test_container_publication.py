@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+REPO_ROOT = Path(__file__).resolve().parents[4]
 
 
 @pytest.mark.parametrize("smoke_fails", [False, True])
