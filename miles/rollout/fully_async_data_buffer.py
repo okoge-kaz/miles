@@ -9,19 +9,21 @@ Every group-level decision lives here — what to keep, what to hand to
 
 import asyncio
 import logging
+import math
 from abc import ABC, abstractmethod
 from argparse import Namespace
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from miles.rollout.buffer_ordering import OrderedGroupBuffer
 from miles.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter
 from miles.rollout.filter_hub.common_filters import (
     GroupWeightVersionStats,
     apply_aborted_filter,
     apply_missing_reward_filter,
-    group_staleness,
     group_weight_version_stats,
 )
+from miles.rollout.staleness_metrics import staleness_value
 from miles.utils.function_registry import load_function
 from miles.utils.types import Sample
 
@@ -74,7 +76,7 @@ class DataBuffer(ABC):
 
 
 class DefaultDataBuffer(DataBuffer):
-    """FIFO buffer of finished groups, filtering out what training should not see.
+    """Ordered buffer of finished groups, filtering out what training should not see.
 
     Rejected on put, because the verdict is fixed once the group is generated:
 
@@ -101,7 +103,7 @@ class DefaultDataBuffer(DataBuffer):
         args = input.args
         self._args = args
 
-        self._buffer: list[DataBufferInput] = []
+        self._buffer = OrderedGroupBuffer(getattr(args, "async_data_buffer_order", "fifo"))
         assert args.async_data_buffer_capacity_factor > 0
         self._capacity = int(args.async_data_buffer_capacity_factor * args.rollout_batch_size)
         assert self._capacity >= 1
@@ -110,6 +112,8 @@ class DefaultDataBuffer(DataBuffer):
         self._dynamic_filter = load_function(args.dynamic_sampling_filter_path)
         self._cond = asyncio.Condition()
         self._current_version: int | None = None
+        self._staleness_definition = getattr(args, "async_staleness_metric", "oldest")
+        self._custom_staleness = load_function(getattr(args, "custom_staleness_function_path", None))
 
         self._metric_gatherer = MetricGatherer()
         self._metric_aborted_groups = 0
@@ -126,10 +130,11 @@ class DefaultDataBuffer(DataBuffer):
         if not self._preput_filter(input):
             return
 
+        stats = group_weight_version_stats(input.group)
         async with self._cond:
             while len(self._buffer) >= self._capacity:
                 await self._cond.wait()
-            self._buffer.append(input)
+            self._buffer.push(input, stats)
             self._cond.notify_all()
 
     def _preput_filter(self, input: DataBufferInput) -> bool:
@@ -157,11 +162,28 @@ class DefaultDataBuffer(DataBuffer):
             while True:
                 while not self._buffer:
                     await self._cond.wait()
-                entry = self._buffer.pop(0)
+                buffered = self._buffer.pop()
+                entry, version_stats = buffered.entry, buffered.stats
                 self._cond.notify_all()  # wake producers blocked on a full buffer
 
-                version_stats = group_weight_version_stats(entry.group)
-                staleness = version_stats.oldest_lag(current_version)
+                staleness = (
+                    self._custom_staleness(self._args, entry, current_version)
+                    if self._custom_staleness is not None
+                    else staleness_value(
+                        entry.group, version_stats, current_version, definition=self._staleness_definition
+                    )
+                )
+                requires_provenance = self._custom_staleness is not None or self._staleness_definition != "oldest"
+                if requires_provenance and staleness is not None:
+                    if (
+                        isinstance(staleness, bool)
+                        or not isinstance(staleness, (int, float))
+                        or not math.isfinite(staleness)
+                        or staleness < 0
+                    ):
+                        raise ValueError("Staleness definition must return a finite non-negative lag or None")
+                if staleness is None and requires_provenance and self._args.max_weight_staleness is not None:
+                    raise ValueError(f"Missing provenance for staleness definition {self._staleness_definition}")
                 if staleness is not None:
                     if self._args.max_weight_staleness is not None and staleness > self._args.max_weight_staleness:
                         logger.info(f"Filtered stale group ({staleness=} > max={self._args.max_weight_staleness})")
@@ -217,12 +239,9 @@ class DefaultDataBuffer(DataBuffer):
             metrics[f"{prefix}weight_version_sample_coverage"] = (
                 self._metric_selected_versioned_samples / self._metric_selected_samples
             )
-        buffered = [
-            s for entry in self._buffer if (s := group_staleness(entry.group, self._current_version)) is not None
-        ]
-        if buffered:
-            metrics[f"{prefix}buffer_avg_staleness"] = sum(buffered) / len(buffered)
-            metrics[f"{prefix}buffer_max_staleness"] = max(buffered)
+        metrics.update(
+            {f"{prefix}{key}": value for key, value in self._buffer.lag_summary(self._current_version).items()}
+        )
 
         self._metric_gatherer = MetricGatherer()
         self._metric_consumed_staleness = []

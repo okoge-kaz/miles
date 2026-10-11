@@ -12,7 +12,7 @@ from miles.backends.sglang_utils.arguments import add_sglang_arguments, collect_
 from miles.backends.sglang_utils.arguments import validate_args as sglang_validate_args
 from miles.dashboard.args import add_dashboard_arguments, validate_dashboard_args
 from miles.rollout.checkpoint_eval import is_checkpoint_eval_fn
-from miles.utils.async_buffer_arguments import add_buffer_arguments
+from miles.utils.async_buffer_arguments import add_buffer_arguments, validate_buffer_arguments
 from miles.utils.chat_template_utils.tito_tokenizer import TITOTokenizerType
 from miles.utils.environ import use_legacy_rollout_v1
 from miles.utils.eval_config import EvalDatasetConfig, build_eval_dataset_configs, ensure_dataset_list
@@ -747,10 +747,10 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 type=int,
                 default=None,
                 help=(
-                    "Maximum allowed gap between a group's oldest weight version and the current "
-                    "engine weight version. Groups exceeding this threshold are recycled back to "
-                    "the data buffer instead of being sent to training. Only effective in fully "
-                    "async mode. None (default) disables staleness filtering."
+                    "Maximum allowed lag under --async-staleness-metric or the custom staleness function. "
+                    "The default measures the gap from the group's oldest generated weight version. "
+                    "Groups exceeding the limit follow --async-unused-samples-handler. Only effective "
+                    "in fully async mode. None (default) disables staleness filtering."
                 ),
             )
             parser.add_argument(
@@ -3368,6 +3368,7 @@ def miles_validate_args(args):
         )
 
     _resolve_rollout_functions(args)
+    validate_buffer_arguments(args)
 
     # Both snapshot postures drive the same RolloutManager._eval_checkpoint path.
     # (The fleet-vs-CheckpointEvalFn conflict is asserted where the posture is derived.)

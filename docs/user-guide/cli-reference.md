@@ -294,6 +294,9 @@ Evaluation reports scored and unscored counts separately and computes reward met
 | Flag | Type | Default | Notes |
 |---|---|---|---|
 | `--log-category-staleness` | flag | off | Selected-batch category proportions and measured version-lag distributions, including missing-provenance coverage. |
+| `--async-data-buffer-order` | enum | `fifo` | Built-in fully-async buffer: `fifo` or `oldest-policy-first`. Priority uses the oldest generated version; ties retain insertion order and unknown versions come last. |
+| `--async-staleness-metric` | enum | `oldest` | Definition used by `--max-weight-staleness`: `oldest`, `newest`, `token-mean`, `submission`, `first-prefill`, or `ready`. Non-default definitions with a bound require measured provenance. |
+| `--custom-staleness-function-path` | str | – | Override with `(args, DataBufferInput, current_version) -> nonnegative finite lag or None`. Requires the built-in fully-async buffer. |
 
 ### SGLang and router
 
