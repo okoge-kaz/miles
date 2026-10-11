@@ -1,5 +1,6 @@
 import json
 import os
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -8,10 +9,24 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[4]
 
 
-@pytest.mark.parametrize("smoke_fails", [False, True])
-def test_image_publication_checks_release_pins_and_preserves_link_on_smoke_failure(tmp_path, smoke_fails):
+@pytest.mark.parametrize(
+    "code_sandbox,nemo_gym,failure_stage",
+    [
+        (False, False, None),
+        (False, False, "base"),
+        (True, False, None),
+        (True, False, "sandbox"),
+        (True, True, None),
+        (True, True, "sandbox"),
+        (True, True, "nemo_gym"),
+    ],
+)
+def test_image_publication_checks_release_pins_and_preserves_link_on_smoke_failure(
+    tmp_path, code_sandbox, nemo_gym, failure_stage
+):
     singularity = tmp_path / "singularity"
     capture = tmp_path / "singularity.args"
+    smoke_stages = tmp_path / "smoke-stages"
     singularity.write_text("""#!/bin/bash
 printf '%s\\0' "$@" >> "${FAKE_CAPTURE}"
 case "$1" in
@@ -19,7 +34,17 @@ case "$1" in
         args=("$@")
         printf 'fake-sif\\n' > "${args[${#args[@]}-2]}"
         ;;
-    exec) [[ "${FAKE_SMOKE_FAIL}" == 0 ]] || exit 12 ;;
+    exec)
+        stage=base
+        for argument in "$@"; do
+            case "${argument}" in
+                /opt/miles/verify_code_sandbox.py) stage=sandbox ;;
+                experiments.src.nemo_gym.runtime.verify) stage=nemo_gym ;;
+            esac
+        done
+        printf '%s\\n' "${stage}" >> "${FAKE_SMOKE_STAGES}"
+        [[ "${FAKE_SMOKE_FAIL}" != "${stage}" ]] || exit 12
+        ;;
     --version) printf 'singularity-ce version 4.4.1\\n' ;;
 esac
 """)
@@ -40,8 +65,11 @@ esac
         "IMPORT_OUTPUT_IMAGE": str(dated),
         "DOCKER_IMAGE": "example/miles:test",
         "SINGULARITY_BIN": str(singularity),
+        "INSTALL_CODE_SANDBOX": str(int(code_sandbox)),
+        "INSTALL_NEMO_GYM": str(int(nemo_gym)),
         "FAKE_CAPTURE": str(capture),
-        "FAKE_SMOKE_FAIL": str(int(smoke_fails)),
+        "FAKE_SMOKE_STAGES": str(smoke_stages),
+        "FAKE_SMOKE_FAIL": failure_stage or "none",
     }
     result = subprocess.run(
         ["bash", "experiments/container/import_image.sh"],
@@ -55,10 +83,15 @@ esac
     assert f"SGLANG_COMMIT={lock['sglang_commit']}" in arguments
     assert f"MEGATRON_COMMIT={lock['megatron_commit']}" in arguments
     assert "DOCKER_IMAGE=example/miles:test" in arguments
-    if smoke_fails:
+    assert f"INSTALL_CODE_SANDBOX={int(code_sandbox)}" in arguments
+    assert f"INSTALL_NEMO_GYM={int(nemo_gym)}" in arguments
+    expected_stages = ["base", *(["sandbox"] if code_sandbox else []), *(["nemo_gym"] if nemo_gym else [])]
+    if failure_stage:
+        expected_stages = expected_stages[: expected_stages.index(failure_stage) + 1]
         assert result.returncode == 12
         assert stable.resolve() == old_image
         assert not dated.exists() and not Path(f"{dated}.sha256").exists()
+        assert not Path(f"{dated}.provenance.env").exists()
     else:
         assert result.returncode == 0, result.stderr
         assert stable.resolve() == dated
@@ -67,9 +100,34 @@ esac
             ["sha256sum", "--check", f"{dated.name}.sha256"], cwd=containers, capture_output=True
         )
         assert checksum.returncode == 0
-        assert f"sglang_commit={lock['sglang_commit']}" in Path(f"{dated}.provenance.env").read_text()
+        provenance = Path(f"{dated}.provenance.env").read_text()
+        assert f"sglang_commit={lock['sglang_commit']}" in provenance
+        assert f"code_sandbox_enabled={int(code_sandbox)}" in provenance
+        assert f"nemo_gym_enabled={int(nemo_gym)}" in provenance
+    assert smoke_stages.read_text().splitlines() == expected_stages
     assert old_image.read_text() == "old-image"
     assert not list(containers.glob("*.partial-*")) and not list(containers.glob("*.publishing-*"))
+
+
+def test_container_build_features_reach_the_pbs_job(tmp_path):
+    result = subprocess.run(
+        ["bash", "experiments/setup.sh", "container"],
+        cwd=REPO_ROOT,
+        env={
+            "PATH": os.environ["PATH"],
+            "WANDB_MODE": "disabled",
+            "MILES_WORKSPACE_ROOT": str(tmp_path / "workspace"),
+            "INSTALL_CODE_SANDBOX": "1",
+            "INSTALL_NEMO_GYM": "1",
+        },
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    command = shlex.split(result.stdout)
+    exported = command[command.index("-v") + 1].split(",")
+    assert {"INSTALL_CODE_SANDBOX", "INSTALL_NEMO_GYM"} <= set(exported)
+    assert "-V" not in command
 
 
 def test_checkpoint_cleanup_rejects_symlink_escape(tmp_path):

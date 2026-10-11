@@ -17,6 +17,14 @@ stable_image="${SINGULARITY_LINK-${CONTAINER_IMAGE}}"
 definition_file="${MILES_REPO}/experiments/container/miles.def"
 sglang_patch_file="${MILES_REPO}/experiments/container/sglang-v0.1.1-provenance.patch"
 : "${APPLY_SGLANG_PROVENANCE_PATCH:=0}"
+: "${INSTALL_CODE_SANDBOX:=0}"
+: "${INSTALL_NEMO_GYM:=0}"
+[[ "${INSTALL_NEMO_GYM}" == 0 || "${INSTALL_NEMO_GYM}" == 1 ]] || {
+    echo "INSTALL_NEMO_GYM must be 0 or 1" >&2; exit 2
+}
+[[ "${INSTALL_CODE_SANDBOX}" == 0 || "${INSTALL_CODE_SANDBOX}" == 1 ]] || {
+    echo "INSTALL_CODE_SANDBOX must be 0 or 1" >&2; exit 2
+}
 [[ "${APPLY_SGLANG_PROVENANCE_PATCH}" == 0 || "${APPLY_SGLANG_PROVENANCE_PATCH}" == 1 ]] || {
     echo "APPLY_SGLANG_PROVENANCE_PATCH must be 0 or 1" >&2; exit 2
 }
@@ -71,6 +79,17 @@ trap 'exit 143' TERM
 trap 'exit 130' INT
 install -m 0644 -- "${definition_file}" "${build_dir}/miles.def"
 install -m 0644 -- "${sglang_patch_file}" "${build_dir}/sglang-provenance.patch"
+for asset in prepare_code_sandbox.py verify_code_sandbox.py code_sandbox.requirements.json; do
+    install -m 0644 -- "${MILES_REPO}/experiments/container/${asset}" "${build_dir}/${asset}"
+done
+mkdir -p "${build_dir}/nemo_gym/runtime" "${build_dir}/nemo_gym/patches"
+if [[ "${INSTALL_NEMO_GYM}" == 1 ]]; then
+    cp -- "${MILES_REPO}/experiments/src/nemo_gym/runtime/"{setup.py,sources.lock.json,requirements.lock.txt} \
+        "${build_dir}/nemo_gym/runtime/"
+    cp -- "${MILES_REPO}/experiments/src/nemo_gym/patches/"*.patch "${build_dir}/nemo_gym/patches/"
+fi
+code_sandbox_requirements_sha256="$(sha256sum "${build_dir}/code_sandbox.requirements.json")"
+code_sandbox_requirements_sha256="${code_sandbox_requirements_sha256%% *}"
 definition_sha256="$(sha256sum "${build_dir}/miles.def")"
 definition_sha256="${definition_sha256%% *}"
 export SINGULARITY_TMPDIR="${build_dir}" APPTAINER_TMPDIR="${build_dir}"
@@ -84,6 +103,10 @@ echo "building docker://${oci_image} in ${build_dir}"
     --build-arg "SGLANG_PATCH_FILE=${build_dir}/sglang-provenance.patch" \
     --build-arg "SGLANG_PATCH_SHA256=${sglang_patch_sha256}" \
     --build-arg "APPLY_SGLANG_PROVENANCE_PATCH=${APPLY_SGLANG_PROVENANCE_PATCH}" \
+    --build-arg "INSTALL_CODE_SANDBOX=${INSTALL_CODE_SANDBOX}" \
+    --build-arg "CODE_SANDBOX_BUILD_DIR=${build_dir}" \
+    --build-arg "INSTALL_NEMO_GYM=${INSTALL_NEMO_GYM}" \
+    --build-arg "NEMO_GYM_BUILD_DIR=${build_dir}/nemo_gym" \
     "${local_image}" "${build_dir}/miles.def"
 
 # Test the actual mounts as the ordinary submitting UID before publication.
@@ -104,6 +127,18 @@ test "$(git -c safe.directory=/sgl-workspace/sglang -C /sgl-workspace/sglang rev
 test "$(git -c safe.directory=/root/Megatron-LM -C /root/Megatron-LM rev-parse HEAD)" = "${MEGATRON_COMMIT}"
 PYTHONPATH=/root/miles:/root/Megatron-LM python3 -c "import megatron, miles, sglang, ray"
 '
+if [[ "${INSTALL_CODE_SANDBOX}" == 1 ]]; then
+    miles_container_exec --image "${local_image}" --bind "${CONTAINER_MOUNTS}" \
+        --cwd /root/miles --no-nv --cleanenv \
+        env PYTHONPATH=/root/miles:/root/Megatron-LM python3 /opt/miles/verify_code_sandbox.py --sandbox
+fi
+if [[ "${INSTALL_NEMO_GYM}" == 1 ]]; then
+    miles_container_exec --image "${local_image}" --bind "${CONTAINER_MOUNTS}" \
+        --cwd /root/miles --no-nv --cleanenv \
+        env PYTHONPATH=/root/miles:/opt/nemo-gym OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+        /opt/nemo-gym/.venv/bin/python -m experiments.src.nemo_gym.runtime.verify \
+        --state-dir "/root/miles/experiments/outputs/validation/nemo-gym-image-${job_id}"
+fi
 image_sha256="$(sha256sum "${local_image}")"
 image_sha256="${image_sha256%% *}"
 printf '%s  %s\n' "${image_sha256}" "$(basename -- "${dated_image}")" > "${partial_checksum}"
@@ -113,6 +148,9 @@ sglang_commit=${SGLANG_COMMIT}
 megatron_commit=${MEGATRON_COMMIT}
 sglang_provenance_patch_enabled=${APPLY_SGLANG_PROVENANCE_PATCH}
 sglang_provenance_patch_sha256=${sglang_patch_sha256}
+code_sandbox_enabled=${INSTALL_CODE_SANDBOX}
+nemo_gym_enabled=${INSTALL_NEMO_GYM}
+code_sandbox_requirements_sha256=${code_sandbox_requirements_sha256}
 definition_sha256=${definition_sha256}
 image_sha256=${image_sha256}
 singularity_version=$("${SINGULARITY_BIN}" --version)

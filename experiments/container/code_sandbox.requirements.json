@@ -1,0 +1,5 @@
+{
+  "schema": 2,
+  "sandbox_commands": ["bwrap", "unshare", "mount", "prlimit", "g++", "timeout"],
+  "environment_runtime": "separate-nemo-gym-cpu-venv"
+}
