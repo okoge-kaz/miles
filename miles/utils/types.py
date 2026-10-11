@@ -7,7 +7,6 @@ import torch
 
 from miles.utils.sampling_mask import RolloutSamplingMask
 
-
 LEGACY_WEIGHT_VERSIONS_KEY = "legacy_weight_versions"
 
 

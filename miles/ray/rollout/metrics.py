@@ -143,9 +143,9 @@ def _compute_metrics_from_samples(args, samples):
             }
             for strict_type, threshold in strict_thresholds.items():
                 rate = log_dict.get(f"{metric_prefix}/{strict_type}", 0)
-                assert (
-                    rate <= threshold
-                ), f"{metric_prefix}/{strict_type}={rate:.4f} exceeds {threshold} — this indicates a bug in the TITO algorithm or chat template. Please check your tito model and chat template."
+                assert rate <= threshold, (
+                    f"{metric_prefix}/{strict_type}={rate:.4f} exceeds {threshold} — this indicates a bug in the TITO algorithm or chat template. Please check your tito model and chat template."
+                )
             # assistant_text mismatch is non-critical: assistant tokens are inherited
             # from the pretokenized prefix and may differ from canonical tokenization.
 

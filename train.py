@@ -31,9 +31,9 @@ async def train(args):
     init_tracking(args)
 
     if args.colocate_memory_peak_device == "gpu":
-        assert (
-            args.offload_train and args.offload_rollout
-        ), "--colocate-memory-peak-device gpu requires --offload-train and --offload-rollout"
+        assert args.offload_train and args.offload_rollout, (
+            "--colocate-memory-peak-device gpu requires --offload-train and --offload-rollout"
+        )
         assert not args.use_critic, "--colocate-memory-peak-device gpu is not wired for the critic path"
 
     # create the rollout manager, with sglang engines inside.
