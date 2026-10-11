@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import time
+from time import monotonic
 
 import ray
 
@@ -124,7 +125,11 @@ class RolloutExecutor:
         if (get_buffer_length := getattr(self.data_source, "get_buffer_length", None)) is not None:
             dashboard_hooks.report_data_buffer(get_buffer_length())
         with timer("rollout"):
+            wait_start = monotonic()
             data, metadata, metrics = await self._get_rollout_data(rollout_id=rollout_id)
+            batch_wait_time = monotonic() - wait_start
+        if getattr(self.args, "fully_async", False):
+            metrics = {**(metrics or {}), "perf/rollout_wait_time": batch_wait_time}
         save_debug_rollout_data(self.args, data, rollout_id=rollout_id, evaluation=False, metadata=metadata)
         if getattr(self.args, "log_category_staleness", False):
             targets = getattr(getattr(self.data_source, "dataset", None), "category_target_group_fractions", None)

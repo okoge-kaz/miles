@@ -138,6 +138,42 @@ class TestRolloutFunctionConstruction:
 
 @pytest.mark.asyncio
 class TestGenerate:
+    @pytest.mark.parametrize("fully_async", [False, True])
+    async def test_async_batch_wait_excludes_debug_and_category_logging(
+        self, ray_local_mode, patch_low_level, monkeypatch, fully_async
+    ):
+        import miles.ray.rollout.rollout_executor as rexec
+
+        now = [100.0]
+        monkeypatch.setattr(rexec, "monotonic", lambda: now[0])
+        args = _make_test_args(fully_async=fully_async, log_category_staleness=True)
+        args.global_batch_size = 4
+        executor = _make_executor(args)
+        executor.set_train_parallel_config({"dp_size": 1})
+
+        def generate(input):
+            now[0] += 2
+            return RolloutFnTrainOutput(
+                samples=[make_samples_grouped(n_groups=1, group_size=4)], metrics={"rollout/custom": 7}
+            )
+
+        def slow_log_preparation(*args, **kwargs):
+            now[0] += 100
+            return {}
+
+        captured = {}
+        monkeypatch.setattr(rexec, "save_debug_rollout_data", slow_log_preparation)
+        monkeypatch.setattr(rexec, "batch_category_staleness_metrics", slow_log_preparation)
+        monkeypatch.setattr(rexec, "log_rollout_data", lambda rid, args, data, metrics, elapsed: captured.update(metrics))
+        executor.generate_rollout = generate
+        await executor.get(rollout_id=0)
+
+        assert captured["rollout/custom"] == 7
+        if fully_async:
+            assert captured["perf/rollout_wait_time"] == 2
+        else:
+            assert "perf/rollout_wait_time" not in captured
+
     async def test_invokes_rollout_fn_with_correct_input_and_returns_dp_split(self, ray_local_mode, patch_low_level):
         """generate passes a train input and returns the samples split per dp rank."""
         args = _make_test_args()
