@@ -67,3 +67,49 @@ def test_replay_cursor_resume_rejects_changed_prompt_content(tmp_path, monkeypat
     path.write_text('{"prompt":"changed","label":"answer"}\n')
     with pytest.raises(ValueError, match="differ"):
         RolloutDataSource(args).load_state_dict(state)
+
+
+@pytest.mark.parametrize("shuffle", [False, True])
+def test_mixture_cursor_resume_across_multiple_epochs_and_source_change_rejection(tmp_path, monkeypatch, shuffle):
+    paths = []
+    for name in ("math", "code"):
+        path = tmp_path / f"{name}.jsonl"
+        path.write_text("\n".join(json.dumps({"prompt": f"{name}{i}", "label": "answer"}) for i in range(2)) + "\n")
+        paths.append(str(path))
+    monkeypatch.setattr(source_module, "load_tokenizer", lambda *a, **kw: object())
+    monkeypatch.setattr(source_module, "load_processor", lambda *a, **kw: None)
+    args = _make_args(
+        rollout_global_dataset=True,
+        prompt_data=None,
+        prompt_data_files=paths,
+        prompt_data_ratios=[0.75, 0.25],
+        prompt_data_epoch_size=4,
+        hf_checkpoint="model",
+        chat_template_path=None,
+        dump_details=None,
+        rollout_max_prompt_len=None,
+        input_key="prompt",
+        label_key="label",
+        multimodal_keys=None,
+        metadata_key="metadata",
+        tool_key=None,
+        apply_chat_template=False,
+        apply_chat_template_kwargs=None,
+        rollout_seed=42,
+        rollout_shuffle=shuffle,
+        n_samples_per_prompt=2,
+        save=str(tmp_path),
+        load=str(tmp_path),
+    )
+    source = RolloutDataSource(args)
+    source.get_samples(5)
+    source.save(3)
+    expected = [[(s.prompt, s.index, s.group_index, s.metadata) for s in g] for g in source.get_samples(7)]
+    resumed = RolloutDataSource(args)
+    resumed.load(3)
+    actual = [[(s.prompt, s.index, s.group_index, s.metadata) for s in g] for g in resumed.get_samples(7)]
+    assert actual == expected
+    Path(paths[0]).write_text('{"prompt":"different","label":"answer"}\n')
+    changed = RolloutDataSource(args)
+    with pytest.raises(ValueError, match="differ"):
+        changed.load(3)

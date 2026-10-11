@@ -14,6 +14,7 @@ from miles.dashboard.args import add_dashboard_arguments, validate_dashboard_arg
 from miles.rollout.checkpoint_eval import is_checkpoint_eval_fn
 from miles.utils.async_buffer_arguments import add_buffer_arguments, validate_buffer_arguments
 from miles.utils.chat_template_utils.tito_tokenizer import TITOTokenizerType
+from miles.utils.dataset_mixture import validate_prompt_arguments
 from miles.utils.environ import use_legacy_rollout_v1
 from miles.utils.eval_config import EvalDatasetConfig, build_eval_dataset_configs, ensure_dataset_list
 from miles.utils.file_arg_utils import resolve_file_arg
@@ -1108,6 +1109,30 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument("--apply-chat-template", action="store_true", default=False)
+            parser.add_argument(
+                "--prompt-data-files",
+                nargs="+",
+                default=None,
+                help="Multiple prompt JSONL/parquet sources; preserves the single-path --prompt-data API.",
+            )
+            parser.add_argument(
+                "--prompt-data-ratios",
+                nargs="+",
+                type=float,
+                default=None,
+                help="Per-source epoch ratios, paired with --prompt-data-files.",
+            )
+            parser.add_argument(
+                "--prompt-data-config",
+                default=None,
+                help="YAML/JSON file or base64: inline JSON with paths, ratios, categories, generation/reward hooks.",
+            )
+            parser.add_argument(
+                "--prompt-data-epoch-size",
+                type=int,
+                default=None,
+                help="Prompt groups per mixture cycle, not training steps; defaults to total filtered source rows.",
+            )
             # Temporarily be JSON-serialized str, will be a real dict after using Omegaconf
             parser.add_argument("--apply-chat-template-kwargs", type=json.loads, default="{}")
             parser.add_argument(
@@ -3368,6 +3393,7 @@ def miles_validate_args(args):
         )
 
     _resolve_rollout_functions(args)
+    validate_prompt_arguments(args)
     validate_buffer_arguments(args)
 
     # Both snapshot postures drive the same RolloutManager._eval_checkpoint path.

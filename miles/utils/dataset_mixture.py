@@ -79,6 +79,19 @@ def prompt_sources(args) -> tuple[list[PromptSource], int | None]:
     return sources, size
 
 
+def validate_prompt_arguments(args) -> None:
+    files = getattr(args, "prompt_data_files", None)
+    config = getattr(args, "prompt_data_config", None)
+    if getattr(args, "prompt_data_ratios", None) is not None and not files:
+        raise ValueError("--prompt-data-ratios requires --prompt-data-files; config files carry their own ratios")
+    if getattr(args, "prompt_data_epoch_size", None) is not None and not (files or config):
+        raise ValueError("--prompt-data-epoch-size requires a mixture")
+    if files or config:
+        if not args.rollout_global_dataset:
+            raise ValueError("Prompt mixture options require the global rollout dataset")
+        prompt_sources(args)
+
+
 def _validate_sources(sources: list[PromptSource]) -> None:
     if not sources:
         raise ValueError("Prompt mixture needs nonempty, unique source names")

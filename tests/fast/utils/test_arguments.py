@@ -92,6 +92,38 @@ class TestAddArgumentsSupport:
             get_miles_extra_args_provider()(parser)
 
 
+class TestPromptMixtureArguments:
+    def _parse(self, extra):
+        parser = argparse.ArgumentParser()
+        get_miles_extra_args_provider()(parser)
+        return parser.parse_args(extra + ["--num-rollout", "1"] + REQUIRED_ARGS)
+
+    @pytest.mark.parametrize("fully_async", [False, True])
+    def test_step_limited_mixture_accepts_ratios_without_replay(self, fully_async):
+        extra = ["--prompt-data-files", "math.jsonl", "code.jsonl", "--prompt-data-ratios", "0.75", "0.25"]
+        if fully_async:
+            extra += ["--fully-async", "--pause-generation-mode", "in_place"]
+        args = self._parse(extra)
+        miles_validate_args(args)
+        assert args.prompt_data_ratios == [0.75, 0.25]
+        assert args.prompt_data_epoch_size is None and not args.use_replay_data_buffer
+
+    @pytest.mark.parametrize(
+        "extra,message",
+        [
+            (["--prompt-data-ratios", "1"], "requires --prompt-data-files"),
+            (["--prompt-data-epoch-size", "10"], "requires a mixture"),
+            (["--prompt-data-files", "a", "b", "--prompt-data-ratios", "1"], "one ratio per"),
+            (["--prompt-data-files", "a", "--prompt-data", "b"], "exactly one"),
+            (["--prompt-data-files", "a", "--prompt-data-epoch-size", "0"], "positive integer"),
+            (["--prompt-data-files", "a", "--disable-rollout-global-dataset"], "require the global rollout dataset"),
+        ],
+    )
+    def test_invalid_mixture_options_fail_during_argument_validation(self, extra, message):
+        with pytest.raises(ValueError, match=message):
+            miles_validate_args(self._parse(extra))
+
+
 class TestMaybeApplyDumperOverrides:
     def _make_args(
         self,

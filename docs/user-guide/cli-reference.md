@@ -85,7 +85,7 @@ then push up until you OOM.
 | `--rollout-max-response-len` | `–` | Max tokens per response. |
 | `--rollout-stop-token-ids` | model default | Stop token IDs. Override when generations don't stop. |
 | `--apply-chat-template` | off | Apply the tokenizer's chat template. |
-| `--rollout-shuffle` | off | Shuffle prompts each rollout. |
+| `--rollout-shuffle` | off | Shuffle prompts each dataset epoch. |
 
 ### Optimizer
 
@@ -168,12 +168,16 @@ Sections mirror the launch-script argument groups.
 
 | Flag | Type | Default | Notes |
 |---|---|---|---|
-| `--prompt-data` | str | – | Path to a single JSONL file. |
+| `--prompt-data` | str | – | Path to a single JSONL or Parquet file. |
+| `--prompt-data-files` | str+ | – | Multiple JSONL/Parquet sources; mutually exclusive with `--prompt-data` and `--prompt-data-config`. |
+| `--prompt-data-ratios` | float+ | – | One non-negative relative weight per `--prompt-data-files` entry; at least one must be positive. Omit to weight by filtered source row counts. |
+| `--prompt-data-config` | str | – | JSON/YAML file or `base64:` JSON containing `datasets` and optional `epoch_size`. Sources specify names, paths, ratios, categories, field mappings and reward/generation hooks. |
+| `--prompt-data-epoch-size` | int | filtered row total | Prompt groups per mixture cycle; overrides the config's `epoch_size`. Requires a mixture and a positive integer. |
 | `--input-key` | str | `input` | JSONL key to `Sample.prompt`. |
 | `--label-key` | str | `None` | JSONL key to `Sample.label`. |
 | `--metadata-key` | str | `metadata` | JSONL key to `Sample.metadata`. |
 | `--apply-chat-template` | flag | off | Apply tokenizer chat template. |
-| `--rollout-shuffle` | flag | off | Shuffle prompts each rollout. |
+| `--rollout-shuffle` | flag | off | Shuffle prompts each dataset epoch. Mixtures shuffle within sources and after mixing using `rollout_seed + epoch_id`. |
 | `--num-rollout` | int | – | Total rollout iterations. If unset, derived from dataset size. |
 | `--rollout-batch-size` | int | – | Prompts per rollout. |
 | `--n-samples-per-prompt` | int | `1` | Responses per prompt. |
@@ -181,6 +185,17 @@ Sections mirror the launch-script argument groups.
 | `--num-steps-per-rollout` | int | – | Optimizer steps per rollout. Alternative to `--global-batch-size`; setting one derives the other. |
 | `--over-sampling-batch-size` | int | – | Oversample size for dynamic sampling (DAPO). |
 | `--balance-data` | flag | off | Balance per-rank token count. |
+
+Mixtures require the global rollout dataset. Source ratios are normalized and converted
+to integer group counts for each cycle using largest remainders. A source repeats when
+its allocation exceeds its row count; ratio zero selects no prompts. An active source
+with no rows after prompt-length filtering is rejected.
+
+The cycle size does not set the training step count. `--num-rollout` still controls the
+number of rollout batches. Ratios describe the input groups over a complete cycle;
+partial cycles, asynchronous completion and reward filtering can change the proportions
+in each training batch. File configs resolve relative source paths beside the config;
+inline configs require absolute paths.
 
 ### Rollout: sampling
 
