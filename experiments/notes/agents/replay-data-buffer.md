@@ -15,6 +15,20 @@ Restored groups are consumed once, subject to the usual staleness filter.
 `--use-replay-buffer` and `--replay-buffer-async-restore` remain aliases.
 Legacy environment variables are fallbacks; the new variables take precedence, including explicit `0` values.
 
+### staleness_math の設定
+
+`zero_loss_truncation` / `zero_reward_truncation` は次の条件を recipe 内で固定する。
+適用範囲は `scripts/staleness_math/` 配下のみで、共通処理や他の recipe では強制 OFF にしない。
+環境変数で逆の組合せを指定した場合も、この条件を優先する。
+
+- R3 有効時は `USE_REPLAY_DATA_BUFFER=0`、`REPLAY_DATA_BUFFER_ASYNC_RESTORE=0` にする。
+  未使用の `REPLAY_DATA_BUFFER_MODE` は `rollout` に戻す。
+  ReplayDataBuffer の ON 指定を OFF に変更した場合は、recipe 名・変更内容・保存 overhead の理由を stderr に警告する。
+- R3 無効かつ ReplayDataBuffer 有効時は `REPLAY_DATA_BUFFER_ASYNC_RESTORE=1` にする。
+  復元データから次の train batch が揃えば、残り全体の読み込みを待たずに学習を開始する。
+
+ReplayDataBuffer 自体の既定は OFF。上の条件は旧環境変数の fallback を解決した後に適用する。
+
 ## Implementation and checkpoint format
 
 | Module | Responsibility |
@@ -86,6 +100,11 @@ A save requested during restore removes capacity backpressure and loads the enti
 Memory use and waiting time for this save therefore depend on the remaining buffer size.
 
 ## Rollout routing replay (R3)
+
+R3 では token・layer・top-k expert ごとの routing 配列も ReplayDataBuffer に保存するため、
+checkpoint のデータ量が増え、シリアライズ・書き込みによる save overhead が大きい。
+このため `staleness_math` の両 recipe は R3 有効時に ReplayDataBuffer を OFF にする。
+非同期復元は resume の読み込み待ちを短縮する option であり、この保存 overhead は解消しない。
 
 R3 (`--use-rollout-routing-replay`) reuses MoE expert-routing decisions during training.
 Its compatibility with ReplayDataBuffer depends on the restore mode:
