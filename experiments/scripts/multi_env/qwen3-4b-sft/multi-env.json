@@ -1,0 +1,40 @@
+{
+  "datasets": [
+    {
+      "name": "dapo_math",
+      "category": "math",
+      "path": "/data/dapo-math-nonzero-std-qwen3-4b-sft-iter4000/dapo-math-nonzero-std-qwen3-4b-sft-iter4000.jsonl",
+      "ratio": 0.2,
+      "rm_type": "deepscaler"
+    },
+    {
+      "name": "nemotron_code",
+      "category": "code",
+      "path": "/data/nemotron-code-nonzero-std-qwen3-4b-sft-iter4000/nemotron-code-nonzero-std-qwen3-4b-sft-iter4000.jsonl",
+      "ratio": 0.2,
+      "custom_rm_path": "experiments.src.nemo_gym.bridge.reward.reward"
+    },
+    {
+      "name": "nemotron_mcqa",
+      "category": "mcqa",
+      "path": "/data/nemotron-mcqa-nonzero-std-qwen3-4b-sft-iter4000/nemotron-mcqa-nonzero-std-qwen3-4b-sft-iter4000.jsonl",
+      "ratio": 0.2,
+      "custom_rm_path": "experiments.src.nemo_gym.bridge.reward.reward"
+    },
+    {
+      "name": "instruction_following",
+      "category": "ifevalg",
+      "path": "/data/instruction-following-nonzero-std-qwen3-4b-sft-iter4000/instruction-following-nonzero-std-qwen3-4b-sft-iter4000.jsonl",
+      "ratio": 0.2,
+      "custom_rm_path": "experiments.src.nemo_gym.bridge.reward.reward"
+    },
+    {
+      "name": "tau2",
+      "category": "tool",
+      "path": "/data/multi_env/tau2-train.jsonl",
+      "ratio": 0.2,
+      "generate_function_path": "experiments.src.nemo_gym.bridge.generate.generate",
+      "custom_rm_path": "experiments.src.nemo_gym.bridge.reward.reward"
+    }
+  ]
+}
