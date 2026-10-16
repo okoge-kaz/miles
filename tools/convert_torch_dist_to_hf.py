@@ -13,6 +13,7 @@ from typing_extensions import override
 
 from miles.backends.megatron_utils.megatron_to_hf import convert_to_hf, remove_padding
 from miles.utils.hf_utils.config import load_hf_config
+from miles.utils.torch_dist_checkpoint import load_common_state
 
 
 class UnpicklerWrapper(pickle.Unpickler):
@@ -53,7 +54,7 @@ class EmptyStateDictLoadPlanner(dist_cp.default_planner.DefaultLoadPlanner):
         is_coordinator: bool = False,
     ) -> None:
         for k, v in metadata.state_dict_metadata.items():
-            if "optimizer" in k or "_state" in k:
+            if "optimizer" in k or "_state" in k or not isinstance(v, dist_cp.metadata.TensorStorageMetadata):
                 continue
             print(f"find {k} in torch_dist ckpt")
             if isinstance(v, dist_cp.metadata.TensorStorageMetadata):
@@ -200,7 +201,7 @@ if __name__ == "__main__":
     state_dict = {}
     print(f"loading model from {args.input_dir}")
     t = time.time()
-    megatron_args = torch.load(os.path.join(args.input_dir, "common.pt"), weights_only=False)["args"]
+    megatron_args = load_common_state(args.input_dir)["args"]
     if args.origin_hf_dir:
         megatron_args.hf_checkpoint = args.origin_hf_dir
     dist_cp.state_dict_loader._load_state_dict(

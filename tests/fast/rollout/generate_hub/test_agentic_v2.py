@@ -142,6 +142,7 @@ async def test_empty_reply_returns_aborted_list(monkeypatch, empty_reason):
     assert len(output.samples) == 1
     assert output.samples[0] is not generate_input.sample
     assert output.samples[0].status == Sample.Status.ABORTED
+    assert output.samples[0].metadata["agent_result"] == "done"
     assert SESSION_ROLLOUT_METRICS_KEY not in output.samples[0].metadata
 
 
@@ -156,6 +157,7 @@ async def test_transport_collection_error_has_no_metrics_owner(monkeypatch):
 
     (sample,) = output.samples
     assert sample.status == Sample.Status.ABORTED
+    assert sample.metadata["agent_result"] == "done"
     assert SESSION_ROLLOUT_METRICS_KEY not in sample.metadata
 
 

@@ -109,6 +109,7 @@ class FakeTrainingModel:
         self.saved: list[int] = []
         self.external_data: dict[int, Any] = {}
         self.train_outputs: dict[int, Any] = {}
+        self.save_artifacts: list[tuple[int, bool, bool]] = []
         self.train_started: dict[int, asyncio.Event] = defaultdict(asyncio.Event)
         self.consume_external_data: Callable[[Any], None] | None = None
 
@@ -121,9 +122,12 @@ class FakeTrainingModel:
         self.train_started[rollout_id].set()
         return self.train_outputs.get(rollout_id, f"{self.role}-values-{rollout_id}")
 
-    async def save_model(self, rollout_id: int, force_sync: bool = False) -> None:
+    async def save_model(
+        self, rollout_id: int, force_sync: bool = False, *, write_dist: bool = True, write_hf: bool = True
+    ) -> None:
         self.events.append(f"{self.role}_save:{rollout_id}")
         self.saved.append(rollout_id)
+        self.save_artifacts.append((rollout_id, write_dist, write_hf))
 
     async def export_hf(self, rollout_id: int, path: str) -> None:
         self.events.append(f"{self.role}_export_hf:{rollout_id}")

@@ -1,0 +1,81 @@
+--- a/resources_servers/math_with_judge/app.py
++++ b/resources_servers/math_with_judge/app.py
+@@ -34,7 +34,7 @@
+     SimpleResourcesServer,
+ )
+ from nemo_gym.config_types import ModelServerRef
+-from nemo_gym.judge import call_judge
++from nemo_gym.judge import JudgeError, call_judge
+ from nemo_gym.openai_utils import (
+     NeMoGymEasyInputMessage,
+     NeMoGymResponse,
+@@ -374,21 +374,21 @@
+         )
+         judge_evaluation = JudgeEvaluation(responses_create_params=responses_create_params, response=judge_response)
+ 
+-        # Currently, for all the cases in which the response from the LLM judge
+-        # does not conform to the expected format, the judge's evaluation is
+-        # treated as if the answers are not equal.  This may not be ideal, but it
+-        # is intended to minimize the number of failures for verify requests.
++        if not judge_response.output:
++            raise JudgeError("judge_invalid_response")
+         last_output = judge_response.output[-1]
+-        if last_output.type != "message":
+-            return False, judge_evaluation
+-
++        if last_output.type != "message" or not last_output.content:
++            raise JudgeError("judge_invalid_response")
+         last_content = last_output.content[-1]
+         if last_content.type != "output_text":
+-            return False, judge_evaluation
++            raise JudgeError("judge_invalid_response")
+ 
+         output_text = last_content.text
+         equal_choice_position = output_text.find(self.JUDGE_EQUAL_LABEL)
+         not_equal_choice_position = output_text.find(self.JUDGE_NOT_EQUAL_LABEL)
++
++        if equal_choice_position < 0 and not_equal_choice_position < 0:
++            raise JudgeError("judge_invalid_response")
+ 
+         # The first label that appears in the text is used for the evaluation.
+         if equal_choice_position < 0:
+--- a/resources_servers/equivalence_llm_judge/app.py
++++ b/resources_servers/equivalence_llm_judge/app.py
+@@ -39,7 +39,7 @@
+     SimpleResourcesServer,
+ )
+ from nemo_gym.config_types import ModelServerRef
+-from nemo_gym.judge import call_judge
++from nemo_gym.judge import JudgeError, call_judge
+ from nemo_gym.openai_utils import (
+     NeMoGymEasyInputMessage,
+     NeMoGymResponse,
+@@ -590,6 +590,8 @@
+         eval_record.verdict_label, eval_record.judgement_parsing_issues = _parse_judge_verdict(
+             text, equal_label, not_equal_label, truncated=judge_response.status == "incomplete"
+         )
++        if eval_record.judgement_parsing_issues:
++            raise JudgeError("judge_invalid_response")
+         return equal_label != not_equal_label and eval_record.verdict_label == equal_label, eval_record
+ 
+     def compute_metrics(self, tasks: list[list[dict[str, Any]]]) -> dict[str, Any]:
+--- a/resources_servers/multichallenge/app.py
++++ b/resources_servers/multichallenge/app.py
+@@ -44,7 +44,7 @@
+     SimpleResourcesServer,
+ )
+ from nemo_gym.config_types import ModelServerRef
+-from nemo_gym.judge import call_judge
++from nemo_gym.judge import JudgeError, call_judge
+ from nemo_gym.openai_utils import (
+     NeMoGymEasyInputMessage,
+     NeMoGymResponse,
+@@ -229,7 +229,7 @@
+             return "YES"
+         elif "NO" in last_line:
+             return "NO"
+-        return "NO"  # Default to NO if unclear
++        raise JudgeError("judge_invalid_response")
+     # Return whichever appears last (most authoritative)
+     if yes_pos > no_pos:
+         return "YES"

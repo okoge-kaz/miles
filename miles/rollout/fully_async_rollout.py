@@ -17,8 +17,10 @@ rollout engines, pausing producer submissions for the duration of the
 """
 
 import asyncio
+import copy
 import logging
 from dataclasses import replace
+from time import monotonic
 
 from miles.backends.megatron_utils.megatron_config import resolve_megatron_config
 from miles.rollout.base_types import (
@@ -31,6 +33,7 @@ from miles.rollout.base_types import (
     RolloutFnTrainInput,
     RolloutFnTrainOutput,
 )
+from miles.rollout.filter_hub.base_types import iter_samples
 from miles.rollout.fully_async_data_buffer import (
     DataBuffer,
     DataBufferConstructorInput,
@@ -44,7 +47,11 @@ from miles.rollout.fully_async_data_buffer import (
 from miles.rollout.generate_utils.sample_utils import reward_log_summary, sample_text_preview
 from miles.rollout.inference_rollout.inference_rollout_common import GenerateState, generate_and_rm_group
 from miles.rollout.inference_rollout.inference_rollout_eval import run_eval_datasets
+from miles.rollout.replay_data_buffer import ReplayDataBuffer
+from miles.rollout.replay_data_buffer_inflight import validate_inflight_group
+from miles.rollout.rm_hub.worker import collect_reward_metrics
 from miles.rollout.submission_scheduler import make_submission_scheduler
+from miles.utils import async_utils
 from miles.utils.function_registry import load_function
 from miles.utils.types import Sample
 
@@ -82,11 +89,42 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         self._producer_resumed = asyncio.Event()
         self._producer_resumed.set()
         self._output: DataBuffer | None = None
+        self._weight_version: int | None = None
+        self._active: dict[asyncio.Task, list[Sample]] = {}
+        self._original_prompts: dict[asyncio.Task, list[Sample]] = {}
+        self._pending_ready: dict[asyncio.Task, DataBufferInput] = {}
+        self._draining = False
+        self._replay_data_buffer = (
+            ReplayDataBuffer(self) if getattr(self.args, "use_replay_data_buffer", False) else None
+        )
+        # Submission/ready clocks describe one policy. Multi-policy keeps its
+        # engine-provided token versions and reports missing lifecycle coverage.
+        self._track_lifecycle = not resolve_megatron_config(self.args).is_multi_policy and (
+            self._replay_data_buffer is not None
+            or getattr(self.args, "log_category_staleness", False)
+            or getattr(self.args, "async_staleness_metric", "oldest") in ("submission", "ready", "first-prefill")
+        )
 
     async def __call__(self, input: RolloutFnInput) -> RolloutFnOutput:
         if input.evaluation:
             return await self._call_eval(input)
+        if input.weight_version is not None and input.trainer_model_id is None:
+            self.on_weight_version(input.weight_version)
         if self._worker is None:
+            self._ensure_buffer()
+            self._worker = asyncio.create_task(self._worker_loop())
+            logger.info("Started fully-async rollout worker")
+        self._draining = True
+        try:
+            result = await self._drain(input)
+            if self._replay_data_buffer is not None:
+                result.metrics.update(self._replay_data_buffer.pop_metrics())
+            return result
+        finally:
+            self._draining = False
+
+    def _ensure_buffer(self) -> None:
+        if self._output is None:
             default_buffer_cls = (
                 DefaultMultiDataBuffer if resolve_megatron_config(self.args).is_multi_policy else DefaultDataBuffer
             )
@@ -94,14 +132,39 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
             self._output = buffer_cls(
                 DataBufferConstructorInput(args=self.args, unused_handler_fn=self._handle_unused)
             )
-            self._worker = asyncio.create_task(self._worker_loop())
-            logger.info("Started fully-async rollout worker")
-        return await self._drain(input)
+
+    def on_weight_version(self, version: int) -> None:
+        self._weight_version = version
+
+    @property
+    def owns_data_source_checkpoint(self) -> bool:
+        return self._replay_data_buffer is not None
+
+    def save(self, rollout_id: int) -> None:
+        if self._replay_data_buffer is not None:
+            self._replay_data_buffer.save(rollout_id)
+
+    def load(self, rollout_id: int | None) -> None:
+        if self._replay_data_buffer is not None:
+            self._replay_data_buffer.load(rollout_id)
+
+    def close(self) -> None:
+        async_utils.run(self._close())
+
+    async def _close(self) -> None:
+        tasks = [*self._active, *([self._worker] if self._worker is not None else [])]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        if self._replay_data_buffer is not None:
+            await self._replay_data_buffer.close()
 
     async def dispose(self) -> None:
-        if (worker := self._worker) is None:
-            return
-        await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(_end_worker(worker), worker.get_loop()))
+        loop = self._worker.get_loop() if self._worker is not None else async_utils.get_async_loop().loop
+        if loop is asyncio.get_running_loop():
+            await self._close()
+        else:
+            await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(self._close(), loop))
 
     async def _call_eval(self, input: RolloutFnEvalInput) -> RolloutFnOutput:
         if input.generate_state is not None:
@@ -126,10 +189,33 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         return self.args.rollout_batch_size
 
     def _submit_one_group(self) -> tuple[asyncio.Task, list[Sample]]:
+        inflight = self._replay_data_buffer.inflight if self._replay_data_buffer is not None else None
+        if inflight is not None and inflight.pending:
+            entry = inflight.pending.popleft()
+            validate_inflight_group(entry.group)
+            self._scheduler.on_submit([entry.group])
+            task = asyncio.create_task(self._generate_group(entry.group))
+            self._original_prompts[task] = entry.prompt_group
+            return task, entry.group
         samples = self.data_source.get_samples(1)
+        if inflight is not None:
+            validate_inflight_group(samples[0])
         self._scheduler.on_submit(samples)
         [prompt_group] = samples
-        return asyncio.create_task(self._generate_group(prompt_group)), prompt_group
+        if self._track_lifecycle:
+            for sample in prompt_group:
+                if sample.metadata:
+                    sample.metadata = {
+                        key: value for key, value in sample.metadata.items() if key != "policy_provenance"
+                    }
+            self._stamp_lifecycle(prompt_group, "submitted_weight_version", self._weight_version)
+        original = copy.deepcopy(prompt_group) if self._replay_data_buffer is not None else None
+        task = asyncio.create_task(self._generate_group(prompt_group))
+        if original is not None:
+            for sample in original:
+                sample.reset_for_retry()
+            self._original_prompts[task] = original
+        return task, prompt_group
 
     async def _generate_group(self, prompt_group: list[Sample]) -> DataBufferInput:
         result = await generate_and_rm_group(
@@ -139,10 +225,25 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
             evaluation=False,
             sample_done_callback=self._scheduler.sample_done_callback,
         )
+        if self._track_lifecycle:
+            self._stamp_lifecycle(result, "ready_weight_version", self._weight_version)
         return DataBufferInput(prompt_group=prompt_group, group=result)
 
+    @staticmethod
+    def _stamp_lifecycle(group, key: str, version: int | None) -> None:
+        if version is None:
+            return
+        for sample in iter_samples(group):
+            metadata = dict(sample.metadata or {})
+            provenance = dict(metadata.get("policy_provenance") or {})
+            provenance[key] = version
+            metadata["policy_provenance"] = provenance
+            sample.metadata = metadata
+
     async def _worker_loop(self) -> None:
-        active: dict[asyncio.Task, list[Sample]] = {}
+        if self._replay_data_buffer is not None:
+            await self._replay_data_buffer.before_production()
+        active = self._active
         while True:
             await self._producer_resumed.wait()
             while self._scheduler.has_capacity(pending_groups=len(active), group_budget=self._max_in_flight_groups()):
@@ -150,12 +251,19 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
                 active[task] = prompt_group
             done, _ = await self._scheduler.wait_for_progress(set(active))
             for task in done:
-                entry = self._collect_group_result(task, active.pop(task))
+                entry = self._collect_group_result(task, active[task])
+                self._pending_ready[task] = entry
                 await self._output.put(entry)
+                active.pop(task)
+                self._pending_ready.pop(task)
+                self._original_prompts.pop(task, None)
 
     def _collect_group_result(self, task: asyncio.Task, prompt_group: list[Sample]) -> DataBufferInput:
         if not task.cancelled():
-            return task.result()
+            entry = task.result()
+            if self._replay_data_buffer is not None:
+                entry.prompt_group = self._original_prompts[task]
+            return entry
 
         logger.warning(
             "Rollout group was cancelled; marking samples aborted: indices=%s",
@@ -168,46 +276,52 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
 
     # -------------------------- consumer --------------------------
 
-    async def _next_group(self, *, current_version: int | None, trainer_model_id: str | None) -> DataBufferInput:
-        queue_get = asyncio.create_task(
-            self._output.get(current_version=current_version, trainer_model_id=trainer_model_id)
-        )
+    async def _next_batch(
+        self, current_version: int | None, started: float, trainer_model_id: str | None = None
+    ) -> tuple[list[Group], dict]:
+        if self._replay_data_buffer is not None:
+            self._replay_data_buffer.check_restore()
+        collection = asyncio.create_task(self._collect_groups(current_version, started, trainer_model_id))
         try:
             while True:
                 done, _ = await asyncio.wait(
-                    {queue_get, self._worker},
+                    {collection, self._worker},
                     return_when=asyncio.FIRST_COMPLETED,
                     timeout=NO_PROGRESS_WARN_SECS,
                 )
                 # Checked before the queue: the worker loop never returns normally, so a
                 # dead worker fails the step now instead of after its backlog drains.
-                if self._worker in done:
+                if self._worker.done():
                     if self._worker.cancelled():
                         raise RuntimeError("fully-async rollout was disposed while a step waited for groups")
                     self._worker.result()
                     raise RuntimeError("fully-async rollout worker exited without an exception")
-                if queue_get in done:
-                    return queue_get.result()
-                logger.warning(f"No completed rollout groups for {NO_PROGRESS_WARN_SECS}s")
+                if self._replay_data_buffer is not None:
+                    self._replay_data_buffer.check_restore()
+                if collection in done:
+                    data, metrics, finished = collection.result()
+                    metrics["perf/batch_fetch_resume_wait_time"] = monotonic() - finished
+                    return data, metrics
+                logger.warning(f"Waiting for a complete rollout batch for another {NO_PROGRESS_WARN_SECS}s")
         finally:
-            if not queue_get.done():
-                queue_get.cancel()
+            if not collection.done():
+                collection.cancel()
+                await asyncio.gather(collection, return_exceptions=True)
+            elif not collection.cancelled():
+                collection.exception()
 
-    async def _drain(self, input: RolloutFnTrainInput) -> RolloutFnTrainOutput:
-        args = self.args
-        assert args.rollout_global_dataset
-
-        target_data_size = args.rollout_batch_size
+    async def _collect_groups(
+        self, current_version: int | None, started: float, trainer_model_id: str | None = None
+    ) -> tuple[list[Group], dict, float]:
+        metrics = {"perf/batch_fetch_dispatch_wait_time": monotonic() - started}
         data: list[Group] = []
-        do_print = True
-
-        while len(data) < target_data_size:
-            entry = await self._next_group(
-                current_version=input.weight_version, trainer_model_id=input.trainer_model_id
-            )
-            assert len(entry.group) == args.n_samples_per_prompt
-
-            if do_print:
+        # Ready gets do not yield; only an empty/custom buffer needs to suspend.
+        # Keep the batch's version fixed while waiting for its remaining groups.
+        while len(data) < self.args.rollout_batch_size:
+            entry = await self._output.get(current_version=current_version, trainer_model_id=trainer_model_id)
+            assert len(entry.group) == self.args.n_samples_per_prompt
+            if not data:
+                metrics["perf/batch_first_group_time"] = monotonic() - started
                 sample = first_sample(entry.group)
                 logger.info(
                     "First rollout sample: text_preview=%s, label=%s, reward_summary=%s",
@@ -215,9 +329,14 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
                     str(sample.label)[:100],
                     reward_log_summary(sample.reward),
                 )
-                do_print = False
-
             data.append(entry.group)
+        return data, metrics, monotonic()
+
+    async def _drain(self, input: RolloutFnTrainInput) -> RolloutFnTrainOutput:
+        args = self.args
+        assert args.rollout_global_dataset
+        started = monotonic()
+        data, fetch_metrics = await self._next_batch(input.weight_version, started, input.trainer_model_id)
 
         sample = first_sample(data[-1])
         logger.info(
@@ -232,14 +351,15 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         if self._sample_filter is not None:
             self._sample_filter(args, data)
 
-        return RolloutFnTrainOutput(samples=data, metrics=self._output.get_metrics(input.trainer_model_id))
+        metrics = self._output.get_metrics(input.trainer_model_id)
+        metrics.update(collect_reward_metrics())
+        metrics.update(fetch_metrics)
+        metrics["perf/batch_drain_time"] = monotonic() - started
+        return RolloutFnTrainOutput(samples=data, metrics=metrics)
 
     def _recycle(self, prompt_group: list[Sample]) -> None:
         for sample in prompt_group:
             sample.reset_for_retry()
+            if sample.metadata:
+                sample.metadata = {key: value for key, value in sample.metadata.items() if key != "policy_provenance"}
         self.data_source.add_samples([prompt_group])
-
-
-async def _end_worker(worker: asyncio.Task) -> None:
-    worker.cancel()
-    await asyncio.wait({worker})

@@ -71,6 +71,8 @@ _NOT_ACTUALLY_SECRET_ARG_NAMES = frozenset(
         "tool_key",
     }
 )
+# Newer router builds add this boolean routing-policy switch; it contains no key value.
+_OPTIONAL_NOT_ACTUALLY_SECRET_ARG_NAMES = frozenset({"router_allow_requests_without_routing_key"})
 _SGLANG_ARG_PREFIXES = ("sglang_", "eval_sglang_")
 _INHERITED_CREDENTIAL_PATTERN = re.compile(r"^(eval_)?(sglang|router)_(.*_)?(api_keys?|password)$")
 
@@ -355,6 +357,38 @@ class TestEventDirectoryDefaults:
         miles_validate_args(args)
 
         assert args.save_debug_event_data == "/debug/run/events"
+
+
+class TestPromptMixtureArguments:
+    def _parse(self, extra):
+        parser = argparse.ArgumentParser()
+        get_miles_extra_args_provider()(parser)
+        return parser.parse_args(extra + ["--num-rollout", "1"] + REQUIRED_ARGS)
+
+    @pytest.mark.parametrize("fully_async", [False, True])
+    def test_step_limited_mixture_accepts_ratios_without_replay(self, fully_async):
+        extra = ["--prompt-data-files", "math.jsonl", "code.jsonl", "--prompt-data-ratios", "0.75", "0.25"]
+        if fully_async:
+            extra += ["--fully-async", "--pause-generation-mode", "in_place"]
+        args = self._parse(extra)
+        miles_validate_args(args)
+        assert args.prompt_data_ratios == [0.75, 0.25]
+        assert args.prompt_data_epoch_size is None and not args.use_replay_data_buffer
+
+    @pytest.mark.parametrize(
+        "extra,message",
+        [
+            (["--prompt-data-ratios", "1"], "requires --prompt-data-files"),
+            (["--prompt-data-epoch-size", "10"], "requires a mixture"),
+            (["--prompt-data-files", "a", "b", "--prompt-data-ratios", "1"], "one ratio per"),
+            (["--prompt-data-files", "a", "--prompt-data", "b"], "exactly one"),
+            (["--prompt-data-files", "a", "--prompt-data-epoch-size", "0"], "positive integer"),
+            (["--prompt-data-files", "a", "--disable-rollout-global-dataset"], "require the global rollout dataset"),
+        ],
+    )
+    def test_invalid_mixture_options_fail_during_argument_validation(self, extra, message):
+        with pytest.raises(ValueError, match=message):
+            miles_validate_args(self._parse(extra))
 
 
 class TestMaybeApplyDumperOverrides:
@@ -2878,13 +2912,15 @@ class TestSecretArgumentsAreClassified:
 
     def test_every_secret_looking_miles_flag_is_either_redacted_or_declared_harmless(self):
         """The env report hashes args by an explicit list, so a new credential flag would leak until listed."""
+        declared = self._declared_names()
         suspicious = {
             name
-            for name in self._declared_names()
+            for name in declared
             if _SECRET_ENV_VAR_PATTERN.search(name) and not name.startswith(_SGLANG_ARG_PREFIXES)
         }
 
-        assert suspicious - _SECRET_ARG_NAMES == _NOT_ACTUALLY_SECRET_ARG_NAMES, (
+        harmless = _NOT_ACTUALLY_SECRET_ARG_NAMES | (_OPTIONAL_NOT_ACTUALLY_SECRET_ARG_NAMES & declared)
+        assert suspicious - _SECRET_ARG_NAMES == harmless, (
             "an argument's name looks like a credential; add it to _SECRET_ARG_NAMES in env_report/redaction.py so the env "
             "report hashes it, or to _NOT_ACTUALLY_SECRET_ARG_NAMES here to say it names something else"
         )

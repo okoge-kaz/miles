@@ -19,6 +19,7 @@ from miles.backends.training_utils.loss.hub.math_utils import (
     compute_opsm_mask,
     compute_policy_loss,
 )
+from miles.backends.training_utils.loss.hub.policy_lag_metrics import collect_policy_lag_parts
 from miles.backends.training_utils.loss.hub.score_centering_loss import score_centering_loss_function
 from miles.backends.training_utils.parallel import get_parallel_state
 from miles.utils.function_registry import load_function
@@ -380,6 +381,28 @@ def policy_loss_function(
         reported_loss["train_rollout_logprob_abs_diff"] = train_rollout_logprob_abs_diff.clone().detach()
     if train_rollout_kl is not None:
         reported_loss["train_rollout_kl"] = train_rollout_kl.clone().detach()
+
+    if getattr(args, "log_policy_lag_metrics", False):
+        if rollout_old_log_probs is None or batch.get("sample_categories") is None:
+            raise ValueError("Policy-lag logging requires rollout logprobs and batch categories")
+        diagnostic_masks = local_loss_mask_list
+        if args.get_mismatch_metrics or args.use_tis:
+            diagnostic_masks = get_local_response_loss_masks(
+                total_lengths, response_lengths, modified_response_masks, args.qkv_format, max_seq_lens
+            )
+        if args.use_opsm:
+            flat_mask = torch.cat(diagnostic_masks).to(device=opsm_mask.device) * opsm_mask
+            diagnostic_masks = list(flat_mask.split([mask.numel() for mask in diagnostic_masks]))
+        reported_loss.update(
+            collect_policy_lag_parts(
+                train_log_probs_list,
+                rollout_old_log_probs,
+                diagnostic_masks,
+                categories=batch["sample_categories"],
+                category_vocabulary=batch["category_vocabulary"],
+                truncated=batch.get("truncated"),
+            )
+        )
 
     if args.use_kl_loss:
         reported_loss["kl_loss"] = kl_loss.clone().detach()

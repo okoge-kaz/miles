@@ -23,9 +23,9 @@ async def generate(input: GenerateFnInput, url: str | None = None) -> GenerateFn
     prompt_ids = compute_prompt_ids_from_sample(input.state, sample)
 
     # Handle Partial Rollout resuming
-    if len(sample.response) > 0:
+    if sample.response_length > 0:
         input_ids = sample.tokens
-        sampling_params["max_new_tokens"] -= len(sample.tokens) - len(prompt_ids)
+        sampling_params["max_new_tokens"] -= sample.response_length
 
         assert sampling_params["max_new_tokens"] >= 0
         if sampling_params["max_new_tokens"] == 0:
@@ -46,6 +46,8 @@ async def generate(input: GenerateFnInput, url: str | None = None) -> GenerateFn
         return GenerateFnOutput(samples=sample)
 
     output = await post(url, payload, headers=compute_routing_headers(args, sample))
-    await update_sample_from_response(args, sample, payload=payload, output=output)
+    await update_sample_from_response(
+        args, sample, payload=payload, output=output, update_loss_mask=sample.loss_mask is not None
+    )
 
     return GenerateFnOutput(samples=sample)

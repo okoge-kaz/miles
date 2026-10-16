@@ -9,3 +9,9 @@ Recheck which rules apply when the task expands to additional files or component
 ## Code Review Rules
 
 For pull request reviews, also read and follow `REVIEW.md` at the repository root.
+
+Per user preference, do not add opening module docstrings to new Python files. Put design explanations in the relevant notes and retain useful function/class documentation.
+
+For ABCI experiment implementation, debugging, or notes, use
+`.claude/skills/abci-experiments/SKILL.md` and consult the relevant files in
+`experiments/notes/agents/`. Keep analysis and measurements in `experiments/notes/logs/`.

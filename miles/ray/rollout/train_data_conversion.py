@@ -4,12 +4,13 @@ from typing import Any
 import torch
 
 from miles.rollout.generate_utils.rollout_topk_logprobs import validate_rollout_topk_logprobs_sample
+from miles.rollout.staleness_metrics import sample_category
 from miles.utils import object_store
 from miles.utils.dp_schedule import build_dp_schedule, has_full_schedule_config
 from miles.utils.lora.utils import is_multi_lora_enabled
 from miles.utils.object_store import ValueSpec
 from miles.utils.seqlen_balancing import get_seqlen_balanced_partitions
-from miles.utils.timer import Timer
+from miles.utils.timer import Timer, measure_time
 from miles.utils.types import Sample
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,8 @@ ROLLOUT_DATA_VALUE_SPEC: dict[str, ValueSpec] = {
     "prompt": ValueSpec(codec="msgpack_ragged"),
     "metadata": ValueSpec(codec="msgpack_ragged"),
     "weight_versions": ValueSpec(codec="msgpack_ragged"),
+    "sample_categories": ValueSpec(codec="msgpack_ragged"),
+    "category_vocabulary": ValueSpec(codec="auto"),
     "raw_reward": ValueSpec(codec="auto"),
     "total_lengths": ValueSpec(codec="auto"),
     "dynamic_global_batch_size": ValueSpec(codec="auto"),
@@ -104,6 +107,11 @@ def convert_samples_to_train_data(
             sample.loss_mask = [0] * sample.response_length
         loss_masks.append(sample.loss_mask)
     train_data["loss_masks"] = loss_masks
+    if getattr(args, "log_policy_lag_metrics", False):
+        train_data["sample_categories"] = [sample_category(sample) for sample in samples]
+        train_data["category_vocabulary"] = sorted(set(train_data["sample_categories"]))
+        if any(sample.rollout_log_probs is None for sample in samples):
+            raise ValueError("Policy-lag logging requires engine logprobs for every training sample")
 
     train_data["rollout_mask_sums"] = _compute_rollout_mask_sums(train_data["rollout_ids"], loss_masks)
 
@@ -282,7 +290,7 @@ def _normalize_rewards_by_rollout(
     if not samples:
         return []
 
-    normalized_rewards = torch.empty(len(raw_rewards), dtype=torch.float)
+    groups_by_size: dict[int, list[tuple[list[list[int]], list[float]]]] = {}
     for prompt_segments in _reward_group_segments(args, samples, prompt_group_sizes):
         segments_by_rollout_key: dict[int | tuple[str, int], list[int]] = {}
         for segment_index in prompt_segments:
@@ -306,20 +314,26 @@ def _normalize_rewards_by_rollout(
                 )
             shared_rewards.append(sibling_rewards[0])
 
-        rollout_rewards = torch.tensor(shared_rewards, dtype=torch.float)
-        normalized_rollout_rewards = rollout_rewards - rollout_rewards.mean()
-        if args.advantage_estimator in ["grpo", "gspo"] and args.grpo_std_normalization and len(rollout_rewards) > 1:
-            rollout_std = rollout_rewards.std()
-            if rollout_std > 0:
-                normalized_rollout_rewards = normalized_rollout_rewards / (rollout_std + 1e-6)
+        group_segments = list(segments_by_rollout_key.values())
+        groups_by_size.setdefault(len(shared_rewards), []).append((group_segments, shared_rewards))
 
-        for (_, rollout_segments), normalized_reward in zip(
-            rollout_segment_groups, normalized_rollout_rewards.tolist(), strict=True
-        ):
-            for segment_index in rollout_segments:
-                normalized_rewards[segment_index] = normalized_reward
+    normalized_rewards = [0.0] * len(raw_rewards)
+    normalize_std = args.advantage_estimator in ["grpo", "gspo"] and args.grpo_std_normalization
+    for group_size, groups in groups_by_size.items():
+        # Each row is one prompt group; only the rollout axis is reduced.
+        rollout_rewards = torch.tensor([rewards for _, rewards in groups], dtype=torch.float)
+        normalized = rollout_rewards - rollout_rewards.mean(dim=1, keepdim=True)
+        if normalize_std and group_size > 1:
+            rollout_std = rollout_rewards.std(dim=1, keepdim=True, correction=1)
+            scale = torch.where(rollout_std > 0, rollout_std + 1e-6, 1.0)
+            normalized = normalized / scale
 
-    return normalized_rewards.tolist()
+        for (group_segments, _), group_rewards in zip(groups, normalized.tolist(), strict=True):
+            for rollout_segments, normalized_reward in zip(group_segments, group_rewards, strict=True):
+                for segment_index in rollout_segments:
+                    normalized_rewards[segment_index] = normalized_reward
+
+    return normalized_rewards
 
 
 def _post_process_rewards(
@@ -339,18 +353,23 @@ def _post_process_rewards(
     return raw_rewards, raw_rewards
 
 
-def split_train_data_by_dp(args, data: dict[str, Any], train_parallel_config: dict | None):
+def split_train_data_by_dp(
+    args, data: dict[str, Any], train_parallel_config: dict | None, *, timings: dict | None = None
+):
     """Split the train data across DP ranks and put the shards into the object store.
 
     When the training backend can consume a rollout-side schedule, the shards
     also carry the precomputed micro-batch layout; otherwise this falls back to
     the legacy split (the training side schedules locally)."""
     if can_schedule_on_rollout_side(args, data, train_parallel_config):
-        shards = split_train_data_by_dp_scheduled_raw(args, data, train_parallel_config=train_parallel_config)
+        shards = split_train_data_by_dp_scheduled_raw(
+            args, data, train_parallel_config=train_parallel_config, timings=timings
+        )
     else:
-        shards = split_train_data_by_dp_raw(args, data, dp_size=train_parallel_config["dp_size"])
-    store = object_store.get_instance()
-    return [store.put(value=shard, value_spec=ROLLOUT_DATA_VALUE_SPEC) for shard in shards]
+        shards = split_train_data_by_dp_raw(args, data, dp_size=train_parallel_config["dp_size"], timings=timings)
+    with measure_time(timings, "perf/rollout_postprocess/object_store_put"):
+        store = object_store.get_instance()
+        return [store.put(value=shard, value_spec=ROLLOUT_DATA_VALUE_SPEC) for shard in shards]
 
 
 def can_schedule_on_rollout_side(args, data: dict[str, Any], train_parallel_config: dict | None) -> bool:
@@ -368,50 +387,56 @@ def can_schedule_on_rollout_side(args, data: dict[str, Any], train_parallel_conf
 
 
 def split_train_data_by_dp_scheduled_raw(
-    args, data: dict[str, Any], *, train_parallel_config: dict
+    args, data: dict[str, Any], *, train_parallel_config: dict, timings: dict | None = None
 ) -> list[dict[str, Any]]:
     """DP split with the micro-batch schedule precomputed on the rollout side."""
-    total_lengths = [len(t) for t in data["tokens"]]
-    data["total_lengths"] = total_lengths
+    with measure_time(timings, "perf/rollout_postprocess/dp_schedule"):
+        total_lengths = [len(t) for t in data["tokens"]]
+        data["total_lengths"] = total_lengths
 
-    global_batch_size = data.get("dynamic_global_batch_size", args.global_batch_size)
-    partitions, micro_batch_indices, num_microbatches, num_rollouts = build_dp_schedule(
-        args,
-        train_parallel_config,
-        total_lengths,
-        global_batch_size=global_batch_size,
-        rollout_indices=data["rollout_ids"],
-    )
-    logger.info(
-        f"Rollout-side DP schedule: num_samples={len(total_lengths)}, "
-        f"num_rollouts={num_rollouts}, num_microbatches={num_microbatches}"
-    )
+        global_batch_size = data.get("dynamic_global_batch_size", args.global_batch_size)
+        partitions, micro_batch_indices, num_microbatches, num_rollouts = build_dp_schedule(
+            args,
+            train_parallel_config,
+            total_lengths,
+            global_batch_size=global_batch_size,
+            rollout_indices=data["rollout_ids"],
+        )
+        logger.info(
+            f"Rollout-side DP schedule: num_samples={len(total_lengths)}, "
+            f"num_rollouts={num_rollouts}, num_microbatches={num_microbatches}"
+        )
 
-    shards = _package_shards(args, data, partitions)
-    for rank, shard in enumerate(shards):
-        shard["num_microbatches"] = num_microbatches
-        shard["micro_batch_indices"] = micro_batch_indices[rank]
-        shard["num_rollouts"] = num_rollouts
+    with measure_time(timings, "perf/rollout_postprocess/shard_packaging"):
+        shards = _package_shards(args, data, partitions)
+        for rank, shard in enumerate(shards):
+            shard["num_microbatches"] = num_microbatches
+            shard["micro_batch_indices"] = micro_batch_indices[rank]
+            shard["num_rollouts"] = num_rollouts
     return shards
 
 
-def split_train_data_by_dp_raw(args, data: dict[str, Any], *, dp_size: int) -> list[dict[str, Any]]:
+def split_train_data_by_dp_raw(
+    args, data: dict[str, Any], *, dp_size: int, timings: dict | None = None
+) -> list[dict[str, Any]]:
     """Split the train data by data parallel size."""
-    total_lengths = [len(t) for t in data["tokens"]]
-    data["total_lengths"] = total_lengths
+    with measure_time(timings, "perf/rollout_postprocess/dp_schedule"):
+        total_lengths = [len(t) for t in data["tokens"]]
+        data["total_lengths"] = total_lengths
 
-    if args.balance_data:
-        partitions = get_seqlen_balanced_partitions(total_lengths, dp_size, equal_size=True)
-    else:
-        partitions = [range(i, len(total_lengths), dp_size) for i in range(dp_size)]
+        if args.balance_data:
+            partitions = get_seqlen_balanced_partitions(total_lengths, dp_size, equal_size=True)
+        else:
+            partitions = [range(i, len(total_lengths), dp_size) for i in range(dp_size)]
 
-    # Multi-LoRA: sort partitions by adapter slot so each microbatch is
-    # contiguous-by-slot (required by the per-adapter token-count math).
-    adapter_slots = data.get("adapter_slots")
-    if adapter_slots is not None:
-        partitions = [sorted(p, key=lambda i: adapter_slots[i]) for p in partitions]
+        # Multi-LoRA: sort partitions by adapter slot so each microbatch is
+        # contiguous-by-slot (required by the per-adapter token-count math).
+        adapter_slots = data.get("adapter_slots")
+        if adapter_slots is not None:
+            partitions = [sorted(p, key=lambda i: adapter_slots[i]) for p in partitions]
 
-    return _package_shards(args, data, partitions)
+    with measure_time(timings, "perf/rollout_postprocess/shard_packaging"):
+        return _package_shards(args, data, partitions)
 
 
 def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, Any]]:
@@ -446,6 +471,7 @@ def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, An
             "opd_reverse_kl",
             "seq_witness_ids",
             "weight_versions",
+            "sample_categories",
             "adapter_slots",
             "loss_weights",
             "advantages",
@@ -463,6 +489,7 @@ def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, An
             "prompt_group_sizes",
             "loss_fn",
             "loss_fn_config",
+            "category_vocabulary",
         ]:
             if key not in data:
                 continue

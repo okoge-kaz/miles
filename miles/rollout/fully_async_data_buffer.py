@@ -9,20 +9,23 @@ Every group-level decision lives here — what to keep, what to hand to
 
 import asyncio
 import logging
+import math
 from abc import ABC, abstractmethod
 from argparse import ArgumentParser, Namespace
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from time import monotonic
 
 from miles.backends.megatron_utils.megatron_config import resolve_megatron_config
+from miles.rollout.buffer_ordering import OrderedGroupBuffer
 from miles.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter, iter_samples
 from miles.rollout.filter_hub.common_filters import (
     GroupWeightVersionStats,
     apply_aborted_filter,
     apply_missing_reward_filter,
-    group_staleness,
     group_weight_version_stats,
 )
+from miles.rollout.staleness_metrics import staleness_value
 from miles.utils.function_registry import load_function
 from miles.utils.types import Sample
 
@@ -104,7 +107,7 @@ class DataBuffer(ABC):
 
 
 class DefaultDataBuffer(DataBuffer):
-    """FIFO buffer of finished groups, filtering out what training should not see.
+    """Ordered buffer of finished groups, filtering out what training should not see.
 
     Rejected on put, because the verdict is fixed once the group is generated:
 
@@ -131,7 +134,7 @@ class DefaultDataBuffer(DataBuffer):
         args = input.args
         self._args = args
 
-        self._buffer: list[DataBufferInput] = []
+        self._buffer = OrderedGroupBuffer(getattr(args, "async_data_buffer_order", "fifo"))
         assert args.async_data_buffer_capacity_factor > 0
         self._capacity = int(args.async_data_buffer_capacity_factor * args.rollout_batch_size)
         assert self._capacity >= 1
@@ -140,6 +143,9 @@ class DefaultDataBuffer(DataBuffer):
         self._dynamic_filter = load_function(args.dynamic_sampling_filter_path)
         self._cond = asyncio.Condition()
         self._current_version: int | None = None
+        self._staleness_definition = getattr(args, "async_staleness_metric", "oldest")
+        self._custom_staleness = load_function(getattr(args, "custom_staleness_function_path", None))
+        self._complete_restore_for_checkpoint = False
 
         self._metric_gatherer = MetricGatherer()
         self._metric_aborted_groups = 0
@@ -151,15 +157,38 @@ class DefaultDataBuffer(DataBuffer):
         self._metric_selected_versioned_tokens = 0
         self._metric_selected_samples = 0
         self._metric_selected_versioned_samples = 0
+        self._metric_accepted_groups = 0
+        self._metric_window_start = monotonic()
+        self._metric_get_seconds = 0.0
+        self._metric_empty_wait_seconds = 0.0
 
     async def put(self, input: DataBufferInput) -> None:
         if not self._preput_filter(input):
             return
 
+        await self.restore_entry(input)
+        self._metric_accepted_groups += 1
+
+    async def restore_entry(self, input: DataBufferInput, *, wait_for_capacity: bool = True) -> None:
+        """Restore an already accepted entry without repeating reward/dynamic filters."""
+        stats = group_weight_version_stats(input.group)
         async with self._cond:
-            while len(self._buffer) >= self._capacity:
+            while (
+                wait_for_capacity and not self._complete_restore_for_checkpoint and len(self._buffer) >= self._capacity
+            ):
                 await self._cond.wait()
-            self._buffer.append(input)
+            self._buffer.push(input, stats)
+            self._cond.notify_all()
+
+    def snapshot_entries(self) -> tuple[DataBufferInput, ...]:
+        return tuple(value.entry for value in self._buffer.snapshot())
+
+    def __len__(self):
+        return len(self._buffer)
+
+    async def request_restore_completion(self) -> None:
+        async with self._cond:
+            self._complete_restore_for_checkpoint = True
             self._cond.notify_all()
 
     def _preput_filter(self, input: DataBufferInput) -> bool:
@@ -182,17 +211,37 @@ class DefaultDataBuffer(DataBuffer):
         return True
 
     async def get(self, current_version: int | None = None, **_) -> DataBufferInput:
+        started = monotonic()
         if current_version is not None:
             self._current_version = current_version
         async with self._cond:
             while True:
                 while not self._buffer:
+                    wait_started = monotonic()
                     await self._cond.wait()
-                entry = self._buffer.pop(0)
+                    self._metric_empty_wait_seconds += monotonic() - wait_started
+                buffered = self._buffer.pop()
+                entry, version_stats = buffered.entry, buffered.stats
                 self._cond.notify_all()  # wake producers blocked on a full buffer
 
-                version_stats = group_weight_version_stats(entry.group)
-                staleness = version_stats.oldest_lag(current_version)
+                staleness = (
+                    self._custom_staleness(self._args, entry, current_version)
+                    if self._custom_staleness is not None
+                    else staleness_value(
+                        entry.group, version_stats, current_version, definition=self._staleness_definition
+                    )
+                )
+                requires_provenance = self._custom_staleness is not None or self._staleness_definition != "oldest"
+                if requires_provenance and staleness is not None:
+                    if (
+                        isinstance(staleness, bool)
+                        or not isinstance(staleness, (int, float))
+                        or not math.isfinite(staleness)
+                        or staleness < 0
+                    ):
+                        raise ValueError("Staleness definition must return a finite non-negative lag or None")
+                if staleness is None and requires_provenance and self._args.max_weight_staleness is not None:
+                    raise ValueError(f"Missing provenance for staleness definition {self._staleness_definition}")
                 if staleness is not None:
                     if self._args.max_weight_staleness is not None and staleness > self._args.max_weight_staleness:
                         logger.info(f"Filtered stale group ({staleness=} > max={self._args.max_weight_staleness})")
@@ -201,6 +250,7 @@ class DefaultDataBuffer(DataBuffer):
                         continue
                     self._metric_consumed_staleness.append(staleness)
                 self._record_selected_version_stats(version_stats, current_version)
+                self._metric_get_seconds += monotonic() - started
                 return entry
 
     def _record_selected_version_stats(
@@ -224,13 +274,23 @@ class DefaultDataBuffer(DataBuffer):
             self._metric_selected_versioned_tokens += stats.versioned_token_count
 
     def get_metrics(self, trainer_model_id: str | None = None) -> dict[str, float]:
+        now = monotonic()
+        elapsed = now - self._metric_window_start
         prefix = "rollout/fully_async/"
         metrics = {
             f"{prefix}queue_size": len(self._buffer),
+            f"{prefix}accepted_groups": self._metric_accepted_groups,
+            "perf/rollout_window_time": elapsed,
+            "perf/buffer_get_time": self._metric_get_seconds,
+            "perf/buffer_empty_wait_time": self._metric_empty_wait_seconds,
             f"{prefix}aborted_groups_filtered": self._metric_aborted_groups,
             f"{prefix}stale_groups_filtered": self._metric_stale_groups,
             **self._metric_gatherer.collect(),
         }
+        # Count fresh, accepted production even while the trainer is busy.
+        # restore_entry bypasses this counter; an empty window has no rate.
+        if elapsed > 0 and self._metric_accepted_groups:
+            metrics["perf/rollout_step_time"] = elapsed * self._args.rollout_batch_size / self._metric_accepted_groups
         if consumed := self._metric_consumed_staleness:
             metrics[f"{prefix}avg_staleness"] = sum(consumed) / len(consumed)
             metrics[f"{prefix}max_staleness"] = max(consumed)
@@ -248,12 +308,9 @@ class DefaultDataBuffer(DataBuffer):
             metrics[f"{prefix}weight_version_sample_coverage"] = (
                 self._metric_selected_versioned_samples / self._metric_selected_samples
             )
-        buffered = [
-            s for entry in self._buffer if (s := group_staleness(entry.group, self._current_version)) is not None
-        ]
-        if buffered:
-            metrics[f"{prefix}buffer_avg_staleness"] = sum(buffered) / len(buffered)
-            metrics[f"{prefix}buffer_max_staleness"] = max(buffered)
+        metrics.update(
+            {f"{prefix}{key}": value for key, value in self._buffer.lag_summary(self._current_version).items()}
+        )
 
         self._metric_gatherer = MetricGatherer()
         self._metric_consumed_staleness = []
@@ -264,6 +321,10 @@ class DefaultDataBuffer(DataBuffer):
         self._metric_selected_samples = 0
         self._metric_selected_versioned_samples = 0
         self._metric_aborted_groups = self._metric_stale_groups = 0
+        self._metric_accepted_groups = 0
+        self._metric_get_seconds = 0.0
+        self._metric_empty_wait_seconds = 0.0
+        self._metric_window_start = now
         return metrics
 
 

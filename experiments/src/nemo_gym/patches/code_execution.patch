@@ -1,0 +1,198 @@
+--- a/resources_servers/code_gen/app.py
++++ b/resources_servers/code_gen/app.py
+@@ -20,7 +20,7 @@
+ from time import time
+ from typing import Any, Dict, List, Optional, Union
+ 
+-from lcb_integration.compute_code_generation_metrics import check_correctness_remote
++from experiments.src.nemo_gym.sandbox.execution import check_python
+ from lcb_integration.extraction_utils import LMStyle, extract_code
+ from pydantic import BaseModel
+ 
+@@ -83,7 +83,7 @@
+ # Server
+ # ----------------------------
+ class CompCodingResourcesServer(SimpleResourcesServer):
+-    ray_enabled = True
++    ray_enabled = False
+     config: CompCodingResourcesServerConfig
+ 
+     def model_post_init(self, context):
+@@ -220,8 +220,7 @@
+                 self.config.debug,  # debug
+             )
+ 
+-            future = check_correctness_remote.remote(*task_args)
+-            result, metadata = await future
++            result, metadata = await check_python(*task_args)
+ 
+             unit_tests_time_taken = time() - start_time
+ 
+--- a/resources_servers/code_gen/lcb_integration/testing_util.py
++++ b/resources_servers/code_gen/lcb_integration/testing_util.py
+@@ -598,6 +598,8 @@
+                     timeout=timeout,
+                 )
+                 return results, metadata
++            except TimeoutException:
++                raise
+             except Exception as e:
+                 return [-4], {
+                     "error_code": -4,
+@@ -618,6 +620,8 @@
+                     timeout=timeout,
+                 )
+                 return results, metadata
++            except TimeoutException:
++                raise
+             except Exception as e:
+                 return [-4], {
+                     "error_code": -4,
+--- a/resources_servers/competitive_coding_challenges/ccc_eval.py
++++ b/resources_servers/competitive_coding_challenges/ccc_eval.py
+@@ -15,6 +15,8 @@
+ from uuid import uuid4
+ 
+ import httpx
++from fastapi import HTTPException
++from experiments.src.nemo_gym.sandbox.execution import execute_shell, fail
+ 
+ 
+ def nested_dataclass(*args, **kwargs):
+@@ -115,7 +117,10 @@
+         max_output_characters: int = 1000,
+         session_id=None,
+         traceback_verbosity="plain",
++        work_dir=None,
+     ):
++        if os.environ.get("NEMO_GYM_CODE_SHARED_DIR"):
++            return await execute_shell(generated_code, timeout=timeout, language=language, work_dir=work_dir)
+         if session_id is not None:
+             raise RuntimeError("Stateful execution is not supported by this sandbox client.")
+ 
+@@ -134,14 +139,18 @@
+                 timeout=timeout + 5.0,
+                 headers={"Content-Type": "application/json"},
+             )
+-            if response.status_code == 502:
+-                raise httpx.TimeoutException("502 error")
+-            try:
+-                output = response.json()
+-            except json.JSONDecodeError:
+-                output = {"process_status": "error", "stdout": "", "stderr": "Unknown error"}
+-        except (httpx.TimeoutException, httpx.TransportError):
+-            output = {"process_status": "timeout", "stdout": "", "stderr": "Client timed out\n"}
++            response.raise_for_status()
++            output = response.json()
++        except httpx.TimeoutException:
++            fail("sandbox_transport_timeout")
++        except httpx.HTTPStatusError:
++            fail("sandbox_http_error")
++        except httpx.TransportError:
++            fail("sandbox_transport_error")
++        except ValueError:
++            fail("invalid_sandbox_response")
++        if output.get("process_status") == "timeout":
++            fail("execution_deadline", retryable=False)
+         return output, None
+ 
+ 
+@@ -162,12 +171,12 @@
+ _test_sandbox_tls = threading.local()
+ 
+ 
+-def _exec_sync(tls: threading.local, sandbox: LocalSandbox, cmd: str, *, language: str = "shell", timeout: int = 120):
++def _exec_sync(tls: threading.local, sandbox: LocalSandbox, cmd: str, *, language: str = "shell", timeout: int = 120, work_dir=None):
+     loop = getattr(tls, "loop", None)
+     if loop is None or loop.is_closed():
+         loop = asyncio.new_event_loop()
+         tls.loop = loop
+-    return loop.run_until_complete(sandbox.execute_code(cmd, language=language, timeout=timeout))[0]
++    return loop.run_until_complete(sandbox.execute_code(cmd, language=language, timeout=timeout, work_dir=work_dir))[0]
+ 
+ 
+ def _get_thread_test_sandbox() -> LocalSandbox:
+@@ -222,7 +231,7 @@
+ 
+     if ignore_failure:
+         command = f"({command}) || true"
+-    return _exec_sync(tls, sandbox, command, language="shell", timeout=timeout)
++    return _exec_sync(tls, sandbox, command, language="shell", timeout=timeout, work_dir=work_dir)
+ 
+ 
+ def wait_for_sandbox(sandbox, timeout: int = 240, poll: float = 1.0):
+@@ -499,17 +508,22 @@
+             f"cd {unique_dir} && export TMPDIR={unique_dir}/tmp && TIME_LIMIT_SCALE={task_args.get('time_scale', 1.0)} ./run.sh",
+             language="shell",
+             timeout=run_timeout,
++            work_dir=unique_dir,
+         )
+         result["run_time_s"] = time.monotonic() - run_start
+         result["run_stdout"] = run_result.get("stdout", "")
+         result["run_stderr"] = run_result.get("stderr", "")
++        if "time limit exceeded" in result["run_stderr"].lower():
++            fail("execution_time_limit", retryable=False)
+         try:
+             result["score"] = float(result["run_stdout"].strip())
+         except (ValueError, TypeError):
+             result["score"] = 0.0
+         return result
+-    except Exception as e:
+-        return {"score": 0.0, "output": "", "error": str(e)}
++    except HTTPException:
++        raise
++    except Exception:
++        fail("grader_exception")
+     finally:
+         try:
+             shutil.rmtree(unique_dir, ignore_errors=True)
+--- a/resources_servers/competitive_coding_challenges/app.py
++++ b/resources_servers/competitive_coding_challenges/app.py
+@@ -18,7 +18,8 @@
+ from datetime import datetime, timezone
+ from typing import Any, Dict, List, Literal, Optional
+ 
+-from fastapi import FastAPI
++from fastapi import FastAPI, HTTPException
++from experiments.src.nemo_gym.sandbox.execution import fail
+ from pydantic import ConfigDict, Field, PrivateAttr
+ 
+ from nemo_gym.base_resources_server import (
+@@ -335,8 +336,10 @@
+                 evaluation_entry["total_time"] = payload["total_time"]
+             details = await self._evaluator.eval_single(evaluation_entry)
+             reward = self._compute_reward(body, details)
+-        except Exception as e:
+-            details = {"error": str(e)}
++        except HTTPException:
++            raise
++        except Exception:
++            fail("grader_exception")
+ 
+         if LOG_JSONL_PATH:
+             await self._append_log_jsonl(
+--- a/resources_servers/competitive_coding_challenges/tests/test_app.py
++++ b/resources_servers/competitive_coding_challenges/tests/test_app.py
+@@ -19,6 +19,7 @@
+ from unittest.mock import AsyncMock, MagicMock, patch
+ 
+ import pytest
++from fastapi import HTTPException
+ 
+ 
+ GYM_ROOT = Path(__file__).resolve().parents[3]
+@@ -314,10 +315,10 @@
+     evaluator.eval_single = AsyncMock(side_effect=RuntimeError("boom"))
+     server._evaluator = evaluator
+ 
+-    response = await server.verify(request)
+-
+-    assert response.reward == 0.0
+-    assert response.details == {"error": "boom"}
++    with pytest.raises(HTTPException) as error:
++        await server.verify(request)
++    assert error.value.status_code == 503
++    assert error.value.detail == {"failure_kind": "grader_exception", "retryable": True}
+ 
+ 
+ # ---------------------------------------------------------------------------

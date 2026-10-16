@@ -1,0 +1,46 @@
+#!/bin/bash
+
+# Qwen3-8B
+# hf: https://huggingface.co/Qwen/Qwen3-8B/blob/main/config.json
+# hf base: https://huggingface.co/Qwen/Qwen3-8B-Base
+# Math settings follow the Qwen3-4B study; GPU validation is still required.
+
+# SFT paths: HF_MODEL is relative to HF_CKPT_DIR and /ckpt/hf.
+export QWEN3_8B_BASE_HF_RELATIVE_DIR="${QWEN3_8B_BASE_HF_RELATIVE_DIR:-Qwen3-8B-Base/LR1.5e-5-SEQ32768-GBS128-MBS1-TP2-PP1-CP1-EP1-PACK1-standard-cp-STEPS4000}"
+export QWEN3_8B_BASE_HF_MODEL="${QWEN3_8B_BASE_HF_MODEL:-${QWEN3_8B_BASE_HF_RELATIVE_DIR}/iter_0004000}"
+export QWEN3_8B_BASE_HF_ROOT="${QWEN3_8B_BASE_HF_ROOT:-${HF_CKPT_DIR}/${QWEN3_8B_BASE_HF_RELATIVE_DIR}}"
+
+: "${MODEL_NAME:=Qwen3-8B-Base-LR1.5e-5-Step4000}"
+: "${HF_MODEL_NAME:=${QWEN3_8B_BASE_HF_MODEL}}"
+: "${MODEL_PROFILE:=qwen3-8B}"
+: "${MEGATRON_TO_HF_MODE:=raw}"
+
+: "${LR:=1e-6}"
+: "${NUM_ROLLOUT:=300}"
+: "${ROLLOUT_BATCH_SIZE:=192}"
+: "${N_SAMPLES_PER_PROMPT:=16}"
+: "${GLOBAL_BATCH_SIZE:=3072}"
+: "${NUM_STEPS_PER_ROLLOUT:=1}"
+: "${MAX_RESPONSE_LEN:=16384}"
+: "${MAX_CONTEXT_LEN:=32768}"
+
+: "${TENSOR_PARALLEL_SIZE:=2}"
+: "${CONTEXT_PARALLEL_SIZE:=1}"
+: "${PIPELINE_PARALLEL_SIZE:=1}"
+: "${EXPERT_PARALLEL_SIZE:=1}"
+: "${EXPERT_TENSOR_PARALLEL_SIZE:=1}"
+: "${TRAINING_ATTENTION_BACKEND:=fused}"
+: "${MAX_TOKENS_PER_GPU:=32768}"
+
+: "${SKIP_ACTOR_FORWARD_ONLY:=1}"
+
+: "${IS_CORRECTION:=tis}"
+: "${TIS_CLIP:=2.0}"
+: "${TIS_CLIP_LOW:=0}"
+: "${ASYNC_DATA_BUFFER_CAPACITY_FACTOR:=30}"
+: "${ASYNC_UNUSED_SAMPLES_HANDLER:=retry}"
+
+: "${SAVE_INTERVAL:=10}"
+: "${SAVE_RETAIN_INTERVAL:=100}"
+: "${SAVE_HF:=1}"
+: "${EVAL_INTERVAL:=0}"

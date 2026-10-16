@@ -85,7 +85,7 @@ then push up until you OOM.
 | `--rollout-max-response-len` | `–` | Max tokens per response. |
 | `--rollout-stop-token-ids` | model default | Stop token IDs. Override when generations don't stop. |
 | `--apply-chat-template` | off | Apply the tokenizer's chat template. |
-| `--rollout-shuffle` | off | Shuffle prompts each rollout. |
+| `--rollout-shuffle` | off | Shuffle prompts each dataset epoch. |
 
 ### Optimizer
 
@@ -158,7 +158,8 @@ Sections mirror the launch-script argument groups.
 | `--ref-load` | path | – | Reference model in `torch_dist` format (Megatron). |
 | `--load` | path | – | Actor checkpoint to resume from. |
 | `--save` | path | – | Actor checkpoint write directory. |
-| `--save-interval` | int | – | Rollouts between saves. |
+| `--save-interval` | int | – | Rollouts between resume checkpoint saves (model, optimizer, and rollout state). |
+| `--hf-save-interval` | int | – | Independent HF export cadence; requires `--save-hf` and single-policy Megatron training. Unset follows `--save-interval`. HF-only saves do not write the prompt cursor or replay buffer. |
 | `--async-save` | flag | off | Write Megatron checkpoint shards asynchronously. With `--save-hf`, the native write overlaps the HF export. |
 | `--save-trigger-sentinel` | path | – | If this file exists at a save point, save a checkpoint now (regardless of `--save-interval`) and remove the file. |
 | `--custom-megatron-post-save-hook-path` | `<module>.<fn>` | – | Rank-0 callback after each checkpoint save. |
@@ -169,12 +170,16 @@ Sections mirror the launch-script argument groups.
 
 | Flag | Type | Default | Notes |
 |---|---|---|---|
-| `--prompt-data` | str | – | Path to a single JSONL file. |
+| `--prompt-data` | str | – | Path to a single JSONL or Parquet file. |
+| `--prompt-data-files` | str+ | – | Multiple JSONL/Parquet sources; mutually exclusive with `--prompt-data` and `--prompt-data-config`. |
+| `--prompt-data-ratios` | float+ | – | One non-negative relative weight per `--prompt-data-files` entry; at least one must be positive. Omit to weight by filtered source row counts. |
+| `--prompt-data-config` | str | – | JSON/YAML file or `base64:` JSON containing `datasets` and optional `epoch_size`. Sources specify names, paths, ratios, categories, field mappings and reward/generation hooks. |
+| `--prompt-data-epoch-size` | int | filtered row total | Prompt groups per mixture cycle; overrides the config's `epoch_size`. Requires a mixture and a positive integer. |
 | `--input-key` | str | `input` | JSONL key to `Sample.prompt`. |
 | `--label-key` | str | `None` | JSONL key to `Sample.label`. |
 | `--metadata-key` | str | `metadata` | JSONL key to `Sample.metadata`. |
 | `--apply-chat-template` | flag | off | Apply tokenizer chat template. |
-| `--rollout-shuffle` | flag | off | Shuffle prompts each rollout. |
+| `--rollout-shuffle` | flag | off | Shuffle prompts each dataset epoch. Mixtures shuffle within sources and after mixing using `rollout_seed + epoch_id`. |
 | `--num-rollout` | int | – | Total rollout iterations. If unset, derived from dataset size. |
 | `--rollout-batch-size` | int | – | Prompts per rollout. |
 | `--n-samples-per-prompt` | int | `1` | Responses per prompt. |
@@ -182,6 +187,17 @@ Sections mirror the launch-script argument groups.
 | `--num-steps-per-rollout` | int | – | Optimizer steps per rollout. Alternative to `--global-batch-size`; setting one derives the other. |
 | `--over-sampling-batch-size` | int | – | Oversample size for dynamic sampling (DAPO). |
 | `--balance-data` | flag | off | Balance per-rank token count. |
+
+Mixtures require the global rollout dataset. Source ratios are normalized and converted
+to integer group counts for each cycle using largest remainders. A source repeats when
+its allocation exceeds its row count; ratio zero selects no prompts. An active source
+with no rows after prompt-length filtering is rejected.
+
+The cycle size does not set the training step count. `--num-rollout` still controls the
+number of rollout batches. Ratios describe the input groups over a complete cycle;
+partial cycles, asynchronous completion and reward filtering can change the proportions
+in each training batch. File configs resolve relative source paths beside the config;
+inline configs require absolute paths.
 
 ### Rollout: sampling
 
@@ -276,13 +292,37 @@ Sections mirror the launch-script argument groups.
 | Flag | Type | Default | Notes |
 |---|---|---|---|
 | `--rm-type` | str | – | Built-in reward: `math`, `dapo`, `deepscaler`, `gemma_math`, `f1`, `gpqa`, `ifbench`, `remote_rm`, `random`, `deterministic_random`. A `boxed_` prefix (e.g. `boxed_math`) extracts `\boxed{}` from the response before grading. |
+| `--rm-num-workers` | int | `0` | CPU Ray actors shared by `deepscaler`, `gemma_math`, `dapo`, `math`, `f1`, `gpqa`, and `ifbench` per rollout executor. A positive count moves scoring out of the rollout event loop and bounds active reward RPCs to that count. `0` keeps inline scoring. Remote/custom rewards and random baselines keep their existing paths. |
+| `--log-rollout-event-loop` | flag | off | Sample rollout event loop scheduling delay every 100 ms; fully async rollout reports its mean, p95 and maximum per metric window. |
+| `--log-rollout-postprocess` | flag | off | Measure wall, thread CPU, and GC time for rollout logging, sample conversion/release, DP scheduling, shard packaging, and object-store writes. Adds per-step diagnostics without changing rewards or batch selection. |
 | `--rm-url` | str | – | Endpoint when `--rm-type remote_rm`. |
+| `--rm-max-retries` | int | `1` | Nonnegative number of retries after the first `remote_rm` request; `0` disables retries. |
+| `--rm-request-timeout` | float | `30.0` | Positive, finite timeout in seconds for each `remote_rm` HTTP attempt. |
 | `--group-rm` | flag | off | Batched reward computation. |
 | `--custom-rm-path` | str | – | Custom reward function (see [Customization](/user-guide/customization)). |
 | `--dynamic-sampling-filter-path` | str | – | Group filter (DAPO-style). |
 | `--rollout-submission-granularity` | enum | driver | `group` or `sample`: what frees rollout submission capacity. Unset means `sample` under `--fully-async`, `group` otherwise. |
 | `--buffer-filter-path` | str | – | Buffer dequeue filter. |
 | `--rollout-sample-filter-path` | str | – | Per-sample filter. |
+
+For `remote_rm`, HTTP, connection, timeout, and JSON-decoding failures are retried. After the final failed attempt, the reward remains `None`; a warning and `Sample.metadata.remote_reward_error` record the attempt count, HTTP status (when available), and exception type. The standard rollout filter excludes its prompt group from training.
+
+Evaluation reports scored and unscored counts separately and computes reward metrics from scored samples. Pass-rate metrics use only complete prompt groups with no missing rewards. Metrics with no eligible samples or groups are omitted. Custom reward functions manage their own retry and timeout policies.
+
+### Staleness and replay buffer
+
+| Flag | Type | Default | Notes |
+|---|---|---|---|
+| `--log-category-staleness` | flag | off | Selected-batch category proportions and measured version-lag distributions, including missing-provenance coverage. |
+| `--async-data-buffer-order` | enum | `fifo` | Built-in fully-async buffer: `fifo` or `oldest-policy-first`. Priority uses the oldest generated version; ties retain insertion order and unknown versions come last. |
+| `--async-staleness-metric` | enum | `oldest` | `submission` and `ready` require single-policy training. Definition used by `--max-weight-staleness`: `oldest`, `newest`, `token-mean`, `submission`, `first-prefill`, or `ready`. Non-default definitions with a bound require measured provenance. |
+| `--custom-staleness-function-path` | str | – | Override with `(args, DataBufferInput, current_version) -> nonnegative finite lag or None`. Requires the built-in fully-async buffer. |
+| `--use-replay-data-buffer` | flag | off | Persist ready groups, prompt cursor, and unfinished work alongside training checkpoints. Requires fully-async global-dataset training, a single Megatron actor on Ray (separate from Kubernetes hot restart), and `--save` / `--save-interval`. Alias: `--use-replay-buffer`. |
+| `--replay-data-buffer-mode` | enum | `rollout` | `rollout` regenerates unfinished prompts; `inflight` retains and continues single-turn text prefixes. Inflight mode excludes custom generators, sessions, multimodal inputs, and routing/indexer replay. |
+| `--replay-data-buffer-async-restore` | flag | off | Restore the first part before starting training, then verify/load the remaining parts with capacity backpressure. Alias: `--replay-buffer-async-restore`. Requires replay and capacity for at least one batch. |
+| `--log-policy-lag-metrics` | flag | off | Log detached `log π_train − log μ_inf` moments over response tokens, globally and per category. Requires engine rollout logprobs; supported with both policy loss and score centering without changing gradients. The `staleness_math` and `staleness_multi_env` experiment recipes enable this by default; set `LOG_POLICY_LAG_METRICS=0` to opt out. |
+
+Policy-lag metrics appear under `train/policy_lag/`, separately for all response, loss-enabled, truncated, and non-truncated tokens. Token sums and counts are pooled across microbatches and DP/CP before computing means. These logprob differences are diagnostics, not KL estimates; their interpretation depends on the inference sampling/logprob convention.
 
 ### SGLang and router
 

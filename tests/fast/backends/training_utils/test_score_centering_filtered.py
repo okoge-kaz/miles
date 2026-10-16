@@ -113,6 +113,19 @@ def test_filtered_loss_matches_dense_support_gradient(single_rank: None, mode: s
     loss, metrics = score_centering_loss_function(args, batch, logits, torch.mean)
     actual = torch.autograd.grad(loss, logits)[0]
 
+    # Measurement must also work with the new loss, without changing its update.
+    from miles.backends.training_utils.loss.hub.policy_lag_metrics import finalize_policy_lag_metrics
+
+    args.log_policy_lag_metrics = True
+    batch.update(sample_categories=["math"], category_vocabulary=["math"], truncated=[0])
+    measured_loss, measured_metrics = score_centering_loss_function(args, batch, logits, torch.mean)
+    measured_gradient = torch.autograd.grad(measured_loss, logits)[0]
+    torch.testing.assert_close(measured_loss, loss)
+    torch.testing.assert_close(measured_gradient, actual)
+    finalized = finalize_policy_lag_metrics(measured_metrics)
+    assert finalized["policy_lag/total/loss_enabled/token_count"] == 1
+    assert finalized["policy_lag/category/math/loss_enabled/token_count"] == 1
+
     reference_logits = logits.detach().clone().requires_grad_()
     logp = torch.log_softmax(reference_logits[0, 1, [2, 3]] / 0.7, dim=0)
     q = torch.tensor([4 / 7, 3 / 7])

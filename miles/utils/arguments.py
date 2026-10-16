@@ -20,8 +20,10 @@ from miles.backends.sglang_utils.arguments import validate_args as sglang_valida
 from miles.dashboard.args import add_dashboard_arguments, validate_dashboard_args
 from miles.ray.specs.train import compute_trainer_ids, external_trainer_controller_addrs
 from miles.rollout.checkpoint_eval import is_checkpoint_eval_fn
+from miles.utils.async_buffer_arguments import add_buffer_arguments, validate_buffer_arguments
 from miles.utils.audit_utils.event_logger.logger import EVENTS_DIRNAME
 from miles.utils.chat_template_utils.tito_tokenizer import TITOTokenizerType
+from miles.utils.dataset_mixture import validate_prompt_arguments
 from miles.utils.env_report.launcher_report import LAUNCHER_REPORT_ENV_VAR
 from miles.utils.environ import use_legacy_rollout_v1
 from miles.utils.eval_config import EvalDatasetConfig, build_eval_dataset_configs, ensure_dataset_list
@@ -858,10 +860,10 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 type=int,
                 default=None,
                 help=(
-                    "Maximum allowed gap between a group's oldest weight version and the current "
-                    "engine weight version. Groups exceeding this threshold are recycled back to "
-                    "the data buffer instead of being sent to training. Only effective in fully "
-                    "async mode. None (default) disables staleness filtering."
+                    "Maximum allowed lag under --async-staleness-metric or the custom staleness function. "
+                    "The default measures the gap from the group's oldest generated weight version. "
+                    "Groups exceeding the limit follow --async-unused-samples-handler. Only effective "
+                    "in fully async mode. None (default) disables staleness filtering."
                 ),
             )
             parser.add_argument(
@@ -887,6 +889,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "unboundedly ahead of training."
                 ),
             )
+            add_buffer_arguments(parser)
             parser.add_argument(
                 "--async-unused-samples-handler",
                 type=str,
@@ -1244,6 +1247,30 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument("--apply-chat-template", action="store_true", default=False)
+            parser.add_argument(
+                "--prompt-data-files",
+                nargs="+",
+                default=None,
+                help="Multiple prompt JSONL/parquet sources; preserves the single-path --prompt-data API.",
+            )
+            parser.add_argument(
+                "--prompt-data-ratios",
+                nargs="+",
+                type=float,
+                default=None,
+                help="Per-source epoch ratios, paired with --prompt-data-files.",
+            )
+            parser.add_argument(
+                "--prompt-data-config",
+                default=None,
+                help="YAML/JSON file or base64: inline JSON with paths, ratios, categories, generation/reward hooks.",
+            )
+            parser.add_argument(
+                "--prompt-data-epoch-size",
+                type=int,
+                default=None,
+                help="Prompt groups per mixture cycle, not training steps; defaults to total filtered source rows.",
+            )
             # Temporarily be JSON-serialized str, will be a real dict after using Omegaconf
             parser.add_argument("--apply-chat-template-kwargs", type=json.loads, default="{}")
             parser.add_argument(
@@ -1543,6 +1570,12 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "Path to save the model in HuggingFace format when using Megatron backend. "
                     "The model will be saved to `save_hf.format(rollout_id)`. "
                 ),
+            )
+            parser.add_argument(
+                "--hf-save-interval",
+                type=int,
+                default=None,
+                help="Independent HF export interval (Megatron only); unset follows --save-interval.",
             )
             parser.add_argument(
                 "--save-trigger-sentinel",
@@ -1961,6 +1994,12 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
 
         # wandb
         def add_wandb_arguments(parser):
+            parser.add_argument(
+                "--log-rollout-repetition",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help="Compute compression-based response repetition metrics for rollout and evaluation.",
+            )
             # wandb parameters
             parser.add_argument("--use-wandb", action="store_true", default=False)
             parser.add_argument(
@@ -2371,6 +2410,25 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
 
         def add_reward_model_arguments(parser):
             parser.add_argument(
+                "--rm-num-workers",
+                type=int,
+                default=0,
+                help=(
+                    "CPU Ray workers shared by deepscaler, gemma_math, dapo, math, f1, gpqa, and ifbench scoring "
+                    "per rollout executor; 0 keeps inline scoring. Remote and custom reward functions are unaffected."
+                ),
+            )
+            parser.add_argument(
+                "--log-rollout-event-loop",
+                action="store_true",
+                help="Measure shared rollout event loop scheduling delay.",
+            )
+            parser.add_argument(
+                "--log-rollout-postprocess",
+                action="store_true",
+                help="Measure wall, thread CPU, and GC time for rollout logging, conversion, scheduling, and storage.",
+            )
+            parser.add_argument(
                 "--rm-type",
                 type=str,
                 default=None,
@@ -2399,6 +2457,18 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 type=str,
                 default=None,
                 help="URL for the reward model service for --rm-type remote_rm, e.g. http://localhost:8000",
+            )
+            parser.add_argument(
+                "--rm-max-retries",
+                type=int,
+                default=1,
+                help="Retries after the first remote reward request; exhausted requests leave the sample unscored.",
+            )
+            parser.add_argument(
+                "--rm-request-timeout",
+                type=float,
+                default=30.0,
+                help="Timeout in seconds for each remote reward HTTP attempt.",
             )
             parser.add_argument(
                 "--custom-rm-path",
@@ -3461,6 +3531,12 @@ def miles_validate_args(args):
     if args.save_interval is not None:
         assert args.save is not None, "'--save' is required when save_interval is set."
 
+    if args.hf_save_interval is not None:
+        assert not resolve_megatron_config(args).is_multi_policy, "--hf-save-interval supports single-policy training"
+        assert args.hf_save_interval > 0, "--hf-save-interval must be positive"
+        assert args.save_hf is not None, "--hf-save-interval requires --save-hf"
+        assert args.train_backend == "megatron", "--hf-save-interval requires the Megatron backend"
+
     if args.save_trigger_sentinel is not None:
         assert args.save is not None, "'--save' is required when save_trigger_sentinel is set."
 
@@ -3778,6 +3854,12 @@ def miles_validate_args(args):
         )
 
     _resolve_rollout_functions(args)
+    validate_prompt_arguments(args)
+    validate_buffer_arguments(args)
+    if args.rm_num_workers > 0 and args.cluster_backend != "ray":
+        raise ValueError("--rm-num-workers requires the Ray cluster backend")
+    if args.rm_num_workers < 0:
+        raise ValueError("--rm-num-workers must be nonnegative")
 
     # Both snapshot postures drive the same RolloutManager._eval_checkpoint path.
     # (The fleet-vs-CheckpointEvalFn conflict is asserted where the posture is derived.)
@@ -3804,10 +3886,11 @@ def miles_validate_args(args):
             if not any(field == "rollout_id" for _, field, _, _ in Formatter().parse(args.save_hf)):
                 args.save_hf = os.path.join(args.save_hf, "step_{rollout_id}")
                 logger.info(f"Using per-step checkpoints for snapshot eval: --save-hf={args.save_hf}")
-            assert args.save_interval is not None and args.eval_interval % args.save_interval == 0, (
+            hf_interval = args.hf_save_interval if args.hf_save_interval is not None else args.save_interval
+            assert hf_interval is not None and args.eval_interval % hf_interval == 0, (
                 "Reusing --save-hf checkpoints for eval requires eval_interval to be a "
-                f"multiple of save_interval (got eval_interval={args.eval_interval}, "
-                f"save_interval={args.save_interval}). Set --eval-hf-dir for independent snapshots."
+                f"multiple of the HF save interval (got eval_interval={args.eval_interval}, "
+                f"hf_interval={hf_interval}). Set --eval-hf-dir for independent snapshots."
             )
 
     if args.num_steps_per_rollout is not None:
@@ -4058,6 +4141,7 @@ def _maybe_apply_dumper_overrides(args) -> None:
     args.eval_interval = None
     args.save = None
     args.save_interval = None
+    args.hf_save_interval = None
     args.save_retain_interval = None
 
 

@@ -1,0 +1,230 @@
+import argparse
+import os
+import re
+import shlex
+import subprocess
+from collections.abc import Mapping
+from pathlib import Path
+
+from experiments.common.dataset_args import prompt_arguments
+from miles.utils.external_utils.model_args_utils import load_model_args
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def validate_config(environment: Mapping[str, str]) -> None:
+    prompt_arguments(environment)
+    judge_mode = environment.get("LLM_JUDGE_MODE", "off")
+    if judge_mode != "off":
+        raise ValueError("LLM_JUDGE_MODE was removed; select a native NeMo Gym judge in the dataset reward hook")
+    if environment["PLACEMENT"] not in ("disaggregate", "colocated"):
+        raise ValueError("PLACEMENT must be disaggregate or colocated")
+    if environment["TRUNCATION_MODE"] not in ("none", "zero_reward", "zero_loss"):
+        raise ValueError("TRUNCATION_MODE must be none, zero_reward, or zero_loss")
+    for name in (
+        "GPUS_PER_NODE",
+        "ACTOR_NUM_NODES",
+        "ACTOR_GPUS_PER_NODE",
+        "ROLLOUT_NUM_GPUS_PER_ENGINE",
+        "TENSOR_PARALLEL_SIZE",
+        "CONTEXT_PARALLEL_SIZE",
+        "PIPELINE_PARALLEL_SIZE",
+        "EXPERT_PARALLEL_SIZE",
+        "EXPERT_TENSOR_PARALLEL_SIZE",
+        "ROLLOUT_BATCH_SIZE",
+        "N_SAMPLES_PER_PROMPT",
+        "GLOBAL_BATCH_SIZE",
+        "NUM_STEPS_PER_ROLLOUT",
+        "NUM_ROLLOUT",
+        "MAX_RESPONSE_LEN",
+        "MAX_CONTEXT_LEN",
+        "MAX_TOKENS_PER_GPU",
+        "SAVE_INTERVAL",
+    ):
+        if int(environment[name]) <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+    if int(environment.get("RM_NUM_WORKERS", "0")) < 0:
+        raise ValueError("RM_NUM_WORKERS must be nonnegative")
+    rollout_ep = int(environment.get("ROLLOUT_EXPERT_PARALLEL_SIZE", "1"))
+    if rollout_ep <= 0 or int(environment["ROLLOUT_NUM_GPUS_PER_ENGINE"]) % rollout_ep:
+        raise ValueError("ROLLOUT_EXPERT_PARALLEL_SIZE must be positive and divide the rollout engine GPU count")
+    if rollout_ep != 1 and environment["MODEL_PROFILE"] in ("qwen3-4B", "qwen3-8B"):
+        raise ValueError("ROLLOUT_EXPERT_PARALLEL_SIZE > 1 requires a MoE model")
+    retain_interval = environment["SAVE_RETAIN_INTERVAL"]
+    if retain_interval != "none":
+        retain_interval = int(retain_interval)
+        if retain_interval <= 0 or retain_interval % int(environment["SAVE_INTERVAL"]) != 0:
+            raise ValueError("SAVE_RETAIN_INTERVAL must be none or a positive multiple of SAVE_INTERVAL")
+    for name in ("SKIP_ACTOR_FORWARD_ONLY", "SAVE_HF", "DUMP_ROLLOUT_DATA", "USE_CHECKPOINT_OPT_PARAM_SCHEDULER"):
+        if environment[name] not in ("0", "1"):
+            raise ValueError(f"{name} must be 0 or 1")
+    for name in (
+        "USE_ROLLOUT_ROUTING_REPLAY",
+        "USE_REPLAY_DATA_BUFFER",
+        "REPLAY_DATA_BUFFER_ASYNC_RESTORE",
+        "LOG_ROLLOUT_REPETITION",
+        "LOG_ROLLOUT_EVENT_LOOP",
+        "LOG_ROLLOUT_POSTPROCESS",
+        "LOG_CATEGORY_STALENESS",
+        "LOG_POLICY_LAG_METRICS",
+        "SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS",
+    ):
+        if environment.get(name, "0") not in ("0", "1"):
+            raise ValueError(f"{name} must be 0 or 1")
+    if (
+        environment.get("REPLAY_DATA_BUFFER_ASYNC_RESTORE", "0") == "1"
+        and environment.get("USE_REPLAY_DATA_BUFFER", "0") != "1"
+    ):
+        raise ValueError("REPLAY_DATA_BUFFER_ASYNC_RESTORE requires USE_REPLAY_DATA_BUFFER=1")
+    if environment.get("USE_REPLAY_DATA_BUFFER", "0") == "1" and environment["PLACEMENT"] != "disaggregate":
+        raise ValueError("ReplayDataBuffer requires disaggregate placement")
+    hf_interval = environment.get("HF_SAVE_INTERVAL", "")
+    if hf_interval and (int(hf_interval) <= 0 or environment["SAVE_HF"] != "1"):
+        raise ValueError("HF_SAVE_INTERVAL must be positive and requires SAVE_HF=1")
+    replay_mode = environment.get("REPLAY_DATA_BUFFER_MODE", "rollout")
+    if replay_mode not in ("rollout", "inflight"):
+        raise ValueError("REPLAY_DATA_BUFFER_MODE must be rollout or inflight")
+    if replay_mode == "inflight" and environment.get("USE_REPLAY_DATA_BUFFER", "0") != "1":
+        raise ValueError("REPLAY_DATA_BUFFER_MODE=inflight requires USE_REPLAY_DATA_BUFFER=1")
+    if environment.get("USE_ROLLOUT_ROUTING_REPLAY", "0") == "1":
+        if environment["MODEL_PROFILE"] in ("qwen3-4B", "qwen3-8B"):
+            raise ValueError("USE_ROLLOUT_ROUTING_REPLAY requires a MoE model")
+        if replay_mode == "inflight":
+            raise ValueError("USE_ROLLOUT_ROUTING_REPLAY is incompatible with REPLAY_DATA_BUFFER_MODE=inflight")
+    order = environment.get("ASYNC_DATA_BUFFER_ORDER", "fifo")
+    metric = environment.get("ASYNC_STALENESS_METRIC", "oldest")
+    if order not in ("fifo", "oldest-policy-first"):
+        raise ValueError("ASYNC_DATA_BUFFER_ORDER must be fifo or oldest-policy-first")
+    if metric not in ("oldest", "newest", "token-mean", "submission", "first-prefill", "ready"):
+        raise ValueError("Unknown ASYNC_STALENESS_METRIC")
+    if metric == "first-prefill" and environment.get("SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS", "0") != "1":
+        raise ValueError("first-prefill requires SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS=1")
+    if environment["PLACEMENT"] != "disaggregate" and (
+        order != "fifo" or metric != "oldest" or environment.get("CUSTOM_STALENESS_FUNCTION_PATH")
+    ):
+        raise ValueError("Async buffer ordering/staleness options require disaggregate placement")
+    if (
+        environment.get("REPLAY_DATA_BUFFER_ASYNC_RESTORE", "0") == "1"
+        and float(environment["ASYNC_DATA_BUFFER_CAPACITY_FACTOR"]) < 1
+    ):
+        raise ValueError("Async ReplayDataBuffer restore requires capacity for at least one batch")
+    samples = int(environment["ROLLOUT_BATCH_SIZE"]) * int(environment["N_SAMPLES_PER_PROMPT"])
+    steps = int(environment["NUM_STEPS_PER_ROLLOUT"])
+    if samples != int(environment["GLOBAL_BATCH_SIZE"]) * steps:
+        raise ValueError(
+            "ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT must equal GLOBAL_BATCH_SIZE * NUM_STEPS_PER_ROLLOUT"
+        )
+    if environment["SKIP_ACTOR_FORWARD_ONLY"] == "1" and steps != 1:
+        raise ValueError("SKIP_ACTOR_FORWARD_ONLY=1 requires exactly one optimizer step per rollout")
+    if int(environment["MAX_RESPONSE_LEN"]) > int(environment["MAX_CONTEXT_LEN"]):
+        raise ValueError("MAX_RESPONSE_LEN must not exceed MAX_CONTEXT_LEN")
+    if environment["IS_CORRECTION"] not in ("tis", "none"):
+        raise ValueError("IS_CORRECTION must be tis or none")
+    if environment["MEGATRON_TO_HF_MODE"] not in ("raw", "bridge"):
+        raise ValueError("MEGATRON_TO_HF_MODE must be raw or bridge")
+    mode = environment["WANDB_MODE"]
+    if mode not in ("online", "offline", "disabled"):
+        raise ValueError("WANDB_MODE must be online, offline, or disabled")
+    if mode == "online" and not environment.get("WANDB_API_KEY"):
+        raise ValueError("WANDB_MODE=online requires WANDB_API_KEY or the compute host's ~/.netrc")
+    fraction = float(environment["SGLANG_MEM_FRACTION"])
+    if not 0 < fraction < 1:
+        raise ValueError("SGLANG_MEM_FRACTION must be between 0 and 1")
+    if environment["PLACEMENT"] == "disaggregate":
+        if float(environment["ASYNC_DATA_BUFFER_CAPACITY_FACTOR"]) <= 0:
+            raise ValueError("ASYNC_DATA_BUFFER_CAPACITY_FACTOR must be positive")
+        if environment["ASYNC_UNUSED_SAMPLES_HANDLER"] not in ("retry", "drop"):
+            raise ValueError("ASYNC_UNUSED_SAMPLES_HANDLER must be retry or drop")
+        if environment["MAX_WEIGHT_STALENESS"] != "none" and int(environment["MAX_WEIGHT_STALENESS"]) < 0:
+            raise ValueError("MAX_WEIGHT_STALENESS must be nonnegative or none")
+        if environment.get("ASYNC_MAX_CONCURRENT_SAMPLES") and int(environment["ASYNC_MAX_CONCURRENT_SAMPLES"]) <= 0:
+            raise ValueError("ASYNC_MAX_CONCURRENT_SAMPLES must be positive")
+        if environment["PAUSE_GENERATION_MODE"] not in ("in_place", "retract"):
+            raise ValueError("PAUSE_GENERATION_MODE must be in_place or retract")
+        if environment["UPDATE_WEIGHT_TRANSFER_MODE"] not in ("broadcast", "p2p"):
+            raise ValueError("UPDATE_WEIGHT_TRANSFER_MODE must be broadcast or p2p")
+        if environment["PAUSE_GENERATION_MODE"] == "in_place" and environment["UPDATE_WEIGHT_TRANSFER_MODE"] == "p2p":
+            raise ValueError("in_place generation requires broadcast weight transfer")
+
+
+def _recipe_args(environment: Mapping[str, str]) -> list[str]:
+    project = environment["PROJECT_NAME"]
+    experiment = environment["EXPERIMENT_NAME"]
+    if any(re.fullmatch(r"[A-Za-z0-9_-]+", name) is None for name in (project, experiment)):
+        raise ValueError("PROJECT_NAME and EXPERIMENT_NAME must be path-safe recipe names")
+    recipe_dir = REPO_ROOT / "experiments/scripts" / project
+    if experiment != project:
+        recipe_dir /= experiment
+    recipe = recipe_dir / "train.sh"
+    if not recipe.is_file():
+        raise ValueError(f"unknown training recipe: {recipe}")
+    result = subprocess.run(
+        ["bash", str(recipe), "--print-args"],
+        env={**environment, "MILES_REPO": str(REPO_ROOT)},
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise ValueError(f"cannot build training arguments from {recipe}: {result.stderr.strip()}")
+    if not result.stdout.endswith("\0"):
+        raise ValueError(f"recipe must emit NUL-separated training arguments: {recipe}")
+    return result.stdout[:-1].split("\0")
+
+
+def build_command(environment: Mapping[str, str]) -> list[str]:
+    environment = dict(environment)
+    for name, legacy in (
+        ("USE_REPLAY_DATA_BUFFER", "USE_REPLAY_BUFFER"),
+        ("REPLAY_DATA_BUFFER_ASYNC_RESTORE", "REPLAY_BUFFER_ASYNC_RESTORE"),
+    ):
+        environment.setdefault(name, environment.get(legacy, "0"))
+    validate_config(environment)
+    train_script = "train_async.py" if environment["PLACEMENT"] == "disaggregate" else "train.py"
+    return [
+        "python3",
+        str(REPO_ROOT / train_script),
+        *shlex.split(load_model_args(environment["MODEL_PROFILE"])),
+        *_recipe_args(environment),
+    ]
+
+
+def runtime_environment(environment: Mapping[str, str]) -> dict[str, dict[str, str]]:
+    names = (
+        "MASTER_ADDR",
+        "no_proxy",
+        "NCCL_IB_DISABLE",
+        "NCCL_NET",
+        "NCCL_NVLS_ENABLE",
+        "NCCL_SOCKET_IFNAME",
+        "GLOO_SOCKET_IFNAME",
+        "NCCL_DEBUG",
+        "WANDB_MODE",
+        "NEMO_GYM_ENDPOINTS",
+        "NEMO_GYM_REQUEST_TIMEOUT",
+    )
+    return {
+        "env_vars": {
+            "PYTHONPATH": f"{REPO_ROOT}:/root/Megatron-LM",
+            "PYTHONUNBUFFERED": "1",
+            "CUDA_DEVICE_MAX_CONNECTIONS": "1",
+            **{name: environment[name] for name in names if environment.get(name)},
+        }
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Build and submit the selected ABCI training recipe")
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+    command = build_command(os.environ)
+    print(shlex.join(command), flush=True)
+    if args.dry_run:
+        return
+    # The preview must also work on login hosts without Ray or GPU packages.
+    from miles.utils.external_utils.ray_job import run_ray_job
+
+    run_ray_job(entrypoint=shlex.join(command), runtime_env=runtime_environment(os.environ), job_lifetime="launcher")
+
+
+if __name__ == "__main__":
+    main()

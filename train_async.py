@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+from time import monotonic
 
 from miles.ray.placement_group import (
     create_rollout_components,
@@ -13,7 +14,7 @@ from miles.utils.arguments import parse_args, validate_async_off_policy_correcti
 from miles.utils.async_utils import Disposer, eager_create_task, with_disposer
 from miles.utils.data import remove_rollout_data_refs, remove_train_output_refs
 from miles.utils.ft_utils.mini_ft_controller import maybe_start_mini_ft_controller
-from miles.utils.misc import should_run_periodic_action
+from miles.utils.misc import checkpoint_artifacts_due, should_run_periodic_action
 from miles.utils.orchestration_utils import init_orchestration_script
 
 logger = logging.getLogger(__name__)
@@ -21,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 # The framework supports other asynchronous approaches such as fully async (see miles/rollout/fully_async_rollout.py).
 async def train(args, *, disposer: Disposer):
+    use_replay_data_buffer = getattr(args, "use_replay_data_buffer", False)
     assert not args.colocate, "Colocation is not supported for async training."
     validate_async_off_policy_correction(args)
     _worker_manager = init_orchestration_script(args, disposer=disposer)
@@ -55,16 +57,20 @@ async def train(args, *, disposer: Disposer):
         await inference_controller.prepare_eval()
         await eval_dispatcher.dispatch(0, hf_dir=args.hf_checkpoint)
 
-    async def save_training_model(model, rollout_id, force_sync):
+    async def save_training_model(model, rollout_id, force_sync, *, write_dist=True, write_hf=True):
         if args.use_critic and args.offload_train:
             await model.onload()
-        await model.save_model(rollout_id, force_sync=force_sync)
+        await model.save_model(rollout_id, force_sync=force_sync, write_dist=write_dist, write_hf=write_hf)
         if args.use_critic and args.offload_train:
             await model.offload()
 
     async def prepare_and_generate(rollout_id):
         await inference_controller.prepare_rollout(rollout_id)
-        return await rollout_executor.get(rollout_id)
+        started = monotonic()
+        data = await rollout_executor.get(rollout_id)
+        if getattr(args, "log_rollout_postprocess", False):
+            logger.info("rollout_delivery %s: %s", rollout_id, {"perf/rollout_rpc_time": monotonic() - started})
+        return data
 
     # async train loop.
     rollout_data_next_future = await eager_create_task(prepare_and_generate(args.start_rollout_id))
@@ -78,7 +84,7 @@ async def train(args, *, disposer: Disposer):
 
         # A fully-async producer keeps generating without a pending get(). When
         # weights will change, defer the next drain so it uses the new version.
-        defer_next_drain = args.fully_async and has_next_rollout and weight_update_due
+        defer_next_drain = args.fully_async and has_next_rollout and (weight_update_due or use_replay_data_buffer)
         if has_next_rollout and not defer_next_drain:
             rollout_data_next_future = await eager_create_task(prepare_and_generate(rollout_id + 1))
 
@@ -96,14 +102,23 @@ async def train(args, *, disposer: Disposer):
         remove_rollout_data_refs(args, rollout_data_curr_ref)
 
         external_save = args.save_trigger_sentinel is not None and os.path.exists(args.save_trigger_sentinel)
-        if external_save or should_run_periodic_action(
-            rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout
-        ):
-            force_sync = external_save or rollout_id == args.num_rollout - 1
-            await save_training_model(actor_model, rollout_id, force_sync)
+        write_dist, write_hf = checkpoint_artifacts_due(
+            rollout_id,
+            save_interval=args.save_interval,
+            hf_save_interval=getattr(args, "hf_save_interval", None),
+            num_rollout_per_epoch=num_rollout_per_epoch,
+            num_rollout=args.num_rollout,
+            external_save=external_save,
+        )
+        if write_dist or write_hf:
+            force_sync = external_save or rollout_id == args.num_rollout - 1 or use_replay_data_buffer
+            await save_training_model(actor_model, rollout_id, force_sync, write_dist=write_dist, write_hf=write_hf)
             if args.use_critic:
-                await save_training_model(critic_model, rollout_id, force_sync)
-            await rollout_executor.save(rollout_id)
+                await save_training_model(
+                    critic_model, rollout_id, force_sync, write_dist=write_dist, write_hf=write_hf
+                )
+            if write_dist:
+                await rollout_executor.save(rollout_id)
             if external_save:
                 os.remove(args.save_trigger_sentinel)
 
@@ -113,8 +128,8 @@ async def train(args, *, disposer: Disposer):
                 rollout_data_curr_ref = (await x) if (x := rollout_data_next_future) is not None else None
                 rollout_data_next_future = None
             await update_weights(args, actor_model, rollout_executor, inference_controller, rollout_id=rollout_id)
-            if defer_next_drain:
-                rollout_data_next_future = await eager_create_task(prepare_and_generate(rollout_id + 1))
+        if defer_next_drain:
+            rollout_data_next_future = await eager_create_task(prepare_and_generate(rollout_id + 1))
 
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch, args.num_rollout):
             await inference_controller.prepare_eval()

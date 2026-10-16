@@ -1,8 +1,9 @@
+import gc
 import time
 
 import pytest
 
-from miles.utils.timer import Timer, inverse_timer, timer
+from miles.utils.timer import Timer, inverse_timer, measure_time, timer
 
 
 @pytest.fixture
@@ -75,3 +76,30 @@ def test_sink_with_begin_hears_starts():
     finally:
         timer.event_sinks.clear()
         timer.reset()
+
+
+def test_block_measurement_cleans_up_gc_callback_on_failure():
+    callbacks = list(gc.callbacks)
+    metrics = {}
+    with pytest.raises(RuntimeError, match="block failed"):
+        with measure_time(metrics, "stage"):
+            gc.collect()
+            raise RuntimeError("block failed")
+
+    assert gc.callbacks == callbacks
+    assert metrics["stage/wall_time"] >= metrics["stage/gc_time"] >= 0
+    assert metrics["stage/cpu_time"] >= 0
+    assert metrics["stage/gc_collections"] >= 1
+
+
+def test_disabled_block_measurement_does_not_read_clocks_or_register_callbacks(monkeypatch):
+    import miles.utils.timer as timer_module
+
+    def fail():
+        pytest.fail("disabled measurement must not read a clock")
+
+    monkeypatch.setattr(timer_module, "monotonic", fail)
+    monkeypatch.setattr(timer_module, "thread_time", fail)
+    callbacks = list(gc.callbacks)
+    with measure_time(None, "stage"):
+        assert gc.callbacks == callbacks

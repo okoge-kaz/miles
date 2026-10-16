@@ -57,6 +57,8 @@ TRAIN_KEYS = FORWARD_ONLY_KEYS + [
     "returns",
     "ref_log_probs",
     "rollout_log_probs",
+    "sample_categories",
+    "truncated",
     "rollout_topk_token_ids",
     "rollout_topk_lengths",
     "rollout_topk_log_probs",
@@ -112,8 +114,10 @@ class TorchNativeTrainRayActor(TrainRayActor):
             return None
         return lambda seq_lens: fwd_tflops_per_gpu(seq_lens, flops_args, dist.get_world_size())
 
-    def save_model(self, rollout_id: int, force_sync: bool = False) -> None:
-        if self.args.debug_rollout_only or self.args.save is None:
+    def save_model(
+        self, rollout_id: int, force_sync: bool = False, *, write_dist: bool = True, write_hf: bool = True
+    ) -> None:
+        if not write_dist or self.args.debug_rollout_only or self.args.save is None:
             return
         assert not self.args.async_save, f"{type(self).__name__} does not support async_save yet."
         self._save_checkpoint(rollout_id)

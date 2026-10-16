@@ -1,5 +1,6 @@
 import logging
 from numbers import Number
+from time import monotonic
 from typing import Any
 
 import numpy as np
@@ -15,10 +16,27 @@ from miles.utils.metric_utils import (
     has_repetition,
     namespace_metrics,
 )
+from miles.utils.timer import measure_time
 from miles.utils.tracking_utils import tracking
 from miles.utils.types import Sample
 
 logger = logging.getLogger(__name__)
+
+
+def log_rollout_postprocess_metrics(
+    args, rollout_id, metrics, *, get_started, postprocess_started, trainer_model_id=None
+):
+    """Publish completed stage measurements; report diagnostic logging overhead in the console."""
+    finished = monotonic()
+    metrics["perf/rollout_postprocess_time"] = finished - postprocess_started
+    metrics["perf/rollout_get_time"] = finished - get_started
+    step = compute_rollout_step(args, rollout_id)
+    with measure_time(metrics, "perf/rollout_postprocess/diagnostic_logging"):
+        log_dict, step_key = namespace_metrics(
+            metrics, trainer_model_id=trainer_model_id, step_name="rollout/step", step=step
+        )
+        tracking.log(args, log_dict, step_key=step_key)
+    logger.info("postprocess %s: %s", rollout_id, metrics)
 
 
 def log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any] | None = None):
@@ -31,26 +49,36 @@ def log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any] 
     for key in data.keys():
         rewards = data[key]["rewards"]
         num_none = sum(1 for r in rewards if r is None)
+        scored_rewards = [reward for reward in rewards if reward is not None]
+        log_dict[f"eval/{key}-unscored_count"] = num_none
+        log_dict[f"eval/{key}-scored_count"] = len(scored_rewards)
         log_dict[f"eval/{key}-none_reward_ratio"] = num_none / len(rewards) if len(rewards) > 0 else 0.0
         if num_none:
-            logger.warning(
-                f"eval/{key}: {num_none}/{len(rewards)} samples have reward=None (likely errored/aborted trials); treating as 0.0 for metrics."
-            )
-            rewards = [0.0 if r is None else r for r in rewards]
-        log_dict[f"eval/{key}"] = sum(rewards) / len(rewards) if len(rewards) > 0 else 0.0
+            logger.warning(f"eval/{key}: excluding {num_none}/{len(rewards)} unscored samples from reward metrics.")
+        if scored_rewards:
+            log_dict[f"eval/{key}"] = sum(scored_rewards) / len(scored_rewards)
         if (samples := data[key].get("samples")) is not None:
-            log_dict |= dict_add_prefix(_compute_metrics_from_samples(args, samples), f"eval/{key}/")
+            scored_samples = [sample for sample, reward in zip(samples, rewards, strict=True) if reward is not None]
+            if scored_samples:
+                log_dict |= dict_add_prefix(_compute_metrics_from_samples(args, scored_samples), f"eval/{key}/")
         if "truncated" in data[key]:
             truncated = data[key]["truncated"]
-            log_dict[f"eval/{key}-truncated_ratio"] = sum(truncated) / len(truncated)
+            if truncated:
+                log_dict[f"eval/{key}-truncated_ratio"] = sum(truncated) / len(truncated)
         if args.log_passrate:
-            log_dict |= dict_add_prefix(
-                compute_pass_rate(
-                    flat_rewards=rewards,
-                    group_size=args.n_samples_per_eval_prompt,
-                ),
-                f"eval/{key}-",
-            )
+            group_size = args.n_samples_per_eval_prompt
+            assert len(rewards) % group_size == 0
+            groups = [rewards[i : i + group_size] for i in range(0, len(rewards), group_size)]
+            complete_groups = [group for group in groups if all(reward is not None for reward in group)]
+            log_dict[f"eval/{key}-passrate_excluded_group_count"] = len(groups) - len(complete_groups)
+            if complete_groups:
+                log_dict |= dict_add_prefix(
+                    compute_pass_rate(
+                        flat_rewards=[reward for group in complete_groups for reward in group],
+                        group_size=group_size,
+                    ),
+                    f"eval/{key}-",
+                )
 
     logger.info(f"eval {rollout_id}: {log_dict}")
 
@@ -111,7 +139,8 @@ def _compute_metrics_from_samples(args, samples):
     log_dict |= _compute_spec_metrics(args, samples)
     log_dict |= _compute_prefix_cache_metrics(args, samples)
     log_dict |= _compute_reward_cat_metrics(args, samples)
-    log_dict["repetition_frac"] = np.mean([int(has_repetition(s.response)) for s in samples]).item()
+    if getattr(args, "log_rollout_repetition", True):
+        log_dict["repetition_frac"] = np.mean([int(has_repetition(s.response)) for s in samples]).item()
     log_dict["truncated_ratio"] = np.mean([int(s.status == Sample.Status.TRUNCATED) for s in samples]).item()
 
     oldest_versions = [s.oldest_weight_version for s in samples if s.oldest_weight_version is not None]

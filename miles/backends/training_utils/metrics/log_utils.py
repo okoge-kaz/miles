@@ -9,6 +9,10 @@ import torch.distributed as dist
 
 from miles.backends.training_utils.data.context_parallel import get_sum_of_sample_mean
 from miles.backends.training_utils.data.rollout import DataIterator
+from miles.backends.training_utils.loss.hub.policy_lag_metrics import (
+    POLICY_LAG_PART_PREFIX,
+    finalize_policy_lag_metrics,
+)
 from miles.backends.training_utils.metrics import perf
 from miles.backends.training_utils.parallel import get_parallel_state
 from miles.utils.flops_utils import fwd_tflops_per_gpu
@@ -492,7 +496,9 @@ def aggregate_train_losses(
         cp_factor = parallel_state.cp.size
 
     for key, value in zip(keys, values[1:], strict=False):
-        loss_reduced[key] = value * cp_factor / num_samples_or_tokens
+        loss_reduced[key] = (
+            value if key.startswith(POLICY_LAG_PART_PREFIX) else value * cp_factor / num_samples_or_tokens
+        )
 
     return loss_reduced
 
@@ -529,6 +535,7 @@ def log_train_step(
     accumulated_step_id = rollout_id * num_steps_per_rollout + step_id
     role_tag = "" if role == "actor" else f"{role}-"
 
+    loss_dict = finalize_policy_lag_metrics(loss_dict)
     log_dict_out = {
         f"train/{role_tag}{key}": val.mean().item() if isinstance(val, torch.Tensor) else val
         for key, val in loss_dict.items()

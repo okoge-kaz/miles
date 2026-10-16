@@ -116,6 +116,7 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
     if collect_failed:
         sample = deepcopy(input.sample)
         sample.status = Sample.Status.ABORTED
+        sample.metadata = {**(sample.metadata or {}), **(agent_metadata or {})}
         if collect_spec_metrics:
             sample.metadata.pop(SESSION_ROLLOUT_METRICS_KEY, None)
         return GenerateFnOutput(samples=[sample] if use_v2 else sample)
@@ -127,6 +128,7 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
             logger.warning("No model calls recorded for sample")
         sample = deepcopy(input.sample)
         sample.status = Sample.Status.ABORTED
+        sample.metadata = {**(sample.metadata or {}), **(agent_metadata or {})}
         if collect_spec_metrics:
             sample.metadata.pop(SESSION_ROLLOUT_METRICS_KEY, None)
         return GenerateFnOutput(samples=[sample] if use_v2 else sample)

@@ -811,29 +811,32 @@ class MegatronTrainRayActor(TrainRayActor):
         return TrainStepOutput(outcome=train_step_outcome)
 
     @timer
-    def save_model(self, rollout_id: int, force_sync: bool = False) -> None:
+    def save_model(
+        self, rollout_id: int, force_sync: bool = False, *, write_dist: bool = True, write_hf: bool = True
+    ) -> None:
         self._heartbeat.bump()
         if self.args.debug_rollout_only:
             return
 
         self._finalize_pending_async_save()
 
-        save(
-            rollout_id,
-            self.model,
-            self.optimizer,
-            self.opt_param_scheduler,
-            snapshot_publisher=self.snapshot_publisher,
-        )
+        if write_dist:
+            save(
+                rollout_id,
+                self.model,
+                self.optimizer,
+                self.opt_param_scheduler,
+                snapshot_publisher=self.snapshot_publisher,
+            )
 
-        if self.args.save_hf is not None and self.role == "actor":
+        if write_hf and self.args.save_hf is not None and self.role == "actor":
             assert self.snapshot_publisher is not None, "HF export requires a snapshot publisher"
             save_hf_model(self.args, rollout_id, self.model, publisher=self.snapshot_publisher)
 
         if force_sync:
             self._finalize_pending_async_save()
 
-        if self.args.custom_megatron_post_save_hook_path is not None and dist.get_rank() == 0:
+        if write_dist and self.args.custom_megatron_post_save_hook_path is not None and dist.get_rank() == 0:
             self._finalize_pending_async_save()
 
             from megatron.training.checkpointing import get_checkpoint_name
@@ -843,7 +846,7 @@ class MegatronTrainRayActor(TrainRayActor):
             checkpoint_dir = get_checkpoint_name(self.args.save, rollout_id, return_base_dir=True)
             hf_checkpoint_dir = (
                 self.args.save_hf.format(rollout_id=rollout_id)
-                if self.args.save_hf is not None and self.role == "actor"
+                if write_hf and self.args.save_hf is not None and self.role == "actor"
                 else None
             )
             post_save_hook = load_function(self.args.custom_megatron_post_save_hook_path)

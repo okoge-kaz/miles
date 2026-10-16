@@ -12,6 +12,7 @@ from miles.backends.training_utils.data.context_parallel import (
 )
 from miles.backends.training_utils.loss.hub.logit_processors import _iter_response_chunks
 from miles.backends.training_utils.loss.hub.math_utils import compute_approx_kl
+from miles.backends.training_utils.loss.hub.policy_lag_metrics import collect_policy_lag_parts
 from miles.backends.training_utils.loss.hub.score_centering import (
     ScoreCenteringInputs,
     score_centering_loss,
@@ -162,15 +163,14 @@ def score_centering_loss_function(
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     probabilities = _candidate_log_probs(args, batch, logits)
     selected = torch.cat(probabilities["selected"])
-    active = torch.cat(
-        get_local_response_loss_masks(
-            batch["total_lengths"],
-            batch["response_lengths"],
-            batch["loss_masks"],
-            args.qkv_format,
-            batch.get("max_seq_lens"),
-        )
-    ).bool()
+    local_masks = get_local_response_loss_masks(
+        batch["total_lengths"],
+        batch["response_lengths"],
+        batch["loss_masks"],
+        args.qkv_format,
+        batch.get("max_seq_lens"),
+    )
+    active = torch.cat(local_masks).bool()
     rollout = torch.where(active, torch.cat(batch["rollout_log_probs"]).detach(), 0.0)
     advantages = torch.where(active, torch.cat(batch["advantages"]).detach(), 0.0)
     ids = _local_candidates(args, batch, "rollout_topk_token_ids", logits.device)
@@ -208,4 +208,17 @@ def score_centering_loss_function(
         0.0,
     )
     log["train_rollout_kl"] = sum_of_sample_mean(rollout_train_kl).detach()
+    if getattr(args, "log_policy_lag_metrics", False):
+        if batch.get("sample_categories") is None:
+            raise ValueError("Policy-lag logging requires batch categories")
+        log.update(
+            collect_policy_lag_parts(
+                [sample[:, 0] for sample in probabilities["selected"]],
+                batch["rollout_log_probs"],
+                local_masks,
+                categories=batch["sample_categories"],
+                category_vocabulary=batch["category_vocabulary"],
+                truncated=batch.get("truncated"),
+            )
+        )
     return loss, log

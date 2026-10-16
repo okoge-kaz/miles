@@ -7,6 +7,7 @@ from pathlib import Path
 import torch
 
 from miles.utils.data import Dataset
+from miles.utils.dataset_mixture import build_mixture_dataset, prompt_fingerprint
 from miles.utils.function_registry import load_function
 from miles.utils.processing_utils import load_processor, load_tokenizer
 from miles.utils.types import Sample
@@ -59,6 +60,8 @@ class RolloutDataSource(DataSource):
         self.sample_offset = 0
         # TODO remove this
         self.metadata = {}
+        self._is_mixture = False
+        self._fingerprint = None
 
         if args.rollout_global_dataset:
             tokenizer = load_tokenizer(
@@ -73,8 +76,7 @@ class RolloutDataSource(DataSource):
                 if hasattr(processor, "save_pretrained"):
                     processor.save_pretrained(Path(d) / "processor")
 
-            self.dataset = Dataset(
-                args.prompt_data,
+            dataset_kwargs = dict(
                 tokenizer=tokenizer,
                 processor=processor,
                 max_length=args.rollout_max_prompt_len,
@@ -87,6 +89,21 @@ class RolloutDataSource(DataSource):
                 apply_chat_template_kwargs=args.apply_chat_template_kwargs,
                 seed=args.rollout_seed,
             )
+            self._is_mixture = bool(
+                getattr(args, "prompt_data_files", None) or getattr(args, "prompt_data_config", None)
+            )
+            self.dataset = (
+                build_mixture_dataset(args, dataset_factory=Dataset, dataset_kwargs=dataset_kwargs)
+                if self._is_mixture
+                else Dataset(args.prompt_data, **dataset_kwargs)
+            )
+            if not len(self.dataset):
+                raise ValueError("Prompt dataset is empty after filtering")
+            self._fingerprint = (
+                prompt_fingerprint(args)
+                if self._is_mixture or getattr(args, "use_replay_data_buffer", False)
+                else None
+            )
             if self.args.rollout_shuffle:
                 self.dataset.shuffle(self.epoch_id)
         else:
@@ -95,17 +112,16 @@ class RolloutDataSource(DataSource):
     def get_samples(self, num_samples):
         # TODO further improve code
         if self.dataset is not None:
-            if self.sample_offset + num_samples <= len(self.dataset):
-                prompt_samples = self.dataset.samples[self.sample_offset : self.sample_offset + num_samples]
-                self.sample_offset += num_samples
-            else:
-                prompt_samples = self.dataset.samples[self.sample_offset :]
-                num_samples -= len(prompt_samples)
-                self.epoch_id += 1
-                if self.args.rollout_shuffle:
-                    self.dataset.shuffle(self.epoch_id)
-                prompt_samples += self.dataset.samples[:num_samples]
-                self.sample_offset = num_samples
+            prompt_samples = []
+            while len(prompt_samples) < num_samples:
+                if self.sample_offset == len(self.dataset):
+                    self.epoch_id += 1
+                    if self.args.rollout_shuffle or self._is_mixture:
+                        self.dataset.shuffle(self.epoch_id)
+                    self.sample_offset = 0
+                take = min(num_samples - len(prompt_samples), len(self.dataset) - self.sample_offset)
+                prompt_samples.extend(self.dataset.samples[self.sample_offset : self.sample_offset + take])
+                self.sample_offset += take
         else:
             prompt_samples = [Sample() for _ in range(num_samples)]
 
@@ -129,16 +145,20 @@ class RolloutDataSource(DataSource):
         if not self.args.rollout_global_dataset:
             return
 
-        state_dict = {
+        state_dict = self.state_dict()
+        path = compute_global_dataset_state_path(self.args.save, rollout_id=rollout_id)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        torch.save(state_dict, path)
+
+    def state_dict(self):
+        return {
             "sample_offset": self.sample_offset,
             "epoch_id": self.epoch_id,
             "sample_group_index": self.sample_group_index,
             "sample_index": self.sample_index,
             "metadata": self.metadata,
+            "prompt_fingerprint": self._fingerprint,
         }
-        path = compute_global_dataset_state_path(self.args.save, rollout_id=rollout_id)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        torch.save(state_dict, path)
 
     def load(self, rollout_id=None):
         if not self.args.rollout_global_dataset:
@@ -156,14 +176,20 @@ class RolloutDataSource(DataSource):
 
         logger.info(f"load metadata from {path}")
         logger.info(f"load metadata: {self.metadata}")
-        state_dict = torch.load(path)
+        state_dict = torch.load(path, weights_only=False)
+        self.load_state_dict(state_dict)
+
+    def load_state_dict(self, state_dict):
+        expected = state_dict.get("prompt_fingerprint")
+        if self._fingerprint is not None and expected != self._fingerprint:
+            raise ValueError("Checkpoint prompt sources/settings differ from the current dataset")
         self.sample_offset = state_dict.get("sample_offset", 0)
         self.epoch_id = state_dict.get("epoch_id", 0)
         self.sample_group_index = state_dict.get("sample_group_index", 0)
         self.sample_index = state_dict.get("sample_index", 0)
         self.metadata = state_dict.get("metadata", {})
 
-        if self.args.rollout_global_dataset and self.args.rollout_shuffle:
+        if self.args.rollout_global_dataset and (self.args.rollout_shuffle or self._is_mixture):
             self.dataset.shuffle(self.epoch_id)
 
 

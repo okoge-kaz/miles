@@ -224,7 +224,9 @@ class TrainRayActor(NodeProbeMixin):
         raise NotImplementedError
 
     @abc.abstractmethod
-    def save_model(self, rollout_id: int, force_sync: bool = False) -> None:
+    def save_model(
+        self, rollout_id: int, force_sync: bool = False, *, write_dist: bool = True, write_hf: bool = True
+    ) -> None:
         raise NotImplementedError
 
     def export_hf(self, rollout_id: int, path: str) -> None:
