@@ -38,6 +38,7 @@ done
 
 export PYTHONPATH="${REPO_ROOT}:/root/Megatron-LM${PYTHONPATH:+:${PYTHONPATH}}"
 export CUDA_VISIBLE_DEVICES="$(seq -s, 0 "$(( GPUS_PER_NODE - 1 ))")"
+export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 mkdir -p -- "$(dirname -- "${destination}")"
 exec 9> "${destination}.lock"

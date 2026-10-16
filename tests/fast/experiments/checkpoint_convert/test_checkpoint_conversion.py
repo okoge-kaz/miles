@@ -118,7 +118,11 @@ def test_hf_conversion_forwards_input_and_skips_completed_release(tmp_path):
         """import json, os, sys
 from pathlib import Path
 args = sys.argv[1:]
-Path(os.environ['FAKE_CAPTURE']).write_text(json.dumps({'args': args, 'gpus': os.environ['CUDA_VISIBLE_DEVICES']}))
+Path(os.environ['FAKE_CAPTURE']).write_text(json.dumps({
+    'args': args,
+    'gpus': os.environ['CUDA_VISIBLE_DEVICES'],
+    'connections': os.environ['CUDA_DEVICE_MAX_CONNECTIONS'],
+}))
 destination = Path(args[args.index('--save') + 1])
 destination.mkdir(parents=True)
 (destination / 'latest_checkpointed_iteration.txt').write_text('release')
@@ -130,6 +134,7 @@ destination.mkdir(parents=True)
         CONVERT_INPUT_DIR=str(source),
         CONVERT_OUTPUT_DIR=str(destination),
         GPUS_PER_NODE="2",
+        CUDA_DEVICE_MAX_CONNECTIONS="8",
         FAKE_CAPTURE=str(capture),
     )
     result = _run_conversion("hf_mcore", environment)
@@ -139,6 +144,7 @@ destination.mkdir(parents=True)
     assert arguments[arguments.index("--nproc-per-node") + 1] == "2"
     assert arguments[arguments.index("--hf-checkpoint") + 1] == str(source)
     assert recorded["gpus"] == "0,1"
+    assert recorded["connections"] == "1"
     capture.unlink()
     result = _run_conversion("hf_mcore", environment)
     assert result.returncode == 0 and "already exists" in result.stdout
