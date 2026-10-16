@@ -227,13 +227,14 @@ def test_sweep_previews_requested_grid_without_calling_qsub(tmp_path, recipe):
     assert "-V" not in shlex.split(result.stdout)
 
 
-def test_scheduler_exports_configuration_without_credentials(tmp_path):
+@pytest.mark.parametrize("experiment", ["zero_loss_truncation", "zero_reward_truncation"])
+def test_scheduler_exports_configuration_without_credentials(tmp_path, experiment):
     qsub = tmp_path / "qsub"
     capture = tmp_path / "qsub.args"
     qsub.write_text(f"#!/bin/bash\nprintf '%s\\0' \"$@\" > {shlex.quote(str(capture))}\nprintf '123.pbs1\\n'\n")
     qsub.chmod(0o755)
     result = subprocess.run(
-        ["bash", "experiments/submit_training.sh", "staleness_math/zero_loss_truncation", "test-export", "--nodes=2"],
+        ["bash", "experiments/submit_training.sh", f"staleness_math/{experiment}", "test-export", "--nodes=2"],
         cwd=REPO_ROOT,
         env=_environment(
             tmp_path,
@@ -241,6 +242,10 @@ def test_scheduler_exports_configuration_without_credentials(tmp_path):
             WANDB_API_KEY="fake-secret",
             LR="2e-6",
             RM_NUM_WORKERS="6",
+            MODEL_PRESET="qwen3-30b-a3b-sft",
+            EXPERT_PARALLEL_SIZE="4",
+            ROLLOUT_EXPERT_PARALLEL_SIZE="2",
+            USE_ROLLOUT_ROUTING_REPLAY="0",
             USE_REPLAY_DATA_BUFFER="1",
             REPLAY_DATA_BUFFER_ASYNC_RESTORE="1",
         ),
@@ -253,7 +258,9 @@ def test_scheduler_exports_configuration_without_credentials(tmp_path):
     assert "-V" not in arguments
     assert "LR" in arguments[arguments.index("-v") + 1]
     exported = arguments[arguments.index("-v") + 1].split(",")
+    assert {"MODEL_PRESET", "EXPERT_PARALLEL_SIZE", "USE_ROLLOUT_ROUTING_REPLAY"} <= set(exported)
     assert "RM_NUM_WORKERS" in exported
+    assert "ROLLOUT_EXPERT_PARALLEL_SIZE" in exported
     assert "USE_REPLAY_DATA_BUFFER" in exported
     assert "REPLAY_DATA_BUFFER_ASYNC_RESTORE" in exported
     assert "WANDB_API_KEY" not in " ".join(arguments) and "fake-secret" not in " ".join(arguments)
