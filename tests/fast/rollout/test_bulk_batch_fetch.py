@@ -39,6 +39,8 @@ async def test_batch_refills_stale_groups_without_overconsuming(consumer, unused
     assert output.metrics["rollout/fully_async/max_staleness"] == 2
     assert len(fn._output) == 1
     assert (await fn._output.get(current_version=10)).group == groups[-1]
+    for key in ("dispatch", "resume"):
+        assert 0 <= output.metrics[f"perf/batch_fetch_{key}_wait_time"] <= output.metrics["perf/batch_drain_time"]
 
 
 async def test_partial_batch_waits_only_for_missing_groups_at_fixed_version(consumer):
