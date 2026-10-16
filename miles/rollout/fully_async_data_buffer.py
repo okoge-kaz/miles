@@ -129,6 +129,8 @@ class DefaultDataBuffer(DataBuffer):
         self._metric_selected_versioned_samples = 0
         self._metric_accepted_groups = 0
         self._metric_window_start = monotonic()
+        self._metric_get_seconds = 0.0
+        self._metric_empty_wait_seconds = 0.0
 
     async def put(self, input: DataBufferInput) -> None:
         if not self._preput_filter(input):
@@ -178,12 +180,15 @@ class DefaultDataBuffer(DataBuffer):
         return True
 
     async def get(self, current_version: int | None = None, **_) -> DataBufferInput:
+        started = monotonic()
         if current_version is not None:
             self._current_version = current_version
         async with self._cond:
             while True:
                 while not self._buffer:
+                    wait_started = monotonic()
                     await self._cond.wait()
+                    self._metric_empty_wait_seconds += monotonic() - wait_started
                 buffered = self._buffer.pop()
                 entry, version_stats = buffered.entry, buffered.stats
                 self._cond.notify_all()  # wake producers blocked on a full buffer
@@ -214,6 +219,7 @@ class DefaultDataBuffer(DataBuffer):
                         continue
                     self._metric_consumed_staleness.append(staleness)
                 self._record_selected_version_stats(version_stats, current_version)
+                self._metric_get_seconds += monotonic() - started
                 return entry
 
     def _record_selected_version_stats(
@@ -244,6 +250,8 @@ class DefaultDataBuffer(DataBuffer):
             f"{prefix}queue_size": len(self._buffer),
             f"{prefix}accepted_groups": self._metric_accepted_groups,
             "perf/rollout_window_time": elapsed,
+            "perf/buffer_get_time": self._metric_get_seconds,
+            "perf/buffer_empty_wait_time": self._metric_empty_wait_seconds,
             f"{prefix}aborted_groups_filtered": self._metric_aborted_groups,
             f"{prefix}stale_groups_filtered": self._metric_stale_groups,
             **self._metric_gatherer.collect(),
@@ -283,5 +291,7 @@ class DefaultDataBuffer(DataBuffer):
         self._metric_selected_versioned_samples = 0
         self._metric_aborted_groups = self._metric_stale_groups = 0
         self._metric_accepted_groups = 0
+        self._metric_get_seconds = 0.0
+        self._metric_empty_wait_seconds = 0.0
         self._metric_window_start = now
         return metrics
