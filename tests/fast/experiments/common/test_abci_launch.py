@@ -42,6 +42,8 @@ def _environment(tmp_path, **overrides):
 
 
 def _recipe_config(tmp_path, experiment="zero_loss_truncation", *, project="staleness_math", **overrides):
+    if project == "staleness_math":
+        overrides.setdefault("MODEL_PRESET", "qwen3-4b-sft")
     command = """
 set -euo pipefail
 export MILES_JOB_NUM_NODES=8
@@ -80,6 +82,118 @@ def test_colocated_recipe_does_not_request_dedicated_rollout_gpus(tmp_path):
     command = build_command(_recipe_config(tmp_path, PLACEMENT="colocated"))
     assert "--colocate" in command
     assert "--fully-async" not in command and "--rollout-num-gpus" not in command
+
+
+@pytest.mark.parametrize("experiment", ["zero_loss_truncation", "zero_reward_truncation"])
+@pytest.mark.parametrize("preset", [None, "", "qwen3-4b", "unknown", "../qwen3-4b-sft"])
+def test_math_requires_an_explicit_supported_sft_preset(tmp_path, experiment, preset):
+    overrides = {} if preset is None else {"MODEL_PRESET": preset}
+    result = subprocess.run(
+        ["bash", f"experiments/scripts/staleness_math/{experiment}/run.sh"],
+        cwd=REPO_ROOT,
+        env=_environment(tmp_path, MILES_LAUNCH_DRY_RUN="1", **overrides),
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 2
+    assert "MODEL_PRESET must be explicitly set" in result.stderr
+    assert "--hf-checkpoint" not in result.stdout
+
+
+@pytest.mark.parametrize("experiment", ["zero_loss_truncation", "zero_reward_truncation"])
+@pytest.mark.parametrize("placement", ["disaggregate", "colocated"])
+@pytest.mark.parametrize(
+    "preset,model,tp,ep,engines,r3,dataset,hf_directory",
+    [
+        (
+            "qwen3-4b-sft",
+            "Qwen3-4B",
+            "2",
+            "1",
+            "1",
+            False,
+            "dapo-math-nonzero-std-qwen3-4b-sft-iter4000",
+            "training/reasoing-sft/Qwen3-4B-Base/LR2.0e-5-MINLR2.0e-6-SEQ32768-GBS128-MBS1-TP2-PP1-CP1-EP1-PACK1",
+        ),
+        (
+            "qwen3-8b-sft",
+            "Qwen3-8B",
+            "2",
+            "1",
+            "1",
+            False,
+            "dapo-math-nonzero-std-qwen3-8b-sft-iter4000",
+            "Qwen3-8B-Base/LR1.5e-5-MINLR1.5e-6-SEQ32768-GBS128-MBS1-TP2-PP1-CP2-EP1-PACK1-standard-cp-STEPS4000",
+        ),
+        (
+            "qwen3-30b-a3b-sft",
+            "Qwen3-30B-A3B",
+            "1",
+            "8",
+            "2",
+            True,
+            "dapo-math-nonzero-std-qwen3-30b-a3b-sft-iter4000",
+            "Qwen3-30B-A3B-Base/LR2.0e-5-MINLR2.0e-6-SEQ32768-GBS128-MBS1-TP4-PP2-CP2-EP4-PACK1-standard-cp-STEPS4000",
+        ),
+    ],
+)
+def test_math_sft_presets_reach_training_command(
+    tmp_path, experiment, placement, preset, model, tp, ep, engines, r3, dataset, hf_directory
+):
+    config = _recipe_config(tmp_path, experiment, MODEL_PRESET=preset, PLACEMENT=placement)
+    command = build_command(config)
+    for flag, value in {
+        "--hf-checkpoint": f"/ckpt/hf/{hf_directory}/iter_0004000",
+        "--ref-load": f"/ckpt/megatron/{model}-SFT-iter4000_torch_dist",
+        "--prompt-data": f"/data/{dataset}/{dataset}.jsonl",
+        "--tensor-model-parallel-size": tp,
+        "--expert-model-parallel-size": ep,
+        "--rollout-num-gpus-per-engine": engines if placement == "disaggregate" else "2",
+        "--lr": "1e-6",
+        "--rm-num-workers": "4",
+        "--custom-rm-path": f"experiments.src.training.truncation.{experiment.removesuffix('_truncation')}",
+    }.items():
+        assert command[command.index(flag) + 1] == value
+    assert ("--num-experts" in command) == r3
+    assert f"/{model}-SFT-iter4000/" in config["CKPT_PATH"]
+
+
+@pytest.mark.parametrize("experiment", ["zero_loss_truncation", "zero_reward_truncation"])
+@pytest.mark.parametrize("preset", ["qwen3-4b-sft", "qwen3-8b-sft", "qwen3-30b-a3b-sft"])
+def test_math_sft_presets_preserve_explicit_overrides(tmp_path, experiment, preset):
+    config = _recipe_config(
+        tmp_path,
+        experiment,
+        MODEL_PRESET=preset,
+        HF_MODEL_NAME="custom-sft/iter_0002000",
+        MODEL_NAME="custom-sft",
+        DATASET_PRESET="dapo-math-17k",
+        LR="2e-6",
+        TENSOR_PARALLEL_SIZE="4",
+        CONTEXT_PARALLEL_SIZE="2",
+        PIPELINE_PARALLEL_SIZE="2",
+        EXPERT_PARALLEL_SIZE="2",
+        EXPERT_TENSOR_PARALLEL_SIZE="2",
+        ROLLOUT_NUM_GPUS_PER_ENGINE="4",
+        MAX_TOKENS_PER_GPU="8192",
+        USE_ROLLOUT_ROUTING_REPLAY="0",
+    )
+    command = build_command(config)
+    for flag, value in {
+        "--hf-checkpoint": "/ckpt/hf/custom-sft/iter_0002000",
+        "--ref-load": "/ckpt/megatron/custom-sft_torch_dist",
+        "--prompt-data": "/data/dapo-math-17k/dapo-math-17k.jsonl",
+        "--lr": "2e-6",
+        "--tensor-model-parallel-size": "4",
+        "--context-parallel-size": "2",
+        "--pipeline-model-parallel-size": "2",
+        "--expert-model-parallel-size": "2",
+        "--expert-tensor-parallel-size": "2",
+        "--rollout-num-gpus-per-engine": "4",
+        "--max-tokens-per-gpu": "8192",
+    }.items():
+        assert command[command.index(flag) + 1] == value
+    assert "--use-rollout-routing-replay" not in command
 
 
 def test_separate_treatments_cannot_share_default_checkpoint_path(tmp_path):
@@ -211,6 +325,7 @@ def test_sweep_previews_requested_grid_without_calling_qsub(tmp_path, recipe):
         RUN_NAMESPACE="test-grid",
         CHAIN_JOBS="1",
         PBS_QSUB_BIN="must-not-run",
+        MODEL_PRESET="qwen3-4b-sft",
         STALENESS_LEVELS="0 2",
         RATIOS="1:1",
         TOTAL_NODES="2",
@@ -356,6 +471,7 @@ def test_invalid_pipeline_allocation_fails_before_ray(tmp_path):
         env=_environment(
             tmp_path,
             MILES_LAUNCH_DRY_RUN="1",
+            MODEL_PRESET="qwen3-4b-sft",
             GPUS_PER_NODE="8",
             ACTOR_NUM_NODES="1",
             TENSOR_PARALLEL_SIZE="2",

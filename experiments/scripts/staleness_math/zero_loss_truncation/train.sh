@@ -6,8 +6,12 @@ MILES_REPO="${MILES_REPO:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../..
 source "${MILES_REPO}/experiments/common/training_config.sh"
 
 # --- Model and dataset presets -----------------------------------------------
-: "${MODEL_PRESET:=qwen3-4b}"
-: "${DATASET_PRESET:=dapo-math-p10-90-qwen3-4b-base-lr2e-5-step4000}"
+case "${MODEL_PRESET:-}" in
+    qwen3-4b-sft) : "${DATASET_PRESET:=dapo-math-nonzero-std-qwen3-4b-sft-iter4000}" ;;
+    qwen3-8b-sft) : "${DATASET_PRESET:=dapo-math-nonzero-std-qwen3-8b-sft-iter4000}" ;;
+    qwen3-30b-a3b-sft) : "${DATASET_PRESET:=dapo-math-nonzero-std-qwen3-30b-a3b-sft-iter4000}" ;;
+    *) echo "MODEL_PRESET must be explicitly set to qwen3-4b-sft, qwen3-8b-sft, or qwen3-30b-a3b-sft" >&2; exit 2 ;;
+esac
 
 for preset_name in MODEL_PRESET DATASET_PRESET; do
     [[ "${!preset_name}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || { echo "invalid ${preset_name}" >&2; exit 2; }
