@@ -54,6 +54,7 @@ def validate_config(environment: Mapping[str, str]) -> None:
         if environment[name] not in ("0", "1"):
             raise ValueError(f"{name} must be 0 or 1")
     for name in (
+        "USE_ROLLOUT_ROUTING_REPLAY",
         "USE_REPLAY_DATA_BUFFER",
         "REPLAY_DATA_BUFFER_ASYNC_RESTORE",
         "LOG_ROLLOUT_REPETITION",
@@ -80,6 +81,11 @@ def validate_config(environment: Mapping[str, str]) -> None:
         raise ValueError("REPLAY_DATA_BUFFER_MODE must be rollout or inflight")
     if replay_mode == "inflight" and environment.get("USE_REPLAY_DATA_BUFFER", "0") != "1":
         raise ValueError("REPLAY_DATA_BUFFER_MODE=inflight requires USE_REPLAY_DATA_BUFFER=1")
+    if environment.get("USE_ROLLOUT_ROUTING_REPLAY", "0") == "1":
+        if environment["MODEL_PROFILE"] in ("qwen3-4B", "qwen3-8B"):
+            raise ValueError("USE_ROLLOUT_ROUTING_REPLAY requires a MoE model")
+        if replay_mode == "inflight":
+            raise ValueError("USE_ROLLOUT_ROUTING_REPLAY is incompatible with REPLAY_DATA_BUFFER_MODE=inflight")
     order = environment.get("ASYNC_DATA_BUFFER_ORDER", "fifo")
     metric = environment.get("ASYNC_STALENESS_METRIC", "oldest")
     if order not in ("fifo", "oldest-policy-first"):

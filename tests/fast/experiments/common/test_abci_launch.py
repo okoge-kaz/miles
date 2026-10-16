@@ -154,8 +154,101 @@ def test_math_sft_presets_reach_training_command(
         "--custom-rm-path": f"experiments.src.training.truncation.{experiment.removesuffix('_truncation')}",
     }.items():
         assert command[command.index(flag) + 1] == value
+    assert ("--use-rollout-routing-replay" in command) == r3
     assert ("--num-experts" in command) == r3
     assert f"/{model}-SFT-iter4000/" in config["CKPT_PATH"]
+
+
+@pytest.mark.parametrize("experiment", ["zero_loss_truncation", "zero_reward_truncation"])
+@pytest.mark.parametrize("preset", ["qwen3-4b-sft", "qwen3-8b-sft", "qwen3-30b-a3b-sft"])
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("mode", ["rollout", "inflight"])
+def test_math_replay_enables_async_restore_for_the_next_batch(tmp_path, experiment, preset, legacy, mode):
+    prefix = "REPLAY_BUFFER" if legacy else "REPLAY_DATA_BUFFER"
+    config = _recipe_config(
+        tmp_path,
+        experiment,
+        MODEL_PRESET=preset,
+        USE_ROLLOUT_ROUTING_REPLAY="0",
+        REPLAY_DATA_BUFFER_MODE=mode,
+        RM_NUM_WORKERS="6",
+        **{f"USE_{prefix}": "1", f"{prefix}_ASYNC_RESTORE": "0"},
+    )
+    assert config["REPLAY_DATA_BUFFER_ASYNC_RESTORE"] == "1"
+    command = build_command(config)
+    assert "--use-rollout-routing-replay" not in command
+    assert "--use-replay-data-buffer" in command
+    assert "--replay-data-buffer-async-restore" in command
+    assert command[command.index("--replay-data-buffer-mode") + 1] == mode
+    assert command[command.index("--rm-num-workers") + 1] == "6"
+
+
+@pytest.mark.parametrize("experiment", ["zero_loss_truncation", "zero_reward_truncation"])
+@pytest.mark.parametrize("placement", ["disaggregate", "colocated"])
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("mode", ["rollout", "inflight"])
+def test_math_r3_disables_replay_and_restore_overrides(tmp_path, experiment, placement, legacy, mode):
+    prefix = "REPLAY_BUFFER" if legacy else "REPLAY_DATA_BUFFER"
+    config = _recipe_config(
+        tmp_path,
+        experiment,
+        MODEL_PRESET="qwen3-30b-a3b-sft",
+        PLACEMENT=placement,
+        REPLAY_DATA_BUFFER_MODE=mode,
+        **{f"USE_{prefix}": "1", f"{prefix}_ASYNC_RESTORE": "1"},
+    )
+    assert config["USE_REPLAY_DATA_BUFFER"] == "0"
+    assert config["REPLAY_DATA_BUFFER_ASYNC_RESTORE"] == "0"
+    assert config["REPLAY_DATA_BUFFER_MODE"] == "rollout"
+    command = build_command(config)
+    assert "--use-rollout-routing-replay" in command
+    assert "--use-replay-data-buffer" not in command
+    assert "--replay-data-buffer-async-restore" not in command
+    assert "--replay-data-buffer-mode" not in command
+
+
+@pytest.mark.parametrize("experiment", ["zero_loss_truncation", "zero_reward_truncation"])
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("replay", ["0", "1"])
+def test_math_r3_override_warns_on_stderr_only_when_disabling_replay(tmp_path, experiment, legacy, replay):
+    replay_name = "USE_REPLAY_BUFFER" if legacy else "USE_REPLAY_DATA_BUFFER"
+    result = subprocess.run(
+        ["bash", f"experiments/scripts/staleness_math/{experiment}/run.sh"],
+        cwd=REPO_ROOT,
+        env=_environment(
+            tmp_path,
+            MODEL_PRESET="qwen3-30b-a3b-sft",
+            MILES_LAUNCH_DRY_RUN="1",
+            **{replay_name: replay},
+        ),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    warning = f"WARNING [staleness_math/{experiment}]"
+    assert (warning in result.stderr) == (replay == "1")
+    if replay == "1":
+        assert "overriding USE_REPLAY_DATA_BUFFER=1 to 0" in result.stderr
+        assert "high save overhead" in result.stderr
+    assert warning not in result.stdout
+    assert "--use-rollout-routing-replay" in result.stdout
+    assert "--use-replay-data-buffer" not in result.stdout
+
+
+@pytest.mark.parametrize("project,experiment", [("multi_env", ""), ("staleness_multi_env", "math_code_mcqa_if")])
+def test_r3_does_not_disable_replay_outside_staleness_math(tmp_path, project, experiment):
+    config = _recipe_config(
+        tmp_path,
+        experiment,
+        project=project,
+        MODEL_PRESET="qwen3-30b-a3b-sft",
+        USE_REPLAY_DATA_BUFFER="1",
+        REPLAY_DATA_BUFFER_ASYNC_RESTORE="0",
+    )
+    assert config["USE_ROLLOUT_ROUTING_REPLAY"] == "1"
+    assert config["USE_REPLAY_DATA_BUFFER"] == "1"
+    assert config["REPLAY_DATA_BUFFER_ASYNC_RESTORE"] == "0"
+    assert "--use-replay-data-buffer" in build_command(config)
 
 
 @pytest.mark.parametrize("experiment", ["zero_loss_truncation", "zero_reward_truncation"])
@@ -194,6 +287,19 @@ def test_math_sft_presets_preserve_explicit_overrides(tmp_path, experiment, pres
     }.items():
         assert command[command.index(flag) + 1] == value
     assert "--use-rollout-routing-replay" not in command
+
+
+def test_math_routing_replay_rejects_invalid_combinations(tmp_path):
+    config = _recipe_config(tmp_path, MODEL_PRESET="qwen3-30b-a3b-sft", USE_ROLLOUT_ROUTING_REPLAY="invalid")
+    with pytest.raises(ValueError, match="USE_ROLLOUT_ROUTING_REPLAY must be 0 or 1"):
+        build_command(config)
+    config.update(USE_ROLLOUT_ROUTING_REPLAY="1", USE_REPLAY_DATA_BUFFER="1", REPLAY_DATA_BUFFER_MODE="inflight")
+    with pytest.raises(ValueError, match="incompatible with REPLAY_DATA_BUFFER_MODE=inflight"):
+        build_command(config)
+    for preset in ("qwen3-4b-sft", "qwen3-8b-sft"):
+        config = _recipe_config(tmp_path, MODEL_PRESET=preset, USE_ROLLOUT_ROUTING_REPLAY="1")
+        with pytest.raises(ValueError, match="requires a MoE model"):
+            build_command(config)
 
 
 def test_separate_treatments_cannot_share_default_checkpoint_path(tmp_path):
@@ -525,5 +631,6 @@ def test_checkpoint_and_logging_controls_reach_training_command(tmp_path, experi
         build_command(config)
     config["SAVE_HF"] = "1"
     config["USE_REPLAY_DATA_BUFFER"] = "0"
+    config["REPLAY_DATA_BUFFER_ASYNC_RESTORE"] = "0"
     with pytest.raises(ValueError, match="inflight"):
         build_command(config)

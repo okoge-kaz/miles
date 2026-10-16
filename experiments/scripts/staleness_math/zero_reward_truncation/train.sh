@@ -100,6 +100,19 @@ fi
 : "${USE_REPLAY_DATA_BUFFER:=${USE_REPLAY_BUFFER:-0}}"
 : "${REPLAY_DATA_BUFFER_ASYNC_RESTORE:=${REPLAY_BUFFER_ASYNC_RESTORE:-0}}"
 : "${REPLAY_DATA_BUFFER_MODE:=rollout}"
+# R3 routing tensors make buffer checkpoints expensive. This recipe disables
+# persistence with R3; otherwise resume training as soon as one batch is ready.
+: "${USE_ROLLOUT_ROUTING_REPLAY:=0}"
+if [[ "${USE_ROLLOUT_ROUTING_REPLAY}" == 1 ]]; then
+    if [[ "${USE_REPLAY_DATA_BUFFER}" == 1 ]]; then
+        printf 'WARNING [staleness_math/%s]: R3 is enabled; overriding USE_REPLAY_DATA_BUFFER=1 to 0 because routing-data checkpoints have high save overhead.\n' "${EXPERIMENT_NAME}" >&2
+    fi
+    USE_REPLAY_DATA_BUFFER=0
+    REPLAY_DATA_BUFFER_ASYNC_RESTORE=0
+    REPLAY_DATA_BUFFER_MODE=rollout
+elif [[ "${USE_REPLAY_DATA_BUFFER}" == 1 ]]; then
+    REPLAY_DATA_BUFFER_ASYNC_RESTORE=1
+fi
 
 # --- Optimizer and GRPO/TIS --------------------------------------------------
 : "${LR:=1e-6}"
@@ -266,6 +279,9 @@ miles_recipe_training_args() {
     fi
     if [[ "${SKIP_ACTOR_FORWARD_ONLY}" == 1 ]]; then
         GRPO_ARGS+=(--skip-actor-forward-only)
+    fi
+    if [[ "${USE_ROLLOUT_ROUTING_REPLAY}" == 1 ]]; then
+        GRPO_ARGS+=(--use-rollout-routing-replay)
     fi
 
     local -a PERF_ARGS=(
