@@ -302,6 +302,25 @@ def test_math_routing_replay_rejects_invalid_combinations(tmp_path):
             build_command(config)
 
 
+def test_math_rollout_expert_parallelism_is_independent_and_validated(tmp_path):
+    config = _recipe_config(
+        tmp_path,
+        "zero_reward_truncation",
+        MODEL_PRESET="qwen3-30b-a3b-sft",
+        ROLLOUT_NUM_GPUS_PER_ENGINE="4",
+        ROLLOUT_EXPERT_PARALLEL_SIZE="2",
+        EXPERT_PARALLEL_SIZE="8",
+    )
+    command = build_command(config)
+    assert command[command.index("--sglang-ep-size") + 1] == "2"
+    assert command[command.index("--expert-model-parallel-size") + 1] == "8"
+    for value in ("0", "3", "8"):
+        with pytest.raises(ValueError, match="ROLLOUT_EXPERT_PARALLEL_SIZE"):
+            build_command({**config, "ROLLOUT_EXPERT_PARALLEL_SIZE": value})
+    with pytest.raises(ValueError, match="requires a MoE"):
+        build_command({**config, "MODEL_PROFILE": "qwen3-8B"})
+
+
 def test_separate_treatments_cannot_share_default_checkpoint_path(tmp_path):
     reward = _recipe_config(tmp_path, "zero_reward_truncation", RUN_NAME="same-study")
     loss = _recipe_config(tmp_path, "zero_loss_truncation", RUN_NAME="same-study")

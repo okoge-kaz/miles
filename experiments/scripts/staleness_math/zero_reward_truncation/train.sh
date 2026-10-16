@@ -134,6 +134,7 @@ fi
 : "${TRAINING_ATTENTION_BACKEND:=fused}"
 
 # --- SGLang -----------------------------------------------------------------
+: "${ROLLOUT_EXPERT_PARALLEL_SIZE:=1}"
 if [[ "${PLACEMENT}" == disaggregate ]]; then
     : "${ROLLOUT_NUM_GPUS_PER_ENGINE:=1}"
     : "${SGLANG_MEM_FRACTION:=0.70}"
@@ -291,6 +292,7 @@ miles_recipe_training_args() {
         --context-parallel-size "${CONTEXT_PARALLEL_SIZE}"
         --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
         --rollout-num-gpus-per-engine "${ROLLOUT_NUM_GPUS_PER_ENGINE}"
+        --sglang-ep-size "${ROLLOUT_EXPERT_PARALLEL_SIZE}"
         --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION}"
         --attention-backend "${TRAINING_ATTENTION_BACKEND}"
         --pipeline-model-parallel-size "${PIPELINE_PARALLEL_SIZE}"

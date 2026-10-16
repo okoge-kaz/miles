@@ -45,6 +45,11 @@ def validate_config(environment: Mapping[str, str]) -> None:
             raise ValueError(f"{name} must be a positive integer")
     if int(environment.get("RM_NUM_WORKERS", "0")) < 0:
         raise ValueError("RM_NUM_WORKERS must be nonnegative")
+    rollout_ep = int(environment.get("ROLLOUT_EXPERT_PARALLEL_SIZE", "1"))
+    if rollout_ep <= 0 or int(environment["ROLLOUT_NUM_GPUS_PER_ENGINE"]) % rollout_ep:
+        raise ValueError("ROLLOUT_EXPERT_PARALLEL_SIZE must be positive and divide the rollout engine GPU count")
+    if rollout_ep != 1 and environment["MODEL_PROFILE"] in ("qwen3-4B", "qwen3-8B"):
+        raise ValueError("ROLLOUT_EXPERT_PARALLEL_SIZE > 1 requires a MoE model")
     retain_interval = environment["SAVE_RETAIN_INTERVAL"]
     if retain_interval != "none":
         retain_interval = int(retain_interval)
