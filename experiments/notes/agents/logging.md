@@ -105,8 +105,45 @@ original-logprob、true-on-policy、sampling-support replay を変更した場�
 
 
 `--log-policy-lag-metrics` (`LOG_POLICY_LAG_METRICS=1`) で有効化する。
-`staleness_math` と `staleness_multi_env` の recipe は既定で有効。
-`LOG_POLICY_LAG_METRICS=0` で無効化できる。core CLI の既定は無効。
+`staleness_math` の両recipeは常に有効で、外部の `LOG_POLICY_LAG_METRICS=0` より優先する。
+`staleness_multi_env` は既定で有効、`LOG_POLICY_LAG_METRICS=0` で無効化できる。
+core CLI の既定は無効。
+
+## TIS の pre / post
+
+`--log-tis-metrics` で、通常の組み込みTISとscore-centering TISの双方に共通の診断値を追加する。
+`staleness_math` の両recipeは `LOG_TIS_METRICS=1` を外部指定より優先し、常に記録する。
+lossは変更しない。TISなし・custom TIS・SCのnone/MISでこのflagを指定すると起動時に拒否する。
+
+| Metric | 定義 |
+| --- | --- |
+| `train/tis/pre/{mean,std,min,max}` | 打ち切り前のtoken IS比 `r=exp(log p − log q)` |
+| `train/tis/post/{mean,std,min,max}` | lossが実際に使う打ち切り後の重み。今回の設定では `w=min(r,2)` |
+| `train/tis/clip_fraction` | TISの上下限を超えたtokenの割合。今回の設定では `r>2` |
+| `train/tis/token_count` | 集計対象のtoken数 |
+| `train/tis/{pre,post}/nonfinite_token_count`、`finite_coverage` | 非有限値の件数と有限値の割合 |
+| `train/tis/clip_coverage` | clippingを判定できた割合。NaNのlog-ratioは判定不能 |
+
+母集団は両lossとも元のloss maskが有効なresponse token。advantage=0も含め、mask=0は除外する。
+通常TISのpはTISに渡すtrainer score、SCのpは現在のtraining forward。
+今回のsingle-step・skip-actor-forward-only条件では通常TISも現在のtraining forwardを使う。
+生成の長さ打ち切りとTISの重み打ち切りは別で、zero-reward条件の生成打ち切りtokenも集計する。
+
+mean/stdはDP・CP・microbatch全体の件数、和、二乗和を合算して計算する。stdは母標準偏差。
+min/maxは全体の極値で、rankごとの統計を平均しない。空の母集団は件数のみ記録する。
+preはfloat64でexpし、非有限値があるstageの4統計はNaNにする。postはlossの計算済み重みを再利用する。
+非有限のpreを黙って除外して平均を良く見せることはない。clipping判定不能値があればclip_fractionもNaN。
+
+候補tokenの全語彙統計ではなく、実際に生成したtokenの統計である。
+SCではTISを適用した重み付きscoreをcenteringし、centering後に再clampしない。
+
+既存の `train/tis`、`train/tis_abs`、`train/tis_clipfrac`、`train/sc_importance_weight` は互換性のため残す。
+これらはloss reducerに従う回答平均で、新しいtoken平均とは異なる。比較には明示的なpre/postを使う。
+
+追加forwardやtoken配列のCPU転送はない。和・件数は既存のmetric通信に載せ、
+min/maxは符号反転したminとmaxの4 scalarを1回のMAX通信にまとめる（集約groupごと・stepごと）。
+GPU上の局所集約は増えるが、microbatchごとに追加のGPU間通信は行わない。
+学習全体に対するoverheadの割合はGPU実測前のため未確定。
 
 ## v0.1.2 の実行境界
 

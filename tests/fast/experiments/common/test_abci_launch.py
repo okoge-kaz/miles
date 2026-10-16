@@ -72,10 +72,11 @@ python3 -c 'import json, os; print(json.dumps(dict(os.environ)))'
     ],
 )
 @pytest.mark.parametrize("enabled", [None, "0"])
-def test_staleness_policy_lag_logging_is_default_and_can_be_disabled(tmp_path, project, experiment, enabled):
-    overrides = {} if enabled is None else {"LOG_POLICY_LAG_METRICS": enabled}
+def test_staleness_math_always_logs_policy_lag_and_tis(tmp_path, project, experiment, enabled):
+    overrides = {} if enabled is None else {"LOG_POLICY_LAG_METRICS": enabled, "LOG_TIS_METRICS": enabled}
     command = build_command(_recipe_config(tmp_path, experiment, project=project, **overrides))
-    assert ("--log-policy-lag-metrics" in command) == (enabled != "0")
+    assert ("--log-policy-lag-metrics" in command) == (project == "staleness_math" or enabled != "0")
+    assert ("--log-tis-metrics" in command) == (project == "staleness_math")
 
 
 def test_colocated_recipe_does_not_request_dedicated_rollout_gpus(tmp_path):
@@ -342,6 +343,13 @@ def test_math_builtin_reward_and_full_checkpoint_retention(tmp_path, truncation)
         assert command[command.index("--custom-rm-path") + 1] == "experiments.src.training.truncation.zero_reward"
 
 
+@pytest.mark.parametrize("experiment", ["zero_loss_truncation", "zero_reward_truncation"])
+def test_staleness_math_retains_latest_and_fifty_rollout_milestones(tmp_path, experiment):
+    command = build_command(_recipe_config(tmp_path, experiment))
+    assert command[command.index("--save-interval") + 1] == "10"
+    assert command[command.index("--save-retain-interval") + 1] == "50"
+
+
 @pytest.mark.parametrize("retain_interval", ["0", "1", "15", "-10"])
 def test_checkpoint_retention_rejects_incompatible_interval(tmp_path, retain_interval):
     config = _recipe_config(tmp_path, SAVE_INTERVAL="10", SAVE_RETAIN_INTERVAL=retain_interval)
@@ -451,6 +459,7 @@ def test_sweep_previews_requested_grid_without_calling_qsub(tmp_path, recipe):
         CHAIN_JOBS="1",
         PBS_QSUB_BIN="must-not-run",
         MODEL_PRESET="qwen3-4b-sft",
+        LOSS_VARIANTS="tis",
         STALENESS_LEVELS="0 2",
         RATIOS="1:1",
         TOTAL_NODES="2",
@@ -474,6 +483,7 @@ def test_math_sweep_previews_all_default_node_ratios(tmp_path):
         env=_environment(
             tmp_path,
             MODEL_PRESET="qwen3-4b-sft",
+            LOSS_VARIANTS="tis",
             RUN_NAMESPACE="test-default-grid",
             STALENESS_LEVELS="0",
             CHAIN_JOBS="1",
@@ -487,6 +497,117 @@ def test_math_sweep_previews_all_default_node_ratios(tmp_path):
     assert result.stdout.count("must-not-run -q") == 4
     for train, rollout in [(1, 7), (2, 6), (3, 5), (4, 4)]:
         assert f"s0-t{train}r{rollout}-test-default-grid" in result.stdout
+
+
+@pytest.mark.parametrize("preset", ["qwen3-4b-sft", "qwen3-8b-sft", "qwen3-30b-a3b-sft"])
+@pytest.mark.parametrize("variant", ["tis", "tis_sc"])
+def test_math_loss_variants_use_the_supported_upstream_flags(tmp_path, preset, variant):
+    config = _recipe_config(tmp_path, "zero_reward_truncation", MODEL_PRESET=preset, LOSS_VARIANT=variant)
+    command = build_command(config)
+    assert command[command.index("--lr") + 1] == "1e-6"
+    assert command[command.index("--global-batch-size") + 1] == "3072"
+    assert command[command.index("--rollout-batch-size") + 1] == "192"
+    assert ("--use-tis" in command) == (variant == "tis")
+    assert ("--skip-actor-forward-only" in command) == (variant == "tis")
+    assert ("--use-rollout-logprobs" in command) == (variant == "tis_sc")
+    assert "--disable-grpo-std-normalization" not in command
+    assert "--calculate-per-token-loss" not in command
+    assert "--log-policy-lag-metrics" in command and "--log-tis-metrics" in command
+    if variant == "tis_sc":
+        assert command[command.index("--loss-type") + 1] == "score_centering"
+        assert command[command.index("--score-centering-is") + 1] == "tis"
+        assert command[command.index("--score-centering-tis-clip") + 1] == "2.0"
+        assert command[command.index("--rollout-top-logprobs-num") + 1] == "128"
+        assert "--eps-clip" not in command
+    else:
+        assert command[command.index("--loss-type") + 1] == "policy_loss"
+        assert "--rollout-top-logprobs-num" not in command
+
+
+@pytest.mark.parametrize(
+    "overrides,error",
+    [
+        ({"SKIP_ACTOR_FORWARD_ONLY": "1"}, "SKIP_ACTOR_FORWARD_ONLY=0"),
+        ({"SCORE_CENTERING_TOP_K": "0"}, "between 1 and 128"),
+        ({"SCORE_CENTERING_TOP_K": "129"}, "between 1 and 128"),
+        ({"IS_CORRECTION": "none"}, "IS_CORRECTION=tis"),
+        ({"TIS_CLIP_LOW": "0.5"}, "TIS_CLIP_LOW=0"),
+    ],
+)
+def test_math_score_centering_rejects_incompatible_overrides(tmp_path, overrides, error):
+    with pytest.raises(subprocess.CalledProcessError) as caught:
+        _recipe_config(tmp_path, "zero_reward_truncation", LOSS_VARIANT="tis_sc", **overrides)
+    assert error in caught.value.stderr
+
+
+def test_math_full_sweep_submits_distinct_model_loss_configs_to_fake_scheduler(tmp_path):
+    capture = tmp_path / "jobs.jsonl"
+    qsub = tmp_path / "qsub"
+    qsub.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "names = ('MODEL_PRESET', 'LOSS_VARIANT', 'LR', 'GLOBAL_BATCH_SIZE', 'ROLLOUT_BATCH_SIZE', "
+        "'NUM_ROLLOUT', 'MAX_WEIGHT_STALENESS', 'ACTOR_NUM_NODES', 'ROLLOUT_NUM_GPUS', 'RUN_NAME', "
+        "'USE_ROLLOUT_ROUTING_REPLAY', 'USE_REPLAY_DATA_BUFFER', 'SKIP_ACTOR_FORWARD_ONLY')\n"
+        f"with open({str(capture)!r}, 'a') as out:\n"
+        "    out.write(json.dumps({'args': sys.argv[1:], 'env': {k: os.environ[k] for k in names}}) + '\\n')\n"
+        "print('123.pbs1')\n"
+    )
+    qsub.chmod(0o755)
+    subprocess.run(
+        ["bash", "experiments/scripts/staleness_math/zero_reward_truncation/sweep.sh", "--submit"],
+        cwd=REPO_ROOT,
+        env=_environment(tmp_path, PBS_QSUB_BIN=str(qsub), RUN_NAMESPACE="test-full-study"),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    jobs = [json.loads(line) for line in capture.read_text().splitlines()]
+    assert len(jobs) == 60
+    assert len({job["env"]["RUN_NAME"] for job in jobs}) == 60
+    configs = set()
+    for job in jobs:
+        env, args = job["env"], job["args"]
+        assert env["LOSS_VARIANT"] == "tis"
+        configs.add((env["MODEL_PRESET"], env["LOSS_VARIANT"], env["ACTOR_NUM_NODES"], env["MAX_WEIGHT_STALENESS"]))
+        assert env["LR"] == "1e-6" and env["GLOBAL_BATCH_SIZE"] == "3072" and env["ROLLOUT_BATCH_SIZE"] == "192"
+        assert env["NUM_ROLLOUT"] == "300"
+        assert int(env["ACTOR_NUM_NODES"]) * 8 + int(env["ROLLOUT_NUM_GPUS"]) == 64
+        moe = env["MODEL_PRESET"] == "qwen3-30b-a3b-sft"
+        assert env["USE_ROLLOUT_ROUTING_REPLAY"] == str(int(moe))
+        assert env["USE_REPLAY_DATA_BUFFER"] == str(int(not moe))
+        assert env["SKIP_ACTOR_FORWARD_ONLY"] == str(int(env["LOSS_VARIANT"] == "tis"))
+        assert "walltime=168:00:00" in args and "-V" not in args
+        export_names = args[args.index("-v") + 1].split(",")
+        assert "LOSS_VARIANT" in export_names
+    assert len(configs) == 60
+
+
+@pytest.mark.parametrize("overrides", [{"LOSS_VARIANT": "tis_sc"}, {"LOSS_VARIANTS": "tis tis_sc"}])
+def test_math_sweep_rejects_score_centering_before_submission(tmp_path, overrides):
+    result = subprocess.run(
+        ["bash", "experiments/scripts/staleness_math/zero_reward_truncation/sweep.sh", "--submit"],
+        cwd=REPO_ROOT,
+        env=_environment(tmp_path, PBS_QSUB_BIN="must-not-run", **overrides),
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 2
+    assert "TIS only" in result.stderr
+    assert "must-not-run" not in result.stdout
+
+
+def test_math_moe_sweep_rejects_resume_chains_before_submission(tmp_path):
+    result = subprocess.run(
+        ["bash", "experiments/scripts/staleness_math/zero_reward_truncation/sweep.sh", "--submit"],
+        cwd=REPO_ROOT,
+        env=_environment(tmp_path, MODEL_PRESET="qwen3-30b-a3b-sft", CHAIN_JOBS="2", PBS_QSUB_BIN="must-not-run"),
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 2
+    assert "one uninterrupted allocation" in result.stderr
+    assert "must-not-run" not in result.stdout
 
 
 @pytest.mark.parametrize("experiment", ["zero_loss_truncation", "zero_reward_truncation"])

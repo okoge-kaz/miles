@@ -50,10 +50,14 @@ R3 と ReplayDataBuffer の組合せには [recipe の固定条件](replay-data-
 ```bash
 MODEL_PRESET=qwen3-8b-sft WANDB_MODE=disabled MILES_LAUNCH_DRY_RUN=1 \
   bash experiments/scripts/staleness_math/zero_reward_truncation/run.sh
-MODEL_PRESET=qwen3-30b-a3b-sft LR=5e-7 USE_ROLLOUT_ROUTING_REPLAY=0 \
+MODEL_PRESET=qwen3-30b-a3b-sft LR=5e-7 \
   CHAIN_JOBS=1 bash experiments/scripts/staleness_math/zero_reward_truncation/sweep.sh
 # sweep は preview。投入時は --submit を追加する。
 ```
+
+`zero_reward_truncation/sweep.sh` の既定は3モデル × TIS / TIS＋score centeringの比較。
+この sweep では LR / batch を共通化し、30B の R3 ON / Replay OFF を固定する。
+全条件と loss / forward の違いは [zero-reward-study.md](zero-reward-study.md) を参照する。
 
 filtered dataset は各モデルの offline filtering の merge 完了後に利用する。
 初回学習前に、同じ SFT の HF weights と `/ckpt/megatron/<MODEL_NAME>_torch_dist` を用意する。

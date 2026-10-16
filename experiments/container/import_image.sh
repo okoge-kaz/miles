@@ -16,6 +16,9 @@ dated_image="${IMPORT_OUTPUT_IMAGE:-${CONTAINER_DIR}/miles-v0.1.2-$(date +%Y%m%d
 stable_image="${SINGULARITY_LINK-${CONTAINER_IMAGE}}"
 definition_file="${MILES_REPO}/experiments/container/miles.def"
 sglang_patch_file="${MILES_REPO}/experiments/container/sglang-v0.1.2-provenance.patch"
+megatron_retention_patch_file="${MILES_REPO}/experiments/container/megatron-v0.1.2-checkpoint-retention.patch"
+megatron_retention_patch_sha256="$(sha256sum "${megatron_retention_patch_file}")"
+megatron_retention_patch_sha256="${megatron_retention_patch_sha256%% *}"
 : "${APPLY_SGLANG_PROVENANCE_PATCH:=0}"
 : "${INSTALL_CODE_SANDBOX:=0}"
 : "${INSTALL_NEMO_GYM:=0}"
@@ -79,7 +82,8 @@ trap 'exit 143' TERM
 trap 'exit 130' INT
 install -m 0644 -- "${definition_file}" "${build_dir}/miles.def"
 install -m 0644 -- "${sglang_patch_file}" "${build_dir}/sglang-provenance.patch"
-for asset in prepare_code_sandbox.py verify_code_sandbox.py code_sandbox.requirements.json; do
+install -m 0644 -- "${megatron_retention_patch_file}" "${build_dir}/megatron-checkpoint-retention.patch"
+for asset in prepare_code_sandbox.py verify_code_sandbox.py code_sandbox.requirements.json verify_checkpoint_retention.py; do
     install -m 0644 -- "${MILES_REPO}/experiments/container/${asset}" "${build_dir}/${asset}"
 done
 mkdir -p "${build_dir}/nemo_gym/runtime" "${build_dir}/nemo_gym/patches"
@@ -100,6 +104,8 @@ echo "building docker://${oci_image} in ${build_dir}"
     --build-arg "DOCKER_IMAGE=${oci_image}" \
     --build-arg "SGLANG_COMMIT=${SGLANG_COMMIT}" \
     --build-arg "MEGATRON_COMMIT=${MEGATRON_COMMIT}" \
+    --build-arg "MEGATRON_RETENTION_PATCH_FILE=${build_dir}/megatron-checkpoint-retention.patch" \
+    --build-arg "MEGATRON_RETENTION_PATCH_SHA256=${megatron_retention_patch_sha256}" \
     --build-arg "SGLANG_PATCH_FILE=${build_dir}/sglang-provenance.patch" \
     --build-arg "SGLANG_PATCH_SHA256=${sglang_patch_sha256}" \
     --build-arg "APPLY_SGLANG_PROVENANCE_PATCH=${APPLY_SGLANG_PROVENANCE_PATCH}" \
@@ -126,6 +132,7 @@ for path in /data /ckpt/hf /ckpt/megatron /ckpt/training /cache "${HOME}"; do te
 test "$(git -c safe.directory=/sgl-workspace/sglang -C /sgl-workspace/sglang rev-parse HEAD)" = "${SGLANG_COMMIT}"
 test "$(git -c safe.directory=/root/Megatron-LM -C /root/Megatron-LM rev-parse HEAD)" = "${MEGATRON_COMMIT}"
 PYTHONPATH=/root/miles:/root/Megatron-LM python3 -c "import megatron, miles, sglang, ray"
+python3 /opt/miles/verify_checkpoint_retention.py /root/Megatron-LM/megatron/training/checkpointing.py
 '
 if [[ "${APPLY_SGLANG_PROVENANCE_PATCH}" == 1 ]]; then
     miles_container_exec --image "${local_image}" --bind "${CONTAINER_MOUNTS}" \
@@ -152,6 +159,7 @@ cat > "${partial_provenance}" <<EOF
 oci_image=${oci_image}
 sglang_commit=${SGLANG_COMMIT}
 megatron_commit=${MEGATRON_COMMIT}
+megatron_retention_patch_sha256=${megatron_retention_patch_sha256}
 sglang_provenance_patch_enabled=${APPLY_SGLANG_PROVENANCE_PATCH}
 sglang_provenance_patch_sha256=${sglang_patch_sha256}
 code_sandbox_enabled=${INSTALL_CODE_SANDBOX}

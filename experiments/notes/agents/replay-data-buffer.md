@@ -28,6 +28,9 @@ Legacy environment variables are fallbacks; the new variables take precedence, i
   復元データから次の train batch が揃えば、残り全体の読み込みを待たずに学習を開始する。
 
 ReplayDataBuffer 自体の既定は OFF。上の条件は旧環境変数の fallback を解決した後に適用する。
+`zero_reward_truncation/sweep.sh` の比較実験では4B / 8Bを ON、30B-A3Bを OFFに固定する。
+30Bは R3 ONで1 allocation内の完走を想定し、複数allocationの resume chainを拒否する。
+設定とscore centering時の保存負荷は [zero-reward-study.md](zero-reward-study.md) を参照する。
 
 ## Implementation and checkpoint format
 
@@ -56,6 +59,16 @@ completed groups waiting for capacity, and unfinished work.
 The checkpoint directory is synced and renamed before writing the commit marker. Iteration 0 is valid.
 Initial weights without rollout history start fresh; resuming training requires a buffer checkpoint at the same iteration.
 Corruption and mismatches in mode, source, or fingerprinted sampling/filter/ordering settings stop restoration.
+
+## 保存世代の保持
+
+`save_retain_interval` が指定されている場合、RolloutExecutorはcursor・Replay・event snapshotの
+保存成功後に古いcursorとReplayを整理する。0始まりの保存番号に1を加えて判定するため、
+interval=50では番号49、99、149…と最新の完了世代を保持する。Noneは全世代保持。
+モデルtrackerが示す完了世代に対応するcursorと、Replay有効時はCOMMITTED markerが必要。
+未完了・未来の世代、symlink、未知のファイル、HFは削除しない。
+モデルdirectoryがまだ残る世代も保持し、次回保存時に再確認する。
+このため非同期のモデル削除が遅れた場合、一時的に余分なsidecarが残る。
 
 ## Restore modes
 

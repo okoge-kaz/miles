@@ -67,6 +67,7 @@ def validate_config(environment: Mapping[str, str]) -> None:
         "LOG_ROLLOUT_POSTPROCESS",
         "LOG_CATEGORY_STALENESS",
         "LOG_POLICY_LAG_METRICS",
+        "LOG_TIS_METRICS",
         "SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS",
     ):
         if environment.get(name, "0") not in ("0", "1"):

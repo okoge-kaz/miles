@@ -1,3 +1,5 @@
+import math
+
 from miles.backends.megatron_utils.megatron_config import resolve_megatron_config
 from miles.utils.dataset_mixture import prompt_sources
 
@@ -54,9 +56,34 @@ def add_buffer_arguments(parser) -> None:
         default=False,
         help="Signed current-training-forward logprob minus rollout logprob, pooled globally and per category.",
     )
+    parser.add_argument(
+        "--log-tis-metrics",
+        action="store_true",
+        default=False,
+        help="Global loss-enabled-token pre/post TIS mean, std, min, max and clipping fraction; built-in TIS only.",
+    )
+
+
+def validate_tis_metrics_arguments(args) -> None:
+    if not getattr(args, "log_tis_metrics", False):
+        return
+    loss_type = getattr(args, "loss_type", None)
+    if loss_type == "score_centering" and getattr(args, "score_centering_is", None) == "tis":
+        low, high = 0.0, args.score_centering_tis_clip
+    elif (
+        loss_type == "policy_loss"
+        and getattr(args, "use_tis", False)
+        and not getattr(args, "custom_tis_function_path", None)
+    ):
+        low, high = args.tis_clip_low, args.tis_clip
+    else:
+        raise ValueError("--log-tis-metrics requires built-in --use-tis or score-centering TIS")
+    if not (math.isfinite(low) and math.isfinite(high) and 0 <= low <= high and high > 0):
+        raise ValueError("TIS metric bounds must be finite with 0 <= low <= high and high > 0")
 
 
 def validate_buffer_arguments(args) -> None:
+    validate_tis_metrics_arguments(args)
     replay = getattr(args, "use_replay_data_buffer", False)
     multi_policy = getattr(args, "megatron_config", None) is not None and resolve_megatron_config(args).is_multi_policy
     if multi_policy and getattr(args, "async_staleness_metric", "oldest") in ("submission", "ready"):

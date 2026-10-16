@@ -29,6 +29,7 @@ from miles.rollout.base_types import (
     call_rollout_fn,
 )
 from miles.rollout.checkpoint_eval import CheckpointEvalFn, EvalSkip
+from miles.rollout.checkpoint_retention import prune_rollout_checkpoints
 from miles.rollout.inference_rollout.compatibility import call_rollout_function, load_rollout_function
 from miles.rollout.rm_hub.worker import close_reward_workers, initialize_reward_workers
 from miles.rollout.staleness_metrics import batch_category_staleness_metrics
@@ -352,6 +353,12 @@ class RolloutExecutor:
             if (eval_fn := self.eval_generate_rollout) is not None and eval_fn is not self.generate_rollout:
                 eval_fn.save(rollout_id)
         event_logger_checkpoint.snapshot(self.args, rollout_id)
+        prune_rollout_checkpoints(
+            getattr(self.args, "save", None),
+            rollout_id=rollout_id,
+            retain_interval=getattr(self.args, "save_retain_interval", None),
+            replay_required=getattr(self.args, "use_replay_data_buffer", False),
+        )
 
     def load(self, rollout_id: int | None = None) -> None:
         if not getattr(self.generate_rollout, "owns_data_source_checkpoint", False):

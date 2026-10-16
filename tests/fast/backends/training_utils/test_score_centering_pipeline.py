@@ -48,7 +48,7 @@ def test_multiturn_wire_dp_split_and_training_gradient(single_rank: None, mode: 
     restored.reward, restored.index = 1.0, 0
     other = deepcopy(restored)
     other.index, other.reward = 1, -0.7
-    args = _args(score_centering_is=mode, ci_test=ci_test)
+    args = _args(score_centering_is=mode, ci_test=ci_test, log_tis_metrics=(mode == "tis"))
     data = convert_samples_to_train_data(args, [restored, other], {}, None, None)
     batch = split_train_data_by_dp_raw(args, data, dp_size=2)[1]
     np.testing.assert_array_equal(batch["rollout_topk_token_ids"][0], restored.rollout_topk_token_ids)

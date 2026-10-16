@@ -1,5 +1,6 @@
 import asyncio
 from argparse import Namespace
+from types import SimpleNamespace
 
 import pytest
 
@@ -66,6 +67,41 @@ class TestDispose:
         await executor.dispose()
 
         assert disposed == ["train", "eval"]
+
+
+class TestSave:
+    @pytest.mark.parametrize("fail_save", [False, True])
+    def test_retention_runs_only_after_all_checkpoint_writes(self, monkeypatch, fail_save):
+        events = []
+
+        def save_replay(rollout_id):
+            events.append("replay")
+            if fail_save:
+                raise OSError("incomplete replay")
+
+        executor = RolloutExecutor.__new__(RolloutExecutor)
+        executor.args = Namespace(save="checkpoint", save_retain_interval=50, use_replay_data_buffer=True)
+        executor.use_legacy_rollout_v1 = False
+        executor.data_source = SimpleNamespace(save=lambda _: events.append("cursor"))
+        executor.generate_rollout = SimpleNamespace(save=save_replay)
+        executor.eval_generate_rollout = None
+        monkeypatch.setattr(
+            rollout_executor_module.event_logger_checkpoint, "snapshot", lambda *_: events.append("events")
+        )
+
+        def prune(save, **kwargs):
+            assert save == "checkpoint"
+            assert kwargs == {"rollout_id": 19, "retain_interval": 50, "replay_required": True}
+            events.append("retention")
+
+        monkeypatch.setattr(rollout_executor_module, "prune_rollout_checkpoints", prune)
+        if fail_save:
+            with pytest.raises(OSError, match="incomplete replay"):
+                executor.save(19)
+            assert events == ["cursor", "replay"]
+        else:
+            executor.save(19)
+            assert events == ["cursor", "replay", "events", "retention"]
 
 
 class TestSetEvalFleetInfo:

@@ -36,6 +36,21 @@ SIF、checksum、provenance を公開する。成功した場合だけ stable sy
 patch は scratch に staging し、SHA256 と `git apply --check` を検査する。
 provenance patch を有効にした build では、SGLang の patch 回帰テストも公開前に実行する。
 
+### Checkpoint 保持
+
+`megatron-v0.1.2-checkpoint-retention.patch` は、Megatronの保持判定を
+Milesの0始まりのrollout IDに合わせる。`(保存番号 + 1) % 保持間隔 == 0` の世代と最新を残す。
+保存ディレクトリ名・tracker・保存形式は変えず、既存の保存完了callback内で判定する。
+同期・非同期保存とも、新しい保存が完了するまで前の世代を削除しない。
+HF exportとReplayのディレクトリは、このMegatronの削除処理に含まれない。
+Replay/cursorはMiles側の保存完了後に整理する（[保持契約](replay-data-buffer.md#保存世代の保持)）。
+
+build時に固定commit・patch checksum・適用可否を検査し、SIF labelとprovenanceにpatch SHA256を残す。
+`verify_checkpoint_retention.py` は実際のSIF内sourceから保存完了callbackを抽出し、
+一時ディレクトリで50/100 stepの保持、最新の保持、全量保持、step 0、最終保存、上書き、
+symlink保護、HF/Replayへの非干渉を検査する。同期/非同期の分岐を検査し、削除taskは即時実行する。
+GPU学習や実checkpointのresumeを実行する検査ではない。
+
 ### Multi-env image
 
 `INSTALL_NEMO_GYM=1 INSTALL_CODE_SANDBOX=1 APPLY_SGLANG_PROVENANCE_PATCH=1` を指定し、

@@ -5,6 +5,9 @@ set -euo pipefail
 MILES_REPO="${MILES_REPO:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../.." && pwd)}"
 source "${MILES_REPO}/experiments/common/training_config.sh"
 
+# Set the experiment's retention default before loading model presets.
+: "${SAVE_RETAIN_INTERVAL:=50}"
+
 # --- Model and dataset presets -----------------------------------------------
 case "${MODEL_PRESET:-}" in
     qwen3-4b-sft) : "${DATASET_PRESET:=dapo-math-nonzero-std-qwen3-4b-sft-iter4000}" ;;
@@ -51,7 +54,7 @@ fi
 : "${RUN_NAME:=${EXPERIMENT_NAME}-${PLACEMENT}-${MILES_JOB_ID_SHORT}}"
 : "${CKPT_PATH:=/ckpt/training/v0.1.2/${PROJECT_NAME}/${EXPERIMENT_NAME}/${DATASET_TAG}/${MODEL_NAME}/${PLACEMENT}/${RUN_NAME}}"
 : "${SAVE_INTERVAL:=10}"
-: "${SAVE_RETAIN_INTERVAL:=100}"
+: "${SAVE_RETAIN_INTERVAL:=50}"
 : "${SAVE_HF:=1}"
 : "${HF_SAVE_INTERVAL:=}"
 : "${USE_CHECKPOINT_OPT_PARAM_SCHEDULER:=1}"
@@ -157,7 +160,8 @@ export EVAL_INTERVAL=0
 : "${DUMP_ROLLOUT_DATA:=0}"
 : "${LOG_ROLLOUT_REPETITION:=0}"
 : "${LOG_CATEGORY_STALENESS:=0}"
-: "${LOG_POLICY_LAG_METRICS:=1}"
+# This study always records policy lag and TIS diagnostics, overriding caller switches.
+export LOG_POLICY_LAG_METRICS=1 LOG_TIS_METRICS=1
 : "${WANDB_MODE:=online}"
 : "${WANDB_PROJECT:=miles-v0.1.2-abci-math}"
 : "${WANDB_TEAM:=}"
@@ -336,6 +340,7 @@ miles_recipe_training_args() {
     fi
     [[ "${LOG_CATEGORY_STALENESS}" == 0 ]] || TELEMETRY_ARGS+=(--log-category-staleness)
     [[ "${LOG_POLICY_LAG_METRICS}" == 0 ]] || TELEMETRY_ARGS+=(--log-policy-lag-metrics)
+    [[ "${LOG_TIS_METRICS}" == 0 ]] || TELEMETRY_ARGS+=(--log-tis-metrics)
     if [[ "${DUMP_ROLLOUT_DATA}" == 1 ]]; then
         TELEMETRY_ARGS+=(
             --save-debug-rollout-data "${CKPT_PATH}/dump/rollout_{rollout_id}.pt"

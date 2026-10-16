@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import shlex
@@ -84,6 +85,11 @@ esac
     lock = json.loads((REPO_ROOT / "release-lock.json").read_text())
     assert f"SGLANG_COMMIT={lock['sglang_commit']}" in arguments
     assert f"MEGATRON_COMMIT={lock['megatron_commit']}" in arguments
+    retention_digest = hashlib.sha256(
+        (REPO_ROOT / "experiments/container/megatron-v0.1.2-checkpoint-retention.patch").read_bytes()
+    ).hexdigest()
+    assert f"MEGATRON_RETENTION_PATCH_SHA256={retention_digest}" in arguments
+    assert "python3 /opt/miles/verify_checkpoint_retention.py" in " ".join(arguments)
     assert "DOCKER_IMAGE=example/miles:test" in arguments
     assert f"INSTALL_CODE_SANDBOX={int(code_sandbox)}" in arguments
     assert f"INSTALL_NEMO_GYM={int(nemo_gym)}" in arguments
@@ -104,6 +110,7 @@ esac
         assert checksum.returncode == 0
         provenance = Path(f"{dated}.provenance.env").read_text()
         assert f"sglang_commit={lock['sglang_commit']}" in provenance
+        assert f"megatron_retention_patch_sha256={retention_digest}" in provenance
         assert f"code_sandbox_enabled={int(code_sandbox)}" in provenance
         assert f"nemo_gym_enabled={int(nemo_gym)}" in provenance
     assert smoke_stages.read_text().splitlines() == expected_stages

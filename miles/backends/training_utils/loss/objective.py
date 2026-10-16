@@ -228,7 +228,7 @@ def loss_function(
                         for value in [num_samples if not args.calculate_per_token_loss else num_tokens, *log.values()]
                     ]
                 )
-                if getattr(args, "log_policy_lag_metrics", False)
+                if getattr(args, "log_policy_lag_metrics", False) or getattr(args, "log_tis_metrics", False)
                 else torch.tensor(
                     [num_samples if not args.calculate_per_token_loss else num_tokens] + list(log.values()),
                     device=logits.device,

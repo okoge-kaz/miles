@@ -5,6 +5,22 @@ set -euo pipefail
 MILES_REPO="${MILES_REPO:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../.." && pwd)}"
 source "${MILES_REPO}/experiments/common/training_config.sh"
 
+# Fix the study defaults before model presets can supply model-specific values.
+: "${SAVE_RETAIN_INTERVAL:=50}"
+: "${LR:=1e-6}"
+: "${GLOBAL_BATCH_SIZE:=3072}"
+: "${ROLLOUT_BATCH_SIZE:=192}"
+: "${N_SAMPLES_PER_PROMPT:=16}"
+: "${NUM_STEPS_PER_ROLLOUT:=1}"
+: "${NUM_ROLLOUT:=300}"
+: "${LOSS_VARIANT:=tis}"
+: "${SCORE_CENTERING_TOP_K:=128}"
+case "${LOSS_VARIANT}" in
+    tis) ;;
+    tis_sc) : "${SKIP_ACTOR_FORWARD_ONLY:=0}" ;;
+    *) echo "LOSS_VARIANT must be tis or tis_sc" >&2; exit 2 ;;
+esac
+
 # --- Model and dataset presets -----------------------------------------------
 case "${MODEL_PRESET:-}" in
     qwen3-4b-sft) : "${DATASET_PRESET:=dapo-math-nonzero-std-qwen3-4b-sft-iter4000}" ;;
@@ -52,7 +68,7 @@ fi
 : "${RUN_NAME:=${EXPERIMENT_NAME}-${PLACEMENT}-${MILES_JOB_ID_SHORT}}"
 : "${CKPT_PATH:=/ckpt/training/v0.1.2/${PROJECT_NAME}/${EXPERIMENT_NAME}/${DATASET_TAG}/${MODEL_NAME}/${PLACEMENT}/${RUN_NAME}}"
 : "${SAVE_INTERVAL:=10}"
-: "${SAVE_RETAIN_INTERVAL:=100}"
+: "${SAVE_RETAIN_INTERVAL:=50}"
 : "${SAVE_HF:=1}"
 : "${HF_SAVE_INTERVAL:=}"
 : "${USE_CHECKPOINT_OPT_PARAM_SCHEDULER:=1}"
@@ -123,6 +139,17 @@ fi
 : "${TIS_CLIP:=2.0}"
 : "${TIS_CLIP_LOW:=0}"
 : "${SKIP_ACTOR_FORWARD_ONLY:=1}"
+if [[ "${LOSS_VARIANT}" == tis_sc ]]; then
+    [[ "${IS_CORRECTION}" == tis && "${TIS_CLIP_LOW}" == 0 ]] || {
+        echo "tis_sc requires IS_CORRECTION=tis and TIS_CLIP_LOW=0" >&2; exit 2
+    }
+    [[ "${SKIP_ACTOR_FORWARD_ONLY}" == 0 ]] || {
+        echo "score centering requires SKIP_ACTOR_FORWARD_ONLY=0 in v0.1.2" >&2; exit 2
+    }
+    [[ "${SCORE_CENTERING_TOP_K}" =~ ^[1-9][0-9]*$ ]] && (( SCORE_CENTERING_TOP_K <= 128 )) || {
+        echo "SCORE_CENTERING_TOP_K must be between 1 and 128" >&2; exit 2
+    }
+fi
 
 # --- Parallelism and training performance -----------------------------------
 : "${TENSOR_PARALLEL_SIZE:=2}"
@@ -154,7 +181,8 @@ export EVAL_INTERVAL=0
 : "${DUMP_ROLLOUT_DATA:=0}"
 : "${LOG_ROLLOUT_REPETITION:=0}"
 : "${LOG_CATEGORY_STALENESS:=0}"
-: "${LOG_POLICY_LAG_METRICS:=1}"
+# This study always records policy lag and TIS diagnostics, overriding caller switches.
+export LOG_POLICY_LAG_METRICS=1 LOG_TIS_METRICS=1
 : "${WANDB_MODE:=online}"
 : "${WANDB_PROJECT:=miles-v0.1.2-abci-math}"
 : "${WANDB_TEAM:=}"
@@ -272,11 +300,22 @@ miles_recipe_training_args() {
         --kl-coef 0
         --kl-loss-coef 0
         --entropy-coef "${ENTROPY_COEF}"
-        --eps-clip "${EPS_CLIP}"
-        --eps-clip-high "${EPS_CLIP_HIGH}"
     )
-    if [[ "${IS_CORRECTION}" == tis ]]; then
-        GRPO_ARGS+=(--use-tis --tis-clip "${TIS_CLIP}" --tis-clip-low "${TIS_CLIP_LOW}")
+    if [[ "${LOSS_VARIANT}" == tis_sc ]]; then
+        # The upstream REINFORCE loss owns its TIS weights; --use-tis is incompatible.
+        # Keep the existing GRPO reward normalization and sample-mean reduction in both arms.
+        GRPO_ARGS+=(
+            --loss-type score_centering
+            --score-centering-is tis
+            --score-centering-tis-clip "${TIS_CLIP}"
+            --rollout-top-logprobs-num "${SCORE_CENTERING_TOP_K}"
+            --use-rollout-logprobs
+        )
+    else
+        GRPO_ARGS+=(--loss-type policy_loss --eps-clip "${EPS_CLIP}" --eps-clip-high "${EPS_CLIP_HIGH}")
+        if [[ "${IS_CORRECTION}" == tis ]]; then
+            GRPO_ARGS+=(--use-tis --tis-clip "${TIS_CLIP}" --tis-clip-low "${TIS_CLIP_LOW}")
+        fi
     fi
     if [[ "${SKIP_ACTOR_FORWARD_ONLY}" == 1 ]]; then
         GRPO_ARGS+=(--skip-actor-forward-only)
@@ -334,6 +373,7 @@ miles_recipe_training_args() {
     fi
     [[ "${LOG_CATEGORY_STALENESS}" == 0 ]] || TELEMETRY_ARGS+=(--log-category-staleness)
     [[ "${LOG_POLICY_LAG_METRICS}" == 0 ]] || TELEMETRY_ARGS+=(--log-policy-lag-metrics)
+    [[ "${LOG_TIS_METRICS}" == 0 ]] || TELEMETRY_ARGS+=(--log-tis-metrics)
     if [[ "${DUMP_ROLLOUT_DATA}" == 1 ]]; then
         TELEMETRY_ARGS+=(
             --save-debug-rollout-data "${CKPT_PATH}/dump/rollout_{rollout_id}.pt"

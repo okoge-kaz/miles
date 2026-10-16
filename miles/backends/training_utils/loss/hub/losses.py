@@ -21,6 +21,7 @@ from miles.backends.training_utils.loss.hub.math_utils import (
 )
 from miles.backends.training_utils.loss.hub.policy_lag_metrics import collect_policy_lag_parts
 from miles.backends.training_utils.loss.hub.score_centering_loss import score_centering_loss_function
+from miles.backends.training_utils.loss.hub.tis_metrics import TIS_PART_PREFIX
 from miles.backends.training_utils.parallel import get_parallel_state
 from miles.utils.function_registry import load_function
 from miles.utils.types import RolloutBatch
@@ -262,6 +263,8 @@ def policy_loss_function(
             "parallel_state": parallel_state,
             "max_seq_lens": max_seq_lens,
         }
+        if args.custom_tis_function_path is None:
+            tis_kwargs["local_loss_masks"] = local_loss_mask_list
 
         pg_loss, modified_response_masks, tis_metrics = tis_func(**tis_kwargs)
 
@@ -414,7 +417,11 @@ def policy_loss_function(
         # Assume all metrics are already cloned and detached
         for metric_key, metric_value in tis_metrics.items():
             key_name = f"{metric_key}"
-            reported_loss[key_name] = sum_of_sample_mean_for_mismatch_metrics(metric_value)
+            reported_loss[key_name] = (
+                metric_value
+                if key_name.startswith(TIS_PART_PREFIX)
+                else sum_of_sample_mean_for_mismatch_metrics(metric_value)
+            )
 
     if args.use_opsm:
         reported_loss["opsm_clipfrac"] = opsm_clipfrac

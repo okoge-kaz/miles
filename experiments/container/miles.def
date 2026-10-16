@@ -5,12 +5,15 @@ From: {{ DOCKER_IMAGE }}
     org.opencontainers.image.title Miles v0.1.2 ABCI runtime
     ai.miles.sglang.commit {{ SGLANG_COMMIT }}
     ai.miles.megatron.commit {{ MEGATRON_COMMIT }}
+    ai.miles.megatron.retention-patch-sha256 {{ MEGATRON_RETENTION_PATCH_SHA256 }}
     ai.miles.sglang.provenance-patch-enabled {{ APPLY_SGLANG_PROVENANCE_PATCH }}
     ai.miles.sglang.provenance-patch-sha256 {{ SGLANG_PATCH_SHA256 }}
     ai.miles.code-sandbox-enabled {{ INSTALL_CODE_SANDBOX }}
     ai.miles.nemo-gym-enabled {{ INSTALL_NEMO_GYM }}
 
 %files
+    {{ MEGATRON_RETENTION_PATCH_FILE }} /opt/miles/megatron-checkpoint-retention.patch
+    {{ CODE_SANDBOX_BUILD_DIR }}/verify_checkpoint_retention.py /opt/miles/verify_checkpoint_retention.py
     {{ SGLANG_PATCH_FILE }} /opt/miles/sglang-provenance.patch
     {{ CODE_SANDBOX_BUILD_DIR }}/prepare_code_sandbox.py /opt/miles/prepare_code_sandbox.py
     {{ CODE_SANDBOX_BUILD_DIR }}/verify_code_sandbox.py /opt/miles/verify_code_sandbox.py
@@ -22,6 +25,9 @@ From: {{ DOCKER_IMAGE }}
     # Use the official release dependencies already installed in the OCI image.
     test "$(git -c safe.directory=/sgl-workspace/sglang -C /sgl-workspace/sglang rev-parse HEAD)" = "{{ SGLANG_COMMIT }}"
     test "$(git -c safe.directory=/root/Megatron-LM -C /root/Megatron-LM rev-parse HEAD)" = "{{ MEGATRON_COMMIT }}"
+    printf '%s  %s\n' '{{ MEGATRON_RETENTION_PATCH_SHA256 }}' /opt/miles/megatron-checkpoint-retention.patch | sha256sum --check --strict
+    git -c safe.directory=/root/Megatron-LM -C /root/Megatron-LM apply --check /opt/miles/megatron-checkpoint-retention.patch
+    git -c safe.directory=/root/Megatron-LM -C /root/Megatron-LM apply /opt/miles/megatron-checkpoint-retention.patch
     printf '%s  %s\n' '{{ SGLANG_PATCH_SHA256 }}' /opt/miles/sglang-provenance.patch | sha256sum --check --strict
     if [ '{{ APPLY_SGLANG_PROVENANCE_PATCH }}' = 1 ]; then
         git -c safe.directory=/sgl-workspace/sglang -C /sgl-workspace/sglang apply --check /opt/miles/sglang-provenance.patch
@@ -76,6 +82,7 @@ From: {{ DOCKER_IMAGE }}
     test -x /root
     test -r /root/Megatron-LM/megatron/core/__init__.py
     test -r /root/miles/train_async.py
+    python3 /opt/miles/verify_checkpoint_retention.py /root/Megatron-LM/megatron/training/checkpointing.py
     test "$(git -c safe.directory=/sgl-workspace/sglang -C /sgl-workspace/sglang rev-parse HEAD)" = "{{ SGLANG_COMMIT }}"
     test "$(git -c safe.directory=/root/Megatron-LM -C /root/Megatron-LM rev-parse HEAD)" = "{{ MEGATRON_COMMIT }}"
     if [ '{{ INSTALL_CODE_SANDBOX }}' = 1 ]; then python3 /opt/miles/verify_code_sandbox.py; fi

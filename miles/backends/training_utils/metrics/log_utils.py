@@ -13,6 +13,7 @@ from miles.backends.training_utils.loss.hub.policy_lag_metrics import (
     POLICY_LAG_PART_PREFIX,
     finalize_policy_lag_metrics,
 )
+from miles.backends.training_utils.loss.hub.tis_metrics import TIS_PART_PREFIX, finalize_tis_metrics
 from miles.backends.training_utils.metrics import perf
 from miles.backends.training_utils.parallel import get_parallel_state
 from miles.utils.flops_utils import fwd_tflops_per_gpu
@@ -474,17 +475,38 @@ def aggregate_train_losses(
 
     keys = losses_reduced[0]["keys"]
 
+    # Pack -min and max together: one small MAX collective per group/step,
+    # independent of the number of tokens and microbatches.
+    extrema_indices = [
+        i + 1 for i, key in enumerate(keys) if key.startswith(TIS_PART_PREFIX) and key.endswith(("/min", "/max"))
+    ]
+    extrema_signs = (
+        losses_reduced[0]["values"].new_tensor([-1 if keys[i - 1].endswith("/min") else 1 for i in extrema_indices])
+        if extrema_indices
+        else None
+    )
+    extrema = None
+
     values = None
     for log_dict in losses_reduced:
         if values is None:
             values = log_dict["values"].clone()
         else:
             values += log_dict["values"]
+        if extrema_indices:
+            local_extrema = log_dict["values"][extrema_indices] * extrema_signs
+            extrema = local_extrema if extrema is None else torch.maximum(extrema, local_extrema)
 
     assert len(keys) + 1 == values.numel(), f"Expected {len(keys) + 1} values, got {values.numel()}"
 
+    if extrema_indices:
+        values[extrema_indices] = 0
     for group in parallel_state.effective_dp_cp.groups_inner_to_outer:
         MultiPGUtil.all_reduce(values, [group], op=dist.ReduceOp.SUM)
+        if extrema is not None:
+            MultiPGUtil.all_reduce(extrema, [group], op=dist.ReduceOp.MAX)
+    if extrema is not None:
+        values[extrema_indices] = extrema * extrema_signs
 
     loss_reduced = {}
     values = values.tolist()
@@ -497,7 +519,9 @@ def aggregate_train_losses(
 
     for key, value in zip(keys, values[1:], strict=False):
         loss_reduced[key] = (
-            value if key.startswith(POLICY_LAG_PART_PREFIX) else value * cp_factor / num_samples_or_tokens
+            value
+            if key.startswith((POLICY_LAG_PART_PREFIX, TIS_PART_PREFIX))
+            else value * cp_factor / num_samples_or_tokens
         )
 
     return loss_reduced
@@ -536,6 +560,7 @@ def log_train_step(
     role_tag = "" if role == "actor" else f"{role}-"
 
     loss_dict = finalize_policy_lag_metrics(loss_dict)
+    loss_dict = finalize_tis_metrics(loss_dict)
     log_dict_out = {
         f"train/{role_tag}{key}": val.mean().item() if isinstance(val, torch.Tensor) else val
         for key, val in loss_dict.items()

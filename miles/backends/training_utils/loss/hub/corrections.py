@@ -3,6 +3,8 @@ from typing import Any
 
 import torch
 
+from miles.backends.training_utils.loss.hub.tis_metrics import collect_tis_parts
+
 
 def vanilla_tis_function(
     args: Namespace,
@@ -19,8 +21,9 @@ def vanilla_tis_function(
     """
     rollout_log_probs = torch.cat(rollout_log_probs, dim=0)
     old_log_probs = torch.cat(train_log_probs, dim=0)
-    tis = torch.exp(old_log_probs - rollout_log_probs)
-    tis_abs = (torch.exp(old_log_probs - rollout_log_probs) - 1).abs()
+    log_ratio = old_log_probs - rollout_log_probs
+    tis = torch.exp(log_ratio)
+    tis_abs = (tis - 1).abs()
     tis_weights = torch.clamp(tis, min=args.tis_clip_low, max=args.tis_clip)
     tis_clipfrac = (tis_weights != tis).float()
     metrics = {
@@ -28,6 +31,16 @@ def vanilla_tis_function(
         "tis_clipfrac": tis_clipfrac.clone().detach(),
         "tis_abs": tis_abs.clone().detach(),
     }
+    if getattr(args, "log_tis_metrics", False):
+        metrics.update(
+            collect_tis_parts(
+                log_ratio,
+                tis_weights,
+                torch.cat(kwargs["local_loss_masks"]),
+                clip_low=args.tis_clip_low,
+                clip_high=args.tis_clip,
+            )
+        )
     pg_loss = pg_loss * tis_weights
     return pg_loss, loss_masks, metrics
 

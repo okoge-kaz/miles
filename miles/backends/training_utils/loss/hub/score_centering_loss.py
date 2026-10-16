@@ -18,6 +18,7 @@ from miles.backends.training_utils.loss.hub.score_centering import (
     score_centering_loss,
     selected_log_probs_and_entropy,
 )
+from miles.backends.training_utils.loss.hub.tis_metrics import collect_tis_parts
 from miles.backends.training_utils.parallel import get_parallel_state
 from miles.utils.types import RolloutBatch
 
@@ -197,6 +198,16 @@ def score_centering_loss_function(
     )
     loss = loss + pg_loss
     log.update({key: sum_of_sample_mean(value).detach() for key, value in metrics.as_log_dict().items()})
+    if getattr(args, "log_tis_metrics", False):
+        log.update(
+            collect_tis_parts(
+                selected[:, 0].detach() - rollout,
+                metrics.importance_weight,
+                active,
+                clip_low=0.0,
+                clip_high=args.score_centering_tis_clip,
+            )
+        )
     log.update(loss=loss.detach(), pg_loss=pg_loss.detach())
     train_log_probs = torch.where(active, selected[:, 0].detach(), 0.0)
     log["train_rollout_logprob_abs_diff"] = sum_of_sample_mean((train_log_probs - rollout).abs()).detach()

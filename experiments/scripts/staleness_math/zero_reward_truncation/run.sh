@@ -3,7 +3,7 @@
 #PBS -q R9920261300
 #PBS -l select=8:ncpus=192:ngpus=8:mpiprocs=1
 #PBS -l place=scatter:excl
-#PBS -l walltime=24:00:00
+#PBS -l walltime=168:00:00
 #PBS -j oe
 # In-run eval is OFF; evaluate saved checkpoints separately.
 # Rollout dumps default OFF; W&B defaults online (settings in train.sh).
