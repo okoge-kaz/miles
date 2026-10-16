@@ -1,5 +1,6 @@
 import logging
 from numbers import Number
+from time import monotonic
 from typing import Any
 
 import numpy as np
@@ -14,10 +15,22 @@ from miles.utils.metric_utils import (
     dict_add_prefix,
     has_repetition,
 )
+from miles.utils.timer import measure_time
 from miles.utils.tracking_utils import tracking
 from miles.utils.types import Sample
 
 logger = logging.getLogger(__name__)
+
+
+def log_rollout_postprocess_metrics(args, rollout_id, metrics, *, get_started, postprocess_started):
+    """Publish completed stage measurements; report diagnostic logging overhead in the console."""
+    finished = monotonic()
+    metrics["perf/rollout_postprocess_time"] = finished - postprocess_started
+    metrics["perf/rollout_get_time"] = finished - get_started
+    step = compute_rollout_step(args, rollout_id)
+    with measure_time(metrics, "perf/rollout_postprocess/diagnostic_logging"):
+        tracking.log(args, {**metrics, "rollout/step": step}, step_key="rollout/step")
+    logger.info("postprocess %s: %s", rollout_id, metrics)
 
 
 def log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any] | None = None):

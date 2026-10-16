@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+from time import monotonic
 
 from miles.ray.placement_group import create_rollout_components, create_training_models, update_weights
 from miles.ray.rollout.eval_dispatch import EvalDispatcher
@@ -76,7 +77,11 @@ async def train(args):
 
     async def prepare_and_generate(rollout_id):
         await inference_controller.prepare_rollout(rollout_id)
-        return await rollout_executor.get.remote(rollout_id)
+        started = monotonic()
+        data = await rollout_executor.get.remote(rollout_id)
+        if getattr(args, "log_rollout_postprocess", False):
+            logger.info("rollout_delivery %s: %s", rollout_id, {"perf/rollout_rpc_time": monotonic() - started})
+        return data
 
     # async train loop.
     rollout_data_next_future = await eager_create_task(prepare_and_generate(args.start_rollout_id))

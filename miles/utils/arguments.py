@@ -2241,6 +2241,11 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="Measure shared rollout event loop scheduling delay.",
             )
             parser.add_argument(
+                "--log-rollout-postprocess",
+                action="store_true",
+                help="Measure wall, thread CPU, and GC time for rollout logging, conversion, scheduling, and storage.",
+            )
+            parser.add_argument(
                 "--rm-type",
                 type=str,
                 default=None,

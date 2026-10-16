@@ -9,7 +9,7 @@ from miles.utils.dp_schedule import build_dp_schedule, has_full_schedule_config
 from miles.utils.lora.utils import is_multi_lora_enabled
 from miles.utils.object_store import ValueSpec
 from miles.utils.seqlen_balancing import get_seqlen_balanced_partitions
-from miles.utils.timer import Timer
+from miles.utils.timer import Timer, measure_time
 from miles.utils.types import Sample
 
 logger = logging.getLogger(__name__)
@@ -296,18 +296,23 @@ def _post_process_rewards(
     return raw_rewards, raw_rewards
 
 
-def split_train_data_by_dp(args, data: dict[str, Any], train_parallel_config: dict | None):
+def split_train_data_by_dp(
+    args, data: dict[str, Any], train_parallel_config: dict | None, *, timings: dict | None = None
+):
     """Split the train data across DP ranks and put the shards into the object store.
 
     When the training backend can consume a rollout-side schedule, the shards
     also carry the precomputed micro-batch layout; otherwise this falls back to
     the legacy split (the training side schedules locally)."""
     if can_schedule_on_rollout_side(args, data, train_parallel_config):
-        shards = split_train_data_by_dp_scheduled_raw(args, data, train_parallel_config=train_parallel_config)
+        shards = split_train_data_by_dp_scheduled_raw(
+            args, data, train_parallel_config=train_parallel_config, timings=timings
+        )
     else:
-        shards = split_train_data_by_dp_raw(args, data, dp_size=train_parallel_config["dp_size"])
-    store = object_store.get_instance()
-    return [store.put(value=shard, value_spec=ROLLOUT_DATA_VALUE_SPEC) for shard in shards]
+        shards = split_train_data_by_dp_raw(args, data, dp_size=train_parallel_config["dp_size"], timings=timings)
+    with measure_time(timings, "perf/rollout_postprocess/object_store_put"):
+        store = object_store.get_instance()
+        return [store.put(value=shard, value_spec=ROLLOUT_DATA_VALUE_SPEC) for shard in shards]
 
 
 def can_schedule_on_rollout_side(args, data: dict[str, Any], train_parallel_config: dict | None) -> bool:
@@ -325,50 +330,56 @@ def can_schedule_on_rollout_side(args, data: dict[str, Any], train_parallel_conf
 
 
 def split_train_data_by_dp_scheduled_raw(
-    args, data: dict[str, Any], *, train_parallel_config: dict
+    args, data: dict[str, Any], *, train_parallel_config: dict, timings: dict | None = None
 ) -> list[dict[str, Any]]:
     """DP split with the micro-batch schedule precomputed on the rollout side."""
-    total_lengths = [len(t) for t in data["tokens"]]
-    data["total_lengths"] = total_lengths
+    with measure_time(timings, "perf/rollout_postprocess/dp_schedule"):
+        total_lengths = [len(t) for t in data["tokens"]]
+        data["total_lengths"] = total_lengths
 
-    global_batch_size = data.get("dynamic_global_batch_size", args.global_batch_size)
-    partitions, micro_batch_indices, num_microbatches, num_rollouts = build_dp_schedule(
-        args,
-        train_parallel_config,
-        total_lengths,
-        global_batch_size=global_batch_size,
-        rollout_indices=data["rollout_ids"],
-    )
-    logger.info(
-        f"Rollout-side DP schedule: num_samples={len(total_lengths)}, "
-        f"num_rollouts={num_rollouts}, num_microbatches={num_microbatches}"
-    )
+        global_batch_size = data.get("dynamic_global_batch_size", args.global_batch_size)
+        partitions, micro_batch_indices, num_microbatches, num_rollouts = build_dp_schedule(
+            args,
+            train_parallel_config,
+            total_lengths,
+            global_batch_size=global_batch_size,
+            rollout_indices=data["rollout_ids"],
+        )
+        logger.info(
+            f"Rollout-side DP schedule: num_samples={len(total_lengths)}, "
+            f"num_rollouts={num_rollouts}, num_microbatches={num_microbatches}"
+        )
 
-    shards = _package_shards(args, data, partitions)
-    for rank, shard in enumerate(shards):
-        shard["num_microbatches"] = num_microbatches
-        shard["micro_batch_indices"] = micro_batch_indices[rank]
-        shard["num_rollouts"] = num_rollouts
+    with measure_time(timings, "perf/rollout_postprocess/shard_packaging"):
+        shards = _package_shards(args, data, partitions)
+        for rank, shard in enumerate(shards):
+            shard["num_microbatches"] = num_microbatches
+            shard["micro_batch_indices"] = micro_batch_indices[rank]
+            shard["num_rollouts"] = num_rollouts
     return shards
 
 
-def split_train_data_by_dp_raw(args, data: dict[str, Any], *, dp_size: int) -> list[dict[str, Any]]:
+def split_train_data_by_dp_raw(
+    args, data: dict[str, Any], *, dp_size: int, timings: dict | None = None
+) -> list[dict[str, Any]]:
     """Split the train data by data parallel size."""
-    total_lengths = [len(t) for t in data["tokens"]]
-    data["total_lengths"] = total_lengths
+    with measure_time(timings, "perf/rollout_postprocess/dp_schedule"):
+        total_lengths = [len(t) for t in data["tokens"]]
+        data["total_lengths"] = total_lengths
 
-    if args.balance_data:
-        partitions = get_seqlen_balanced_partitions(total_lengths, dp_size, equal_size=True)
-    else:
-        partitions = [range(i, len(total_lengths), dp_size) for i in range(dp_size)]
+        if args.balance_data:
+            partitions = get_seqlen_balanced_partitions(total_lengths, dp_size, equal_size=True)
+        else:
+            partitions = [range(i, len(total_lengths), dp_size) for i in range(dp_size)]
 
-    # Multi-LoRA: sort partitions by adapter slot so each microbatch is
-    # contiguous-by-slot (required by the per-adapter token-count math).
-    adapter_slots = data.get("adapter_slots")
-    if adapter_slots is not None:
-        partitions = [sorted(p, key=lambda i: adapter_slots[i]) for p in partitions]
+        # Multi-LoRA: sort partitions by adapter slot so each microbatch is
+        # contiguous-by-slot (required by the per-adapter token-count math).
+        adapter_slots = data.get("adapter_slots")
+        if adapter_slots is not None:
+            partitions = [sorted(p, key=lambda i: adapter_slots[i]) for p in partitions]
 
-    return _package_shards(args, data, partitions)
+    with measure_time(timings, "perf/rollout_postprocess/shard_packaging"):
+        return _package_shards(args, data, partitions)
 
 
 def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, Any]]:

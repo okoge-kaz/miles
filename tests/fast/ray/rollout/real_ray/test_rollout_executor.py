@@ -174,10 +174,18 @@ class TestGenerate:
         else:
             assert "perf/rollout_wait_time" not in captured
 
-    async def test_invokes_rollout_fn_with_correct_input_and_returns_dp_split(self, ray_local_mode, patch_low_level):
+    @pytest.mark.parametrize("log_postprocess", [False, True])
+    async def test_invokes_rollout_fn_with_correct_input_and_returns_dp_split(
+        self, ray_local_mode, patch_low_level, monkeypatch, log_postprocess
+    ):
         """generate passes a train input and returns the samples split per dp rank."""
-        args = _make_test_args()
+        args = _make_test_args(log_rollout_postprocess=log_postprocess)
         args.global_batch_size = 8
+        published = []
+        monkeypatch.setattr(
+            "miles.ray.rollout.metrics.tracking.log",
+            lambda args, metrics, step_key: published.append(dict(metrics)),
+        )
 
         executor = _make_executor(args)
         executor.set_train_parallel_config({"dp_size": 2})
@@ -207,6 +215,20 @@ class TestGenerate:
             assert "rewards" in partition
             assert "loss_masks" in partition
             assert len(partition["tokens"]) == 4
+
+        assert len(published) == int(log_postprocess)
+        if log_postprocess:
+            assert published[0]["rollout/step"] == 42
+            for stage in (
+                "rollout_logging",
+                "sample_conversion",
+                "sample_release",
+                "dp_schedule",
+                "shard_packaging",
+                "object_store_put",
+            ):
+                assert published[0][f"perf/rollout_postprocess/{stage}/wall_time"] >= 0
+            assert published[0]["perf/rollout_get_time"] >= published[0]["perf/rollout_postprocess_time"]
 
     async def test_rejects_samples_generated_under_the_default_weight_version(self, ray_local_mode, patch_low_level):
         """A batch carrying the sglang never-updated version must fail get(), not reach training."""

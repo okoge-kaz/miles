@@ -1,13 +1,15 @@
+import gc
 import logging
 from contextlib import contextmanager
 from functools import wraps
-from time import time
+from threading import get_ident
+from time import monotonic, thread_time, time
 
 import torch.distributed
 
 from .misc import SingletonMeta
 
-__all__ = ["Timer", "timer"]
+__all__ = ["Timer", "measure_time", "timer"]
 
 logger = logging.getLogger(__name__)
 
@@ -97,3 +99,42 @@ def inverse_timer(name):
         yield
     finally:
         Timer().start(name)
+
+
+@contextmanager
+def measure_time(metrics: dict | None, name: str):
+    """Measure a synchronous block's wall, thread CPU, and GC time; do not span an await.
+
+    CPU and GC durations overlap wall time. Passing None disables measurement.
+    GC callbacks are scoped to this block and ignore collections on other threads.
+    """
+    if metrics is None:
+        yield
+        return
+
+    owner = get_ident()
+    gc_started = None
+    gc_seconds = 0.0
+    gc_count = 0
+
+    def record_gc(phase, info):
+        nonlocal gc_started, gc_seconds, gc_count
+        if get_ident() != owner:
+            return
+        if phase == "start":
+            gc_started = monotonic()
+        elif phase == "stop" and gc_started is not None:
+            gc_seconds += monotonic() - gc_started
+            gc_count += 1
+            gc_started = None
+
+    started, cpu_started = monotonic(), thread_time()
+    gc.callbacks.append(record_gc)
+    try:
+        yield
+    finally:
+        gc.callbacks.remove(record_gc)
+        metrics[f"{name}/wall_time"] = monotonic() - started
+        metrics[f"{name}/cpu_time"] = thread_time() - cpu_started
+        metrics[f"{name}/gc_time"] = gc_seconds
+        metrics[f"{name}/gc_collections"] = gc_count

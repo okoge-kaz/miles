@@ -66,6 +66,7 @@ fi
 : "${RM_TYPE:=deepscaler}"
 : "${RM_NUM_WORKERS:=4}"
 : "${LOG_ROLLOUT_EVENT_LOOP:=0}"
+: "${LOG_ROLLOUT_POSTPROCESS:=0}"
 : "${NUM_ROLLOUT:=300}"
 : "${ROLLOUT_BATCH_SIZE:=192}"
 : "${N_SAMPLES_PER_PROMPT:=16}"
@@ -235,6 +236,7 @@ miles_recipe_training_args() {
     )
 
     [[ "${LOG_ROLLOUT_EVENT_LOOP}" == 0 ]] || ROLLOUT_ARGS+=(--log-rollout-event-loop)
+    [[ "${LOG_ROLLOUT_POSTPROCESS}" == 0 ]] || ROLLOUT_ARGS+=(--log-rollout-postprocess)
 
     local -a OPTIMIZER_ARGS=(
         --optimizer adam

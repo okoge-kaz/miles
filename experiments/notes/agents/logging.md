@@ -28,6 +28,36 @@ deepscaler・gemma_math・dapo・math・f1・gpqa・ifbenchを扱い、remote/cu
 `RM_NUM_WORKERS=0` でも計測でき、この場合の採点queue時間は0、RPC時間はinline実行時間となる。
 遅延には採点・JSON処理・CPU競合・GC等が含まれ、原因を特定する指標ではない。
 
+## Batch 取得後の処理
+
+`--log-rollout-postprocess` で、`perf/rollout_postprocess/<stage>/` に
+`wall_time`（経過秒）、`cpu_time`（実行threadのCPU秒）、`gc_time`（同threadの循環GC秒）、
+`gc_collections`（同threadのGC回数）を出す。CPU/GC時間はwall時間の内数で、加算しない。
+同期区間のみを測り、GCを強制実行・無効化せず、callbackは区間終了時に解除する。
+参照countによるオブジェクト解放はCPU時間に含まれるが、GC callbackの時間には含まれない。
+
+| Stage | 範囲 |
+| --- | --- |
+| `debug_save` | debug rollout保存。保存無効時はほぼ空の処理 |
+| `category_metrics` | category/staleness集計。有効な場合のみ |
+| `rollout_logging` | 既存rollout metricの集計とtrackingへの送信 |
+| `sample_conversion` | Sampleから学習用dictへの変換、reward後処理、loss mask等の作成 |
+| `sample_release` | 元のSampleリストを指すローカル参照の解放。他の参照が残れば実体は解放されない |
+| `dp_schedule` | DP/microbatch割付。legacy splitではDP partitionの作成 |
+| `shard_packaging` | rankごとのdict作成と事前計算したscheduleの添付 |
+| `object_store_put` | object storeへの格納。delay split時は分割前dataを格納 |
+| `diagnostic_logging` | 追加診断metric自身のtracking送信。自己計測のためconsoleのみ |
+
+`perf/rollout_postprocess_time` は `_get_rollout_data` 完了から格納後の診断送信直前まで。
+`perf/rollout_get_time` はget呼び出しの本体開始から同時点までで、取得待ちも含む。
+診断metricは同じrollout stepに別のrecordとして送信し、既存reward/取得metricを上書きしない。
+consoleの `postprocess <id>:` には診断送信自身の時間も含める。
+
+`train_async.py` は同フラグでdriverの `get.remote` 待ちを
+`rollout_delivery <id>: {'perf/rollout_rpc_time': ...}` としてconsoleへ出す。
+get本体時間と診断送信時間を差し引いた残りにはRayでの呼び出し待ち・返却・driver再開等が含まれ、
+単純なネットワーク転送時間とは解釈しない。
+
 ## Category balance
 
 `rollout/category/<category>/` は選択された batch を集計する。

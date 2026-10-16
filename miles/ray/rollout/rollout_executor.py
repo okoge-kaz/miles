@@ -8,7 +8,12 @@ import ray
 from miles.dashboard import hooks as dashboard_hooks
 from miles.ray.rollout.debug_data import RolloutDataInjectionUtil, load_debug_rollout_data, save_debug_rollout_data
 from miles.ray.rollout.eval_fleet import EvalFleet
-from miles.ray.rollout.metrics import log_eval_rollout_data, log_eval_skip, log_rollout_data
+from miles.ray.rollout.metrics import (
+    log_eval_rollout_data,
+    log_eval_skip,
+    log_rollout_data,
+    log_rollout_postprocess_metrics,
+)
 from miles.ray.rollout.rollout_data_conversion import postprocess_rollout_data
 from miles.ray.rollout.train_data_conversion import (
     ROLLOUT_DATA_VALUE_SPEC,
@@ -35,7 +40,7 @@ from miles.utils.hf_utils.config import is_complete_hf_export
 from miles.utils.http_utils import init_http_client
 from miles.utils.logging_utils import configure_logger
 from miles.utils.metric_checker import MetricChecker
-from miles.utils.timer import timer
+from miles.utils.timer import measure_time, timer
 from miles.utils.tracking_utils.tracking import init_tracking
 from miles.utils.weight_version import assert_samples_weight_version_sane, assert_weight_version_is_published
 
@@ -125,6 +130,7 @@ class RolloutExecutor:
     # -------------------------- data generation -----------------------------
 
     async def get(self, rollout_id):
+        get_started = monotonic()
         start_time = time.time()
         self.rollout_id = rollout_id
         self._rollouts_since_weight_version_publish += 1
@@ -139,28 +145,41 @@ class RolloutExecutor:
             batch_wait_time = monotonic() - wait_start
         if getattr(self.args, "fully_async", False):
             metrics = {**(metrics or {}), "perf/rollout_wait_time": batch_wait_time}
-        save_debug_rollout_data(self.args, data, rollout_id=rollout_id, evaluation=False, metadata=metadata)
+        postprocess_started = monotonic()
+        timings = {} if getattr(self.args, "log_rollout_postprocess", False) else None
+        with measure_time(timings, "perf/rollout_postprocess/debug_save"):
+            save_debug_rollout_data(self.args, data, rollout_id=rollout_id, evaluation=False, metadata=metadata)
         if getattr(self.args, "log_category_staleness", False):
-            targets = getattr(getattr(self.data_source, "dataset", None), "category_target_group_fractions", None)
-            metrics = {
-                **(metrics or {}),
-                **batch_category_staleness_metrics(
-                    data, current_version=self.weight_version, target_group_fractions=targets
-                ),
-            }
-        log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
-        data = convert_samples_to_train_data(
-            self.args,
-            data,
-            metadata=metadata,
-            custom_convert_samples_to_train_data_func=self.custom_convert_samples_to_train_data_func,
-            custom_reward_post_process_func=self.custom_reward_post_process_func,
-        )
+            with measure_time(timings, "perf/rollout_postprocess/category_metrics"):
+                targets = getattr(getattr(self.data_source, "dataset", None), "category_target_group_fractions", None)
+                metrics = {
+                    **(metrics or {}),
+                    **batch_category_staleness_metrics(
+                        data, current_version=self.weight_version, target_group_fractions=targets
+                    ),
+                }
+        with measure_time(timings, "perf/rollout_postprocess/rollout_logging"):
+            log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
+        with measure_time(timings, "perf/rollout_postprocess/sample_conversion"):
+            train_data = convert_samples_to_train_data(
+                self.args,
+                data,
+                metadata=metadata,
+                custom_convert_samples_to_train_data_func=self.custom_convert_samples_to_train_data_func,
+                custom_reward_post_process_func=self.custom_reward_post_process_func,
+            )
+        with measure_time(timings, "perf/rollout_postprocess/sample_release"):
+            data = train_data
         sample_indices = data.get("sample_indices")
         if self.args.delay_split_train_data_by_dp:
-            data_ref = object_store.get_instance().put(value=data, value_spec=ROLLOUT_DATA_VALUE_SPEC)
+            with measure_time(timings, "perf/rollout_postprocess/object_store_put"):
+                data_ref = object_store.get_instance().put(value=data, value_spec=ROLLOUT_DATA_VALUE_SPEC)
         else:
-            data_ref = split_train_data_by_dp(self.args, data, self.train_parallel_config)
+            data_ref = split_train_data_by_dp(self.args, data, self.train_parallel_config, timings=timings)
+        if timings is not None:
+            log_rollout_postprocess_metrics(
+                self.args, rollout_id, timings, get_started=get_started, postprocess_started=postprocess_started
+            )
         return dict(sample_indices=sample_indices, data_ref=data_ref)
 
     async def eval(

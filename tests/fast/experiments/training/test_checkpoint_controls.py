@@ -6,6 +6,7 @@ import logging
 import os
 from argparse import Namespace
 from pathlib import Path
+from time import monotonic
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -54,6 +55,7 @@ async def test_driver_saves_cursor_only_with_distributed_checkpoint(driver, hf_i
     namespace = {name: Mock() for name in noops}
     namespace.update(
         asyncio=asyncio,
+        monotonic=monotonic,
         os=os,
         logger=logging.getLogger(__name__),
         MainProcessIdentity=lambda: None,
