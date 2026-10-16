@@ -254,42 +254,42 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
 
     # -------------------------- consumer --------------------------
 
-    async def _next_group(self, current_version: int | None) -> DataBufferInput:
+    async def _next_batch(self, current_version: int | None) -> list[Group]:
         if self._replay_data_buffer is not None:
             self._replay_data_buffer.check_restore()
-        queue_get = asyncio.create_task(self._output.get(current_version=current_version))
+        collection = asyncio.create_task(self._collect_groups(current_version))
         try:
             while True:
                 done, _ = await asyncio.wait(
-                    {queue_get, self._worker},
+                    {collection, self._worker},
                     return_when=asyncio.FIRST_COMPLETED,
                     timeout=NO_PROGRESS_WARN_SECS,
                 )
                 # Checked before the queue: the worker loop never returns normally, so a
                 # dead worker fails the step now instead of after its backlog drains.
-                if self._worker in done:
+                if self._worker.done():
                     self._worker.result()
                     raise RuntimeError("fully-async rollout worker exited without an exception")
-                if queue_get in done:
-                    return queue_get.result()
-                logger.warning(f"No completed rollout groups for {NO_PROGRESS_WARN_SECS}s")
+                if self._replay_data_buffer is not None:
+                    self._replay_data_buffer.check_restore()
+                if collection in done:
+                    return collection.result()
+                logger.warning(f"Waiting for a complete rollout batch for another {NO_PROGRESS_WARN_SECS}s")
         finally:
-            if not queue_get.done():
-                queue_get.cancel()
+            if not collection.done():
+                collection.cancel()
+                await asyncio.gather(collection, return_exceptions=True)
+            elif not collection.cancelled():
+                collection.exception()
 
-    async def _drain(self, input: RolloutFnTrainInput) -> RolloutFnTrainOutput:
-        args = self.args
-        assert args.rollout_global_dataset
-
-        target_data_size = args.rollout_batch_size
+    async def _collect_groups(self, current_version: int | None) -> list[Group]:
         data: list[Group] = []
-        do_print = True
-
-        while len(data) < target_data_size:
-            entry = await self._next_group(input.weight_version)
-            assert len(entry.group) == args.n_samples_per_prompt
-
-            if do_print:
+        # Ready gets do not yield; only an empty/custom buffer needs to suspend.
+        # Keep the batch's version fixed while waiting for its remaining groups.
+        while len(data) < self.args.rollout_batch_size:
+            entry = await self._output.get(current_version=current_version)
+            assert len(entry.group) == self.args.n_samples_per_prompt
+            if not data:
                 sample = first_sample(entry.group)
                 logger.info(
                     "First rollout sample: text_preview=%s, label=%s, reward_summary=%s",
@@ -297,9 +297,13 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
                     str(sample.label)[:100],
                     reward_log_summary(sample.reward),
                 )
-                do_print = False
-
             data.append(entry.group)
+        return data
+
+    async def _drain(self, input: RolloutFnTrainInput) -> RolloutFnTrainOutput:
+        args = self.args
+        assert args.rollout_global_dataset
+        data = await self._next_batch(input.weight_version)
 
         sample = first_sample(data[-1])
         logger.info(
