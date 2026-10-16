@@ -467,6 +467,28 @@ def test_sweep_previews_requested_grid_without_calling_qsub(tmp_path, recipe):
     assert "-V" not in shlex.split(result.stdout)
 
 
+def test_math_sweep_previews_all_default_node_ratios(tmp_path):
+    result = subprocess.run(
+        ["bash", "experiments/scripts/staleness_math/zero_reward_truncation/sweep.sh"],
+        cwd=REPO_ROOT,
+        env=_environment(
+            tmp_path,
+            MODEL_PRESET="qwen3-4b-sft",
+            RUN_NAMESPACE="test-default-grid",
+            STALENESS_LEVELS="0",
+            CHAIN_JOBS="1",
+            PBS_QSUB_BIN="must-not-run",
+        ),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    assert "nodes=8" in result.stdout
+    assert result.stdout.count("must-not-run -q") == 4
+    for train, rollout in [(1, 7), (2, 6), (3, 5), (4, 4)]:
+        assert f"s0-t{train}r{rollout}-test-default-grid" in result.stdout
+
+
 @pytest.mark.parametrize("experiment", ["zero_loss_truncation", "zero_reward_truncation"])
 def test_scheduler_exports_configuration_without_credentials(tmp_path, experiment):
     qsub = tmp_path / "qsub"
