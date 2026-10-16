@@ -239,7 +239,7 @@ def _normalize_rewards_by_rollout(
     if not samples:
         return []
 
-    normalized_rewards = torch.empty(len(raw_rewards), dtype=torch.float)
+    groups_by_size: dict[int, list[tuple[list[list[int]], list[float]]]] = {}
     for prompt_segments in _reward_group_segments(args, samples, prompt_group_sizes):
         segments_by_rollout_key: dict[int | tuple[str, int], list[int]] = {}
         for segment_index in prompt_segments:
@@ -263,20 +263,26 @@ def _normalize_rewards_by_rollout(
                 )
             shared_rewards.append(sibling_rewards[0])
 
-        rollout_rewards = torch.tensor(shared_rewards, dtype=torch.float)
-        normalized_rollout_rewards = rollout_rewards - rollout_rewards.mean()
-        if args.advantage_estimator in ["grpo", "gspo"] and args.grpo_std_normalization and len(rollout_rewards) > 1:
-            rollout_std = rollout_rewards.std()
-            if rollout_std > 0:
-                normalized_rollout_rewards = normalized_rollout_rewards / (rollout_std + 1e-6)
+        group_segments = list(segments_by_rollout_key.values())
+        groups_by_size.setdefault(len(shared_rewards), []).append((group_segments, shared_rewards))
 
-        for (_, rollout_segments), normalized_reward in zip(
-            rollout_segment_groups, normalized_rollout_rewards.tolist(), strict=True
-        ):
-            for segment_index in rollout_segments:
-                normalized_rewards[segment_index] = normalized_reward
+    normalized_rewards = [0.0] * len(raw_rewards)
+    normalize_std = args.advantage_estimator in ["grpo", "gspo"] and args.grpo_std_normalization
+    for group_size, groups in groups_by_size.items():
+        # Each row is one prompt group; only the rollout axis is reduced.
+        rollout_rewards = torch.tensor([rewards for _, rewards in groups], dtype=torch.float)
+        normalized = rollout_rewards - rollout_rewards.mean(dim=1, keepdim=True)
+        if normalize_std and group_size > 1:
+            rollout_std = rollout_rewards.std(dim=1, keepdim=True, correction=1)
+            scale = torch.where(rollout_std > 0, rollout_std + 1e-6, 1.0)
+            normalized = normalized / scale
 
-    return normalized_rewards.tolist()
+        for (group_segments, _), group_rewards in zip(groups, normalized.tolist(), strict=True):
+            for rollout_segments, normalized_reward in zip(group_segments, group_rewards, strict=True):
+                for segment_index in rollout_segments:
+                    normalized_rewards[segment_index] = normalized_reward
+
+    return normalized_rewards
 
 
 def _post_process_rewards(

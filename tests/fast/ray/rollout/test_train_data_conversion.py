@@ -411,6 +411,53 @@ class TestPostProcessRewards:
 
         assert processed == pytest.approx([-(2**-0.5), 2**-0.5, 2**-0.5], abs=1e-5)
 
+    @pytest.mark.parametrize("estimator", ["grpo", "gspo", "reinforce_plus_plus_baseline"])
+    @pytest.mark.parametrize("normalize_std", [False, True])
+    def test_normalization_preserves_independent_groups_with_mixed_rollout_counts(self, estimator, normalize_std):
+        args = make_args(
+            advantage_estimator=estimator,
+            rewards_normalization=True,
+            grpo_std_normalization=normalize_std,
+        )
+        # (rollout rewards, sample fanouts, expected mean, sample std).
+        cases = [
+            ([0.0, 2.0], [3, 1], 1.0, 2**0.5),
+            ([100.0, 106.0], [1, 2], 103.0, 18**0.5),
+            ([10.0, 20.0, 30.0], [2, 1, 2], 20.0, 10.0),
+            ([7.0], [2], 7.0, 0.0),
+            ([5.0, 5.0], [1, 3], 5.0, 0.0),
+        ]
+        groups = []
+        for group_index, (rewards, fanouts, mean, std) in enumerate(cases):
+            scale = std + 1e-6 if normalize_std and estimator != "reinforce_plus_plus_baseline" and std > 0 else 1.0
+            group = []
+            for rollout_id, (reward, fanout) in enumerate(zip(rewards, fanouts, strict=True)):
+                for _ in range(fanout):
+                    sample = make_sample(group_index=group_index, rollout_id=rollout_id, reward=reward)
+                    group.append((sample, (reward - mean) / scale))
+            groups.append(group)
+        # Reuse rollout IDs across prompts and interleave their sample rows.
+        interleaved = [group[i] for i in range(max(map(len, groups))) for group in groups if i < len(group)]
+        samples, expected = zip(*interleaved, strict=True)
+
+        raw, processed = _post_process_rewards(args, list(samples), custom_reward_post_process_func=None)
+
+        assert raw == [sample.reward for sample in samples]
+        assert processed == pytest.approx(expected, rel=1e-6, abs=1e-7)
+
+    def test_std_normalization_keeps_epsilon_for_small_spread_in_each_group(self):
+        args = make_args(advantage_estimator="grpo", rewards_normalization=True, grpo_std_normalization=True)
+        samples = [
+            make_sample(group_index=group, rollout_id=rollout, reward=reward)
+            for group, spread in enumerate([1e-7, 2.0])
+            for rollout, reward in enumerate([0.0, spread])
+        ]
+
+        _, processed = _post_process_rewards(args, samples, custom_reward_post_process_func=None)
+
+        expected = [sign * (spread / 2) / (spread / 2**0.5 + 1e-6) for spread in [1e-7, 2.0] for sign in [-1, 1]]
+        assert processed == pytest.approx(expected, rel=1e-6, abs=1e-7)
+
     def test_grpo_rejects_different_sibling_rewards(self):
         args = make_args(
             advantage_estimator="grpo",
