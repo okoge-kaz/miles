@@ -45,6 +45,7 @@ from miles.rollout.inference_rollout.inference_rollout_common import GenerateSta
 from miles.rollout.inference_rollout.inference_rollout_eval import run_eval_datasets
 from miles.rollout.replay_data_buffer import ReplayDataBuffer
 from miles.rollout.replay_data_buffer_inflight import validate_inflight_group
+from miles.rollout.rm_hub.worker import collect_reward_metrics
 from miles.rollout.submission_scheduler import make_submission_scheduler
 from miles.utils import async_utils
 from miles.utils.function_registry import load_function
@@ -313,7 +314,9 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         if self._sample_filter is not None:
             self._sample_filter(args, data)
 
-        return RolloutFnTrainOutput(samples=data, metrics=self._output.get_metrics())
+        metrics = self._output.get_metrics()
+        metrics.update(collect_reward_metrics())
+        return RolloutFnTrainOutput(samples=data, metrics=metrics)
 
     def _recycle(self, prompt_group: list[Sample]) -> None:
         for sample in prompt_group:

@@ -23,8 +23,9 @@ from miles.rollout.base_types import (
 )
 from miles.rollout.checkpoint_eval import CheckpointEvalFn, EvalSkip
 from miles.rollout.inference_rollout.compatibility import call_rollout_function, load_rollout_function
+from miles.rollout.rm_hub.worker import close_reward_workers, initialize_reward_workers
 from miles.rollout.staleness_metrics import batch_category_staleness_metrics
-from miles.utils import object_store
+from miles.utils import async_utils, object_store
 from miles.utils.audit_utils.event_analyzer import analyzer as event_analyzer
 from miles.utils.audit_utils.event_logger import checkpoint as event_logger_checkpoint
 from miles.utils.audit_utils.process_identity import RolloutExecutorProcessIdentity
@@ -62,6 +63,7 @@ class RolloutExecutor:
         object_store.init_instance(args, contribute_segment=False)
 
         init_http_client(args)
+        async_utils.run(initialize_reward_workers(getattr(args, "rm_num_workers", 0)))
 
         data_source_cls = load_function(self.args.data_source_path)
         self.data_source = data_source_cls(args)
@@ -103,10 +105,13 @@ class RolloutExecutor:
     # TODO: may have a `async def init` here later
 
     def dispose(self):
-        if (close := getattr(self.generate_rollout, "close", None)) is not None:
-            close()
-        if (close := getattr(self.data_source, "close", None)) is not None:
-            close()
+        try:
+            if (close := getattr(self.generate_rollout, "close", None)) is not None:
+                close()
+            if (close := getattr(self.data_source, "close", None)) is not None:
+                close()
+        finally:
+            async_utils.run(close_reward_workers())
         event_analyzer.run_analysis_from_args(self.args)
         if self._metric_checker is not None:
             self._metric_checker.dispose()

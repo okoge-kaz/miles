@@ -43,6 +43,8 @@ def validate_config(environment: Mapping[str, str]) -> None:
     ):
         if int(environment[name]) <= 0:
             raise ValueError(f"{name} must be a positive integer")
+    if int(environment.get("RM_NUM_WORKERS", "0")) < 0:
+        raise ValueError("RM_NUM_WORKERS must be nonnegative")
     retain_interval = environment["SAVE_RETAIN_INTERVAL"]
     if retain_interval != "none":
         retain_interval = int(retain_interval)

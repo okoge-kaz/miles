@@ -67,6 +67,7 @@ fi
     echo "APPLY_CHAT_TEMPLATE must be 0 or 1" >&2; return 2
 }
 : "${RM_TYPE:=deepscaler}"
+: "${RM_NUM_WORKERS:=4}"
 : "${DYNAMIC_SAMPLING_FILTER_PATH:=}"
 : "${NUM_ROLLOUT:=300}"
 : "${ROLLOUT_BATCH_SIZE:=192}"
@@ -212,6 +213,7 @@ miles_recipe_training_args() {
     [[ -z "${PROMPT_DATA_EPOCH_SIZE}" ]] || PROMPT_ARGS+=(--prompt-data-epoch-size "${PROMPT_DATA_EPOCH_SIZE}")
     local -a ROLLOUT_ARGS=(
         --rm-type "${RM_TYPE}"
+        --rm-num-workers "${RM_NUM_WORKERS}"
         --num-rollout "${NUM_ROLLOUT}"
         --rollout-batch-size "${ROLLOUT_BATCH_SIZE}"
         --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT}"

@@ -6,15 +6,16 @@ import random
 
 import aiohttp
 
+from miles.rollout.rm_hub.deepscaler import get_deepscaler_rule_based_reward as get_deepscaler_rule_based_reward
+from miles.rollout.rm_hub.deepscaler import get_gemma_math_reward as get_gemma_math_reward
+from miles.rollout.rm_hub.f1 import f1_score as f1_score
+from miles.rollout.rm_hub.gpqa import compute_gpqa_reward as compute_gpqa_reward
+from miles.rollout.rm_hub.math_dapo_utils import compute_score as compute_score_dapo  # noqa: F401 - compatibility export
+from miles.rollout.rm_hub.math_utils import extract_answer as extract_boxed_answer
+from miles.rollout.rm_hub.math_utils import grade_answer_verl as grade_answer_verl
+from miles.rollout.rm_hub.worker import BUILTIN_REWARD_TYPES, score_reward
 from miles.utils.function_registry import load_function
 from miles.utils.types import Sample
-
-from .deepscaler import get_deepscaler_rule_based_reward, get_gemma_math_reward
-from .f1 import f1_score
-from .gpqa import compute_gpqa_reward
-from .math_dapo_utils import compute_score as compute_score_dapo
-from .math_utils import extract_answer as extract_boxed_answer
-from .math_utils import grade_answer_verl
 
 logger = logging.getLogger(__name__)
 
@@ -82,26 +83,10 @@ async def async_rm(args, sample: Sample, **kwargs):
         response = extract_boxed_answer(response) or ""
         rm_type = rm_type[len("boxed_") :]
 
-    # This function is intended for remote or time-consuming reward model evaluation.
-    # Implement the actual logic as needed.
     if rm_type == "remote_rm":
         return await remote_rm(args, sample)
-    elif rm_type == "deepscaler":
-        return get_deepscaler_rule_based_reward(response, label)
-    elif rm_type == "gemma_math":
-        return get_gemma_math_reward(response, label)
-    elif rm_type == "dapo":
-        return compute_score_dapo(response, label)
-    elif rm_type == "math":
-        return 1 if grade_answer_verl(response, label) else 0
-    elif rm_type == "f1":
-        return f1_score(response, label)[0]
-    elif rm_type == "gpqa":
-        return compute_gpqa_reward(response, label, metadata=metadata)
-    elif rm_type == "ifbench":
-        from .ifbench import compute_ifbench_reward
-
-        return compute_ifbench_reward(response, label, metadata=metadata)
+    elif rm_type in BUILTIN_REWARD_TYPES:
+        return await score_reward(rm_type, response, label, metadata=metadata if rm_type in {"gpqa", "ifbench"} else None)
     elif rm_type == "random":
         return random.randint(0, 1)
     elif rm_type == "deterministic_random":

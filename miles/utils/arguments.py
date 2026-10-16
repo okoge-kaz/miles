@@ -2227,6 +2227,15 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
 
         def add_reward_model_arguments(parser):
             parser.add_argument(
+                "--rm-num-workers",
+                type=int,
+                default=0,
+                help=(
+                    "CPU Ray workers shared by deepscaler, gemma_math, dapo, math, f1, gpqa, and ifbench scoring "
+                    "per rollout executor; 0 keeps inline scoring. Remote and custom reward functions are unaffected."
+                ),
+            )
+            parser.add_argument(
                 "--rm-type",
                 type=str,
                 default=None,
@@ -3412,6 +3421,8 @@ def miles_validate_args(args):
     _resolve_rollout_functions(args)
     validate_prompt_arguments(args)
     validate_buffer_arguments(args)
+    if args.rm_num_workers < 0:
+        raise ValueError("--rm-num-workers must be nonnegative")
 
     # Both snapshot postures drive the same RolloutManager._eval_checkpoint path.
     # (The fleet-vs-CheckpointEvalFn conflict is asserted where the posture is derived.)

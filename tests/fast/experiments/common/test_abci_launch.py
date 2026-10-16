@@ -240,6 +240,7 @@ def test_scheduler_exports_configuration_without_credentials(tmp_path):
             PBS_QSUB_BIN=str(qsub),
             WANDB_API_KEY="fake-secret",
             LR="2e-6",
+            RM_NUM_WORKERS="6",
             USE_REPLAY_DATA_BUFFER="1",
             REPLAY_DATA_BUFFER_ASYNC_RESTORE="1",
         ),
@@ -252,6 +253,7 @@ def test_scheduler_exports_configuration_without_credentials(tmp_path):
     assert "-V" not in arguments
     assert "LR" in arguments[arguments.index("-v") + 1]
     exported = arguments[arguments.index("-v") + 1].split(",")
+    assert "RM_NUM_WORKERS" in exported
     assert "USE_REPLAY_DATA_BUFFER" in exported
     assert "REPLAY_DATA_BUFFER_ASYNC_RESTORE" in exported
     assert "WANDB_API_KEY" not in " ".join(arguments) and "fake-secret" not in " ".join(arguments)

@@ -3,6 +3,23 @@
 `--log-category-staleness` (`LOG_CATEGORY_STALENESS=1`) で有効化する。
 provenance には patch 済み SIF が必要。
 
+## CPU 採点 worker
+
+`RM_NUM_WORKERS` を `--rm-num-workers` に渡す。Math・multi-env recipe の既定は4、core CLI の既定は0。
+0は従来のinline採点、正の値はRolloutExecutorごとの共通Ray CPU actor数。
+deepscaler・gemma_math・dapo・math・f1・gpqa・ifbenchを扱い、remote/custom rewardとrandom系は従来経路を使う。
+同時RPC数をworker数に制限し、sampleのcancel後も採点完了まで使用枠を保持する。
+
+| Metric | 範囲・意味 |
+| --- | --- |
+| `rollout/reward/completed_samples` | 前回の metric 回収後に共通採点 executor で完了したbuilt-in採点の回答数 |
+| `perf/reward_queue_time_mean` | 完了した採点が worker 使用枠を待った平均秒数 |
+| `perf/reward_rpc_time_mean` | worker RPC の開始から結果を event loop が受け取るまでの平均秒数 |
+| `perf/reward_compute_time_mean` | worker 内で既存の採点関数を実行した平均秒数 |
+
+採点 metrics の母集団は選択された training batch ではなく、その期間に完了した採点。
+共通poolを使う複数scorerの完了分を合算する。IFBenchの初回importも計算/RPC時間に含む。
+
 ## Category balance
 
 `rollout/category/<category>/` は選択された batch を集計する。
