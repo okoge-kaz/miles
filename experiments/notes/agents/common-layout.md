@@ -34,6 +34,7 @@ cluster、workspace、mount、cache、image の既定値は `env.sh` に置く�
 | --- | --- |
 | `sweep_training.sh` | 条件展開、run 命名、job chain |
 | `run_training.sh` | host 側の設定・asset 検証、NCCL、全 node 起動 |
+| `run_nemo_gym_training.sh` | recipe が指定した Gym service の開始・ready 待ち・学習との終了監視 |
 | `train.sh` | container 側の recipe 読み込み、preflight、Ray、driver |
 
 ## 変更時の依存関係
