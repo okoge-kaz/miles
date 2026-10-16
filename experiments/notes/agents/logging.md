@@ -20,6 +20,14 @@ deepscaler・gemma_math・dapo・math・f1・gpqa・ifbenchを扱い、remote/cu
 採点 metrics の母集団は選択された training batch ではなく、その期間に完了した採点。
 共通poolを使う複数scorerの完了分を合算する。IFBenchの初回importも計算/RPC時間に含む。
 
+## Event loop の遅延
+
+`--log-rollout-event-loop`（Math recipeでは `LOG_ROLLOUT_EVENT_LOOP=1`）で有効化し、既定はOFF。
+100 ms sleepの予定時刻から再開までの超過秒数を観測し、直近最大8,192件から
+`perf/rollout_event_loop_lag_{mean,p95,max}` をfully asyncのmetric回収時に出す。
+`RM_NUM_WORKERS=0` でも計測でき、この場合の採点queue時間は0、RPC時間はinline実行時間となる。
+遅延には採点・JSON処理・CPU競合・GC等が含まれ、原因を特定する指標ではない。
+
 ## Category balance
 
 `rollout/category/<category>/` は選択された batch を集計する。

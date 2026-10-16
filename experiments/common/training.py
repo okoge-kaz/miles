@@ -57,6 +57,7 @@ def validate_config(environment: Mapping[str, str]) -> None:
         "USE_REPLAY_DATA_BUFFER",
         "REPLAY_DATA_BUFFER_ASYNC_RESTORE",
         "LOG_ROLLOUT_REPETITION",
+        "LOG_ROLLOUT_EVENT_LOOP",
         "LOG_CATEGORY_STALENESS",
         "LOG_POLICY_LAG_METRICS",
         "SGLANG_RESPONSE_WEIGHT_VERSION_SEGMENTS",

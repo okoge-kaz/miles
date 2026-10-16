@@ -55,7 +55,7 @@ class RewardWorker:
 class RewardExecutor:
     """Bound CPU reward RPCs independently of rollout production and buffer reads."""
 
-    def __init__(self, workers):
+    def __init__(self, workers, *, log_event_loop=False):
         self._workers = list(workers)
         self._available = deque(workers)
         self._slots = asyncio.Semaphore(max(1, len(workers)))
@@ -64,6 +64,8 @@ class RewardExecutor:
         self._ifbench_ready = False
         self._ifbench_lock = asyncio.Lock()
         self._counts = [0, 0.0, 0.0, 0.0]
+        self._loop_lags = deque(maxlen=8192)
+        self._monitor = asyncio.create_task(self._monitor_loop()) if log_event_loop else None
 
     async def score(self, rm_type, response, label, *, metadata=None):
         if self._closed:
@@ -121,6 +123,12 @@ class RewardExecutor:
         self._counts[2] += rpc_seconds
         self._counts[3] += compute_seconds
 
+    async def _monitor_loop(self):
+        while True:
+            started = monotonic()
+            await asyncio.sleep(0.1)
+            self._loop_lags.append(max(0.0, monotonic() - started - 0.1))
+
     def collect_metrics(self):
         count, queue, rpc, compute = self._counts
         self._counts = [0, 0.0, 0.0, 0.0]
@@ -133,10 +141,23 @@ class RewardExecutor:
                     "perf/reward_compute_time_mean": compute / count,
                 }
             )
+        if self._loop_lags:
+            lags = sorted(self._loop_lags)
+            self._loop_lags.clear()
+            metrics.update(
+                {
+                    "perf/rollout_event_loop_lag_mean": sum(lags) / len(lags),
+                    "perf/rollout_event_loop_lag_p95": lags[int(0.95 * (len(lags) - 1))],
+                    "perf/rollout_event_loop_lag_max": lags[-1],
+                }
+            )
         return metrics
 
     async def close(self):
         self._closed = True
+        if self._monitor is not None:
+            self._monitor.cancel()
+            await asyncio.gather(self._monitor, return_exceptions=True)
         for worker in self._workers:
             ray.kill(worker, no_restart=True)
         await asyncio.gather(*self._pending, return_exceptions=True)
@@ -145,13 +166,13 @@ class RewardExecutor:
 _executor = None
 
 
-async def initialize_reward_workers(num_workers):
+async def initialize_reward_workers(num_workers, *, log_event_loop=False):
     global _executor
     if _executor is not None:
         raise RuntimeError("Reward workers already initialized in this process")
     if num_workers < 0:
         raise ValueError("rm_num_workers must be nonnegative")
-    if num_workers == 0:
+    if num_workers == 0 and not log_event_loop:
         return
     workers = [RewardWorker.remote() for _ in range(num_workers)]
     try:
@@ -160,7 +181,7 @@ async def initialize_reward_workers(num_workers):
         for worker in workers:
             ray.kill(worker, no_restart=True)
         raise
-    _executor = RewardExecutor(workers)
+    _executor = RewardExecutor(workers, log_event_loop=log_event_loop)
 
 
 async def score_reward(rm_type, response, label, *, metadata=None):

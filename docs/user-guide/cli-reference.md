@@ -291,6 +291,7 @@ inline configs require absolute paths.
 |---|---|---|---|
 | `--rm-type` | str | – | Built-in reward: `math`, `dapo`, `deepscaler`, `gemma_math`, `f1`, `gpqa`, `ifbench`, `remote_rm`, `random`, `deterministic_random`. A `boxed_` prefix (e.g. `boxed_math`) extracts `\boxed{}` from the response before grading. |
 | `--rm-num-workers` | int | `0` | CPU Ray actors shared by `deepscaler`, `gemma_math`, `dapo`, `math`, `f1`, `gpqa`, and `ifbench` per rollout executor. A positive count moves scoring out of the rollout event loop and bounds active reward RPCs to that count. `0` keeps inline scoring. Remote/custom rewards and random baselines keep their existing paths. |
+| `--log-rollout-event-loop` | flag | off | Sample rollout event loop scheduling delay every 100 ms; fully async rollout reports its mean, p95 and maximum per metric window. |
 | `--rm-url` | str | – | Endpoint when `--rm-type remote_rm`. |
 | `--rm-max-retries` | int | `1` | Nonnegative number of retries after the first `remote_rm` request; `0` disables retries. |
 | `--rm-request-timeout` | float | `30.0` | Positive, finite timeout in seconds for each `remote_rm` HTTP attempt. |

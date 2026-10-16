@@ -161,9 +161,9 @@ async def test_real_workers_preserve_mixed_rewards_metadata_and_order(ray_local_
     inline_samples = deepcopy(samples)
     expected = await batched_async_rm(args, inline_samples)
     assert expected == [1, 1, compute_score_dapo("Answer: 42", "42"), 0, 2 / 3, 1.0, 1.0]
-    for worker_count in (0, 2):
+    for worker_count, log_event_loop in [(0, False), (0, True), (2, False)]:
         batch = deepcopy(samples)
-        await reward_worker.initialize_reward_workers(worker_count)
+        await reward_worker.initialize_reward_workers(worker_count, log_event_loop=log_event_loop)
         try:
             assert await asyncio.wait_for(batched_async_rm(args, batch), 60) == expected
             assert [sample.metadata for sample in batch] == [sample.metadata for sample in inline_samples]
@@ -254,6 +254,25 @@ async def test_ifbench_initialization_is_serialized_even_after_cancellation():
         second.release.set()
         await asyncio.gather(*tasks, return_exceptions=True)
         await asyncio.gather(*pool._pending, return_exceptions=True)
+
+
+async def test_event_loop_metrics_are_collected_reset_and_stopped_without_workers():
+    pool = reward_worker.RewardExecutor([], log_event_loop=True)
+    monitor = pool._monitor
+
+    async def wait_for_measurement():
+        while not pool._loop_lags:
+            await asyncio.sleep(0.01)
+
+    try:
+        await asyncio.wait_for(wait_for_measurement(), 3)
+        metrics = pool.collect_metrics()
+        assert metrics["perf/rollout_event_loop_lag_mean"] >= 0
+        assert 0 <= metrics["perf/rollout_event_loop_lag_p95"] <= metrics["perf/rollout_event_loop_lag_max"]
+        assert not any("event_loop_lag" in name for name in pool.collect_metrics())
+    finally:
+        await pool.close()
+    assert monitor.cancelled()
 
 
 @pytest.mark.parametrize("rm_type", ["remote_rm", "custom", "random", "deterministic_random"])

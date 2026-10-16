@@ -2236,6 +2236,11 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--log-rollout-event-loop",
+                action="store_true",
+                help="Measure shared rollout event loop scheduling delay.",
+            )
+            parser.add_argument(
                 "--rm-type",
                 type=str,
                 default=None,

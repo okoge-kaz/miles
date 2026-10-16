@@ -63,7 +63,11 @@ class RolloutExecutor:
         object_store.init_instance(args, contribute_segment=False)
 
         init_http_client(args)
-        async_utils.run(initialize_reward_workers(getattr(args, "rm_num_workers", 0)))
+        async_utils.run(
+            initialize_reward_workers(
+                getattr(args, "rm_num_workers", 0), log_event_loop=getattr(args, "log_rollout_event_loop", False)
+            )
+        )
 
         data_source_cls = load_function(self.args.data_source_path)
         self.data_source = data_source_cls(args)
